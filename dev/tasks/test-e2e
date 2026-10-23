@@ -65,7 +65,11 @@ echo "Pinned tools (kind, kubectl) ready in ${REPO_ROOT}/.build/bin"
 # ------------------------------------------------------------------------------
 CLUSTER_NAME="auto-optimizer"
 KEEP_CLUSTER="${KEEP_CLUSTER:-false}"
+if [[ "${CI:-}" == "true" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  KEEP_CLUSTER="true"
+fi
 DELETE_EXISTING="false"
+EXTRA_ARGS=()
 
 for arg in "$@"; do
   case "${arg}" in
@@ -74,6 +78,9 @@ for arg in "$@"; do
       ;;
     --delete|-d)
       DELETE_EXISTING="true"
+      ;;
+    *)
+      EXTRA_ARGS+=("${arg}")
       ;;
   esac
 done
@@ -109,148 +116,9 @@ echo "=== Running dev/tasks/deploy-to-kube ==="
 "${REPO_ROOT}/dev/tasks/deploy-to-kube"
 
 # ------------------------------------------------------------------------------
-# 4. Smoke Tests
+# 4. Run E2E Tests in Go
 # ------------------------------------------------------------------------------
-echo "=== Starting Smoke Tests ==="
-
-# Test 1: Minimal Sandbox
-echo "--- Smoke Test 1: Minimal Sandbox ---"
-SANDBOX_NAME="smoke-test-sandbox"
-SHUTDOWN_TIME="$(date -u -d '+10 minutes' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+10M +%Y-%m-%dT%H:%M:%SZ)"
-
-cat << EOF | kubectl apply -f -
-apiVersion: agents.x-k8s.io/v1beta1
-kind: Sandbox
-metadata:
-  name: ${SANDBOX_NAME}
-  namespace: ao-sandboxes
-spec:
-  shutdownPolicy: Delete
-  shutdownTime: "${SHUTDOWN_TIME}"
-  podTemplate:
-    spec:
-      containers:
-        - name: sandboxd
-          image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main
-          ports:
-            - containerPort: 8080
-          readinessProbe:
-            httpGet:
-              path: /v1/health
-              port: 8080
-EOF
-
-echo "Waiting for sandbox ${SANDBOX_NAME} Ready condition..."
-if ! kubectl wait --for=condition=Ready "sandbox/${SANDBOX_NAME}" -n ao-sandboxes --timeout=120s; then
-  echo "FAIL: Sandbox ${SANDBOX_NAME} failed to become Ready." >&2
-  kubectl describe "sandbox/${SANDBOX_NAME}" -n ao-sandboxes >&2 || true
-  kubectl describe pod -l "agents.x-k8s.io/sandbox-name=${SANDBOX_NAME}" -n ao-sandboxes >&2 || true
-  exit 1
-fi
-
-PORT=18080
-kubectl port-forward -n ao-sandboxes "pod/${SANDBOX_NAME}" "${PORT}:8080" >/dev/null 2>&1 &
-PF_PID=$!
-
-HEALTH_OK="false"
-for _ in $(seq 1 15); do
-  HEALTH="$(curl -s "http://127.0.0.1:${PORT}/v1/health" || true)"
-  if [[ "${HEALTH}" == *'"status":"ok"'* ]]; then
-    HEALTH_OK="true"
-    break
-  fi
-  sleep 1
-done
-
-kill "${PF_PID}" >/dev/null 2>&1 || true
-
-if [[ "${HEALTH_OK}" != "true" ]]; then
-  echo "FAIL: Sandbox health check failed on port ${PORT}. Expected {\"status\":\"ok\"}, got: ${HEALTH:-empty}" >&2
-  exit 1
-fi
-echo "PASS: Sandbox ${SANDBOX_NAME} reported healthy status."
-
-echo "Cleaning up sandbox ${SANDBOX_NAME}..."
-kubectl delete "sandbox/${SANDBOX_NAME}" -n ao-sandboxes --wait=true
-
-# Test 2: PersistentVolumeClaim with objectfs-exclusive-local
-echo "--- Smoke Test 2: ObjectFS PVC and Pod write ---"
-PVC_NAME="smoke-test-objectfs-pvc"
-POD_NAME="smoke-test-objectfs-pod"
-
-cat << EOF | kubectl apply -f -
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ${PVC_NAME}
-  namespace: default
-spec:
-  accessModes:
-    - ReadWriteOncePod
-  storageClassName: objectfs-exclusive-local
-  resources:
-    requests:
-      storage: 1Gi
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ${POD_NAME}
-  namespace: default
-spec:
-  restartPolicy: Never
-  volumes:
-    - name: objectfs-vol
-      persistentVolumeClaim:
-        claimName: ${PVC_NAME}
-  containers:
-    - name: writer
-      image: busybox:latest
-      command: ["sh", "-c", "echo 'smoke test data' > /workspace/test.txt && cat /workspace/test.txt && exit 0"]
-      volumeMounts:
-        - name: objectfs-vol
-          mountPath: /workspace
-EOF
-
-echo "Waiting for pod ${POD_NAME} to complete..."
-POD_SUCCEEDED="false"
-for _ in $(seq 1 60); do
-  PHASE="$(kubectl get pod "${POD_NAME}" -n default -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-  if [[ "${PHASE}" == "Succeeded" ]]; then
-    POD_SUCCEEDED="true"
-    break
-  elif [[ "${PHASE}" == "Failed" ]]; then
-    echo "FAIL: Pod ${POD_NAME} failed." >&2
-    kubectl logs "${POD_NAME}" -n default >&2 || true
-    kubectl describe pod "${POD_NAME}" -n default >&2 || true
-    exit 1
-  fi
-  sleep 2
-done
-
-if [[ "${POD_SUCCEEDED}" != "true" ]]; then
-  echo "FAIL: Pod ${POD_NAME} did not succeed within timeout." >&2
-  kubectl describe pod "${POD_NAME}" -n default >&2 || true
-  kubectl describe pvc "${PVC_NAME}" -n default >&2 || true
-  exit 1
-fi
-
-POD_LOGS="$(kubectl logs "${POD_NAME}" -n default)"
-if [[ "${POD_LOGS}" != *"smoke test data"* ]]; then
-  echo "FAIL: Unexpected pod logs from ${POD_NAME}: ${POD_LOGS}" >&2
-  exit 1
-fi
-echo "PASS: ObjectFS PVC read/write verified successfully."
-
-echo "Cleaning up storage test resources..."
-kubectl delete pod "${POD_NAME}" -n default --wait=true
-kubectl delete pvc "${PVC_NAME}" -n default --wait=true
-
-# Test 3: Check service-portals images
-echo "--- Smoke Test 3: service-portals images ---"
-# Note: upstream gke-labs/service-portals does not publish pre-built container images.
-# When published, test with a Pod running 'init-service-portals --help' and 'all-in-one-portal --help'.
-echo "INFO: Skipping service-portals image check: upstream gke-labs/service-portals publishes no container images yet."
-echo "PASS: service-portals image check handled (skipped as unpublished)."
-
-echo "=== All e2e smoke tests passed successfully! ==="
+echo "=== Running Go E2E tests ==="
+export KIND_CLUSTER_NAME="${CLUSTER_NAME}"
+export GOTOOLCHAIN="auto"
+RUN_E2E=1 go test -v -count=1 -timeout 20m ./tests/e2e/... "${EXTRA_ARGS[@]}"
