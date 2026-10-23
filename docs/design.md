@@ -1,9 +1,11 @@
 # auto-optimizer design
 
 Status: v1 design, 2026-10-23. This document is the source of truth for
-architecture. It supersedes `prototype/docs/design.md` (the 2026-10-15 spike).
-Keep it current when the code changes; record changes of direction in the
-Decisions table with a date.
+architecture. It replaces the design of a 2026-10-15 spike that is not part of
+this repository; the ideas worth keeping from it are summarised in
+[Ideas from the spike](#ideas-from-the-spike). Keep this document current when
+the code changes; record changes of direction in the Decisions table with a
+date.
 
 ## What it is
 
@@ -29,14 +31,15 @@ and the maintainer is the judge.
 | 2026-10-23 | Credentials and egress | gke-labs/service-portals runs as a sidecar in every sandbox pod: no real tokens inside the sandbox, iptables egress allowlist, TLS interception with a pod-local CA, credential injection per host, usage logging for LLM traffic. |
 | 2026-10-23 | Filesystem storage | gke-labs/in-cluster-storage (ObjectFS) provides the session workspace volume (clone, worktrees, agent state) so a workspace survives sandbox recreation and can be resumed, replacing the tar snapshot/restore of the upstream example. Control-plane state is files under one state directory, which in production is an ObjectFS volume. |
 | 2026-10-23 | Control plane | One Go binary, `ao`. `ao serve` is a normal Deployment on the cluster that has agent-sandbox installed. Server-rendered `html/template` UI, no JavaScript framework. |
-| 2026-10-23 | Metric trust | Unchanged from the prototype: the agent never decides a PR is good. For metric goals the orchestrator re-measures the candidate in a clean sandbox before opening a PR. |
+| 2026-10-23 | Metric trust | The agent never decides a PR is good. For metric goals the orchestrator re-measures the candidate in a clean sandbox before opening a PR. |
 | 2026-10-15 | Billing | Platform-held LLM keys (injected by the portal, never in the sandbox), usage metered per run and per repo, hard budget caps. Stripe later. |
 | 2026-10-15 | Deployment | kind locally; the GKE cluster that already runs agent-sandbox for real use. runc first, gVisor via RuntimeClass later. |
 
-Changes from the 2026-10-15 spike: the in-sandbox `ao worker` entrypoint and
-the supervisor tool belt are gone (the loop moved to the control plane);
-`gocloud.dev/blob` is replaced by a plain state directory; a PAT-only first cut
-is replaced by the forge abstraction so both PAT and App work from day one.
+Compared with the spike: the agent loop moves from inside the sandbox to the
+control plane, so there is no in-sandbox worker entrypoint and no CLI tool
+belt for a supervisor agent; blob-store SDKs are replaced by a plain state
+directory on a cluster filesystem; a PAT-only first cut is replaced by the
+forge abstraction so both PAT and App work from day one.
 
 ## Architecture
 
@@ -84,12 +87,12 @@ is replaced by the forge abstraction so both PAT and App work from day one.
 | `pkg/llm` | forked from `sandboxed-tools/pkg/llm` | Minimal OpenAI-compatible chat client with tool calling, plus `fake` for tests. Gemini and Anthropic both expose OpenAI-compatible endpoints. |
 | `pkg/tools`, `pkg/toolsets` | forked from `sandboxed-tools/pkg/{tools,toolsets}` | Tool interface, registry, output limiting, the `basic` and `geminicli` toolsets (the `geminicli-toolbox` helper binary ships in our worker image). New `ao` toolset adds `measure`, `open_pull_request`, `finish`, and later `start_session`. |
 | `pkg/acp` | forked from `examples/agentclientprotocol/pkg/acp` | ACP client used to drive inner CLI agents that speak ACP (gemini-cli `--acp`) over a sandboxd `Start` stream, giving us streamed tool calls and permission gating without parsing terminal output. |
-| `pkg/agents` | carried from prototype | Declarative definitions of CLI agent personalities: command template, prompt delivery, output parser for summary and token usage. |
+| `pkg/agents` | new (idea from the spike) | Declarative definitions of CLI agent personalities: command template, prompt delivery, output parser for summary and token usage. |
 | `pkg/sandbox` | new | Builds the per-run `Sandbox` object (or `SandboxClaim` once warm pools are used), waits for readiness, holds the sandboxd client (bearer token, Pod IP or headless Service), extends `shutdownTime`, deletes. Wraps `sigs.k8s.io/agent-sandbox/clients/go/sandbox` where it fits. |
 | `pkg/portal` | new | Renders per-run `PortalRule`s (which hosts, which token) into the Secret the sidecar reads; parses the portal's usage logs for metering. |
-| `pkg/measure` | carried from prototype | Metric protocol (last stdout line is a number or `{"value":N,"unit":"..."}`), median of N runs, verify gate, improvement arithmetic. Now executed through sandboxd `Execute`. |
+| `pkg/measure` | new (idea from the spike) | Metric protocol (last stdout line is a number or `{"value":N,"unit":"..."}`), median of N runs, verify gate, improvement arithmetic. Now executed through sandboxd `Execute`. |
 | `pkg/state` | new | File layout under the state directory, atomic JSON writes, append-only JSONL. |
-| `pkg/web` | carried from prototype, extended | Repo list, repo page with goals and run history, run page with session transcript, tool calls, measurements, PR link. Inline SVG chart of the metric over time. |
+| `pkg/web` | new | Repo list, repo page with goals and run history, run page with session transcript, tool calls, measurements, PR link. Inline SVG chart of the metric over time. |
 
 Build and deploy follow the gke-labs conventions (`dev/tasks/*`, `.ap/`, `ap deploy`), like eval-runner and service-portals.
 
@@ -135,9 +138,14 @@ Goal kinds, decided by which front matter is present:
   opens the PR as a proposal. Feature lists and code quality live here until
   we add rubric/checklist goal types.
 
-Metric protocol and improvement arithmetic are unchanged from the prototype
-(`prototype/docs/goal-file.md`). A goal never changes what is measured
-mid-run: the orchestrator freezes the goal file at the base commit, and an
+Metric protocol: the metric command runs from the repository root and its
+**last non-empty stdout line** is the measurement, either a bare number
+(`1234.5`), a number with a unit (`1234.5 ns/op`), or JSON
+(`{"value": 1234.5, "unit": "ns/op"}`). A non-zero exit code is a failed
+measurement, never a number. Everything else the command prints is kept in the
+run logs, so scripts can be chatty. `minImprovement` is absolute (`5`) or
+relative (`1%`) and is applied in the goal's direction. A goal never changes
+what is measured mid-run: the orchestrator freezes the goal file at the base commit, and an
 attempt that edits `.goals/` or the metric script is rejected.
 
 ## Watching GitHub: the forge
@@ -377,7 +385,7 @@ ownership checks before anything is exposed publicly.
 
 - `ao serve --forge gitremote --repo <url>` watches any public repository or a
   local git daemon and runs sessions; PRs are skipped or pushed to a local
-  bare remote (as the prototype did).
+  bare remote.
 - `GITHUB_TOKEN=... ao serve --repo <url>` uses the `github` forge with a PAT
   and opens real PRs from your account. Use a fork, since merging your own
   bot's PR is a self-merge.
@@ -387,15 +395,67 @@ ownership checks before anything is exposed publicly.
 - Unit tests use the `fake` forge, the fake LLM (`fake-eliza` style scripted
   tool calls), and a fake sandboxd client. One e2e test runs on kind in CI.
 
-## Carried over from the prototype
+## Ideas from the spike
 
-Kept: metric protocol and improvement arithmetic (`pkg/goal`, `pkg/measure`),
-agent CLI definitions and output parsers (`pkg/agents`), PR body generation,
-the `html/template` pages and CSS, run ID format, the sandbox image recipe.
-Dropped: the in-sandbox `ao worker`, the supervisor tool belt commands,
-`gocloud.dev/blob`, the spec.yaml self-hosting metric (it returns as a
-`.goals/` checklist goal once checklist goals exist). The `prototype/`
-directory is deleted once the phase 1 vertical slice lands.
+A one-week spike (2026-10-15) built a working vertical slice with a different
+shape: a worker process inside the sandbox ran a supervisor coding agent that
+delegated to subagents through a CLI tool belt. We are not following it
+closely, but these ideas held up and inform this design. Treat them as
+guidance, not as a spec.
+
+- **The harness decides, the agent proposes.** The agent's own numbers are
+  never trusted. The final tree is re-measured by Go code and the PR body is
+  generated from that measurement. Any agent-reported value is at most
+  context for the reviewer.
+- **A tiny metric protocol beats a plugin API.** Any command that prints a
+  number on its last line is a metric; a non-zero exit is a failure, not a
+  value; repeat and take the median. Repositories can adopt it with a shell
+  script. (Described in full under Goals.)
+- **Small outputs for the model, full outputs on disk.** Tool calls returned
+  about 40 lines and wrote everything else to the run directory. The model's
+  context stayed small and the UI still had the full story. Our limited
+  writer plus per-tool output files keep this.
+- **Context discipline for the planner.** The supervisor prompt said: spend a
+  few turns on layout, never run the benchmark yourself, give subagents
+  complete self-contained tasks, prefer several small independent attempts in
+  separate worktrees over one long one, ask each subagent for a five-line
+  summary, stop before the deadline. This carries straight into the outer
+  session's system prompt in phase 2.
+- **Agents as data, not code.** Each CLI agent was a definition: command
+  template, whether the prompt goes on stdin, and an output mode that extracts
+  the final message and token usage from the CLI's JSON stream. Adding an
+  agent was a YAML entry. Headless flags found to work in October 2026:
+  `claude -p --output-format stream-json --dangerously-skip-permissions`,
+  `gemini --approval-mode yolo --skip-trust --output-format json`,
+  `codex exec --dangerously-bypass-approvals-and-sandbox --json`,
+  `opencode run --auto --format json`, `pi --mode json`. Model names differ
+  (`provider/model` for opencode and pi, bare ids elsewhere). The auto-approve
+  flags are acceptable only because the sandbox is the permission boundary.
+- **Freeze the goal at the base commit.** The goal file was copied out of the
+  tree before the agent started, so an agent could not change what was being
+  measured. Edits to the goal or the metric script in an attempt are rejected.
+- **Exactly one writer per state object.** State was JSON files keyed by a
+  time-sortable run ID (`20261015T120000Z-ab12`), one writer per object, no
+  partial updates. Concurrency problems never appeared. Same rule here.
+- **Let the sandbox controller be the safety net.** Each run's `Sandbox` had
+  `shutdownPolicy: Delete` and a `shutdownTime` of deadline plus grace, so a
+  dead control plane could not leak pods. Everything of value was persisted
+  outside the pod before exit.
+- **Sandbox image recipe.** Debian slim, Go, Node, Python, build essentials,
+  the agent CLIs installed with npm, a non-root uid 1000 user with git
+  configured, `GIT_TERMINAL_PROMPT=0`. Our worker image starts from this and
+  adds sandboxd injection, `tini`, and `geminicli-toolbox`.
+- **Dogfooding through a checklist.** The spike's repository goal was the
+  percentage of acceptance checks passing in a spec file, each check a fast
+  command such as `go test -run TestX`, with the rule that weakening a check
+  is cheating. That returns as a checklist goal type and this repository's
+  own `.goals/`.
+- **A fake agent and a local bare remote** made the whole lifecycle testable
+  without network or credentials. Our fake LLM and fake forge serve the same
+  purpose.
+
+Dropped on purpose: the in-sandbox worker entrypoint, the supervisor CLI tool
+belt, blob-store SDKs for state, and PAT-first sequencing.
 
 ## Expected upstream work
 
