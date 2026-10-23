@@ -1,0 +1,228 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Pinned versions and commit SHAs for upstream dependencies.
+# To bump:
+# - AGENT_SANDBOX_VERSION: Check latest release at https://github.com/kubernetes-sigs/agent-sandbox/releases
+# - SERVICE_PORTALS_COMMIT: Check latest commit at https://github.com/gke-labs/service-portals/commits/main
+# - CERT_MANAGER_VERSION: Check latest release at https://github.com/cert-manager/cert-manager/releases
+# - IN_CLUSTER_STORAGE_COMMIT: Check latest commit at https://github.com/gke-labs/in-cluster-storage/commits/main
+AGENT_SANDBOX_VERSION="v1.0.8"
+SERVICE_PORTALS_COMMIT="686b34d8aa74546af1039119bbfa6e05ead15f53"
+CERT_MANAGER_VERSION="v1.19.2"
+IN_CLUSTER_STORAGE_COMMIT="923578df519c02cd0da1b7455d8a1e0278a103c4"
+
+# Use tools from .build/bin if present
+if [[ -d "${REPO_ROOT}/.build/bin" ]]; then
+  export PATH="${REPO_ROOT}/.build/bin:${PATH}"
+fi
+
+CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || echo "unknown")"
+echo "=== Deploying auto-optimizer dependencies to kubeconfig context: ${CURRENT_CONTEXT} ==="
+
+# ------------------------------------------------------------------------------
+# 1. Namespaces
+# ------------------------------------------------------------------------------
+echo "--- Ensuring namespaces ao-system and ao-sandboxes exist ---"
+kubectl create namespace ao-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl create namespace ao-sandboxes --dry-run=client -o yaml | kubectl apply -f -
+
+# ------------------------------------------------------------------------------
+# 2. agent-sandbox
+# ------------------------------------------------------------------------------
+echo "--- Installing agent-sandbox (${AGENT_SANDBOX_VERSION}) ---"
+kubectl apply --server-side -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/sandbox.yaml"
+kubectl apply --server-side -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/extensions.yaml"
+
+echo "Waiting for sandboxes.agents.x-k8s.io CRD to be established..."
+kubectl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=60s
+
+echo "Waiting for agent-sandbox-controller deployment in agent-sandbox-system..."
+kubectl rollout status deployment/agent-sandbox-controller -n agent-sandbox-system --timeout=120s
+
+# ------------------------------------------------------------------------------
+# 3. service-portals
+# ------------------------------------------------------------------------------
+# Note: service-portals manifests (k8s/manifests.yaml) require cert-manager to
+# generate the service-portal-ca secret via a self-signed Issuer and Certificate.
+echo "--- Ensuring cert-manager (${CERT_MANAGER_VERSION}) is installed for service-portals ---"
+kubectl apply --server-side -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+echo "Waiting for cert-manager-webhook to be ready..."
+kubectl rollout status deployment/cert-manager-webhook -n cert-manager --timeout=120s
+
+echo "--- Installing service-portals cluster-wide manifests (${SERVICE_PORTALS_COMMIT}) ---"
+# Note: gke-labs/service-portals does not publish pre-built container images.
+# To build and push images from source, configure IMAGE_PREFIX and run:
+#   IMAGE_PREFIX=<registry> ap deploy //...
+# from the service-portals repository. For this issue, cluster-wide manifests
+# (k8s/manifests.yaml) are installed. Sidecar images (init-service-portals,
+# all-in-one-portal) will be used when sandboxes requiring portals are deployed.
+kubectl apply -f "https://raw.githubusercontent.com/gke-labs/service-portals/${SERVICE_PORTALS_COMMIT}/k8s/manifests.yaml"
+
+# ------------------------------------------------------------------------------
+# 4. in-cluster-storage (ObjectFS)
+# ------------------------------------------------------------------------------
+echo "--- Installing in-cluster-storage / ObjectFS (${IN_CLUSTER_STORAGE_COMMIT}) ---"
+kubectl create namespace kube-objectfs-system --dry-run=client -o yaml | kubectl apply -f -
+
+# Determine backend: if OBJECTFS_BACKEND is set (e.g. gs://bucket/prefix on GKE), use it.
+# Otherwise, deploy in-cluster fakes3 for kind or local testing.
+BACKEND_URL="${OBJECTFS_BACKEND:-}"
+IS_KIND="false"
+if [[ "${CURRENT_CONTEXT}" == kind-* ]]; then
+  IS_KIND="true"
+fi
+
+# Build images if running on kind and images are missing
+if [[ "${IS_KIND}" == "true" ]]; then
+  KIND_CLUSTER_NAME="${CURRENT_CONTEXT#kind-}"
+  # Check if in-cluster-storage images are already present in kind node
+  NODE_IMAGES="$(docker exec "${KIND_CLUSTER_NAME}-control-plane" crictl images 2>/dev/null || true)"
+  if ! echo "${NODE_IMAGES}" | grep -q "objectfs-controller"; then
+    echo "in-cluster-storage images not found in kind node ${KIND_CLUSTER_NAME}-control-plane."
+    if command -v docker >/dev/null 2>&1; then
+      echo "Building in-cluster-storage images from source commit ${IN_CLUSTER_STORAGE_COMMIT}..."
+      SRC_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/auto-optimizer/in-cluster-storage/${IN_CLUSTER_STORAGE_COMMIT}"
+      if [[ ! -d "${SRC_DIR}" ]]; then
+        mkdir -p "${SRC_DIR}"
+        git clone --depth 1 https://github.com/gke-labs/in-cluster-storage.git "${SRC_DIR}"
+        (cd "${SRC_DIR}" && git fetch --depth 1 origin "${IN_CLUSTER_STORAGE_COMMIT}" && git checkout "${IN_CLUSTER_STORAGE_COMMIT}")
+      fi
+      docker build -t fakes3:latest -f "${SRC_DIR}/fakes3/images/fakes3/Dockerfile" "${SRC_DIR}/fakes3"
+      docker build -t wal-buffer:latest -f "${SRC_DIR}/images/wal-buffer/Dockerfile" "${SRC_DIR}"
+      docker build -t objectfs-controller:latest -f "${SRC_DIR}/images/objectfs-controller/Dockerfile" "${SRC_DIR}"
+      docker build -t objectfs-node-daemon:latest -f "${SRC_DIR}/images/objectfs-node-daemon/Dockerfile" "${SRC_DIR}"
+
+      echo "Loading built images into kind cluster ${KIND_CLUSTER_NAME}..."
+      kind load docker-image fakes3:latest wal-buffer:latest objectfs-controller:latest objectfs-node-daemon:latest --name "${KIND_CLUSTER_NAME}"
+    else
+      echo "Warning: docker command not found. Building images requires Docker." >&2
+      echo "in-cluster-storage publishes no pre-built container images." >&2
+    fi
+  else
+    echo "in-cluster-storage images already present in kind cluster."
+  fi
+fi
+
+if [[ -z "${BACKEND_URL}" ]]; then
+  echo "No OBJECTFS_BACKEND specified; deploying in-cluster fakes3..."
+  cat << 'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: fakes3
+  namespace: kube-objectfs-system
+spec:
+  ports:
+    - port: 9000
+      targetPort: 9000
+  selector:
+    app: fakes3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fakes3
+  namespace: kube-objectfs-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fakes3
+  template:
+    metadata:
+      labels:
+        app: fakes3
+    spec:
+      containers:
+        - name: fakes3
+          image: fakes3:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--listen=0.0.0.0:9000", "--buckets=objectfs-bucket", "--quiet"]
+          ports:
+            - containerPort: 9000
+EOF
+
+  echo "Waiting for fakes3 deployment..."
+  kubectl rollout status deployment/fakes3 -n kube-objectfs-system --timeout=60s
+
+  BACKEND_URL="s3://objectfs-bucket?endpoint=http://fakes3.kube-objectfs-system.svc.cluster.local:9000&region=us-east-1&s3ForcePathStyle=true"
+fi
+
+# Apply wal.yaml then objectfs.yaml
+echo "Applying wal.yaml and objectfs.yaml manifests..."
+if [[ "${IS_KIND}" == "true" || "${BACKEND_URL}" == s3://*fakes3* ]]; then
+  # On kind / fakes3, adapt manifests for local image caching and fakes3 credentials
+  BACKEND_ESCAPED="$(printf '%s\n' "${BACKEND_URL}" | sed -e 's|[\&]|\\&|g')"
+
+  curl -sL "https://raw.githubusercontent.com/gke-labs/in-cluster-storage/${IN_CLUSTER_STORAGE_COMMIT}/k8s/wal.yaml" | \
+    sed -e 's|image: wal-buffer:latest|image: wal-buffer:latest\n          imagePullPolicy: IfNotPresent|g' \
+        -e 's|- name: OBJECT_STORAGE_BACKEND|- name: AWS_ACCESS_KEY_ID\n              value: "fakes3"\n            - name: AWS_SECRET_ACCESS_KEY\n              value: "fakes3"\n            - name: AWS_REGION\n              value: "us-east-1"\n            - name: OBJECT_STORAGE_BACKEND|g' | \
+    kubectl apply -f -
+
+  curl -sL "https://raw.githubusercontent.com/gke-labs/in-cluster-storage/${IN_CLUSTER_STORAGE_COMMIT}/k8s/objectfs.yaml" | \
+    sed -e 's|image: objectfs-node-daemon:latest|image: objectfs-node-daemon:latest\n          imagePullPolicy: IfNotPresent|g' \
+        -e 's|image: objectfs-controller:latest|image: objectfs-controller:latest\n          imagePullPolicy: IfNotPresent|g' \
+        -e 's|- name: OBJECT_STORAGE_BACKEND|- name: AWS_ACCESS_KEY_ID\n              value: "fakes3"\n            - name: AWS_SECRET_ACCESS_KEY\n              value: "fakes3"\n            - name: AWS_REGION\n              value: "us-east-1"\n            - name: OBJECT_STORAGE_BACKEND|g' \
+        -e "s|backend: \"\"|backend: \"${BACKEND_ESCAPED}\"|g" | \
+    kubectl apply -f -
+else
+  kubectl apply -f "https://raw.githubusercontent.com/gke-labs/in-cluster-storage/${IN_CLUSTER_STORAGE_COMMIT}/k8s/wal.yaml"
+  kubectl apply -f "https://raw.githubusercontent.com/gke-labs/in-cluster-storage/${IN_CLUSTER_STORAGE_COMMIT}/k8s/objectfs.yaml"
+fi
+
+# Ensure objectfs-config ConfigMap backend is set
+echo "Ensuring objectfs-config backend is set to: ${BACKEND_URL}"
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: objectfs-config
+  namespace: kube-objectfs-system
+data:
+  backend: "${BACKEND_URL}"
+EOF
+
+echo "Waiting for wal-buffer statefulset in kube-objectfs-system..."
+kubectl rollout status statefulset/wal-buffer -n kube-objectfs-system --timeout=120s
+
+echo "Waiting for objectfs-controller statefulset in kube-objectfs-system..."
+kubectl rollout status statefulset/objectfs-controller -n kube-objectfs-system --timeout=120s
+
+echo "Waiting for objectfs-node-daemon daemonset in kube-objectfs-system..."
+kubectl rollout status daemonset/objectfs-node-daemon -n kube-objectfs-system --timeout=120s
+
+echo "Waiting for StorageClass objectfs-exclusive-local to exist..."
+SC_FOUND="false"
+for _ in $(seq 1 30); do
+  if kubectl get storageclass objectfs-exclusive-local >/dev/null 2>&1; then
+    SC_FOUND="true"
+    break
+  fi
+  sleep 2
+done
+
+if [[ "${SC_FOUND}" != "true" ]]; then
+  echo "ERROR: StorageClass objectfs-exclusive-local was not found after waiting." >&2
+  exit 1
+fi
+
+echo "=== deploy-to-kube completed successfully ==="
