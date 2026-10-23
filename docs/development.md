@@ -52,20 +52,26 @@ Installs all cluster infrastructure and prerequisites needed by `auto-optimizer`
    - Waits for the `sandboxes.agents.x-k8s.io` CRD to be established and the `agent-sandbox-controller` deployment in `agent-sandbox-system` to roll out.
 
 3. **service-portals**:
-   - Ensures `cert-manager` (pinned to `v1.19.2`) is installed and `cert-manager-webhook` is ready, which is required for `service-portals` to generate CA secrets dynamically.
-   - Cluster-wide manifests (`k8s/manifests.yaml`) from `gke-labs/service-portals` pinned to commit `686b34d8aa74546af1039119bbfa6e05ead15f53`.
-   - Note: `gke-labs/service-portals` does not publish pre-built container images to a public registry. To deploy images to a custom registry, run `IMAGE_PREFIX=<registry> ap deploy //...` from that repository. Sidecar images (`init-service-portals`, `all-in-one-portal`) are referenced by sandboxes when portals are needed.
+   - Sandboxes use service-portals exclusively in transparent sidecar mode (see `docs/design.md`, Sandboxes). Auto-optimizer does not need the central explicit service proxy (`Deployment/service-portal`) or `cert-manager`.
+   - Clones `gke-labs/service-portals` outside the source tree under `${XDG_CACHE_HOME:-$HOME/.cache}/auto-optimizer/service-portals/<commit>` at pinned commit `686b34d8aa74546af1039119bbfa6e05ead15f53`.
+   - Builds container images (`init-service-portals`, `all-in-one-portal`, `gitproxy-server`, `service-portal`) using `ap build`.
+   - On `kind`, loads the built images into kind nodes. On a real cluster, builds and pushes images to `IMAGE_PREFIX`.
 
 4. **in-cluster-storage (ObjectFS)**:
-   - Deploys `k8s/wal.yaml` and `k8s/objectfs.yaml` from `gke-labs/in-cluster-storage` pinned to commit `923578df519c02cd0da1b7455d8a1e0278a103c4`.
-   - On local `kind` clusters, deploys an in-cluster `fakes3` S3-compatible service in `kube-objectfs-system` and configures the `objectfs-config` ConfigMap `backend` URL to point to it.
-   - Builds container images from source and loads them into kind if not already present.
+   - Clones `gke-labs/in-cluster-storage` outside the source tree under `${XDG_CACHE_HOME:-$HOME/.cache}/auto-optimizer/in-cluster-storage/<commit>` at pinned commit `923578df519c02cd0da1b7455d8a1e0278a103c4`.
+   - Deploys upstream manifests without patching using `ap deploy`. `ap deploy` builds the images and applies `k8s/wal.yaml` and `k8s/objectfs.yaml`, prefixing image references with `IMAGE_PREFIX`.
+   - On local `kind` clusters:
+     - Builds in-cluster `fakes3` (`fakes3/`) with `ap build` and loads it into kind.
+     - Builds in-cluster-storage images (`wal-buffer`, `objectfs-controller`, `objectfs-node-daemon`) and loads them into kind.
+     - Runs `ap deploy --skip-push`.
+     - Applies the `objectfs-config` ConfigMap pointing `backend` to `fakes3`.
+     - Injects S3 credentials into `wal-buffer` and `objectfs-controller` StatefulSets via a Kubernetes Secret and `kubectl set env` (no manifest patching).
    - Waits for the `wal-buffer` StatefulSet, `objectfs-controller` StatefulSet, and `objectfs-node-daemon` DaemonSet to roll out successfully.
    - Waits for the `objectfs-exclusive-local` StorageClass to be established.
 
 #### Idempotence
 
-`deploy-to-kube` is idempotent. Running it a second time against an already-configured cluster will make no changes, detect existing resources and rollouts, and exit `0` within seconds.
+`deploy-to-kube` is idempotent. Running it a second time against an already-configured cluster will make no changes, detect existing resources and rollouts, and exit `0` within seconds. Sibling checkouts are cached and reused at their pinned commits.
 
 #### Pointing at a Real Cluster (e.g. GKE)
 
@@ -76,7 +82,12 @@ To point `deploy-to-kube` at a real cluster rather than `kind`:
    kubectl config use-context <my-cluster-context>
    ```
 
-2. Specify an external object storage backend URL using the `OBJECTFS_BACKEND` environment variable. For example, for Google Cloud Storage:
+2. Set `IMAGE_PREFIX` to a container registry accessible to the cluster (such as Google Artifact Registry):
+   ```bash
+   export IMAGE_PREFIX="us-central1-docker.pkg.dev/my-project/my-repo"
+   ```
+
+3. Specify an external object storage backend URL using the `OBJECTFS_BACKEND` environment variable. For example, for Google Cloud Storage:
    ```bash
    export OBJECTFS_BACKEND="gs://my-bucket/prefix"
    ```
@@ -85,7 +96,7 @@ To point `deploy-to-kube` at a real cluster rather than `kind`:
    export OBJECTFS_BACKEND="s3://my-bucket/prefix"
    ```
 
-3. Run the script:
+4. Run the script:
    ```bash
    ./dev/tasks/deploy-to-kube
    ```
@@ -99,14 +110,12 @@ All upstream dependencies are pinned in variables at the top of `dev/tasks/deplo
 ```bash
 AGENT_SANDBOX_VERSION="v1.0.8"
 SERVICE_PORTALS_COMMIT="686b34d8aa74546af1039119bbfa6e05ead15f53"
-CERT_MANAGER_VERSION="v1.19.2"
 IN_CLUSTER_STORAGE_COMMIT="923578df519c02cd0da1b7455d8a1e0278a103c4"
 ```
 
 To bump a version:
 - **`AGENT_SANDBOX_VERSION`**: Check releases at [kubernetes-sigs/agent-sandbox/releases](https://github.com/kubernetes-sigs/agent-sandbox/releases) and update the version tag.
 - **`SERVICE_PORTALS_COMMIT`**: Check latest commits at [gke-labs/service-portals/commits/main](https://github.com/gke-labs/service-portals/commits/main) and update the commit SHA.
-- **`CERT_MANAGER_VERSION`**: Check releases at [cert-manager/cert-manager/releases](https://github.com/cert-manager/cert-manager/releases) and update the version tag.
 - **`IN_CLUSTER_STORAGE_COMMIT`**: Check latest commits at [gke-labs/in-cluster-storage/commits/main](https://github.com/gke-labs/in-cluster-storage/commits/main) and update the commit SHA.
 
 After updating versions, run `./dev/tasks/test-e2e` to verify compatibility.
@@ -123,7 +132,7 @@ Runs end-to-end tests against a local `kind` cluster. `dev/tasks/test-e2e` is a 
 
 #### What It Does
 
-1. **Tool Setup**: Ensures pinned `kind` (v0.31.0) and `kubectl` (v1.35.0) are installed into `.build/bin/` and placed at the beginning of `PATH`.
+1. **Tool Setup**: Ensures pinned `kind` (v0.31.0), `kubectl` (v1.35.0), and (if missing) `docker` CLI and `docker-buildx` plugin are installed under `.build/` (with `docker-buildx` linked into `~/.docker/cli-plugins/`) and placed on `PATH`.
 2. **Cluster Creation**: Creates a `kind` cluster named `auto-optimizer` (or reuses an existing one if already present).
 3. **Deployment**: Executes `dev/tasks/deploy-to-kube` against the cluster.
 4. **Go E2E Tests**: Executes `RUN_E2E=1 go test -v -count=1 -timeout 20m ./tests/e2e/...`:
@@ -133,7 +142,7 @@ Runs end-to-end tests against a local `kind` cluster. `dev/tasks/test-e2e` is a 
    - Subtests cover:
      - `SandboxHealth`: Creates a minimal `Sandbox` (`agents.x-k8s.io/v1beta1`) in `ao-sandboxes` running upstream `sandboxd`, waits for `Ready`, port-forwards to port 8080, queries `/v1/health` for `{"status":"ok"}`, and deletes the sandbox.
      - `ObjectFSPVCWrite`: Creates a `PersistentVolumeClaim` with `storageClassName: objectfs-exclusive-local` and `ReadWriteOncePod` access mode. Launches a test Pod writing to the mounted volume, verifies successful exit and output, and deletes test resources.
-     - `ServicePortalsImages`: Skips with an informative message until upstream publishes images.
+     - `ServicePortalsImages`: Launches a test Pod in namespace `default` running `init-service-portals --help` from the built image (`${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}`) and verifies it exits `0`.
 5. **Teardown**: Deletes the `auto-optimizer` kind cluster upon completion (or on error, unless `--keep` is passed).
 
 #### Options and Flags
