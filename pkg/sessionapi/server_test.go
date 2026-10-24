@@ -384,6 +384,133 @@ func TestSendMessage_BusySession(t *testing.T) {
 	}
 }
 
+func TestConcurrentReadDuringTurn(t *testing.T) {
+	ctx := t.Context()
+	blockingSB := &blockingSandbox{
+		startedCh: make(chan struct{}, 1),
+		blockCh:   make(chan struct{}),
+	}
+	client, _, _ := setupTestServer(t, blockingSB)
+
+	turnErrCh := make(chan error, 1)
+	go func() {
+		stream, err := client.SendMessage(ctx, &sessionv1.SendMessageRequest{
+			Name: "concurrent",
+			Text: "run: uname -a",
+		})
+		if err != nil {
+			turnErrCh <- err
+			return
+		}
+		for {
+			_, err := stream.Recv()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					turnErrCh <- nil
+				} else {
+					turnErrCh <- err
+				}
+				return
+			}
+		}
+	}()
+
+	// Wait until the turn is in-flight and blocked in the sandbox.
+	select {
+	case <-blockingSB.startedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for turn to reach sandbox")
+	}
+
+	// Run concurrent readers while the turn is in-flight and while it finishes.
+	stopReaders := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Reader 1: ListMessages
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopReaders:
+				return
+			default:
+				resp, err := client.ListMessages(ctx, &sessionv1.ListMessagesRequest{Name: "concurrent"})
+				if err != nil {
+					t.Errorf("concurrent ListMessages failed: %v", err)
+					return
+				}
+				if len(resp.Messages) == 0 {
+					t.Errorf("concurrent ListMessages returned 0 messages")
+					return
+				}
+			}
+		}
+	}()
+
+	// Reader 2: ListSessions
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopReaders:
+				return
+			default:
+				resp, err := client.ListSessions(ctx, &sessionv1.ListSessionsRequest{})
+				if err != nil {
+					t.Errorf("concurrent ListSessions failed: %v", err)
+					return
+				}
+				if len(resp.Sessions) == 0 {
+					t.Errorf("concurrent ListSessions returned 0 sessions")
+					return
+				}
+			}
+		}
+	}()
+
+	// Reader 3: GetSession
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopReaders:
+				return
+			default:
+				resp, err := client.GetSession(ctx, &sessionv1.GetSessionRequest{Name: "concurrent"})
+				if err != nil {
+					t.Errorf("concurrent GetSession failed: %v", err)
+					return
+				}
+				if resp.MessageCount == 0 {
+					t.Errorf("concurrent GetSession returned 0 message count")
+					return
+				}
+			}
+		}
+	}()
+
+	// Let the readers loop while blocked in the sandbox.
+	time.Sleep(20 * time.Millisecond)
+
+	// Unblock the sandbox so the turn proceeds and appends more messages.
+	close(blockingSB.blockCh)
+
+	select {
+	case err := <-turnErrCh:
+		if err != nil {
+			t.Fatalf("turn failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for turn to finish")
+	}
+
+	close(stopReaders)
+	wg.Wait()
+}
+
 func eToolCallStarted(e *sessionv1.SessionEvent) *sessionv1.ToolCall {
 	if s := e.GetToolCallStarted(); s != nil {
 		return s.ToolCall
