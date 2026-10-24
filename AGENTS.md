@@ -82,36 +82,22 @@ repository.
 - Code that is forked from an upstream example (for example the session loop
   from agent-sandbox's `examples/sandboxed-tools`) keeps the upstream license
   header and names its origin in the package comment.
+- Before pushing, read each commit message against its diff and remove any sentence that describes work not in that diff.
 
 ### Commit messages and PR descriptions
 
-**The code and its commit history must stand on their own.** PR descriptions
-do not become part of the repository; commit messages do. Anything a future
-reader needs to understand a change belongs in the commit messages, and the PR
-description should simply repeat them.
+**The code and its commit history must stand on their own.** PR descriptions do not become part of the repository; commit messages do. Anything a future reader needs to understand a change belongs in the commit messages, and the PR description should simply repeat them.
 
-- **Subject line:** `area: imperative summary`, about 72 characters at most,
-  where `area` is the package or component touched (for example `forge`,
-  `session`, `sandbox`, `goals`, `web`, `images/worker`, `docs`).
-- **Body: explain why, not just what.** Include whatever the diff alone
-  doesn't make obvious:
-    - **Bug fixes:** the symptom, the root cause, why the change fixes it, and
-      the test that reproduces it.
-    - **Design changes:** the approach taken, and the alternatives considered
-      and why they were rejected.
-    - **Performance changes:** the numbers, how they were measured, and in
-      what configuration.
-    - **Review answers:** if a reviewer had to ask, the answer probably
-      belongs in the message.
-- **One logical change per commit**, each building and passing tests where
-  practical.
-- **Keep messages true to the final code.** When review changes the approach,
-  rewrite the affected commit messages so they describe what the code does
-  now, not the history of attempts. Never leave a message describing code that
-  was later removed.
-- **Reference issues** in the commit body: `Fixes #N` for the commit that
-  completes an issue, `Part of #N` otherwise.
-- **PR description = the commit messages**, in order, for multi-commit PRs.
+- **Subject line:** `area: imperative summary`, about 72 characters at most, where `area` is the package or component touched (for example `session`, `sessionapi`, `forge`, `sandbox`, `goals`, `web`, `api/session`, `dev`, `docs`).
+- **Body: explain why, not just what.** Include whatever the diff alone doesn't make obvious:
+  - **Bug fixes:** the symptom, the root cause, why the change fixes it, and the test that reproduces it.
+  - **Design changes:** the approach taken, and the alternatives considered and why they were rejected.
+  - **Performance changes:** the numbers, how they were measured, and in what configuration.
+  - **Review answers:** if a reviewer had to ask, the answer probably belongs in the message.
+- **One logical change per commit**, each building and passing tests where practical (for example: proto changes, then implementation, then tests or CI).
+- **Keep messages true to the final code.** When review changes the approach, make sure the commit messages describe what the code does now, not the history of attempts. Either amend the original commit, or add `fixup!` commits and leave them in place: do not squash them. The fixups are useful history, because code that needed many rounds of tweaking is also the code most likely to still hold bugs, and the record shows where that was. A `fixup!` commit whose diff speaks for itself needs no body; one that changes behaviour or reverses a decision gets a body saying what changed and why. Whichever route you take, never leave a message describing code that was later removed.
+- **Reference issues** in the commit body: `Fixes #N` for the commit that completes an issue, `Part of #N` otherwise.
+- **PR description = the commit messages**, in order, for multi-commit PRs. If a reviewer would need information that isn't in the commits, add it to the commits rather than only to the PR description.
 
 ### Commands
 
