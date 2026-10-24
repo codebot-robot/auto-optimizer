@@ -1,0 +1,69 @@
+# Agent Sessions
+
+`auto-optimizer` runs coding agents in Kubernetes [Agent Sandboxes](https://github.com/kubernetes-sigs/agent-sandbox).
+The core session loop, toolsets, and session persistence are housed under `pkg/session`, `pkg/llm`, `pkg/tools`, and `pkg/toolsets`.
+
+## Origin
+
+The session implementation was forked from `examples/sandboxed-tools` in the [kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) repository at commit `f83f2d87c1aeeb90407d8cfe9a0c1fad74044304`. Both repositories are licensed under Apache 2.0. Upstream license headers (`The Kubernetes Authors`) are preserved on copied files with their origin attributed in each package's doc comment.
+
+## Changes from Upstream
+
+1. **Package Layout**:
+   - `pkg/agent` and `pkg/sessions` are merged into a unified `pkg/session` package.
+   - `cmd/sandboxed-tools-cli` is implemented as the `ao session run` subcommand in `cmd/ao`.
+   - Import paths are updated from `sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/...` to `github.com/gke-labs/auto-optimizer/...`.
+2. **State Directory**:
+   - Session metadata, message history, and filesystem snapshots are stored in `~/.local/auto-optimizer` by default (configurable via the `--state-dir` flag), instead of `~/.local/sandboxed-tools`.
+3. **Default Namespace**:
+   - Sandboxes are created in the `ao-sandboxes` namespace by default (configurable via `--namespace` or the `SANDBOX_NAMESPACE` environment variable), matching auto-optimizer conventions.
+4. **One-Shot Execution and Auto-Approval**:
+   - Added `--prompt` for non-interactive single-turn execution, enabling scripting and automated testing.
+   - Added `--yolo` flag to auto-approve tool calls without user confirmation prompts. Interactive prompt approval remains the default when `--yolo` is not passed.
+5. **Kubeconfig Precedence**:
+   - `GetRESTConfig` prefers local kubeconfig (or `KUBECONFIG`) if present and valid, falling back to in-cluster configuration. This allows running `ao` from dev containers or laptops against local kind clusters even when running within a container.
+6. **Sandbox Lifecycle**:
+   - Sandboxes persist after process exit and expire automatically via `shutdownPolicy: Delete` and inactivity timeout `shutdownTime`, allowing subsequent CLI commands to reuse active sandboxes without recreate latency.
+
+## Running Locally Against Kind
+
+### 1. Prepare Kind Cluster
+
+Ensure the kind cluster is created and dependencies are deployed:
+
+```bash
+./dev/tasks/test-e2e
+```
+
+### 2. Build `ao`
+
+Build the `ao` binary:
+
+```bash
+go build -o bin/ao ./cmd/ao
+```
+
+### 3. Run with the Fake LLM (No API Key Required)
+
+You can run non-interactive one-shot commands using the built-in `fake-eliza` model:
+
+```bash
+OPENAI_MODEL=fake-eliza ./bin/ao session run --session my-session --prompt "run: uname -a" --yolo
+```
+
+### 4. Run Interactively with a Real LLM
+
+Configure your API key and start an interactive session:
+
+```bash
+export GEMINI_API_KEY="your-api-key"
+./bin/ao session run --session my-session
+```
+
+### 5. Using the `geminicli` Toolset
+
+To use the gemini-cli tool surface (`read_file`, `write_file`, `replace`, `grep_search`, `glob`, `list_directory`, `run_shell_command`):
+
+```bash
+./bin/ao session run --session my-session --toolset geminicli
+```
