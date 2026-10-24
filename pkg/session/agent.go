@@ -136,6 +136,9 @@ type Session struct {
 	// created; sessions recorded before metadata existed have zero values.
 	Metadata Metadata
 
+	// messagesMu guards messages.
+	messagesMu sync.RWMutex
+
 	// messages is a list of all the messages in the current session chat.
 	messages []llm.Message
 
@@ -150,6 +153,8 @@ type Session struct {
 
 // Messages returns a copy of the messages in the session so far.
 func (s *Session) Messages() []llm.Message {
+	s.messagesMu.RLock()
+	defer s.messagesMu.RUnlock()
 	return slices.Clone(s.messages)
 }
 
@@ -158,7 +163,9 @@ func (s *Session) AddMessages(ctx context.Context, messages ...llm.Message) erro
 	if err := s.sessionStore.AppendMessages(ctx, s.Name, messages...); err != nil {
 		return fmt.Errorf("failed to persist messages: %w", err)
 	}
+	s.messagesMu.Lock()
 	s.messages = append(s.messages, messages...)
+	s.messagesMu.Unlock()
 
 	return nil
 }
@@ -696,6 +703,9 @@ type TurnEvents interface {
 	// ToolCallFinished is called after a tool executes; err is non-nil if
 	// the tool failed.
 	ToolCallFinished(ctx context.Context, call llm.ToolCall, err error)
+
+	// MessageAppended is called whenever a message is added to the session history.
+	MessageAppended(ctx context.Context, msg llm.Message)
 }
 
 // Harness wires the LLM, the tool registry, and the sandbox client together
@@ -801,7 +811,7 @@ func (h *Harness) LoadSession(ctx context.Context, sessionStore Store, sessionNa
 // EnsureSystemPrompt seeds a new session with the configured system prompt.
 // It is a no-op for resumed sessions that already have history.
 func (h *Harness) EnsureSystemPrompt(ctx context.Context, session *Session) error {
-	if len(session.messages) > 0 {
+	if len(session.Messages()) > 0 {
 		return nil
 	}
 	if h.opts.SystemPrompt == "" {
@@ -821,12 +831,13 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 	if err := session.AddMessages(ctx, userMsg); err != nil {
 		return fmt.Errorf("adding user message: %w", err)
 	}
+	events.MessageAppended(ctx, userMsg)
 
 	shouldSnapshot := false
 	for {
 		req := llm.ChatCompletionRequest{
 			Model:    h.opts.ModelName,
-			Messages: session.messages,
+			Messages: session.Messages(),
 			Tools:    h.toolsRegistry.All(),
 		}
 
@@ -843,6 +854,7 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 		if err := session.AddMessages(ctx, assistantMessage); err != nil {
 			return fmt.Errorf("adding assistant message: %w", err)
 		}
+		events.MessageAppended(ctx, assistantMessage)
 
 		log.V(1).Info("got message from LLM", "msg", assistantMessage)
 
@@ -907,6 +919,7 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 			if err := session.AddMessages(ctx, toolMsg); err != nil {
 				return fmt.Errorf("adding tool response: %w", err)
 			}
+			events.MessageAppended(ctx, toolMsg)
 		}
 
 		// Here we continue the LLM loop, with the tool responses at the tail of the chat thread.
