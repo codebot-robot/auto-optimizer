@@ -17,13 +17,6 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-if [[ "${GIT_CONFIG_GLOBAL:-}" == "/dev/null" ]]; then
-  unset GIT_CONFIG_GLOBAL
-fi
-if [[ "${GIT_CONFIG_SYSTEM:-}" == "/dev/null" ]]; then
-  unset GIT_CONFIG_SYSTEM
-fi
-
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
