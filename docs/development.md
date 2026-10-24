@@ -115,7 +115,7 @@ After updating versions, run `./dev/tasks/test-e2e` to verify compatibility.
 
 ### 2. `dev/tasks/test-e2e`
 
-Runs end-to-end tests against a local `kind` cluster.
+Runs end-to-end tests against a local `kind` cluster. `dev/tasks/test-e2e` is a thin wrapper that prepares the cluster and invokes Go-based E2E tests in `tests/e2e/`.
 
 ```bash
 ./dev/tasks/test-e2e
@@ -126,11 +126,15 @@ Runs end-to-end tests against a local `kind` cluster.
 1. **Tool Setup**: Ensures pinned `kind` (v0.31.0) and `kubectl` (v1.35.0) are installed into `.build/bin/` and placed at the beginning of `PATH`.
 2. **Cluster Creation**: Creates a `kind` cluster named `auto-optimizer` (or reuses an existing one if already present).
 3. **Deployment**: Executes `dev/tasks/deploy-to-kube` against the cluster.
-4. **Smoke Tests**:
-   - **Sandbox test**: Creates a minimal `Sandbox` (`agents.x-k8s.io/v1beta1`) in `ao-sandboxes` running the upstream `sandboxd` image (`us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main`). Waits for `Ready`, port-forwards to port 8080, queries `/v1/health` expecting `{"status":"ok"}`, and deletes the sandbox.
-   - **ObjectFS test**: Creates a `PersistentVolumeClaim` with `storageClassName: objectfs-exclusive-local` and `ReadWriteOncePod` access mode. Launches a test Pod that writes data to the mounted volume and exits `0`. Verifies output and deletes the Pod and PVC.
-   - **service-portals test**: Checks that service-portals sidecar images are pullable, or skips with an explicit message if upstream publishes no images.
-5. **Teardown**: Deletes the `auto-optimizer` kind cluster upon completion (or on error).
+4. **Go E2E Tests**: Executes `RUN_E2E=1 go test -v -count=1 -timeout 20m ./tests/e2e/...`:
+   - Tests are implemented in `tests/e2e/e2e_test.go` using the `Harness` in `tests/e2e/harness.go`.
+   - The test suite skips automatically when `RUN_E2E` is not set, ensuring `ap test` and `go test ./...` pass without a cluster.
+   - The harness wraps `kubectl` against the kind cluster configured by `KIND_CLUSTER_NAME` (default `auto-optimizer`), providing helpers for manifest application, condition waiting, port-forwarding, log inspection, and automatic resource cleanup through `t.Cleanup`.
+   - Subtests cover:
+     - `SandboxHealth`: Creates a minimal `Sandbox` (`agents.x-k8s.io/v1beta1`) in `ao-sandboxes` running upstream `sandboxd`, waits for `Ready`, port-forwards to port 8080, queries `/v1/health` for `{"status":"ok"}`, and deletes the sandbox.
+     - `ObjectFSPVCWrite`: Creates a `PersistentVolumeClaim` with `storageClassName: objectfs-exclusive-local` and `ReadWriteOncePod` access mode. Launches a test Pod writing to the mounted volume, verifies successful exit and output, and deletes test resources.
+     - `ServicePortalsImages`: Skips with an informative message until upstream publishes images.
+5. **Teardown**: Deletes the `auto-optimizer` kind cluster upon completion (or on error, unless `--keep` is passed).
 
 #### Options and Flags
 
@@ -141,6 +145,10 @@ Runs end-to-end tests against a local `kind` cluster.
 - `--delete` or `-d`: Deletes any existing `auto-optimizer` cluster before running tests.
   ```bash
   ./dev/tasks/test-e2e --delete
+  ```
+- Any additional flags are forwarded directly to `go test`, allowing selection of specific subtests via `-run`:
+  ```bash
+  ./dev/tasks/test-e2e --keep -run TestSmoke/SandboxHealth
   ```
 
 ---
