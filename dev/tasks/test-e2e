@@ -42,7 +42,10 @@ if [[ ! -x "${KUBECTL_BIN}" ]]; then
 fi
 ln -sf "../src/kubectl/${KUBECTL_VERSION}/bin/kubectl" "${REPO_ROOT}/.build/bin/kubectl"
 
-# Install docker CLI if not already installed
+# Note: ap builds container images by invoking 'docker buildx build' under the hood
+# (see gke-labs-infra/ap/pkg/images/build.go). When running in minimal environments
+# (such as container agents with a remote DOCKER_HOST daemon), the docker CLI and
+# docker-buildx plugin must be available on PATH / in cli-plugins.
 if ! command -v docker >/dev/null 2>&1; then
   DOCKER_VERSION="29.2.1"
   DOCKER_BIN="${REPO_ROOT}/.build/src/docker/${DOCKER_VERSION}/bin/docker"
@@ -57,8 +60,28 @@ if ! command -v docker >/dev/null 2>&1; then
   ln -sf "../src/docker/${DOCKER_VERSION}/bin/docker" "${REPO_ROOT}/.build/bin/docker"
 fi
 
+# Ensure docker-buildx plugin is installed if missing
+if command -v docker >/dev/null 2>&1 || [[ -x "${REPO_ROOT}/.build/bin/docker" ]]; then
+  export PATH="${REPO_ROOT}/.build/bin:${PATH}"
+  if ! docker buildx version >/dev/null 2>&1; then
+    BUILDX_VERSION="v0.21.1"
+    BUILDX_OS="$(go env GOOS)"
+    BUILDX_ARCH="$(go env GOARCH)"
+    BUILDX_BIN="${REPO_ROOT}/.build/src/docker-buildx/${BUILDX_VERSION}/bin/docker-buildx"
+    if [[ ! -x "${BUILDX_BIN}" ]]; then
+      echo "Installing docker-buildx ${BUILDX_VERSION} for ${BUILDX_OS}/${BUILDX_ARCH}..."
+      mkdir -p "$(dirname "${BUILDX_BIN}")"
+      curl -sLo "${BUILDX_BIN}" "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.${BUILDX_OS}-${BUILDX_ARCH}"
+      chmod +x "${BUILDX_BIN}"
+    fi
+    mkdir -p "${REPO_ROOT}/.build/bin" "${HOME}/.docker/cli-plugins"
+    ln -sf "../src/docker-buildx/${BUILDX_VERSION}/bin/docker-buildx" "${REPO_ROOT}/.build/bin/docker-buildx"
+    ln -sf "${REPO_ROOT}/.build/bin/docker-buildx" "${HOME}/.docker/cli-plugins/docker-buildx"
+  fi
+fi
+
 export PATH="${REPO_ROOT}/.build/bin:${PATH}"
-echo "Pinned tools (kind, kubectl) ready in ${REPO_ROOT}/.build/bin"
+echo "Pinned tools (kind, kubectl, docker) ready in ${REPO_ROOT}/.build/bin"
 
 # ------------------------------------------------------------------------------
 # 2. Kind Cluster Management
@@ -108,6 +131,10 @@ else
   echo "Creating kind cluster: ${CLUSTER_NAME}..."
   kind create cluster --name "${CLUSTER_NAME}"
 fi
+
+# Set image parameters for kind
+export IMAGE_PREFIX="${IMAGE_PREFIX:-auto-optimizer.local}"
+export IMAGE_TAG="${IMAGE_TAG:-dev}"
 
 # ------------------------------------------------------------------------------
 # 3. Deploy Dependencies to Cluster

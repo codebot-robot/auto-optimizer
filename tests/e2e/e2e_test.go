@@ -167,6 +167,44 @@ spec:
 	})
 
 	t.Run("ServicePortalsImages", func(t *testing.T) {
-		t.Skip("Skipping service-portals image check: upstream gke-labs/service-portals publishes no container images yet (see #5)")
+		subH := h.WithT(t)
+		podName := "smoke-test-service-portals"
+		subH.DeleteWithCleanup("default", "pod", podName)
+
+		imagePrefix := os.Getenv("IMAGE_PREFIX")
+		if imagePrefix == "" {
+			imagePrefix = "auto-optimizer.local"
+		}
+		imageTag := os.Getenv("IMAGE_TAG")
+		if imageTag == "" {
+			imageTag = "dev"
+		}
+		image := fmt.Sprintf("%s/init-service-portals:%s", imagePrefix, imageTag)
+
+		manifest := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+    - name: init-service-portals
+      image: %s
+      command: ["init-service-portals", "--help"]
+`, podName, image)
+
+		subH.ApplyManifest(manifest)
+
+		// Wait for pod to complete
+		subH.WaitForPodSuccess("default", podName, 60*time.Second)
+
+		// Verify pod logs
+		logs := subH.GetPodLogs("default", podName)
+		if !strings.Contains(logs, "Usage of") && !strings.Contains(logs, "-cert-dir") {
+			t.Fatalf("Unexpected pod logs from %s: %s", podName, logs)
+		}
+		t.Logf("PASS: service-portals init-service-portals ran --help and exited 0.")
 	})
 }
