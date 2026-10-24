@@ -136,6 +136,11 @@ type Session struct {
 	// created; sessions recorded before metadata existed have zero values.
 	Metadata Metadata
 
+	// messagesMu protects messages against concurrent reads (e.g. Messages())
+	// while a turn is in flight (AddMessages).
+	// auto-optimizer: diverges from upstream, see https://github.com/gke-labs/auto-optimizer/issues/14
+	messagesMu sync.RWMutex
+
 	// messages is a list of all the messages in the current session chat.
 	messages []llm.Message
 
@@ -150,6 +155,8 @@ type Session struct {
 
 // Messages returns a copy of the messages in the session so far.
 func (s *Session) Messages() []llm.Message {
+	s.messagesMu.RLock()
+	defer s.messagesMu.RUnlock()
 	return slices.Clone(s.messages)
 }
 
@@ -158,7 +165,9 @@ func (s *Session) AddMessages(ctx context.Context, messages ...llm.Message) erro
 	if err := s.sessionStore.AppendMessages(ctx, s.Name, messages...); err != nil {
 		return fmt.Errorf("failed to persist messages: %w", err)
 	}
+	s.messagesMu.Lock()
 	s.messages = append(s.messages, messages...)
+	s.messagesMu.Unlock()
 
 	return nil
 }
@@ -804,7 +813,7 @@ func (h *Harness) LoadSession(ctx context.Context, sessionStore Store, sessionNa
 // EnsureSystemPrompt seeds a new session with the configured system prompt.
 // It is a no-op for resumed sessions that already have history.
 func (h *Harness) EnsureSystemPrompt(ctx context.Context, session *Session) error {
-	if len(session.messages) > 0 {
+	if len(session.Messages()) > 0 {
 		return nil
 	}
 	if h.opts.SystemPrompt == "" {
@@ -830,7 +839,7 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 	for {
 		req := llm.ChatCompletionRequest{
 			Model:    h.opts.ModelName,
-			Messages: session.messages,
+			Messages: session.Messages(),
 			Tools:    h.toolsRegistry.All(),
 		}
 
