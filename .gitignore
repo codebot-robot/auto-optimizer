@@ -1,0 +1,11 @@
+# Binaries and build artifacts
+.build/
+bin/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Artifacts and logs
+.artifacts/
+*.log
