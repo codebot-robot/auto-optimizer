@@ -19,10 +19,55 @@ set -o pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
+CLUSTER_NAME="auto-optimizer"
+KIND_VERSION="v0.31.0"
+CLEANUP_ONLY="false"
+DELETE_EXISTING="false"
+
+for arg in "$@"; do
+  case "${arg}" in
+    --cleanup|-c)
+      CLEANUP_ONLY="true"
+      ;;
+    --delete|-d)
+      DELETE_EXISTING="true"
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--cleanup|-c] [--delete|-d]"
+      echo ""
+      echo "Options:"
+      echo "  --cleanup, -c  Delete the kind cluster '${CLUSTER_NAME}' and exit"
+      echo "  --delete, -d   Delete any existing kind cluster '${CLUSTER_NAME}' before creating a fresh one"
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: ${arg}" >&2
+      echo "Usage: $0 [--cleanup|-c] [--delete|-d]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "${CLEANUP_ONLY}" == "true" ]]; then
+  if [[ -x "${REPO_ROOT}/.build/src/kind/${KIND_VERSION}/bin/kind" && ! -x "${REPO_ROOT}/.build/bin/kind" ]]; then
+    mkdir -p "${REPO_ROOT}/.build/bin"
+    ln -sf "../src/kind/${KIND_VERSION}/bin/kind" "${REPO_ROOT}/.build/bin/kind"
+  fi
+  if [[ -d "${REPO_ROOT}/.build/bin" ]]; then
+    export PATH="${REPO_ROOT}/.build/bin:${PATH}"
+  fi
+  if command -v kind >/dev/null 2>&1; then
+    echo "Deleting kind cluster ${CLUSTER_NAME} if present..."
+    kind delete cluster --name "${CLUSTER_NAME}"
+  else
+    echo "kind is not installed; cluster ${CLUSTER_NAME} does not exist."
+  fi
+  exit 0
+fi
+
 # ------------------------------------------------------------------------------
 # 1. Tool Installation (pinned kind and kubectl into .build/bin)
 # ------------------------------------------------------------------------------
-KIND_VERSION="v0.31.0"
 KIND_BIN="${REPO_ROOT}/.build/src/kind/${KIND_VERSION}/bin/kind"
 if [[ ! -x "${KIND_BIN}" ]]; then
   echo "Installing kind ${KIND_VERSION}..."
@@ -86,22 +131,6 @@ echo "Pinned tools (kind, kubectl, docker) ready in ${REPO_ROOT}/.build/bin"
 # ------------------------------------------------------------------------------
 # 2. Kind Cluster Management
 # ------------------------------------------------------------------------------
-CLUSTER_NAME="auto-optimizer"
-DELETE_EXISTING="false"
-
-for arg in "$@"; do
-  case "${arg}" in
-    --delete|-d)
-      DELETE_EXISTING="true"
-      ;;
-    --keep|-k)
-      # Retained for backwards compatibility (cluster is kept for e2e tests)
-      ;;
-    *)
-      ;;
-  esac
-done
-
 if [[ "${DELETE_EXISTING}" == "true" ]]; then
   echo "Deleting existing cluster ${CLUSTER_NAME} if present..."
   kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
