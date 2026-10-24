@@ -79,9 +79,17 @@ repository.
   say so in the issue and split it.
 - Do not check in binary files or large data files. Confirm this before you
   send a PR.
-- Code that is forked from an upstream example (for example the session loop
-  from agent-sandbox's `examples/sandboxed-tools`) keeps the upstream license
-  header and names its origin in the package comment.
+- Code copied from an upstream project that the auto-optimizer maintainers did
+  not author keeps the upstream license header verbatim. Add the path to `skip:`
+  in `.ap/headers.yaml` so `ap generate` leaves it alone, and name the origin
+  and commit in the package doc comment.
+- Code copied from `kubernetes-sigs/agent-sandbox/examples/sandboxed-tools` and
+  `examples/agentclientprotocol` (authored by the maintainer) may carry this
+  repository's header. Still name the origin and commit in the package doc
+  comment.
+- In both cases the PR description must say which case applies. Do not state
+  that headers were retained when `ap generate` rewrote them; check the diff
+  before writing the message.
 
 ### Commit messages and PR descriptions
 
