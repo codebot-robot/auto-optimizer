@@ -15,10 +15,13 @@
 package e2e
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -207,4 +210,82 @@ spec:
 		}
 		t.Logf("PASS: service-portals init-service-portals ran --help and exited 0.")
 	})
+}
+
+func TestSession(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("RUN_E2E env var not set, skipping e2e session tests")
+	}
+
+	clusterName := os.Getenv("KIND_CLUSTER_NAME")
+	if clusterName == "" {
+		clusterName = "auto-optimizer"
+	}
+
+	h := NewHarness(t, clusterName)
+	h.Setup()
+
+	gitRoot, err := h.getGitRoot()
+	if err != nil {
+		t.Fatalf("failed to get git root: %v", err)
+	}
+
+	aoBin := filepath.Join(t.TempDir(), "ao")
+	buildCmd := exec.Command("go", "build", "-o", aoBin, "./cmd/ao")
+	buildCmd.Dir = gitRoot
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
+	}
+
+	sessionName := "e2esession"
+	stateDir := t.TempDir()
+
+	subH := h.WithT(t)
+	subH.DeleteWithCleanup("ao-sandboxes", "sandbox", sessionName)
+
+	runCmd := exec.Command(aoBin, "session", "run",
+		"--session", sessionName,
+		"--prompt", "run: uname -a",
+		"--yolo",
+		"--state-dir", stateDir,
+	)
+	runCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
+
+	var stdout, stderr bytes.Buffer
+	runCmd.Stdout = &stdout
+	runCmd.Stderr = &stderr
+
+	t.Logf("Running %s session run...", aoBin)
+	if err := runCmd.Run(); err != nil {
+		t.Fatalf("ao session run failed: %v\nStdout: %s\nStderr: %s", err, stdout.String(), stderr.String())
+	}
+
+	output := stdout.String()
+	t.Logf("ao session run output:\n%s", output)
+
+	if !strings.Contains(output, "Linux") {
+		t.Fatalf("expected output to contain 'Linux', got:\n%s", output)
+	}
+
+	// Verify sandbox was created in ao-sandboxes and expires (has shutdownPolicy: Delete and shutdownTime)
+	sbJSON, err := subH.Kubectl("get", "sandbox", "-n", "ao-sandboxes", sessionName, "-o", "jsonpath={.spec.shutdownPolicy} {.spec.shutdownTime}")
+	if err != nil {
+		t.Fatalf("failed to get sandbox %s in ao-sandboxes: %v", sessionName, err)
+	}
+
+	parts := strings.Fields(sbJSON)
+	if len(parts) < 2 {
+		t.Fatalf("expected shutdownPolicy and shutdownTime, got: %q", sbJSON)
+	}
+	shutdownPolicy := parts[0]
+	shutdownTime := parts[1]
+
+	if shutdownPolicy != "Delete" {
+		t.Errorf("shutdownPolicy = %q, want Delete", shutdownPolicy)
+	}
+	if shutdownTime == "" {
+		t.Errorf("shutdownTime is empty")
+	}
+
+	t.Logf("PASS: ao session run successfully executed in sandbox, verified output contains Linux, shutdownPolicy=%s, shutdownTime=%s", shutdownPolicy, shutdownTime)
 }
