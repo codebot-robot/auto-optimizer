@@ -87,23 +87,17 @@ echo "Pinned tools (kind, kubectl, docker) ready in ${REPO_ROOT}/.build/bin"
 # 2. Kind Cluster Management
 # ------------------------------------------------------------------------------
 CLUSTER_NAME="auto-optimizer"
-KEEP_CLUSTER="${KEEP_CLUSTER:-false}"
-if [[ "${CI:-}" == "true" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
-  KEEP_CLUSTER="true"
-fi
 DELETE_EXISTING="false"
-EXTRA_ARGS=()
 
 for arg in "$@"; do
   case "${arg}" in
-    --keep|-k)
-      KEEP_CLUSTER="true"
-      ;;
     --delete|-d)
       DELETE_EXISTING="true"
       ;;
+    --keep|-k)
+      # Retained for backwards compatibility (cluster is kept for e2e tests)
+      ;;
     *)
-      EXTRA_ARGS+=("${arg}")
       ;;
   esac
 done
@@ -112,16 +106,6 @@ if [[ "${DELETE_EXISTING}" == "true" ]]; then
   echo "Deleting existing cluster ${CLUSTER_NAME} if present..."
   kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
 fi
-
-cleanup() {
-  if [[ "${KEEP_CLUSTER}" != "true" ]]; then
-    echo "Deleting kind cluster ${CLUSTER_NAME}..."
-    kind delete cluster --name "${CLUSTER_NAME}" || true
-  else
-    echo "Keeping kind cluster ${CLUSTER_NAME} (KEEP_CLUSTER=${KEEP_CLUSTER})"
-  fi
-}
-trap cleanup EXIT
 
 EXISTING_CLUSTERS="$(kind get clusters 2>/dev/null || true)"
 if echo "${EXISTING_CLUSTERS}" | grep -qx "${CLUSTER_NAME}"; then
@@ -142,10 +126,4 @@ export IMAGE_TAG="${IMAGE_TAG:-dev}"
 echo "=== Running dev/tasks/deploy-to-kube ==="
 "${REPO_ROOT}/dev/tasks/deploy-to-kube"
 
-# ------------------------------------------------------------------------------
-# 4. Run E2E Tests in Go
-# ------------------------------------------------------------------------------
-echo "=== Running Go E2E tests ==="
-export KIND_CLUSTER_NAME="${CLUSTER_NAME}"
-export GOTOOLCHAIN="auto"
-RUN_E2E=1 go test -v -count=1 -timeout 20m ./tests/e2e/... "${EXTRA_ARGS[@]}"
+echo "=== Kind cluster ${CLUSTER_NAME} prepared and ready for E2E tests ==="

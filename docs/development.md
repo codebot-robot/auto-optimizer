@@ -124,7 +124,7 @@ After updating versions, run `./dev/tasks/test-e2e` to verify compatibility.
 
 ### 2. `dev/tasks/test-e2e`
 
-Runs end-to-end tests against a local `kind` cluster. `dev/tasks/test-e2e` is a thin wrapper that prepares the cluster and invokes Go-based E2E tests in `tests/e2e/`.
+Prepares a local `kind` cluster and deploys dependencies for end-to-end testing. This script is discovered and run automatically by `ap e2e` before executing the Go E2E tests, but can also be run standalone to prepare or reset the local cluster.
 
 ```bash
 ./dev/tasks/test-e2e
@@ -134,31 +134,54 @@ Runs end-to-end tests against a local `kind` cluster. `dev/tasks/test-e2e` is a 
 
 1. **Tool Setup**: Ensures pinned `kind` (v0.31.0), `kubectl` (v1.35.0), and (if missing) `docker` CLI and `docker-buildx` plugin are installed under `.build/` (with `docker-buildx` linked into `~/.docker/cli-plugins/`) and placed on `PATH`.
 2. **Cluster Creation**: Creates a `kind` cluster named `auto-optimizer` (or reuses an existing one if already present).
-3. **Deployment**: Executes `dev/tasks/deploy-to-kube` against the cluster.
-4. **Go E2E Tests**: Executes `RUN_E2E=1 go test -v -count=1 -timeout 20m ./tests/e2e/...`:
-   - Tests are implemented in `tests/e2e/e2e_test.go` using the `Harness` in `tests/e2e/harness.go`.
-   - The test suite skips automatically when `RUN_E2E` is not set, ensuring `ap test` and `go test ./...` pass without a cluster.
-   - The harness wraps `kubectl` against the kind cluster configured by `KIND_CLUSTER_NAME` (default `auto-optimizer`), providing helpers for manifest application, condition waiting, port-forwarding, log inspection, and automatic resource cleanup through `t.Cleanup`.
-   - Subtests cover:
-     - `SandboxHealth`: Creates a minimal `Sandbox` (`agents.x-k8s.io/v1beta1`) in `ao-sandboxes` running upstream `sandboxd`, waits for `Ready`, port-forwards to port 8080, queries `/v1/health` for `{"status":"ok"}`, and deletes the sandbox.
-     - `ObjectFSPVCWrite`: Creates a `PersistentVolumeClaim` with `storageClassName: objectfs-exclusive-local` and `ReadWriteOncePod` access mode. Launches a test Pod writing to the mounted volume, verifies successful exit and output, and deletes test resources.
-     - `ServicePortalsImages`: Launches a test Pod in namespace `default` running `init-service-portals --help` from the built image (`${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}`) and verifies it exits `0`.
-5. **Teardown**: Deletes the `auto-optimizer` kind cluster upon completion (or on error, unless `--keep` is passed).
+3. **Deployment**: Executes `dev/tasks/deploy-to-kube` against the cluster to deploy all prerequisites.
 
 #### Options and Flags
 
-- `--keep` or `-k` (or environment variable `KEEP_CLUSTER=true`): Keeps the kind cluster alive after tests complete for debugging.
-  ```bash
-  ./dev/tasks/test-e2e --keep
-  ```
-- `--delete` or `-d`: Deletes any existing `auto-optimizer` cluster before running tests.
+- `--delete` or `-d`: Deletes any existing `auto-optimizer` cluster before creating a fresh one.
   ```bash
   ./dev/tasks/test-e2e --delete
   ```
-- Any additional flags are forwarded directly to `go test`, allowing selection of specific subtests via `-run`:
-  ```bash
-  ./dev/tasks/test-e2e --keep -run TestSmoke/SandboxHealth
-  ```
+- `--keep` or `-k`: Accepted for backwards compatibility (clusters are kept alive by default).
+
+---
+
+## End-to-End Testing
+
+End-to-end tests are implemented in `tests/e2e/e2e_test.go` using the test harness in `tests/e2e/harness.go`. Tests skip automatically unless `RUN_E2E=1` is set, ensuring unit test runs (`ap test`, `go test ./...`) pass without a Kubernetes cluster.
+
+### Running E2E Tests via `ap` (Recommended)
+
+The single unified path to run the full end-to-end test suite is:
+
+```bash
+GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest e2e
+```
+
+When `ap e2e` runs:
+1. `dev/tasks/test-e2e` runs first to ensure tools are installed, create the local `auto-optimizer` kind cluster, and deploy dependencies via `deploy-to-kube`.
+2. `ap`'s Go e2e task runs second, executing `RUN_E2E=1 go test -v -count=1 -timeout 30m ./tests/e2e/...` against the prepared cluster.
+
+### Running E2E Tests Directly Against an Existing Cluster
+
+If you already have a cluster prepared (via `./dev/tasks/test-e2e`, `./dev/tasks/deploy-to-kube`, or a remote Kubernetes cluster), you can run the Go E2E tests directly:
+
+```bash
+RUN_E2E=1 go test -v -count=1 ./tests/e2e/...
+```
+
+To run a specific subtest:
+
+```bash
+RUN_E2E=1 go test -v -count=1 -run TestSmoke/SandboxHealth ./tests/e2e/...
+```
+
+#### Test Coverage
+
+Subtests in `TestSmoke` verify:
+- `SandboxHealth`: Creates a minimal `Sandbox` (`agents.x-k8s.io/v1beta1`) in `ao-sandboxes` running upstream `sandboxd`, waits for `Ready`, port-forwards to port 8080, queries `/v1/health` for `{"status":"ok"}`, and deletes the sandbox.
+- `ObjectFSPVCWrite`: Creates a `PersistentVolumeClaim` with `storageClassName: objectfs-exclusive-local` and `ReadWriteOncePod` access mode. Launches a test Pod writing to the mounted volume, verifies successful exit and output, and deletes test resources.
+- `ServicePortalsImages`: Launches a test Pod in namespace `default` running `init-service-portals --help` from the built image (`${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}`) and verifies it exits `0`.
 
 ---
 
@@ -188,4 +211,4 @@ Pull requests run the presubmits defined in `.github/workflows/ci-presubmits.yam
 - `ap-verify-generate`: Verifies that generated files are in sync with `ap generate`.
 - `ap-lint`: Static analysis and formatting check.
 - `ap-test`: Unit tests.
-- `ap-e2e`: Runs `dev/tasks/test-e2e` against a kind cluster in CI.
+- `ap-e2e`: Runs `ap e2e` against a kind cluster in CI (preparing the cluster via `dev/tasks/test-e2e` and executing the Go test suite).

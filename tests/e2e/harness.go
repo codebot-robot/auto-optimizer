@@ -151,19 +151,19 @@ func (h *Harness) getGitRoot() (string, error) {
 
 // ensurePath ensures .build/bin is in PATH if present.
 func (h *Harness) ensurePath() {
-	if _, err := exec.LookPath("kubectl"); err != nil {
-		cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-		out, outErr := cmd.Output()
-		if outErr != nil {
-			return
-		}
-		root := strings.TrimSpace(string(out))
-		buildBin := filepath.Join(root, ".build", "bin")
-		if _, statErr := os.Stat(filepath.Join(buildBin, "kubectl")); statErr != nil {
-			return
-		}
-		if setErr := os.Setenv("PATH", buildBin+string(os.PathListSeparator)+os.Getenv("PATH")); setErr != nil {
-			h.t.Logf("warning: failed to update PATH: %v", setErr)
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	out, outErr := cmd.Output()
+	if outErr != nil {
+		return
+	}
+	root := strings.TrimSpace(string(out))
+	buildBin := filepath.Join(root, ".build", "bin")
+	if info, err := os.Stat(buildBin); err == nil && info.IsDir() {
+		currentPath := os.Getenv("PATH")
+		if !strings.Contains(currentPath, buildBin) {
+			if setErr := os.Setenv("PATH", buildBin+string(os.PathListSeparator)+currentPath); setErr != nil {
+				h.t.Logf("warning: failed to update PATH: %v", setErr)
+			}
 		}
 	}
 }
