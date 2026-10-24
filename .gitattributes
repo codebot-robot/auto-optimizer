@@ -1,0 +1,6 @@
+# Protocol Buffers / gRPC generated code
+
+# Go
+*.pb.go linguist-generated=true
+*.pb.gw.go linguist-generated=true
+*_grpc.pb.go linguist-generated=true
