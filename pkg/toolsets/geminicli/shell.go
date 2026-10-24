@@ -21,8 +21,8 @@ import (
 	"strings"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
-	"k8s.io/klog/v2"
 )
 
 // ShellToolName matches gemini-cli's shell tool name.
@@ -109,7 +109,7 @@ echo "--- initial output ---"
 tail -c 2000 -- "$logfile"`
 
 func (t *RunShellCommandTool) Run(ctx context.Context, sandbox tools.Sandbox) (llm.Message, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	if t.Command == "" {
 		return llm.Message{}, errors.New("command is required")

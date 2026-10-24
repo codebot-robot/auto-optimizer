@@ -41,9 +41,9 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/exec"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/klog/v2"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	agentsclientset "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned"
@@ -372,7 +372,7 @@ func (s *Session) FindLatestBackup() (string, error) {
 
 // PruneBackups deletes older backups, keeping only the most recent keepCount backups.
 func (s *Session) PruneBackups(ctx context.Context, keepCount int) error {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 	dir, err := s.getBackupDir()
 	if err != nil {
 		return err
@@ -401,7 +401,7 @@ func (s *Session) PruneBackups(ctx context.Context, keepCount int) error {
 
 // RestoreFS restores the filesystem in the sandbox from the latest local backup tarball, if one exists.
 func (s *Sandbox) RestoreFS(ctx context.Context) error {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	latestBackup, err := s.session.FindLatestBackup()
 	if err != nil {
@@ -440,7 +440,7 @@ func (s *Sandbox) RestoreFS(ctx context.Context) error {
 
 // SnapshotFS archives the filesystem in the sandbox and saves it to a new timestamped backup inside the session's backup directory.
 func (s *Sandbox) SnapshotFS(ctx context.Context) error {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	dir, err := s.session.getBackupDir()
 	if err != nil {
@@ -815,7 +815,7 @@ func (h *Harness) EnsureSystemPrompt(ctx context.Context, session *Session) erro
 // tool calls in the session's sandbox, and repeats until the LLM produces a
 // final text reply, which is delivered via events.AssistantMessage.
 func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, events TurnEvents) error {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	userMsg := llm.Message{Role: "user", Content: &input}
 	if err := session.AddMessages(ctx, userMsg); err != nil {
@@ -921,7 +921,7 @@ func (h *Harness) ensureSandbox(ctx context.Context, session *Session) (tools.Sa
 		return h.sandboxOverride, nil
 	}
 
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	if sb := session.activeSandbox; sb != nil {
 		if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {

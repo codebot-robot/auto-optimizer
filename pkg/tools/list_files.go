@@ -19,7 +19,7 @@ import (
 	"fmt"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
 // ListFilesTool is a tool that lists files in the sandbox.
@@ -48,7 +48,7 @@ func (t *ListFilesTool) Schema() llm.Tool {
 }
 
 func (t *ListFilesTool) Run(ctx context.Context, sandbox Sandbox) (llm.Message, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	path := t.Path
 	if path == "" {

@@ -19,7 +19,7 @@ import (
 	"fmt"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
 // RunCommand is a tool that runs shell commands in the sandbox.
@@ -48,7 +48,7 @@ func (t *RunCommand) Schema() llm.Tool {
 }
 
 func (t *RunCommand) Run(ctx context.Context, sandbox Sandbox) (llm.Message, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	log.Info("executing command in sandbox", "command", t.Command)
 	res, err := sandbox.ExecCommand(ctx, ExecCommandOptions{
