@@ -21,7 +21,7 @@ import (
 	"path/filepath"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
 // WriteFileTool is a tool that writes content to a file in the sandbox.
@@ -56,7 +56,7 @@ func (t *WriteFileTool) Schema() llm.Tool {
 }
 
 func (t *WriteFileTool) Run(ctx context.Context, sandbox Sandbox) (llm.Message, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	p := t.Path
 	if p == "" {

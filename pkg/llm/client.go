@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
 // Client interacts with an OpenAI-compatible API endpoint using net/http.
@@ -125,7 +125,7 @@ func NewClient(baseURL, apiKey string) (*Client, error) {
 
 // CreateChatCompletion sends a chat completion request to the API.
 func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionRequest) (*ChatCompletionResponse, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	url := c.baseURL + "/chat/completions"
 	bodyBytes, err := json.Marshal(req)

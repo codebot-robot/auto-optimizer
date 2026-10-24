@@ -20,7 +20,7 @@ import (
 	"fmt"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
 // ReadFileTool is a tool that reads file contents from the sandbox.
@@ -50,7 +50,7 @@ func (t *ReadFileTool) Schema() llm.Tool {
 }
 
 func (t *ReadFileTool) Run(ctx context.Context, sandbox Sandbox) (llm.Message, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	if t.Path == "" {
 		return llm.Message{}, errors.New("path is required")

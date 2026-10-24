@@ -38,7 +38,7 @@ you have a reason to depart from it.
 - **State is files.** Records live under one state directory as JSON and
   JSONL, with exactly one writer per file. Anything else is a rebuildable
   cache.
-- **Structured logging.** Use `log := klog.FromContext(ctx)`, pass the context
+- **Structured logging.** Use `log := scoped.Log(ctx)`, pass the context
   down, and log with structured fields such as
   `log.Info("sandbox ready", "sandbox", name)` rather than formatted strings.
 - **Testability.** Unit tests use the fake forge, the fake LLM, and a fake

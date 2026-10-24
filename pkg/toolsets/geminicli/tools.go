@@ -29,9 +29,9 @@ import (
 	"strings"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets/geminicli/toolbox"
-	"k8s.io/klog/v2"
 )
 
 // ToolboxBinary is the in-sandbox helper binary that implements the
@@ -44,7 +44,7 @@ const ToolboxBinary = "geminicli-toolbox"
 // result. Tool failures (non-zero exit) are reported to the model as content,
 // so the model can correct its arguments and retry.
 func runToolbox(ctx context.Context, sandbox tools.Sandbox, name string, params any) (llm.Message, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 	log.Info("running toolbox tool in sandbox", "tool.name", name)
 
 	payload, err := json.Marshal(params)

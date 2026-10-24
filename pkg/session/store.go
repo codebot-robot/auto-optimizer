@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
 // ErrNotFound is returned (wrapped) by Store.LoadSession when no session
@@ -104,7 +104,7 @@ func (s *FileStore) messagesPath(sessionID string) string {
 // loadMetadata reads the session's metadata file, returning nil, nil if none
 // was saved.
 func (s *FileStore) loadMetadata(ctx context.Context, sessionID string) (*Metadata, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	if err := ValidateSessionName(sessionID); err != nil {
 		return nil, err
@@ -128,7 +128,7 @@ func (s *FileStore) loadMetadata(ctx context.Context, sessionID string) (*Metada
 // NewSession creates a new session and writes its metadata file. It returns an
 // error if a session with the given ID already exists.
 func (s *FileStore) NewSession(ctx context.Context, sessionID string, metadata Metadata) error {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	if err := ValidateSessionName(sessionID); err != nil {
 		return err
@@ -178,7 +178,7 @@ func (s *FileStore) NewSession(ctx context.Context, sessionID string, metadata M
 
 // LoadSession reads all messages and metadata from the session store.
 func (s *FileStore) LoadSession(ctx context.Context, sessionID string) ([]llm.Message, *Metadata, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	if err := ValidateSessionName(sessionID); err != nil {
 		return nil, nil, err
@@ -229,7 +229,7 @@ func (s *FileStore) LoadSession(ctx context.Context, sessionID string) ([]llm.Me
 
 // AppendMessages marshals and appends a set of messages to the session file.
 func (s *FileStore) AppendMessages(ctx context.Context, sessionID string, messages ...llm.Message) error {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	if err := ValidateSessionName(sessionID); err != nil {
 		return err

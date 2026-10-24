@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
-	"k8s.io/klog/v2"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
 // Registry keeps track of available tools and handles their invocations.
@@ -88,7 +88,7 @@ var errToolTimeout = errors.New("tool execution timeout")
 
 // Call executes a tool call inside the provided sandbox and returns the LLM tool response message.
 func (r *Registry) Call(ctx context.Context, sandbox Sandbox, tc llm.ToolCall) (llm.Message, error) {
-	log := klog.FromContext(ctx)
+	log := scoped.Log(ctx)
 
 	log.Info("llm invoking tool", "tool.name", tc.Function.Name)
 
