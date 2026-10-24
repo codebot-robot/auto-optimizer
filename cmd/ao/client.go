@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -26,8 +27,10 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
 func defaultServerAddress() string {
@@ -35,6 +38,12 @@ func defaultServerAddress() string {
 		return s
 	}
 	return "127.0.0.1:8081"
+}
+
+func closeConnection(ctx context.Context, conn *grpc.ClientConn) {
+	if err := conn.Close(); err != nil {
+		scoped.Log(ctx).V(4).Info("closing gRPC connection", "error", err)
+	}
 }
 
 func newSessionListCommand() *cobra.Command {
@@ -48,11 +57,7 @@ func newSessionListCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("connecting to server %s: %w", serverAddr, err)
 			}
-			defer func() {
-				if closeErr := conn.Close(); closeErr != nil {
-					_ = closeErr
-				}
-			}()
+			defer closeConnection(cmd.Context(), conn)
 
 			client := sessionv1.NewSessionServiceClient(conn)
 			resp, err := client.ListSessions(cmd.Context(), &sessionv1.ListSessionsRequest{})
@@ -83,6 +88,7 @@ func newSessionListCommand() *cobra.Command {
 
 func newSessionGetCommand() *cobra.Command {
 	var serverAddr string
+	var jsonOutput bool
 
 	cmd := &cobra.Command{
 		Use:   "get <name>",
@@ -95,16 +101,25 @@ func newSessionGetCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("connecting to server %s: %w", serverAddr, err)
 			}
-			defer func() {
-				if closeErr := conn.Close(); closeErr != nil {
-					_ = closeErr
-				}
-			}()
+			defer closeConnection(cmd.Context(), conn)
 
 			client := sessionv1.NewSessionServiceClient(conn)
 			resp, err := client.ListMessages(cmd.Context(), &sessionv1.ListMessagesRequest{Name: name})
 			if err != nil {
 				return fmt.Errorf("getting session messages: %w", err)
+			}
+
+			if jsonOutput {
+				m := protojson.MarshalOptions{
+					Multiline: true,
+					Indent:    "  ",
+				}
+				data, err := m.Marshal(resp)
+				if err != nil {
+					return fmt.Errorf("serializing messages to json: %w", err)
+				}
+				fmt.Println(string(data))
+				return nil
 			}
 
 			for _, msg := range resp.Messages {
@@ -123,6 +138,7 @@ func newSessionGetCommand() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&serverAddr, "server", defaultServerAddress(), "gRPC server address")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output messages as JSON")
 	return cmd
 }
 
@@ -141,11 +157,7 @@ func newSessionSendCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("connecting to server %s: %w", serverAddr, err)
 			}
-			defer func() {
-				if closeErr := conn.Close(); closeErr != nil {
-					_ = closeErr
-				}
-			}()
+			defer closeConnection(cmd.Context(), conn)
 
 			client := sessionv1.NewSessionServiceClient(conn)
 			stream, err := client.SendMessage(cmd.Context(), &sessionv1.SendMessageRequest{

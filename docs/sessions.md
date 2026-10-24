@@ -76,11 +76,13 @@ To use the gemini-cli tool surface (`read_file`, `write_file`, `replace`, `grep_
 ./bin/ao serve --listen 127.0.0.1:8081
 ```
 
+The listen address defaults to `127.0.0.1:8081`, configurable via `--listen` or the `AO_LISTEN` environment variable.
+
 > **Security Note**: The server provides no authentication in this milestone and listens on `127.0.0.1:8081` by default. It must not be exposed to untrusted networks.
 
 ### Admin CLI Subcommands
 
-With `ao serve` running, use the `ao session` client subcommands (all take `--server`, defaulting to `127.0.0.1:8081`):
+With `ao serve` running, use the `ao session` client subcommands (all take `--server`, defaulting to `127.0.0.1:8081` or the `AO_SERVER` environment variable):
 
 1. **List sessions**:
    ```bash
@@ -93,11 +95,13 @@ With `ao serve` running, use the `ao session` client subcommands (all take `--se
    ```
    If the session does not exist, `ao session send` creates it automatically. Tool progress and errors stream as they arrive, and the final assistant reply is printed last.
 
+   *Note on System Prompt Visibility*: The first `SendMessage` on a new session initializes the system prompt and streams it to the client as a `MessageAppended` event. This is expected behavior for an admin CLI inspecting the session history, but when authentication and non-admin clients are introduced in later milestones, streaming of the internal system prompt may be restricted or filtered based on client authorization.
+
 3. **Inspect session messages**:
    ```bash
    ./bin/ao session get demo
    ```
-   Prints the session messages in order, one per line, with their role.
+   Prints the session messages in order, one per line, with their role. Assistant tool calls are rendered as `call: name(args)` and tool outputs as `tool: <output>`. Pass `--json` to output structured JSON for scripts.
 
 ### Real-Model Path with Gemini
 

@@ -428,6 +428,25 @@ func TestSessionAPI(t *testing.T) {
 		t.Fatalf("expected ao session get output to contain messages with 'run: uname -a' and 'Linux', got:\n%s", getOutput)
 	}
 
+	// 3b. Verify ao session get --json produces valid JSON
+	getJSONCmd := exec.Command(aoBin,
+		"session", "get", sessionName,
+		"--server", serverAddr,
+		"--json",
+	)
+	var getJSONStdout, getJSONStderr bytes.Buffer
+	getJSONCmd.Stdout = &getJSONStdout
+	getJSONCmd.Stderr = &getJSONStderr
+
+	t.Logf("Running ao session get %s --json...", sessionName)
+	if err := getJSONCmd.Run(); err != nil {
+		t.Fatalf("ao session get --json failed: %v\nStdout: %s\nStderr: %s", err, getJSONStdout.String(), getJSONStderr.String())
+	}
+	getJSONOutput := getJSONStdout.String()
+	if !strings.Contains(getJSONOutput, `"messages"`) || !strings.Contains(getJSONOutput, `"role"`) {
+		t.Fatalf("expected JSON output from ao session get --json, got:\n%s", getJSONOutput)
+	}
+
 	// 4. Verify sandbox was created in ao-sandboxes with shutdownPolicy: Delete and shutdownTime
 	sbJSON, err := subH.Kubectl("get", "sandbox", "-n", "ao-sandboxes", sessionName, "-o", "jsonpath={.spec.shutdownPolicy} {.spec.shutdownTime}")
 	if err != nil {
