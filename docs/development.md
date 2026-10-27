@@ -165,6 +165,7 @@ To deploy `auto-optimizer` to a real cluster (such as Google Kubernetes Engine):
      -n ao-system \
      --from-literal=GEMINI_API_KEY="your-api-key"
    ```
+   *(Alternatively, use Vertex AI with Workload Identity described below to avoid storing API keys in the cluster.)*
 
 4. Deploy `ao` with `IMAGE_PREFIX` pointing to your container registry:
    ```bash
@@ -184,6 +185,52 @@ To deploy `auto-optimizer` to a real cluster (such as Google Kubernetes Engine):
    ```
 
 If you also need ObjectFS on a real cluster, provide `OBJECTFS_BACKEND` (such as `gs://my-bucket/prefix` or `s3://my-bucket/prefix`) and include `objectfs` in `--only` (for example, `--only ao,objectfs`).
+
+##### Using Vertex AI with Workload Identity (No In-Cluster API Key)
+
+On GKE, the `ao` control plane pod can call Gemini through Vertex AI using Workload Identity federation, avoiding the need for an API key Secret in the cluster.
+
+###### IAM Setup
+
+Configure IAM permissions by running the idempotent setup script with your Google Cloud Project ID (or ensure your active gcloud project is set):
+
+```bash
+./dev/tasks/setup-vertex-iam <PROJECT_ID>
+```
+
+For the corp-dev cluster:
+```bash
+./dev/tasks/setup-vertex-iam gke-labs-corp-dev
+```
+
+The script:
+1. Enables `aiplatform.googleapis.com` on the Google Cloud project.
+2. Grants `roles/aiplatform.user` on the project directly to the Kubernetes ServiceAccount via direct Workload Identity federation:
+   - Member: `principal://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<PROJECT_ID>.svc.id.goog/subject/ns/ao-system/sa/ao`
+   - Role: `roles/aiplatform.user`
+
+No Google Service Account (GSA) and no IAM annotations on the Kubernetes ServiceAccount are needed.
+
+> **Note:** Granting IAM policy bindings requires the `resourcemanager.projects.setIamPolicy` permission on the project (e.g. `roles/resourcemanager.projectIamAdmin` or `roles/owner`).
+
+For the corp-dev cluster:
+- **Project**: `gke-labs-corp-dev`
+- **Project Number**: `616677675326`
+- **Workload Identity Pool**: `gke-labs-corp-dev.svc.id.goog`
+- **Principal**: `principal://iam.googleapis.com/projects/616677675326/locations/global/workloadIdentityPools/gke-labs-corp-dev.svc.id.goog/subject/ns/ao-system/sa/ao`
+
+###### Deployment Configuration
+
+When deploying to a non-kind cluster, `dev/tasks/deploy-to-kube` automatically reads `VERTEX_PROJECT` from `gcloud config get-value project` and sets it in `ao-config`.
+
+You can also set or change `VERTEX_PROJECT` and optional `VERTEX_LOCATION` (defaults to `global`) manually in `ao-config`:
+
+```bash
+kubectl -n ao-system patch configmap ao-config --type=merge -p '{"data":{"VERTEX_PROJECT":"gke-labs-corp-dev","VERTEX_LOCATION":"global"}}'
+kubectl -n ao-system rollout restart deploy/ao
+```
+
+When `VERTEX_PROJECT` is set and no `GEMINI_API_KEY` is present, `ao` connects to the Vertex AI OpenAI-compatible endpoint using Google Application Default Credentials / Workload Identity. Model names on this endpoint should be fully specified with the provider prefix, for example `OPENAI_MODEL=google/gemini-3.5-flash`.
 
 #### Bumping Pinned Versions
 

@@ -1,0 +1,71 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# setup-vertex-iam configures IAM permissions for calling Gemini through Vertex AI
+# with direct Workload Identity federation from the ao Kubernetes ServiceAccount.
+# This script is idempotent.
+
+if ! command -v gcloud >/dev/null 2>&1; then
+  echo "ERROR: gcloud CLI is required to configure Vertex AI IAM." >&2
+  exit 1
+fi
+
+PROJECT_ID="${PROJECT_ID:-${1:-}}"
+if [[ -z "${PROJECT_ID}" ]]; then
+  PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
+  if [[ "${PROJECT_ID}" == "(unset)" ]]; then
+    PROJECT_ID=""
+  fi
+fi
+
+if [[ -z "${PROJECT_ID}" ]]; then
+  echo "ERROR: PROJECT_ID is required. Pass it as \$1, set PROJECT_ID environment variable, or configure 'gcloud config set project <PROJECT_ID>'." >&2
+  exit 1
+fi
+
+PROJECT_NUMBER="${PROJECT_NUMBER:-}"
+if [[ -z "${PROJECT_NUMBER}" ]]; then
+  PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || true)"
+  if [[ -z "${PROJECT_NUMBER}" && "${PROJECT_ID}" == "gke-labs-corp-dev" ]]; then
+    PROJECT_NUMBER="616677675326"
+  fi
+fi
+
+if [[ -z "${PROJECT_NUMBER}" ]]; then
+  echo "ERROR: could not determine PROJECT_NUMBER for project ${PROJECT_ID}. Set PROJECT_NUMBER environment variable." >&2
+  exit 1
+fi
+
+POOL="${PROJECT_ID}.svc.id.goog"
+K8S_NAMESPACE="ao-system"
+K8S_SA="ao"
+PRINCIPAL="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL}/subject/ns/${K8S_NAMESPACE}/sa/${K8S_SA}"
+ROLE="roles/aiplatform.user"
+
+echo "=== Configuring Vertex AI IAM for project ${PROJECT_ID} (${PROJECT_NUMBER}) ==="
+echo "Enabling aiplatform.googleapis.com on project ${PROJECT_ID}..."
+gcloud services enable aiplatform.googleapis.com --project="${PROJECT_ID}"
+
+echo "Granting ${ROLE} to ${PRINCIPAL} on project ${PROJECT_ID}..."
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="${PRINCIPAL}" \
+  --role="${ROLE}" \
+  --condition=None
+
+echo "=== Vertex AI IAM configuration complete ==="
