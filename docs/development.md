@@ -128,39 +128,62 @@ To use a real model such as Gemini:
    kubectl -n ao-system rollout restart deploy/ao
    ```
 
+#### Component Selection
+
+`deploy-to-kube` supports selecting which components to deploy using the `COMPONENTS` environment variable or the `--only <component>` flag:
+
+- **Components**: `agent-sandbox`, `service-portals`, `objectfs`, and `ao`.
+- **Defaults**:
+  - On `kind` clusters: defaults to `agent-sandbox,service-portals,objectfs,ao`.
+  - On non-kind clusters: defaults to `ao`.
+- **Command-line flag**: `--only <component>` accepts one or more comma-separated components, or can be passed multiple times (for example, `--only ao` or `--only agent-sandbox,ao`).
+- **Existing controller protection**: `deploy-to-kube` checks whether `crd/sandboxes.agents.x-k8s.io` is already present with version `v1beta1` served. If an existing install is detected, `deploy-to-kube` skips installing agent-sandbox and preserves the existing controller. To force reinstallation, set `FORCE_AGENT_SANDBOX=1`.
+- **Optional storage**: On non-kind clusters, `deploy-to-kube` skips ObjectFS if `OBJECTFS_BACKEND` is unset instead of failing.
+
 #### Idempotence
 
 `deploy-to-kube` is idempotent. Running it a second time against an already-configured cluster will make no changes, detect existing resources and rollouts, and exit `0` within seconds. Sibling checkouts are cached and reused at their pinned commits.
 
-#### Pointing at a Real Cluster (e.g. GKE)
+#### Deploying to a Real Cluster
 
-To point `deploy-to-kube` at a real cluster rather than `kind`:
+To deploy `auto-optimizer` to a real cluster (such as Google Kubernetes Engine):
 
 1. Set your `kubectl` context to your target cluster:
    ```bash
    kubectl config use-context <my-cluster-context>
    ```
 
-2. Set `IMAGE_PREFIX` to a container registry accessible to the cluster (such as Google Artifact Registry):
+2. Configure Docker credentials for your container registry. For Google Artifact Registry:
    ```bash
-   export IMAGE_PREFIX="us-central1-docker.pkg.dev/my-project/my-repo"
+   gcloud auth configure-docker us-west1-docker.pkg.dev
    ```
 
-3. Specify an external object storage backend URL using the `OBJECTFS_BACKEND` environment variable. For example, for Google Cloud Storage:
+3. Create the `ao-model-keys` Secret in `ao-system` with your model credentials (such as `GEMINI_API_KEY`):
    ```bash
-   export OBJECTFS_BACKEND="gs://my-bucket/prefix"
-   ```
-   Or for Amazon S3:
-   ```bash
-   export OBJECTFS_BACKEND="s3://my-bucket/prefix"
-   ```
-
-4. Run the script:
-   ```bash
-   ./dev/tasks/deploy-to-kube
+   kubectl create namespace ao-system --dry-run=client -o yaml | kubectl apply -f -
+   kubectl create secret generic ao-model-keys \
+     -n ao-system \
+     --from-literal=GEMINI_API_KEY="your-api-key"
    ```
 
-When `OBJECTFS_BACKEND` is set, `deploy-to-kube` skips deploying in-cluster `fakes3` and configures ObjectFS to use the specified cloud storage bucket.
+4. Deploy `ao` with `IMAGE_PREFIX` pointing to your container registry:
+   ```bash
+   IMAGE_PREFIX=us-west1-docker.pkg.dev/gke-labs-corp-dev/images ./dev/tasks/deploy-to-kube --only ao
+   ```
+
+   When deploying to non-kind clusters, `deploy-to-kube` creates the `ao-system` and `ao-sandboxes` namespaces, pushes the `ao` and `geminicli-toolbox` images to `IMAGE_PREFIX`, deploys manifests using `ap deploy`, and sets `SANDBOX_IMAGE` to `${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}` in `ao-config`. You can pass `OPENAI_MODEL` to specify the model to use (for example, `OPENAI_MODEL=gemini-2.5-flash`).
+
+5. Port-forward the in-cluster service to your workstation:
+   ```bash
+   kubectl -n ao-system port-forward svc/ao 8081:8081
+   ```
+
+6. Send a request to verify the server and sandbox:
+   ```bash
+   ao session send demo "run: uname -a"
+   ```
+
+If you also need ObjectFS on a real cluster, provide `OBJECTFS_BACKEND` (such as `gs://my-bucket/prefix` or `s3://my-bucket/prefix`) and include `objectfs` in `--only` (for example, `--only ao,objectfs`).
 
 #### Bumping Pinned Versions
 
