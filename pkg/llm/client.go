@@ -27,13 +27,41 @@ import (
 	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
+	"golang.org/x/oauth2"
 )
 
 // Client interacts with an OpenAI-compatible API endpoint using net/http.
 type Client struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
+	baseURL     string
+	apiKey      string
+	tokenSource oauth2.TokenSource
+	httpClient  *http.Client
+}
+
+// ClientOption configures a Client.
+type ClientOption func(*Client)
+
+// WithTokenSource configures the Client to authenticate using an OAuth2 TokenSource.
+func WithTokenSource(ts oauth2.TokenSource) ClientOption {
+	return func(c *Client) {
+		c.tokenSource = ts
+	}
+}
+
+// WithHTTPClient configures a custom http.Client for the Client.
+func WithHTTPClient(httpClient *http.Client) ClientOption {
+	return func(c *Client) {
+		c.httpClient = httpClient
+	}
+}
+
+// VertexBaseURL returns the OpenAI-compatible base URL for Vertex AI.
+// When location is empty or "global", it uses the global endpoint URL.
+func VertexBaseURL(project, location string) string {
+	if location == "" || location == "global" {
+		return fmt.Sprintf("https://aiplatform.googleapis.com/v1/projects/%s/locations/global/endpoints/openapi", project)
+	}
+	return fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/endpoints/openapi", location, project, location)
 }
 
 // ChatCompletionRequest represents the request body for the chat completions API.
@@ -102,25 +130,27 @@ type Choice struct {
 }
 
 // NewClient initializes a new OpenAI-compatible LLM client.
-func NewClient(baseURL, apiKey string) (*Client, error) {
-	if apiKey == "" {
-		return nil, fmt.Errorf("llm: api key is required")
+func NewClient(baseURL, apiKey string, opts ...ClientOption) (*Client, error) {
+	c := &Client{
+		baseURL: baseURL,
+		apiKey:  apiKey,
+		httpClient: &http.Client{
+			Timeout: 60 * time.Second,
+		},
 	}
-	if baseURL == "" {
-		baseURL = "https://generativelanguage.googleapis.com/v1beta/openai"
-	}
-	baseURL = strings.TrimSuffix(baseURL, "/")
-
-	// Set reasonable timeouts just to avoid hanging on requests for too long.
-	httpClient := &http.Client{
-		Timeout: 60 * time.Second,
+	for _, opt := range opts {
+		opt(c)
 	}
 
-	return &Client{
-		baseURL:    baseURL,
-		apiKey:     apiKey,
-		httpClient: httpClient,
-	}, nil
+	if c.apiKey == "" && c.tokenSource == nil {
+		return nil, fmt.Errorf("llm: api key or token source is required")
+	}
+	if c.baseURL == "" {
+		c.baseURL = "https://generativelanguage.googleapis.com/v1beta/openai"
+	}
+	c.baseURL = strings.TrimSuffix(c.baseURL, "/")
+
+	return c, nil
 }
 
 // CreateChatCompletion sends a chat completion request to the API.
@@ -139,8 +169,20 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 		return nil, fmt.Errorf("llm: failed to create http request: %w", err)
 	}
 
+	bearerToken := c.apiKey
+	if c.tokenSource != nil {
+		tok, err := c.tokenSource.Token()
+		if err != nil {
+			return nil, fmt.Errorf("llm: failed to obtain token from token source: %w", err)
+		}
+		if tok == nil {
+			return nil, fmt.Errorf("llm: token source returned nil token")
+		}
+		bearerToken = tok.AccessToken
+	}
+
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+bearerToken)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
