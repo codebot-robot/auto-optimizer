@@ -241,13 +241,15 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, name s
 	for _, m := range detail.Messages {
 		content := m.Content
 		isTool := m.Role == "tool" || m.ToolCallID != ""
-		canTruncate := len(content) > maxTruncateLen
-		truncated := !full && canTruncate
-
+		canTruncate := false
 		displayContent := content
-		if truncated {
-			displayContent = content[:maxTruncateLen] + "..."
+		if prefix, ok := truncateRunes(content, maxTruncateLen); ok {
+			canTruncate = true
+			if !full {
+				displayContent = prefix + "..."
+			}
 		}
+		truncated := !full && canTruncate
 
 		msgs = append(msgs, messageViewModel{
 			Role:           m.Role,
@@ -353,4 +355,17 @@ func (s *Server) render404(w http.ResponseWriter, r *http.Request, message strin
 	if execErr := s.templates["404"].Execute(w, vm); execErr != nil {
 		scoped.Log(r.Context()).V(4).Info("rendering 404 template", "error", execErr)
 	}
+}
+
+// truncateRunes returns the prefix of s up to maxRunes, and whether s exceeded maxRunes.
+// It is rune-aware and does not split multi-byte UTF-8 sequences.
+func truncateRunes(s string, maxRunes int) (string, bool) {
+	var count int
+	for i := range s {
+		if count == maxRunes {
+			return s[:i], true
+		}
+		count++
+	}
+	return s, false
 }

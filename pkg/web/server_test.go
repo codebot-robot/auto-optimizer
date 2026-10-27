@@ -26,6 +26,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -430,5 +431,165 @@ func TestHealthzAndStatic(t *testing.T) {
 	}
 	if !strings.Contains(string(cssBody), "--indigo") {
 		t.Errorf("expected CSS content, got: %s", string(cssBody))
+	}
+}
+
+func TestTruncateRunes(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		maxRunes      int
+		wantPrefix    string
+		wantTruncated bool
+	}{
+		{
+			name:          "empty",
+			input:         "",
+			maxRunes:      10,
+			wantPrefix:    "",
+			wantTruncated: false,
+		},
+		{
+			name:          "short ascii",
+			input:         "hello",
+			maxRunes:      10,
+			wantPrefix:    "hello",
+			wantTruncated: false,
+		},
+		{
+			name:          "exact ascii",
+			input:         "hello",
+			maxRunes:      5,
+			wantPrefix:    "hello",
+			wantTruncated: false,
+		},
+		{
+			name:          "truncated ascii",
+			input:         "hello world",
+			maxRunes:      5,
+			wantPrefix:    "hello",
+			wantTruncated: true,
+		},
+		{
+			name:          "multibyte utf8 within limit",
+			input:         "你好世界",
+			maxRunes:      4,
+			wantPrefix:    "你好世界",
+			wantTruncated: false,
+		},
+		{
+			name:          "multibyte utf8 truncated",
+			input:         "你好世界",
+			maxRunes:      2,
+			wantPrefix:    "你好",
+			wantTruncated: true,
+		},
+		{
+			name:          "emoji boundary not split",
+			input:         "abc🚀def",
+			maxRunes:      4,
+			wantPrefix:    "abc🚀",
+			wantTruncated: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotPrefix, gotTruncated := truncateRunes(tc.input, tc.maxRunes)
+			if gotTruncated != tc.wantTruncated {
+				t.Errorf("truncateRunes(%q, %d) truncated = %v, want %v", tc.input, tc.maxRunes, gotTruncated, tc.wantTruncated)
+			}
+			if gotPrefix != tc.wantPrefix {
+				t.Errorf("truncateRunes(%q, %d) prefix = %q, want %q", tc.input, tc.maxRunes, gotPrefix, tc.wantPrefix)
+			}
+			if !utf8.ValidString(gotPrefix) {
+				t.Errorf("truncateRunes(%q, %d) returned invalid UTF-8: %q", tc.input, tc.maxRunes, gotPrefix)
+			}
+		})
+	}
+}
+
+func TestTranscriptTruncation_UTF8(t *testing.T) {
+	// 600 multibyte characters (each 3 bytes in UTF-8: 1800 bytes total).
+	// Byte slicing at 500 would split the 167th rune; rune-aware truncation must keep 500 complete runes.
+	const totalRunes = 600
+	var sb strings.Builder
+	for i := 0; i < totalRunes; i++ {
+		sb.WriteRune('世')
+	}
+	longContent := sb.String()
+
+	fakeSvc := &fakeSessionService{
+		details: map[string]*sessionapi.SessionDetail{
+			"utf8-session": {
+				Summary: sessionapi.SessionSummary{
+					Name:         "utf8-session",
+					Toolset:      "basic",
+					MessageCount: 1,
+					CreatedAt:    time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC),
+				},
+				Messages: []sessionapi.Message{
+					{
+						Role:    "assistant",
+						Content: longContent,
+					},
+				},
+			},
+		},
+	}
+
+	webServer, err := NewServer(fakeSvc)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	ts := httptest.NewServer(webServer)
+	t.Cleanup(ts.Close)
+
+	client := &http.Client{}
+
+	// 1. Default request should be truncated at maxTruncateLen (500 runes)
+	resp, err := client.Get(ts.URL + "/sessions/utf8-session")
+	if err != nil {
+		t.Fatalf("GET /sessions/utf8-session: %v", err)
+	}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+	body := string(bodyBytes)
+
+	if !utf8.Valid(bodyBytes) {
+		t.Fatal("response body is not valid UTF-8")
+	}
+
+	wantPrefix := strings.Repeat("世", maxTruncateLen) + "..."
+	if !strings.Contains(body, wantPrefix) {
+		t.Errorf("expected truncated prefix %q in body", wantPrefix)
+	}
+	if !strings.Contains(body, `href="/sessions/utf8-session?full=1"`) {
+		t.Errorf("expected 'show all' link with full=1 in body")
+	}
+
+	// 2. Request with ?full=1 should show all 600 runes
+	fullResp, err := client.Get(ts.URL + "/sessions/utf8-session?full=1")
+	if err != nil {
+		t.Fatalf("GET /sessions/utf8-session?full=1: %v", err)
+	}
+	fullBodyBytes, err := io.ReadAll(fullResp.Body)
+	_ = fullResp.Body.Close()
+	if err != nil {
+		t.Fatalf("reading full body: %v", err)
+	}
+	fullBody := string(fullBodyBytes)
+
+	if !utf8.Valid(fullBodyBytes) {
+		t.Fatal("full response body is not valid UTF-8")
+	}
+	if !strings.Contains(fullBody, longContent) {
+		t.Errorf("expected full content (%d runes) in body", totalRunes)
+	}
+	if !strings.Contains(fullBody, `href="/sessions/utf8-session"`) {
+		t.Errorf("expected 'show less' link in full body")
 	}
 }
