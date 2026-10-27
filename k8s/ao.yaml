@@ -44,7 +44,7 @@ rules:
       - get
       - list
       - watch
-  # pods/exec goes away with epic #30 (sandboxd).
+  # pods/exec is required for the exec-based transport we have today; goes away with epic #30 (sandboxd).
   - apiGroups:
       - ""
     resources:
@@ -101,6 +101,15 @@ spec:
           command:
             - /ao
             - serve
+          ports:
+            - name: grpc
+              containerPort: 8081
+          readinessProbe:
+            tcpSocket:
+              port: 8081
+          livenessProbe:
+            tcpSocket:
+              port: 8081
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
