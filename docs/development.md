@@ -120,11 +120,11 @@ To use a real model such as Gemini:
 
 2. Pass `OPENAI_MODEL` when running `deploy-to-kube`:
    ```bash
-   OPENAI_MODEL=gemini-2.5-flash ./dev/tasks/deploy-to-kube
+   OPENAI_MODEL=gemini-3.5-flash ./dev/tasks/deploy-to-kube
    ```
    Or update the `ao-config` ConfigMap directly and restart the deployment:
    ```bash
-   kubectl -n ao-system patch configmap ao-config --type=merge -p '{"data":{"OPENAI_MODEL":"gemini-2.5-flash"}}'
+   kubectl -n ao-system patch configmap ao-config --type=merge -p '{"data":{"OPENAI_MODEL":"gemini-3.5-flash"}}'
    kubectl -n ao-system rollout restart deploy/ao
    ```
 
