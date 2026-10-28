@@ -25,6 +25,10 @@ The session implementation was forked from `examples/sandboxed-tools` in the [ku
 6. **Sandbox Lifecycle**:
    - Sandboxes persist after process exit and expire automatically via `shutdownPolicy: Delete` and inactivity timeout `shutdownTime`, allowing subsequent CLI commands to reuse active sandboxes without recreate latency.
 
+## Relationship to Upstream
+
+`pkg/session`, `pkg/llm`, `pkg/tools`, and `pkg/toolsets` were forked from `examples/sandboxed-tools` in [kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) at commit `f83f2d87c1aeeb90407d8cfe9a0c1fad74044304`. They are maintained in this repository, and changes are not sent back to upstream.
+
 ## Running Locally Against Kind
 
 ### 1. Prepare Kind Cluster
