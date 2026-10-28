@@ -34,7 +34,6 @@ if [[ -d "${REPO_ROOT}/.build/bin" ]]; then
 fi
 
 CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || echo "unknown")"
-echo "=== Deploying auto-optimizer dependencies to kubeconfig context: ${CURRENT_CONTEXT} ==="
 
 IS_KIND="false"
 KIND_CLUSTER_NAME="auto-optimizer"
@@ -42,6 +41,134 @@ if [[ "${CURRENT_CONTEXT}" == kind-* ]]; then
   IS_KIND="true"
   KIND_CLUSTER_NAME="${CURRENT_CONTEXT#kind-}"
 fi
+
+ensure_kubectl() {
+  if ! command -v kubectl >/dev/null 2>&1; then
+    local kubectl_version="v1.35.0"
+    local kubectl_bin="${REPO_ROOT}/.build/src/kubectl/${kubectl_version}/bin/kubectl"
+    if [[ ! -x "${kubectl_bin}" ]]; then
+      echo "Installing kubectl ${kubectl_version}..." >&2
+      mkdir -p "$(dirname "${kubectl_bin}")"
+      curl -sLo "${kubectl_bin}" "https://dl.k8s.io/release/${kubectl_version}/bin/$(go env GOOS)/$(go env GOARCH)/kubectl"
+      chmod +x "${kubectl_bin}"
+    fi
+    mkdir -p "${REPO_ROOT}/.build/bin"
+    ln -sf "../src/kubectl/${kubectl_version}/bin/kubectl" "${REPO_ROOT}/.build/bin/kubectl"
+    export PATH="${REPO_ROOT}/.build/bin:${PATH}"
+  fi
+}
+
+ensure_kubectl
+
+# Parse command-line arguments
+CLI_COMPONENTS=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --only)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --only requires a component argument" >&2
+        exit 1
+      fi
+      if [[ -z "${CLI_COMPONENTS}" ]]; then
+        CLI_COMPONENTS="$2"
+      else
+        CLI_COMPONENTS="${CLI_COMPONENTS},$2"
+      fi
+      shift 2
+      ;;
+    --only=*)
+      val="${1#*=}"
+      if [[ -z "${CLI_COMPONENTS}" ]]; then
+        CLI_COMPONENTS="${val}"
+      else
+        CLI_COMPONENTS="${CLI_COMPONENTS},${val}"
+      fi
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--only <component>]"
+      echo ""
+      echo "Deploy auto-optimizer and its dependencies to a Kubernetes cluster."
+      echo ""
+      echo "Options:"
+      echo "  --only <component>  Deploy only the specified component(s) (comma-separated)."
+      echo "                      Available components: agent-sandbox, service-portals, objectfs, ao"
+      echo "                      Can be passed multiple times or specified via COMPONENTS env var."
+      echo "  -h, --help          Show this help text"
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unknown argument: $1" >&2
+      echo "Usage: $0 [--only <component>]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -n "${CLI_COMPONENTS}" ]]; then
+  COMPONENTS="${CLI_COMPONENTS}"
+fi
+
+if [[ -z "${COMPONENTS:-}" ]]; then
+  if [[ "${IS_KIND}" == "true" ]]; then
+    COMPONENTS="agent-sandbox,service-portals,objectfs,ao"
+  else
+    COMPONENTS="ao"
+  fi
+fi
+
+# Normalize and validate COMPONENTS
+VALID_COMPONENTS="agent-sandbox service-portals objectfs ao"
+CLEAN_COMPONENTS=""
+IFS=',' read -ra RAW_COMPONENTS <<< "${COMPONENTS}"
+for comp in "${RAW_COMPONENTS[@]}"; do
+  comp="$(echo "${comp}" | tr -d '[:space:]')"
+  if [[ -z "${comp}" ]]; then
+    continue
+  fi
+  is_valid="false"
+  for valid in ${VALID_COMPONENTS}; do
+    if [[ "${comp}" == "${valid}" ]]; then
+      is_valid="true"
+      break
+    fi
+  done
+  if [[ "${is_valid}" != "true" ]]; then
+    echo "ERROR: Unknown component '${comp}'. Valid components are: agent-sandbox, service-portals, objectfs, ao" >&2
+    exit 1
+  fi
+  # Avoid duplicate entries
+  is_duplicate="false"
+  for existing in ${CLEAN_COMPONENTS//,/ }; do
+    if [[ "${existing}" == "${comp}" ]]; then
+      is_duplicate="true"
+      break
+    fi
+  done
+  if [[ "${is_duplicate}" == "true" ]]; then
+    continue
+  fi
+  if [[ -z "${CLEAN_COMPONENTS}" ]]; then
+    CLEAN_COMPONENTS="${comp}"
+  else
+    CLEAN_COMPONENTS="${CLEAN_COMPONENTS},${comp}"
+  fi
+done
+COMPONENTS="${CLEAN_COMPONENTS}"
+
+has_component() {
+  local target="$1"
+  local IFS=','
+  for comp in ${COMPONENTS}; do
+    if [[ "${comp}" == "${target}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+echo "=== Deploying auto-optimizer dependencies to kubeconfig context: ${CURRENT_CONTEXT} ==="
+echo "Components: ${COMPONENTS}"
 
 ensure_docker_cli() {
   if ! command -v docker >/dev/null 2>&1; then
@@ -100,8 +227,13 @@ if [[ "${IS_KIND}" == "true" ]]; then
   export IMAGE_TAG="${IMAGE_TAG:-dev}"
 else
   if [[ -z "${IMAGE_PREFIX:-}" ]]; then
-    echo "ERROR: IMAGE_PREFIX must be set when deploying to a non-kind cluster (e.g. IMAGE_PREFIX=gcr.io/my-project)" >&2
-    exit 1
+    if has_component "ao" || has_component "service-portals"; then
+      echo "ERROR: IMAGE_PREFIX must be set when deploying to a non-kind cluster (e.g. IMAGE_PREFIX=gcr.io/my-project)" >&2
+      exit 1
+    elif has_component "objectfs" && [[ -n "${OBJECTFS_BACKEND:-}" ]]; then
+      echo "ERROR: IMAGE_PREFIX must be set when deploying to a non-kind cluster (e.g. IMAGE_PREFIX=gcr.io/my-project)" >&2
+      exit 1
+    fi
   fi
   export IMAGE_TAG="${IMAGE_TAG:-latest}"
 fi
@@ -145,64 +277,77 @@ kubectl create namespace ao-sandboxes --dry-run=client -o yaml | kubectl apply -
 # ------------------------------------------------------------------------------
 # 2. agent-sandbox
 # ------------------------------------------------------------------------------
-echo "--- Installing agent-sandbox (${AGENT_SANDBOX_VERSION}) ---"
-kubectl apply --server-side -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/sandbox.yaml"
-kubectl apply --server-side -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/extensions.yaml"
+if has_component "agent-sandbox"; then
+  EXISTING_SERVED="$(kubectl get crd/sandboxes.agents.x-k8s.io -o jsonpath='{.spec.versions[?(@.name=="v1beta1")].served}' 2>/dev/null || true)"
+  if [[ "${EXISTING_SERVED}" == "true" && "${FORCE_AGENT_SANDBOX:-0}" != "1" ]]; then
+    echo "--- Skipping agent-sandbox: crd/sandboxes.agents.x-k8s.io with v1beta1 served already present (set FORCE_AGENT_SANDBOX=1 to force) ---"
+  else
+    echo "--- Installing agent-sandbox (${AGENT_SANDBOX_VERSION}) ---"
+    kubectl apply --server-side -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/sandbox.yaml"
+    kubectl apply --server-side -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/extensions.yaml"
 
-echo "Waiting for sandboxes.agents.x-k8s.io CRD to be established..."
-kubectl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=60s
+    echo "Waiting for sandboxes.agents.x-k8s.io CRD to be established..."
+    kubectl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=60s
 
-echo "Waiting for agent-sandbox-controller deployment in agent-sandbox-system..."
-kubectl rollout status deployment/agent-sandbox-controller -n agent-sandbox-system --timeout=120s
+    echo "Waiting for agent-sandbox-controller deployment in agent-sandbox-system..."
+    kubectl rollout status deployment/agent-sandbox-controller -n agent-sandbox-system --timeout=120s
+  fi
+fi
 
 # ------------------------------------------------------------------------------
 # 3. service-portals
 # ------------------------------------------------------------------------------
-echo "--- Building service-portals images (${SERVICE_PORTALS_COMMIT}) with ap build ---"
-# Sandboxes use service-portals exclusively in transparent sidecar mode (see docs/design.md).
-# We do not deploy the central explicit proxy (k8s/manifests.yaml) or require cert-manager.
-# We build the container images (init-service-portals, all-in-one-portal, gitproxy-server, service-portal)
-# using 'ap build'.
-SERVICE_PORTALS_DIR="$(ensure_cached_repo "service-portals" "https://github.com/gke-labs/service-portals.git" "${SERVICE_PORTALS_COMMIT}")"
+if has_component "service-portals"; then
+  echo "--- Building service-portals images (${SERVICE_PORTALS_COMMIT}) with ap build ---"
+  # Sandboxes use service-portals exclusively in transparent sidecar mode (see docs/design.md).
+  # We do not deploy the central explicit proxy (k8s/manifests.yaml) or require cert-manager.
+  # We build the container images (init-service-portals, all-in-one-portal, gitproxy-server, service-portal)
+  # using 'ap build'.
+  SERVICE_PORTALS_DIR="$(ensure_cached_repo "service-portals" "https://github.com/gke-labs/service-portals.git" "${SERVICE_PORTALS_COMMIT}")"
 
-if [[ "${IS_KIND}" == "true" ]]; then
-  echo "Building service-portals images locally..."
-  (cd "${SERVICE_PORTALS_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
-  echo "Loading service-portals images into kind cluster ${KIND_CLUSTER_NAME}..."
-  kind load docker-image \
-    "${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}" \
-    "${IMAGE_PREFIX}/all-in-one-portal:${IMAGE_TAG}" \
-    "${IMAGE_PREFIX}/gitproxy-server:${IMAGE_TAG}" \
-    "${IMAGE_PREFIX}/service-portal:${IMAGE_TAG}" \
-    --name "${KIND_CLUSTER_NAME}"
-else
-  echo "Building and pushing service-portals images to ${IMAGE_PREFIX}..."
-  (cd "${SERVICE_PORTALS_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build --push)
+  if [[ "${IS_KIND}" == "true" ]]; then
+    echo "Building service-portals images locally..."
+    (cd "${SERVICE_PORTALS_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+    echo "Loading service-portals images into kind cluster ${KIND_CLUSTER_NAME}..."
+    kind load docker-image \
+      "${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}" \
+      "${IMAGE_PREFIX}/all-in-one-portal:${IMAGE_TAG}" \
+      "${IMAGE_PREFIX}/gitproxy-server:${IMAGE_TAG}" \
+      "${IMAGE_PREFIX}/service-portal:${IMAGE_TAG}" \
+      --name "${KIND_CLUSTER_NAME}"
+  else
+    echo "Building and pushing service-portals images to ${IMAGE_PREFIX}..."
+    (cd "${SERVICE_PORTALS_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build --push)
+  fi
 fi
 
 # ------------------------------------------------------------------------------
 # 4. in-cluster-storage (ObjectFS)
 # ------------------------------------------------------------------------------
-echo "--- Installing in-cluster-storage / ObjectFS (${IN_CLUSTER_STORAGE_COMMIT}) with ap ---"
-kubectl create namespace kube-objectfs-system --dry-run=client -o yaml | kubectl apply -f -
+if has_component "objectfs"; then
+  if [[ "${IS_KIND}" != "true" && -z "${OBJECTFS_BACKEND:-}" ]]; then
+    echo "--- Skipping objectfs: OBJECTFS_BACKEND is unset on a non-kind cluster ---"
+  else
+    echo "--- Installing in-cluster-storage / ObjectFS (${IN_CLUSTER_STORAGE_COMMIT}) with ap ---"
+    kubectl create namespace kube-objectfs-system --dry-run=client -o yaml | kubectl apply -f -
 
-IN_CLUSTER_STORAGE_DIR="$(ensure_cached_repo "in-cluster-storage" "https://github.com/gke-labs/in-cluster-storage.git" "${IN_CLUSTER_STORAGE_COMMIT}")"
+    IN_CLUSTER_STORAGE_DIR="$(ensure_cached_repo "in-cluster-storage" "https://github.com/gke-labs/in-cluster-storage.git" "${IN_CLUSTER_STORAGE_COMMIT}")"
 
-BACKEND_URL="${OBJECTFS_BACKEND:-}"
-USE_FAKES3="false"
-if [[ -z "${BACKEND_URL}" ]]; then
-  USE_FAKES3="true"
-  BACKEND_URL="s3://objectfs-bucket?endpoint=http://fakes3.kube-objectfs-system.svc.cluster.local:9000&region=us-east-1&s3ForcePathStyle=true"
-fi
+    BACKEND_URL="${OBJECTFS_BACKEND:-}"
+    USE_FAKES3="false"
+    if [[ -z "${BACKEND_URL}" ]]; then
+      USE_FAKES3="true"
+      BACKEND_URL="s3://objectfs-bucket?endpoint=http://fakes3.kube-objectfs-system.svc.cluster.local:9000&region=us-east-1&s3ForcePathStyle=true"
+    fi
 
-if [[ "${IS_KIND}" == "true" ]]; then
-  if [[ "${USE_FAKES3}" == "true" ]]; then
-    echo "Building and loading fakes3 for kind..."
-    (cd "${IN_CLUSTER_STORAGE_DIR}/fakes3" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
-    kind load docker-image "${IMAGE_PREFIX}/fakes3:${IMAGE_TAG}" --name "${KIND_CLUSTER_NAME}"
+    if [[ "${IS_KIND}" == "true" ]]; then
+      if [[ "${USE_FAKES3}" == "true" ]]; then
+        echo "Building and loading fakes3 for kind..."
+        (cd "${IN_CLUSTER_STORAGE_DIR}/fakes3" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+        kind load docker-image "${IMAGE_PREFIX}/fakes3:${IMAGE_TAG}" --name "${KIND_CLUSTER_NAME}"
 
-    echo "Deploying in-cluster fakes3 service and deployment..."
-    cat << EOF | kubectl apply -f -
+        echo "Deploying in-cluster fakes3 service and deployment..."
+        cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: Service
 metadata:
@@ -238,29 +383,29 @@ spec:
           ports:
             - containerPort: 9000
 EOF
-    echo "Waiting for fakes3 deployment..."
-    kubectl rollout status deployment/fakes3 -n kube-objectfs-system --timeout=60s
-  fi
+        echo "Waiting for fakes3 deployment..."
+        kubectl rollout status deployment/fakes3 -n kube-objectfs-system --timeout=60s
+      fi
 
-  echo "Building in-cluster-storage images..."
-  (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
-  echo "Loading in-cluster-storage images into kind cluster ${KIND_CLUSTER_NAME}..."
-  kind load docker-image \
-    "${IMAGE_PREFIX}/wal-buffer:${IMAGE_TAG}" \
-    "${IMAGE_PREFIX}/objectfs-controller:${IMAGE_TAG}" \
-    "${IMAGE_PREFIX}/objectfs-node-daemon:${IMAGE_TAG}" \
-    --name "${KIND_CLUSTER_NAME}"
+      echo "Building in-cluster-storage images..."
+      (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+      echo "Loading in-cluster-storage images into kind cluster ${KIND_CLUSTER_NAME}..."
+      kind load docker-image \
+        "${IMAGE_PREFIX}/wal-buffer:${IMAGE_TAG}" \
+        "${IMAGE_PREFIX}/objectfs-controller:${IMAGE_TAG}" \
+        "${IMAGE_PREFIX}/objectfs-node-daemon:${IMAGE_TAG}" \
+        --name "${KIND_CLUSTER_NAME}"
 
-  echo "Deploying in-cluster-storage manifests with ap deploy..."
-  (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy --skip-push)
-else
-  echo "Deploying in-cluster-storage with ap deploy (pushing to ${IMAGE_PREFIX})..."
-  (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy)
-fi
+      echo "Deploying in-cluster-storage manifests with ap deploy..."
+      (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy --skip-push)
+    else
+      echo "Deploying in-cluster-storage with ap deploy (pushing to ${IMAGE_PREFIX})..."
+      (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy)
+    fi
 
-# Configure backend via objectfs-config ConfigMap (replaces backend without patching manifests)
-echo "Applying objectfs-config ConfigMap (backend: ${BACKEND_URL})..."
-cat << EOF | kubectl apply -f -
+    # Configure backend via objectfs-config ConfigMap (replaces backend without patching manifests)
+    echo "Applying objectfs-config ConfigMap (backend: ${BACKEND_URL})..."
+    cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -270,76 +415,82 @@ data:
   backend: "${BACKEND_URL}"
 EOF
 
-# If using fakes3, create credentials secret and inject into StatefulSets via kubectl set env
-if [[ "${USE_FAKES3}" == "true" ]]; then
-  echo "Configuring fakes3 credentials secret..."
-  kubectl create secret generic objectfs-s3-credentials \
-    -n kube-objectfs-system \
-    --from-literal=AWS_ACCESS_KEY_ID=fakes3 \
-    --from-literal=AWS_SECRET_ACCESS_KEY=fakes3 \
-    --from-literal=AWS_REGION=us-east-1 \
-    --dry-run=client -o yaml | kubectl apply -f -
+    # If using fakes3, create credentials secret and inject into StatefulSets via kubectl set env
+    if [[ "${USE_FAKES3}" == "true" ]]; then
+      echo "Configuring fakes3 credentials secret..."
+      kubectl create secret generic objectfs-s3-credentials \
+        -n kube-objectfs-system \
+        --from-literal=AWS_ACCESS_KEY_ID=fakes3 \
+        --from-literal=AWS_SECRET_ACCESS_KEY=fakes3 \
+        --from-literal=AWS_REGION=us-east-1 \
+        --dry-run=client -o yaml | kubectl apply -f -
 
-  kubectl set env statefulset/wal-buffer -n kube-objectfs-system --from=secret/objectfs-s3-credentials
-  kubectl set env statefulset/objectfs-controller -n kube-objectfs-system --from=secret/objectfs-s3-credentials
+      kubectl set env statefulset/wal-buffer -n kube-objectfs-system --from=secret/objectfs-s3-credentials
+      kubectl set env statefulset/objectfs-controller -n kube-objectfs-system --from=secret/objectfs-s3-credentials
 
-  # If pods were started before credentials were set, reset any crashed pod so it restarts immediately
-  WAL_READY="$(kubectl get pod wal-buffer-0 -n kube-objectfs-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")"
-  if [[ "${WAL_READY}" != "True" ]]; then
-    kubectl delete pod wal-buffer-0 -n kube-objectfs-system --ignore-not-found >/dev/null 2>&1 || true
+      # If pods were started before credentials were set, reset any crashed pod so it restarts immediately
+      WAL_READY="$(kubectl get pod wal-buffer-0 -n kube-objectfs-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")"
+      if [[ "${WAL_READY}" != "True" ]]; then
+        kubectl delete pod wal-buffer-0 -n kube-objectfs-system --ignore-not-found >/dev/null 2>&1 || true
+      fi
+      CTRL_READY="$(kubectl get pod objectfs-controller-0 -n kube-objectfs-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")"
+      if [[ "${CTRL_READY}" != "True" ]]; then
+        kubectl delete pod objectfs-controller-0 -n kube-objectfs-system --ignore-not-found >/dev/null 2>&1 || true
+      fi
+    fi
+
+    echo "Waiting for wal-buffer statefulset in kube-objectfs-system..."
+    kubectl rollout status statefulset/wal-buffer -n kube-objectfs-system --timeout=120s
+
+    echo "Waiting for objectfs-controller statefulset in kube-objectfs-system..."
+    kubectl rollout status statefulset/objectfs-controller -n kube-objectfs-system --timeout=120s
+
+    echo "Waiting for objectfs-node-daemon daemonset in kube-objectfs-system..."
+    kubectl rollout status daemonset/objectfs-node-daemon -n kube-objectfs-system --timeout=120s
+
+    echo "Waiting for StorageClass objectfs-exclusive-local to exist..."
+    SC_FOUND="false"
+    for _ in $(seq 1 30); do
+      if kubectl get storageclass objectfs-exclusive-local >/dev/null 2>&1; then
+        SC_FOUND="true"
+        break
+      fi
+      sleep 2
+    done
+
+    if [[ "${SC_FOUND}" != "true" ]]; then
+      echo "ERROR: StorageClass objectfs-exclusive-local was not found after waiting." >&2
+      exit 1
+    fi
   fi
-  CTRL_READY="$(kubectl get pod objectfs-controller-0 -n kube-objectfs-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")"
-  if [[ "${CTRL_READY}" != "True" ]]; then
-    kubectl delete pod objectfs-controller-0 -n kube-objectfs-system --ignore-not-found >/dev/null 2>&1 || true
-  fi
-fi
-
-echo "Waiting for wal-buffer statefulset in kube-objectfs-system..."
-kubectl rollout status statefulset/wal-buffer -n kube-objectfs-system --timeout=120s
-
-echo "Waiting for objectfs-controller statefulset in kube-objectfs-system..."
-kubectl rollout status statefulset/objectfs-controller -n kube-objectfs-system --timeout=120s
-
-echo "Waiting for objectfs-node-daemon daemonset in kube-objectfs-system..."
-kubectl rollout status daemonset/objectfs-node-daemon -n kube-objectfs-system --timeout=120s
-
-echo "Waiting for StorageClass objectfs-exclusive-local to exist..."
-SC_FOUND="false"
-for _ in $(seq 1 30); do
-  if kubectl get storageclass objectfs-exclusive-local >/dev/null 2>&1; then
-    SC_FOUND="true"
-    break
-  fi
-  sleep 2
-done
-
-if [[ "${SC_FOUND}" != "true" ]]; then
-  echo "ERROR: StorageClass objectfs-exclusive-local was not found after waiting." >&2
-  exit 1
 fi
 
 # ------------------------------------------------------------------------------
 # 5. auto-optimizer (ao)
 # ------------------------------------------------------------------------------
-echo "--- Deploying auto-optimizer with ap ---"
+if has_component "ao"; then
+  echo "--- Deploying auto-optimizer with ap ---"
+  kubectl create namespace ao-system --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create namespace ao-sandboxes --dry-run=client -o yaml | kubectl apply -f -
 
-if [[ "${IS_KIND}" == "true" ]]; then
-  echo "Building auto-optimizer images..."
-  (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
-  echo "Loading auto-optimizer images into kind cluster ${KIND_CLUSTER_NAME}..."
-  kind load docker-image \
-    "${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}" \
-    "${IMAGE_PREFIX}/ao:${IMAGE_TAG}" \
-    --name "${KIND_CLUSTER_NAME}"
-
-  echo "Deploying auto-optimizer manifests with ap deploy..."
-  (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy --skip-push)
-
-  OPENAI_MODEL="${OPENAI_MODEL:-fake-eliza}"
   SANDBOX_IMAGE="${SANDBOX_IMAGE:-${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}}"
 
-  echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE})..."
-  cat << EOF | kubectl apply -f -
+  if [[ "${IS_KIND}" == "true" ]]; then
+    echo "Building auto-optimizer images..."
+    (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+    echo "Loading auto-optimizer images into kind cluster ${KIND_CLUSTER_NAME}..."
+    kind load docker-image \
+      "${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}" \
+      "${IMAGE_PREFIX}/ao:${IMAGE_TAG}" \
+      --name "${KIND_CLUSTER_NAME}"
+
+    echo "Deploying auto-optimizer manifests with ap deploy..."
+    (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy --skip-push)
+
+    OPENAI_MODEL="${OPENAI_MODEL:-fake-eliza}"
+
+    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE})..."
+    cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -352,13 +503,12 @@ data:
   SANDBOX_IMAGE: "${SANDBOX_IMAGE}"
 EOF
 
-  kubectl rollout restart deployment/ao -n ao-system
-else
-  echo "Deploying auto-optimizer with ap deploy (pushing to ${IMAGE_PREFIX})..."
-  (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy)
+    kubectl rollout restart deployment/ao -n ao-system
+  else
+    echo "Deploying auto-optimizer with ap deploy (pushing to ${IMAGE_PREFIX})..."
+    (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy)
 
-  if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" ]]; then
-    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-})..."
+    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE})..."
     cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -369,13 +519,14 @@ data:
   AO_LISTEN: "0.0.0.0:8081"
   SANDBOX_NAMESPACE: "ao-sandboxes"
   OPENAI_MODEL: "${OPENAI_MODEL:-}"
-  SANDBOX_IMAGE: "${SANDBOX_IMAGE:-}"
+  SANDBOX_IMAGE: "${SANDBOX_IMAGE}"
 EOF
+
     kubectl rollout restart deployment/ao -n ao-system
   fi
-fi
 
-echo "Waiting for ao deployment in ao-system..."
-kubectl rollout status deployment/ao -n ao-system --timeout=120s
+  echo "Waiting for ao deployment in ao-system..."
+  kubectl rollout status deployment/ao -n ao-system --timeout=120s
+fi
 
 echo "=== deploy-to-kube completed successfully ==="
