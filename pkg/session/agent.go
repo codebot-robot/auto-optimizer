@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -256,9 +257,85 @@ readyLoop:
 				s.podName = latest.Name
 				break readyLoop
 			}
+
+			if err := s.checkPodImagePullStatus(ctx); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// checkPodImagePullStatus inspects the backing Pod's container statuses to fail fast
+// if any container is stuck in ImagePullBackOff or ErrImagePull.
+func (s *Sandbox) checkPodImagePullStatus(ctx context.Context) error {
+	if s.session == nil || s.session.client == nil || s.session.client.coreClient == nil {
+		return nil
+	}
+
+	pod, err := s.session.client.coreClient.Pods(s.NamespacedName().Namespace).Get(ctx, s.NamespacedName().Name, metav1.GetOptions{})
+	if err != nil {
+		return nil
+	}
+
+	allStatuses := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses)+len(pod.Status.EphemeralContainerStatuses))
+	allStatuses = append(allStatuses, pod.Status.InitContainerStatuses...)
+	allStatuses = append(allStatuses, pod.Status.ContainerStatuses...)
+	allStatuses = append(allStatuses, pod.Status.EphemeralContainerStatuses...)
+
+	for _, cs := range allStatuses {
+		if cs.State.Waiting != nil {
+			reason := cs.State.Waiting.Reason
+			if reason == "ImagePullBackOff" || reason == "ErrImagePull" {
+				msg := cs.State.Waiting.Message
+				if evMsg := s.getPodPullEventMessage(ctx, pod); evMsg != "" {
+					msg = evMsg
+				}
+				if msg == "" {
+					msg = reason
+				}
+				return fmt.Errorf("failed to pull image for container %q in pod %s (%s): %s", cs.Name, pod.Name, reason, msg)
+			}
+		}
+	}
+
+	return nil
+}
+
+// getPodPullEventMessage searches for an event associated with the pod that describes an image pull failure.
+func (s *Sandbox) getPodPullEventMessage(ctx context.Context, pod *corev1.Pod) string {
+	events, err := s.session.client.coreClient.Events(pod.Namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("involvedObject.name=%s", pod.Name),
+	})
+	if err != nil || events == nil {
+		return ""
+	}
+
+	// Look backwards from the newest events for a detailed pull failure message.
+	for i := len(events.Items) - 1; i >= 0; i-- {
+		ev := events.Items[i]
+		if ev.InvolvedObject.Name != "" && ev.InvolvedObject.Name != pod.Name {
+			continue
+		}
+		if strings.Contains(ev.Message, "Failed to pull image") || strings.Contains(ev.Message, "rpc error") {
+			return ev.Message
+		}
+	}
+
+	// Fall back to any Warning event for image pull.
+	for i := len(events.Items) - 1; i >= 0; i-- {
+		ev := events.Items[i]
+		if ev.InvolvedObject.Name != "" && ev.InvolvedObject.Name != pod.Name {
+			continue
+		}
+		if ev.Type == corev1.EventTypeWarning && (ev.Reason == "Failed" || ev.Reason == "FailedToPullImage" || ev.Reason == "ErrImagePull" || ev.Reason == "ImagePullBackOff") {
+			if ev.Message != "" {
+				return ev.Message
+			}
+		}
+	}
+
+	return ""
 }
 
 // ExecCommand executes a command inside the sandbox container with specified options.
