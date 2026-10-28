@@ -172,7 +172,10 @@ To deploy `auto-optimizer` to a real cluster (such as Google Kubernetes Engine):
    IMAGE_PREFIX=us-west1-docker.pkg.dev/gke-labs-corp-dev/images ./dev/tasks/deploy-to-kube --only ao
    ```
 
-   When deploying to non-kind clusters, `deploy-to-kube` creates the `ao-system` and `ao-sandboxes` namespaces, pushes the `ao` and `geminicli-toolbox` images to `IMAGE_PREFIX`, deploys manifests using `ap deploy`, and sets `SANDBOX_IMAGE` to `${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}` in `ao-config`. You can pass `OPENAI_MODEL` to specify the model to use (for example, `OPENAI_MODEL=gemini-2.5-flash`).
+   When deploying to non-kind clusters, `deploy-to-kube` creates the `ao-system` and `ao-sandboxes` namespaces, pushes the `ao` and `geminicli-toolbox` images to `IMAGE_PREFIX`, deploys manifests using `ap deploy`, and sets `SANDBOX_IMAGE` to `${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}` in `ao-config`. You can pass `OPENAI_MODEL` to specify the model to use (for example, `OPENAI_MODEL=gemini-2.5-flash`). The sandbox image must exist in `IMAGE_PREFIX` for sandboxes to pull; you can verify it is present in the registry with:
+   ```bash
+   gcloud artifacts docker images list ${IMAGE_PREFIX}
+   ```
 
 5. Port-forward the in-cluster service to your workstation:
    ```bash
@@ -183,6 +186,8 @@ To deploy `auto-optimizer` to a real cluster (such as Google Kubernetes Engine):
    ```bash
    ao session send demo "run: uname -a"
    ```
+
+> **Note on Session Persistence:** In-cluster sessions do not survive an `ao` pod restart or node reschedule today because `ao` stores state on an `emptyDir` volume. Session persistence across pod restarts will be addressed in epic #33 when state is backed by ObjectFS.
 
 If you also need ObjectFS on a real cluster, provide `OBJECTFS_BACKEND` (such as `gs://my-bucket/prefix` or `s3://my-bucket/prefix`) and include `objectfs` in `--only` (for example, `--only ao,objectfs`).
 
