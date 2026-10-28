@@ -110,7 +110,7 @@ token-only first cut, so a token and an App both work from day one.
 | `pkg/portal` | new | Renders the per-run `PortalRule`s, which say which hosts the sandbox may reach and which token each host gets, into the Secret that the sidecar reads. Parses the portal's usage logs for metering. |
 | `pkg/measure` | new, idea from the spike | Implements the metric protocol, the median of N runs, the verify gate, and the improvement arithmetic. It runs commands through sandboxd `Execute`. |
 | `pkg/state` | new | Defines the file layout under the state directory, atomic JSON writes, and append-only JSONL. |
-| `pkg/web` | new | Serves the repository list, the repository page with goals and run history, and the run page with the session transcript, tool calls, measurements, and PR link. Draws an inline SVG chart of the metric over time. |
+| `pkg/web` | new | Serves the repository list, the repository page with goals and run history, and the run page with the session transcript, tool calls, measurements, and PR link. Draws an inline SVG chart of the metric over time. Web pages follow the one-function-per-page convention (`RenderXPage`) with their template and data type in the same file. |
 
 We build and deploy with the gke-labs `ap` tool and its conventions, which are
 a `.ap/` directory and `dev/tasks/*` scripts. eval-runner and service-portals

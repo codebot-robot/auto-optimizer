@@ -27,7 +27,7 @@
           <td><a href="/sessions/{{.Name}}"><strong>{{.Name}}</strong></a></td>
           <td><code>{{.Toolset}}</code></td>
           <td>{{if .Parent}}<code>{{.Parent}}</code>{{else}}<span class="text-muted">-</span>{{end}}</td>
-          <td>{{.FormattedCreatedAt}}</td>
+          <td>{{formatTime .CreatedAt}}</td>
           <td>{{.MessageCount}}</td>
           <td>
             {{if .InFlight}}
