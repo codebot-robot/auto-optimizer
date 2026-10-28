@@ -488,8 +488,10 @@ if has_component "ao"; then
     (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy --skip-push)
 
     OPENAI_MODEL="${OPENAI_MODEL:-fake-eliza}"
+    VERTEX_PROJECT="${VERTEX_PROJECT:-}"
+    VERTEX_LOCATION="${VERTEX_LOCATION:-}"
 
-    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE})..."
+    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE}, VERTEX_PROJECT=${VERTEX_PROJECT}, VERTEX_LOCATION=${VERTEX_LOCATION})..."
     cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -501,6 +503,8 @@ data:
   SANDBOX_NAMESPACE: "ao-sandboxes"
   OPENAI_MODEL: "${OPENAI_MODEL}"
   SANDBOX_IMAGE: "${SANDBOX_IMAGE}"
+  VERTEX_PROJECT: "${VERTEX_PROJECT}"
+  VERTEX_LOCATION: "${VERTEX_LOCATION}"
 EOF
 
     kubectl rollout restart deployment/ao -n ao-system
@@ -508,8 +512,18 @@ EOF
     echo "Deploying auto-optimizer with ap deploy (pushing to ${IMAGE_PREFIX})..."
     (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy)
 
-    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE})..."
-    cat << EOF | kubectl apply -f -
+    VERTEX_PROJECT="${VERTEX_PROJECT:-}"
+    if [[ -z "${VERTEX_PROJECT}" ]] && command -v gcloud >/dev/null 2>&1; then
+      VERTEX_PROJECT="$(gcloud config get-value project 2>/dev/null || true)"
+      if [[ "${VERTEX_PROJECT}" == "(unset)" ]]; then
+        VERTEX_PROJECT=""
+      fi
+    fi
+    VERTEX_LOCATION="${VERTEX_LOCATION:-}"
+
+    if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" || -n "${VERTEX_PROJECT:-}" || -n "${VERTEX_LOCATION:-}" ]]; then
+      echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-}, VERTEX_PROJECT=${VERTEX_PROJECT:-}, VERTEX_LOCATION=${VERTEX_LOCATION:-})..."
+      cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -519,10 +533,13 @@ data:
   AO_LISTEN: "0.0.0.0:8081"
   SANDBOX_NAMESPACE: "ao-sandboxes"
   OPENAI_MODEL: "${OPENAI_MODEL:-}"
-  SANDBOX_IMAGE: "${SANDBOX_IMAGE}"
+  SANDBOX_IMAGE: "${SANDBOX_IMAGE:-}"
+  VERTEX_PROJECT: "${VERTEX_PROJECT}"
+  VERTEX_LOCATION: "${VERTEX_LOCATION}"
 EOF
 
-    kubectl rollout restart deployment/ao -n ao-system
+      kubectl rollout restart deployment/ao -n ao-system
+    fi
   fi
 
   echo "Waiting for ao deployment in ao-system..."

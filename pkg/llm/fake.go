@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 )
@@ -36,26 +35,6 @@ var _ ChatClient = &ElizaClient{}
 // instead of a real API. Use it (e.g. OPENAI_MODEL=fake-eliza) in tests and
 // demos that should not depend on LLM availability or an API key.
 const FakeModelEliza = "fake-eliza"
-
-// NewFromEnv returns the ChatClient for modelName: the built-in fake for
-// FakeModelEliza (which needs no API key), otherwise the real
-// OpenAI-compatible client configured from the GEMINI_API_KEY /
-// OPENAI_API_KEY and OPENAI_BASE_URL environment variables.
-func NewFromEnv(modelName string) (ChatClient, error) {
-	if modelName == FakeModelEliza {
-		return &ElizaClient{}, nil
-	}
-
-	apiKey := os.Getenv("GEMINI_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("GEMINI_API_KEY or OPENAI_API_KEY environment variable is required")
-	}
-
-	return NewClient(os.Getenv("OPENAI_BASE_URL"), apiKey)
-}
 
 // ElizaClient is a fake ChatClient for testing the agent plumbing without a
 // real LLM. Like its namesake, it answers every message with a question
