@@ -65,7 +65,7 @@ func listDirectory(root string, params ListDirectoryParams) (string, error) {
 		if !it.isDir {
 			info, err := entry.Info()
 			if err != nil {
-				return "", fmt.Errorf("failed to get entry info for %s: %w", entry.Name(), err)
+				continue
 			}
 			it.size = info.Size()
 		}

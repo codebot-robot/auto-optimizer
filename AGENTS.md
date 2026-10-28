@@ -26,12 +26,15 @@ you have a reason to depart from it.
   by the service-portals sidecar or used by the control plane. Never pass a
   secret into a sandbox pod spec, an environment variable the agent can read,
   or a log line.
-- **Use upstream projects, and fix them upstream.** The sandbox API is
-  kubernetes-sigs/agent-sandbox with its `sandboxd` runtime daemon. Egress and
-  credentials come from gke-labs/service-portals. Workspace storage comes from
-  gke-labs/in-cluster-storage. When one of them lacks something we need, say
-  so in the issue or PR so it becomes an upstream issue. Do not add a
-  workaround silently.
+- **Upstream projects.** The sandbox API is kubernetes-sigs/agent-sandbox
+  with its `sandboxd` runtime daemon; egress and credentials come from
+  gke-labs/service-portals; workspace storage comes from
+  gke-labs/in-cluster-storage. When one of them gets in the way, describe the
+  problem in the PR or issue here and stop; the maintainer decides whether to
+  raise it upstream. Never open pull requests or issues in `github.com/kubernetes`
+  or `github.com/kubernetes-sigs` repositories: CNCF rules require a human to
+  initiate those. The code forked from `examples/sandboxed-tools` is maintained
+  in this repository and is not synced back.
 - **Go, with the standard library first.** Add a dependency only when it
   removes a lot of code. Use `any` instead of `interface{}`.
 - **Server-rendered UI.** Pages are `html/template`. No JavaScript framework.

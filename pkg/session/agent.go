@@ -138,7 +138,6 @@ type Session struct {
 
 	// messagesMu protects messages against concurrent reads (e.g. Messages())
 	// while a turn is in flight (AddMessages).
-	// auto-optimizer: diverges from upstream, see https://github.com/gke-labs/auto-optimizer/issues/14
 	messagesMu sync.RWMutex
 
 	// messages is a list of all the messages in the current session chat.
