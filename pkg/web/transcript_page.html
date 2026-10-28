@@ -5,7 +5,7 @@
     <div class="meta-badges">
       <span class="meta-badge">toolset: {{.Summary.Toolset}}</span>
       {{if .Summary.Parent}}<span class="meta-badge">parent: {{.Summary.Parent}}</span>{{end}}
-      <span class="meta-badge">created: {{.FormattedCreatedAt}}</span>
+      <span class="meta-badge">created: {{formatTime .Summary.CreatedAt}}</span>
       {{if .Summary.InFlight}}
       <span class="badge badge-in-flight">turn in flight</span>
       {{else}}
@@ -20,7 +20,7 @@
     {{range .Messages}}
     <div class="message-card role-{{.Role}}">
       <div class="message-role">{{.Role}}</div>
-      {{if .IsTool}}
+      {{if isTool .}}
         <details class="tool-result">
           <summary>Tool Result{{if .ToolCallID}} ({{.ToolCallID}}){{end}}</summary>
           <pre>{{.Content}}</pre>
@@ -28,12 +28,12 @@
       {{else}}
         {{if .Content}}
           <div class="message-content">
-            {{if .Truncated}}
-              {{.DisplayContent}}
+            {{if and (not $.Full) (canTruncate .Content)}}
+              {{truncate .Content}}
               <div><a href="/sessions/{{$.Summary.Name}}?full=1" class="show-all-link">show all</a></div>
             {{else}}
-              {{.DisplayContent}}
-              {{if and $.Full .CanTruncate}}
+              {{.Content}}
+              {{if and $.Full (canTruncate .Content)}}
                 <div><a href="/sessions/{{$.Summary.Name}}" class="show-all-link">show less</a></div>
               {{end}}
             {{end}}

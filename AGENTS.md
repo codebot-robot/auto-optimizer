@@ -35,6 +35,7 @@ you have a reason to depart from it.
 - **Go, with the standard library first.** Add a dependency only when it
   removes a lot of code. Use `any` instead of `interface{}`.
 - **Server-rendered UI.** Pages are `html/template`. No JavaScript framework.
+- **One function per page.** Web pages are `RenderXPage(ctx, w, data XPageData) error` functions with their template and data type in the same file. Handlers stay thin. Reuse domain types in page data rather than copying them into view models.
 - **State is files.** Records live under one state directory as JSON and
   JSONL, with exactly one writer per file. Anything else is a rebuildable
   cache.

@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"html/template"
 	"io/fs"
 	"net/http"
 	"net/url"
@@ -36,13 +35,7 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
-//go:embed templates/*
-var templateFS embed.FS
-
-const (
-	csrfCookieName = "ao_session"
-	maxTruncateLen = 500
-)
+const csrfCookieName = "ao_session"
 
 // SessionService is the interface web requires from the session backend.
 type SessionService interface {
@@ -54,8 +47,7 @@ type SessionService interface {
 
 // Server handles HTTP requests for the web UI.
 type Server struct {
-	service   SessionService
-	templates map[string]*template.Template
+	service SessionService
 }
 
 // NewServer creates a new web Server backed by the given SessionService.
@@ -64,19 +56,8 @@ func NewServer(service SessionService) (*Server, error) {
 		return nil, errors.New("service is required")
 	}
 
-	templates := make(map[string]*template.Template)
-	pages := []string{"list", "transcript", "404", "409"}
-	for _, page := range pages {
-		tmpl, err := template.ParseFS(templateFS, "templates/layout.html", "templates/"+page+".html")
-		if err != nil {
-			return nil, fmt.Errorf("parsing template %s: %w", page, err)
-		}
-		templates[page] = tmpl
-	}
-
 	return &Server{
-		service:   service,
-		templates: templates,
+		service: service,
 	}, nil
 }
 
@@ -157,41 +138,6 @@ func (s *Server) validateCSRF(r *http.Request) bool {
 	return err == nil && cookie.Value != ""
 }
 
-type listViewModel struct {
-	Title    string
-	InFlight bool
-	Sessions []sessionRowViewModel
-}
-
-type sessionRowViewModel struct {
-	Name               string
-	Toolset            string
-	Parent             string
-	FormattedCreatedAt string
-	MessageCount       int
-	InFlight           bool
-}
-
-type transcriptViewModel struct {
-	Title              string
-	InFlight           bool
-	Full               bool
-	Summary            sessionapi.SessionSummary
-	FormattedCreatedAt string
-	Messages           []messageViewModel
-}
-
-type messageViewModel struct {
-	Role           string
-	Content        string
-	DisplayContent string
-	Truncated      bool
-	CanTruncate    bool
-	IsTool         bool
-	ToolCallID     string
-	ToolCalls      []sessionapi.ToolCall
-}
-
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	summaries, err := s.service.ListSessionSummaries(r.Context())
 	if err != nil {
@@ -200,27 +146,8 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var rows []sessionRowViewModel
-	for _, sum := range summaries {
-		rows = append(rows, sessionRowViewModel{
-			Name:               sum.Name,
-			Toolset:            sum.Toolset,
-			Parent:             sum.Parent,
-			FormattedCreatedAt: sum.CreatedAt.UTC().Format("2006-01-02 15:04:05 UTC"),
-			MessageCount:       sum.MessageCount,
-			InFlight:           sum.InFlight,
-		})
-	}
-
-	vm := listViewModel{
-		Title:    "Sessions",
-		InFlight: false,
-		Sessions: rows,
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.templates["list"].Execute(w, vm); err != nil {
-		scoped.Log(r.Context()).Error(err, "rendering list template")
+	if err := RenderSessionListPage(r.Context(), w, SessionListPageData{Sessions: summaries}); err != nil {
+		scoped.Log(r.Context()).Error(err, "rendering session list page")
 	}
 }
 
@@ -237,44 +164,8 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, name s
 	}
 
 	full := r.URL.Query().Get("full") == "1"
-	var msgs []messageViewModel
-	for _, m := range detail.Messages {
-		content := m.Content
-		isTool := m.Role == "tool" || m.ToolCallID != ""
-		canTruncate := false
-		displayContent := content
-		if prefix, ok := truncateRunes(content, maxTruncateLen); ok {
-			canTruncate = true
-			if !full {
-				displayContent = prefix + "..."
-			}
-		}
-		truncated := !full && canTruncate
-
-		msgs = append(msgs, messageViewModel{
-			Role:           m.Role,
-			Content:        content,
-			DisplayContent: displayContent,
-			Truncated:      truncated,
-			CanTruncate:    canTruncate,
-			IsTool:         isTool,
-			ToolCallID:     m.ToolCallID,
-			ToolCalls:      m.ToolCalls,
-		})
-	}
-
-	vm := transcriptViewModel{
-		Title:              "Session " + detail.Summary.Name,
-		InFlight:           detail.Summary.InFlight,
-		Full:               full,
-		Summary:            detail.Summary,
-		FormattedCreatedAt: detail.Summary.CreatedAt.UTC().Format("2006-01-02 15:04:05 UTC"),
-		Messages:           msgs,
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.templates["transcript"].Execute(w, vm); err != nil {
-		scoped.Log(r.Context()).Error(err, "rendering transcript template", "session", name)
+	if err := RenderTranscriptPage(r.Context(), w, TranscriptPageData{Detail: *detail, Full: full}); err != nil {
+		scoped.Log(r.Context()).Error(err, "rendering transcript page", "session", name)
 	}
 }
 
@@ -317,19 +208,8 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, name 
 
 	if err := s.service.StartTurn(r.Context(), name, text); err != nil {
 		if errors.Is(err, sessionapi.ErrBusy) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusConflict)
-			vm := struct {
-				Title    string
-				InFlight bool
-				Name     string
-			}{
-				Title:    "409 Conflict",
-				InFlight: false,
-				Name:     name,
-			}
-			if execErr := s.templates["409"].Execute(w, vm); execErr != nil {
-				scoped.Log(r.Context()).V(4).Info("rendering 409 template", "error", execErr)
+			if execErr := RenderConflictPage(r.Context(), w, ConflictPageData{Name: name}); execErr != nil {
+				scoped.Log(r.Context()).V(4).Info("rendering conflict page", "error", execErr)
 			}
 			return
 		}
@@ -341,31 +221,7 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, name 
 }
 
 func (s *Server) render404(w http.ResponseWriter, r *http.Request, message string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusNotFound)
-	vm := struct {
-		Title    string
-		InFlight bool
-		Message  string
-	}{
-		Title:    "404 Not Found",
-		InFlight: false,
-		Message:  message,
+	if execErr := RenderNotFoundPage(r.Context(), w, NotFoundPageData{Message: message}); execErr != nil {
+		scoped.Log(r.Context()).V(4).Info("rendering not found page", "error", execErr)
 	}
-	if execErr := s.templates["404"].Execute(w, vm); execErr != nil {
-		scoped.Log(r.Context()).V(4).Info("rendering 404 template", "error", execErr)
-	}
-}
-
-// truncateRunes returns the prefix of s up to maxRunes, and whether s exceeded maxRunes.
-// It is rune-aware and does not split multi-byte UTF-8 sequences.
-func truncateRunes(s string, maxRunes int) (string, bool) {
-	var count int
-	for i := range s {
-		if count == maxRunes {
-			return s[:i], true
-		}
-		count++
-	}
-	return s, false
 }
