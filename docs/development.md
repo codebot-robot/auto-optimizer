@@ -24,7 +24,7 @@ This guide covers setting up a development environment, running tests, deploying
 - **Docker**: A running Docker daemon accessible locally or via `DOCKER_HOST`.
 - **Git**: For version control and repository metadata.
 
-Pinned versions of `kind` and `kubectl` are installed automatically into `.build/bin/` by the development tasks and do not need to be installed on your system `PATH`.
+Pinned developer tools (`kind`, `kubectl`, `docker`, `docker-buildx`, `protoc`, and `go`) are installed automatically into `.build/bin/` via `ap tool install`, and none need to be installed on your system `PATH`.
 
 ## Core Development Tasks
 
@@ -261,7 +261,7 @@ Prepares a local `kind` cluster and deploys dependencies for end-to-end testing.
 
 #### What It Does
 
-1. **Tool Setup**: Ensures pinned `kind` (v0.31.0), `kubectl` (v1.35.0), and (if missing) `docker` CLI and `docker-buildx` plugin are installed under `.build/` (with `docker-buildx` linked into `~/.docker/cli-plugins/`) and placed on `PATH`.
+1. **Tool Setup**: Installs pinned developer tools (`kind`, `kubectl`, `docker`, `docker-buildx`, `protoc`, `go`) via `ap tool install` into `.build/bin/` and places them on `PATH`.
 2. **Cluster Creation**: Creates a `kind` cluster named `auto-optimizer` (or reuses an existing one if already present). The cluster is kept alive by default after preparation and test runs so you can inspect resources or rerun tests.
 3. **Deployment**: Executes `dev/tasks/deploy-to-kube` against the cluster to deploy all prerequisites.
 

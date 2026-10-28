@@ -28,10 +28,9 @@ AGENT_SANDBOX_VERSION="v1.0.8"
 SERVICE_PORTALS_COMMIT="686b34d8aa74546af1039119bbfa6e05ead15f53"
 IN_CLUSTER_STORAGE_COMMIT="923578df519c02cd0da1b7455d8a1e0278a103c4"
 
-# Use tools from .build/bin if present
-if [[ -d "${REPO_ROOT}/.build/bin" ]]; then
-  export PATH="${REPO_ROOT}/.build/bin:${PATH}"
-fi
+GOBIN="${REPO_ROOT}/.build/bin" GOTOOLCHAIN=auto go install github.com/gke-labs/gke-labs-infra/ap@latest
+"${REPO_ROOT}/.build/bin/ap" tool install "${REPO_ROOT}/.build/bin"
+export PATH="${REPO_ROOT}/.build/bin:${PATH}"
 
 CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || echo "unknown")"
 
@@ -41,24 +40,6 @@ if [[ "${CURRENT_CONTEXT}" == kind-* ]]; then
   IS_KIND="true"
   KIND_CLUSTER_NAME="${CURRENT_CONTEXT#kind-}"
 fi
-
-ensure_kubectl() {
-  if ! command -v kubectl >/dev/null 2>&1; then
-    local kubectl_version="v1.35.0"
-    local kubectl_bin="${REPO_ROOT}/.build/src/kubectl/${kubectl_version}/bin/kubectl"
-    if [[ ! -x "${kubectl_bin}" ]]; then
-      echo "Installing kubectl ${kubectl_version}..." >&2
-      mkdir -p "$(dirname "${kubectl_bin}")"
-      curl -sLo "${kubectl_bin}" "https://dl.k8s.io/release/${kubectl_version}/bin/$(go env GOOS)/$(go env GOARCH)/kubectl"
-      chmod +x "${kubectl_bin}"
-    fi
-    mkdir -p "${REPO_ROOT}/.build/bin"
-    ln -sf "../src/kubectl/${kubectl_version}/bin/kubectl" "${REPO_ROOT}/.build/bin/kubectl"
-    export PATH="${REPO_ROOT}/.build/bin:${PATH}"
-  fi
-}
-
-ensure_kubectl
 
 # Parse command-line arguments
 CLI_COMPONENTS=""
@@ -169,52 +150,6 @@ has_component() {
 
 echo "=== Deploying auto-optimizer dependencies to kubeconfig context: ${CURRENT_CONTEXT} ==="
 echo "Components: ${COMPONENTS}"
-
-ensure_docker_cli() {
-  if ! command -v docker >/dev/null 2>&1; then
-    local docker_version="29.2.1"
-    local docker_bin="${REPO_ROOT}/.build/src/docker/${docker_version}/bin/docker"
-    if [[ ! -x "${docker_bin}" ]]; then
-      echo "Installing docker ${docker_version}..." >&2
-      mkdir -p "$(dirname "${docker_bin}")"
-      curl -sLo "${REPO_ROOT}/.build/src/docker/${docker_version}/docker.tgz" "https://download.docker.com/linux/static/stable/x86_64/docker-${docker_version}.tgz"
-      tar -C "$(dirname "${docker_bin}")" -xzf "${REPO_ROOT}/.build/src/docker/${docker_version}/docker.tgz" --strip-components=1 docker/docker
-      rm "${REPO_ROOT}/.build/src/docker/${docker_version}/docker.tgz"
-      chmod +x "${docker_bin}"
-    fi
-    mkdir -p "${REPO_ROOT}/.build/bin"
-    ln -sf "../src/docker/${docker_version}/bin/docker" "${REPO_ROOT}/.build/bin/docker"
-    export PATH="${REPO_ROOT}/.build/bin:${PATH}"
-  fi
-}
-
-ensure_docker_cli
-
-# Note: ap builds container images by invoking 'docker buildx build' under the hood
-# (see gke-labs-infra/ap/pkg/images/build.go). When running in minimal environments
-# (such as container agents with a remote DOCKER_HOST daemon), the docker CLI and
-# docker-buildx plugin must be available on PATH / in cli-plugins.
-ensure_docker_buildx() {
-  if ! docker buildx version >/dev/null 2>&1; then
-    local buildx_version="v0.21.1"
-    local os="$(go env GOOS)"
-    local arch="$(go env GOARCH)"
-    local buildx_bin="${REPO_ROOT}/.build/src/docker-buildx/${buildx_version}/bin/docker-buildx"
-    if [[ ! -x "${buildx_bin}" ]]; then
-      echo "Installing docker-buildx ${buildx_version} for ${os}/${arch}..." >&2
-      mkdir -p "$(dirname "${buildx_bin}")"
-      curl -sLo "${buildx_bin}" "https://github.com/docker/buildx/releases/download/${buildx_version}/buildx-${buildx_version}.${os}-${arch}"
-      chmod +x "${buildx_bin}"
-    fi
-    mkdir -p "${REPO_ROOT}/.build/bin" "${HOME}/.docker/cli-plugins"
-    ln -sf "../src/docker-buildx/${buildx_version}/bin/docker-buildx" "${REPO_ROOT}/.build/bin/docker-buildx"
-    ln -sf "${REPO_ROOT}/.build/bin/docker-buildx" "${HOME}/.docker/cli-plugins/docker-buildx"
-  fi
-}
-
-if command -v docker >/dev/null 2>&1; then
-  ensure_docker_buildx
-fi
 
 # Handle IMAGE_PREFIX and IMAGE_TAG.
 # On kind, default IMAGE_PREFIX to auto-optimizer.local and IMAGE_TAG to dev.
