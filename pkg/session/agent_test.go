@@ -18,10 +18,18 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	fakek8s "k8s.io/client-go/kubernetes/fake"
+
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	fakeagents "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
 )
 
 // newTestSession returns a Session backed by a scratch backup directory.
@@ -237,5 +245,307 @@ func TestNewAndLoadSession_Metadata(t *testing.T) {
 	}
 	if _, err := harness.NewSession(ctx, store, "legacy", Metadata{Toolset: "basic"}); err == nil {
 		t.Error("NewSession on existing legacy session should fail")
+	}
+}
+
+func TestWaitForReady_Success(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-ns"
+	sbName := "sb-ready"
+
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      sbName,
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(ns).Create(ctx, sb, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create fake sandbox: %v", err)
+	}
+	coreCS := fakek8s.NewSimpleClientset()
+
+	client := &SandboxClient{
+		agentsClient: agentsCS,
+		coreClient:   coreCS.CoreV1(),
+	}
+
+	session := &Session{
+		Name:   "test-session",
+		client: client,
+	}
+
+	sandbox := &Sandbox{
+		session: session,
+		id: types.NamespacedName{
+			Namespace: ns,
+			Name:      sbName,
+		},
+	}
+
+	if err := sandbox.WaitForReady(ctx); err != nil {
+		t.Fatalf("WaitForReady failed unexpectedly: %v", err)
+	}
+
+	if sandbox.podName != sbName {
+		t.Errorf("podName = %q, want %q", sandbox.podName, sbName)
+	}
+}
+
+func TestWaitForReady_FailsFast_ImagePullBackOff_WithEvent(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-ns"
+	sbName := "sb-pull-error"
+
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      sbName,
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionFalse,
+				},
+			},
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      sbName,
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "sandbox",
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "ImagePullBackOff",
+							Message: `Back-off pulling image "geminicli-toolbox:latest"`,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      "pull-failure-event",
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind: "Pod",
+			Name: sbName,
+		},
+		Type:    corev1.EventTypeWarning,
+		Reason:  "Failed",
+		Message: `Failed to pull image "geminicli-toolbox:latest": rpc error: code = NotFound desc = manifest unknown`,
+	}
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(ns).Create(ctx, sb, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create fake sandbox: %v", err)
+	}
+	coreCS := fakek8s.NewSimpleClientset(pod, event)
+
+	client := &SandboxClient{
+		agentsClient: agentsCS,
+		coreClient:   coreCS.CoreV1(),
+	}
+
+	session := &Session{
+		Name:   "test-session",
+		client: client,
+	}
+
+	sandbox := &Sandbox{
+		session: session,
+		id: types.NamespacedName{
+			Namespace: ns,
+			Name:      sbName,
+		},
+	}
+
+	start := time.Now()
+	err := sandbox.WaitForReady(ctx)
+	duration := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected WaitForReady to fail fast, got nil error")
+	}
+
+	if duration > 10*time.Second {
+		t.Errorf("WaitForReady took %v, want < 10s", duration)
+	}
+
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "failed to pull image") {
+		t.Errorf("expected error to contain 'failed to pull image', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "ImagePullBackOff") {
+		t.Errorf("expected error to contain 'ImagePullBackOff', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "manifest unknown") {
+		t.Errorf("expected error to contain event message with 'manifest unknown', got: %s", errMsg)
+	}
+}
+
+func TestWaitForReady_FailsFast_ErrImagePull_NoEvent(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-ns"
+	sbName := "sb-err-pull"
+
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      sbName,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      sbName,
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "sandbox",
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "ErrImagePull",
+							Message: `rpc error: code = Unknown desc = repository not found`,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(ns).Create(ctx, sb, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create fake sandbox: %v", err)
+	}
+	coreCS := fakek8s.NewSimpleClientset(pod)
+
+	client := &SandboxClient{
+		agentsClient: agentsCS,
+		coreClient:   coreCS.CoreV1(),
+	}
+
+	session := &Session{
+		Name:   "test-session",
+		client: client,
+	}
+
+	sandbox := &Sandbox{
+		session: session,
+		id: types.NamespacedName{
+			Namespace: ns,
+			Name:      sbName,
+		},
+	}
+
+	start := time.Now()
+	err := sandbox.WaitForReady(ctx)
+	duration := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected WaitForReady to fail fast, got nil error")
+	}
+
+	if duration > 10*time.Second {
+		t.Errorf("WaitForReady took %v, want < 10s", duration)
+	}
+
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "ErrImagePull") {
+		t.Errorf("expected error to contain 'ErrImagePull', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "repository not found") {
+		t.Errorf("expected error to contain 'repository not found', got: %s", errMsg)
+	}
+}
+
+func TestWaitForReady_FailsFast_InitContainer_ImagePullBackOff(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-ns"
+	sbName := "sb-init-pull-error"
+
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      sbName,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      sbName,
+		},
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "init-service-portals",
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "ImagePullBackOff",
+							Message: `Back-off pulling image "init-service-portals:latest"`,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(ns).Create(ctx, sb, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create fake sandbox: %v", err)
+	}
+	coreCS := fakek8s.NewSimpleClientset(pod)
+
+	client := &SandboxClient{
+		agentsClient: agentsCS,
+		coreClient:   coreCS.CoreV1(),
+	}
+
+	session := &Session{
+		Name:   "test-session",
+		client: client,
+	}
+
+	sandbox := &Sandbox{
+		session: session,
+		id: types.NamespacedName{
+			Namespace: ns,
+			Name:      sbName,
+		},
+	}
+
+	err := sandbox.WaitForReady(ctx)
+	if err == nil {
+		t.Fatal("expected WaitForReady to fail fast for init container, got nil error")
+	}
+
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "init-service-portals") {
+		t.Errorf("expected error to mention container 'init-service-portals', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "ImagePullBackOff") {
+		t.Errorf("expected error to contain 'ImagePullBackOff', got: %s", errMsg)
 	}
 }
