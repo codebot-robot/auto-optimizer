@@ -308,8 +308,32 @@ func TestSendMessage_BusySessionReturns409(t *testing.T) {
 		t.Errorf("expected 409 Conflict page, got: %s", string(bodyBytes))
 	}
 
-	// Unblock and clean up
+	// Unblock and wait for in-flight turn to finish before returning
 	close(sb.blockCh)
+
+	const refreshTag = `<meta http-equiv="refresh"`
+	deadline := time.Now().Add(5 * time.Second)
+	var finalBody string
+	for time.Now().Before(deadline) {
+		getResp, err := client.Get(ts.URL + "/sessions/busysess")
+		if err != nil {
+			t.Fatalf("GET /sessions/busysess: %v", err)
+		}
+		bodyBytes, err := io.ReadAll(getResp.Body)
+		_ = getResp.Body.Close()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		finalBody = string(bodyBytes)
+		if !strings.Contains(finalBody, refreshTag) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if strings.Contains(finalBody, refreshTag) {
+		t.Fatal("turn timed out: refresh tag still present on transcript page")
+	}
 }
 
 func TestCSRFProtection_RejectsCrossSitePost(t *testing.T) {
