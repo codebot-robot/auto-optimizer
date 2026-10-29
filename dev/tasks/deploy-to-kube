@@ -435,6 +435,7 @@ metadata:
   namespace: ao-system
 data:
   AO_LISTEN: "0.0.0.0:8081"
+  AO_HTTP: "0.0.0.0:8080"
   SANDBOX_NAMESPACE: "ao-sandboxes"
   OPENAI_MODEL: "${OPENAI_MODEL}"
   SANDBOX_IMAGE: "${SANDBOX_IMAGE}"
@@ -469,6 +470,7 @@ metadata:
   namespace: ao-system
 data:
   AO_LISTEN: "0.0.0.0:8081"
+  AO_HTTP: "0.0.0.0:8080"
   SANDBOX_NAMESPACE: "ao-sandboxes"
   OPENAI_MODEL: "${OPENAI_MODEL:-}"
   SANDBOX_IMAGE: "${SANDBOX_IMAGE:-}"
