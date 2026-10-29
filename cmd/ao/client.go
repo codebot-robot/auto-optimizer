@@ -218,3 +218,131 @@ func newSessionSendCommand() *cobra.Command {
 	cmd.Flags().StringVar(&serverAddr, "server", defaultServerAddress(), "gRPC server address")
 	return cmd
 }
+
+func newRepoCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "repo",
+		Short: "Manage registered repositories",
+	}
+	cmd.AddCommand(newRepoListCommand())
+	return cmd
+}
+
+func newRepoListCommand() *cobra.Command {
+	var serverAddr string
+	var jsonOutput bool
+
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List all registered repositories",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			conn, err := grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return fmt.Errorf("connecting to server %s: %w", serverAddr, err)
+			}
+			defer closeConnection(cmd.Context(), conn)
+
+			client := sessionv1.NewSessionServiceClient(conn)
+			resp, err := client.ListRepositories(cmd.Context(), &sessionv1.ListRepositoriesRequest{})
+			if err != nil {
+				return fmt.Errorf("listing repositories: %w", err)
+			}
+
+			if jsonOutput {
+				m := protojson.MarshalOptions{Multiline: true, Indent: "  "}
+				data, err := m.Marshal(resp)
+				if err != nil {
+					return fmt.Errorf("serializing to json: %w", err)
+				}
+				fmt.Println(string(data))
+				return nil
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+			if _, err := fmt.Fprintln(w, "URL\tDEFAULT BRANCH\tHEAD COMMIT\tREGISTERED"); err != nil {
+				return err
+			}
+			for _, r := range resp.Repositories {
+				registered := ""
+				if r.RegisteredTime != nil {
+					registered = r.RegisteredTime.AsTime().Format(time.RFC3339)
+				}
+				head := r.HeadCommit
+				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Url, r.DefaultBranch, head, registered); err != nil {
+					return err
+				}
+			}
+			return w.Flush()
+		},
+	}
+
+	cmd.Flags().StringVar(&serverAddr, "server", defaultServerAddress(), "gRPC server address")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output repositories as JSON")
+	return cmd
+}
+
+func newGoalCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "goal",
+		Short: "Manage goals in registered repositories",
+	}
+	cmd.AddCommand(newGoalListCommand())
+	return cmd
+}
+
+func newGoalListCommand() *cobra.Command {
+	var serverAddr string
+	var repoURL string
+	var jsonOutput bool
+
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List goals for a repository",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if repoURL == "" {
+				return errors.New("--repo flag is required")
+			}
+
+			conn, err := grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return fmt.Errorf("connecting to server %s: %w", serverAddr, err)
+			}
+			defer closeConnection(cmd.Context(), conn)
+
+			client := sessionv1.NewSessionServiceClient(conn)
+			resp, err := client.ListGoals(cmd.Context(), &sessionv1.ListGoalsRequest{RepoUrl: repoURL})
+			if err != nil {
+				return fmt.Errorf("listing goals: %w", err)
+			}
+
+			if jsonOutput {
+				m := protojson.MarshalOptions{Multiline: true, Indent: "  "}
+				data, err := m.Marshal(resp)
+				if err != nil {
+					return fmt.Errorf("serializing to json: %w", err)
+				}
+				fmt.Println(string(data))
+				return nil
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+			if _, err := fmt.Fprintln(w, "NAME\tKIND\tSCHEDULE\tHASH\tBASE COMMIT"); err != nil {
+				return err
+			}
+			for _, g := range resp.Goals {
+				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", g.Name, g.Kind, g.Schedule, g.Hash, g.BaseCommit); err != nil {
+					return err
+				}
+			}
+			return w.Flush()
+		},
+	}
+
+	cmd.Flags().StringVar(&serverAddr, "server", defaultServerAddress(), "gRPC server address")
+	cmd.Flags().StringVar(&repoURL, "repo", "", "Repository URL (required)")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output goals as JSON")
+	if err := cmd.MarkFlagRequired("repo"); err != nil {
+		panic(err)
+	}
+	return cmd
+}
