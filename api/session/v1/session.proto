@@ -37,6 +37,12 @@ service SessionService {
   // SendMessage appends a user message and runs one turn of the loop.
   // The stream carries events until the turn ends.
   rpc SendMessage(SendMessageRequest) returns (stream SessionEvent);
+
+  // ListRepositories returns all registered repositories.
+  rpc ListRepositories(ListRepositoriesRequest) returns (ListRepositoriesResponse);
+
+  // ListGoals returns goals for a repository.
+  rpc ListGoals(ListGoalsRequest) returns (ListGoalsResponse);
 }
 
 // Session carries session metadata and state summary.
@@ -143,3 +149,41 @@ message TurnFinished {
 message Error {
   string message = 1;
 }
+
+// Repository represents a registered repository.
+message Repository {
+  string url = 1;
+  string host = 2;
+  string owner = 3;
+  string name = 4;
+  string default_branch = 5;
+  string forge_kind = 6;
+  google.protobuf.Timestamp registered_time = 7;
+  string head_commit = 8;
+}
+
+message ListRepositoriesRequest {}
+
+message ListRepositoriesResponse {
+  repeated Repository repositories = 1;
+}
+
+message ListGoalsRequest {
+  string repo_url = 1;
+}
+
+message GoalRecord {
+  string name = 1;
+  string kind = 2;
+  string hash = 3;
+  string base_commit = 4;
+  string schedule = 5;
+  string verify = 6;
+  string best_value = 7;
+  string last_run_id = 8;
+}
+
+message ListGoalsResponse {
+  repeated GoalRecord goals = 1;
+}
+

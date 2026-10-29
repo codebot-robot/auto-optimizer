@@ -27,6 +27,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -70,6 +71,7 @@ type SessionDetail struct {
 // ServerOptions configures a SessionService Server.
 type ServerOptions struct {
 	Store          session.Store
+	StateStore     state.Store
 	DefaultToolset string
 	// Harness is used when all sessions use a single harness (e.g. in tests).
 	Harness *session.Harness
@@ -83,6 +85,7 @@ type Server struct {
 	sessionv1.UnimplementedSessionServiceServer
 
 	store          session.Store
+	stateStore     state.Store
 	defaultToolset string
 	harnessFactory func(toolsetName string) (*session.Harness, error)
 
@@ -115,6 +118,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 
 	return &Server{
 		store:          opts.Store,
+		stateStore:     opts.StateStore,
 		defaultToolset: defaultToolset,
 		harnessFactory: factory,
 		busySessions:   make(map[string]bool),
@@ -449,6 +453,86 @@ func toProtoToolCall(tc llm.ToolCall) *sessionv1.ToolCall {
 			Arguments: tc.Function.Arguments,
 		},
 	}
+}
+
+// ListRepositories returns all registered repositories.
+func (s *Server) ListRepositories(ctx context.Context, _ *sessionv1.ListRepositoriesRequest) (*sessionv1.ListRepositoriesResponse, error) {
+	if s.stateStore == nil {
+		return &sessionv1.ListRepositoriesResponse{}, nil
+	}
+
+	repos, err := s.stateStore.ListRepos(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "listing repositories: %v", err)
+	}
+
+	var pbRepos []*sessionv1.Repository
+	for _, r := range repos {
+		var regTime *timestamppb.Timestamp
+		if !r.RegisteredTime.IsZero() {
+			regTime = timestamppb.New(r.RegisteredTime)
+		}
+		pbRepos = append(pbRepos, &sessionv1.Repository{
+			Url:            r.URL,
+			Host:           r.Host,
+			Owner:          r.Owner,
+			Name:           r.Name,
+			DefaultBranch:  r.DefaultBranch,
+			ForgeKind:      r.ForgeKind,
+			RegisteredTime: regTime,
+			HeadCommit:     r.HeadCommit,
+		})
+	}
+
+	return &sessionv1.ListRepositoriesResponse{Repositories: pbRepos}, nil
+}
+
+// ListGoals returns goals for a repository.
+func (s *Server) ListGoals(ctx context.Context, req *sessionv1.ListGoalsRequest) (*sessionv1.ListGoalsResponse, error) {
+	if s.stateStore == nil {
+		return &sessionv1.ListGoalsResponse{}, nil
+	}
+
+	repoURL := req.GetRepoUrl()
+	if repoURL == "" {
+		return nil, status.Error(codes.InvalidArgument, "repo_url is required")
+	}
+
+	key, err := state.ParseRepoURL(repoURL)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid repo_url %q: %v", repoURL, err)
+	}
+
+	goalsList, err := s.stateStore.ListGoals(ctx, key)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "listing goals: %v", err)
+	}
+
+	var pbGoals []*sessionv1.GoalRecord
+	for _, g := range goalsList {
+		var name, kind, schedule, verify string
+		if g.Goal != nil {
+			name = g.Goal.Name
+			kind = string(g.Goal.Kind())
+			schedule = g.Goal.Schedule
+			verify = g.Goal.Verify
+		}
+		rec := &sessionv1.GoalRecord{
+			Name:       name,
+			Kind:       kind,
+			Hash:       g.Hash,
+			BaseCommit: g.BaseCommit,
+			Schedule:   schedule,
+			Verify:     verify,
+			LastRunId:  g.LastRunID,
+		}
+		if g.BestValue != nil {
+			rec.BestValue = fmt.Sprintf("%v", *g.BestValue)
+		}
+		pbGoals = append(pbGoals, rec)
+	}
+
+	return &sessionv1.ListGoalsResponse{Goals: pbGoals}, nil
 }
 
 func (s *Server) getOrLoadSession(ctx context.Context, name string) (*session.Session, *session.Harness, error) {
