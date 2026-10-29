@@ -634,7 +634,45 @@ func TestSessionAPIInCluster(t *testing.T) {
 		t.Fatalf("expected ao session get output to contain messages with 'run: uname -a' and 'Linux', got:\n%s", getOutput)
 	}
 
-	// 4. Verify sandbox exists in ao-sandboxes with shutdownPolicy: Delete and shutdownTime
+	// 4. Verify web UI serves session list containing sessionName via HTTP port 8080
+	httpAddr, stopHTTP := subH.PortForwardService("ao-system", "svc/ao", 8080)
+	defer stopHTTP()
+
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	uiURL := fmt.Sprintf("http://%s/", httpAddr)
+	var uiBody string
+	var lastStatus int
+	uiOK := false
+
+	start := time.Now()
+	for time.Since(start) < 30*time.Second {
+		resp, err := httpClient.Get(uiURL)
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		lastStatus = resp.StatusCode
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		uiBody = string(bodyBytes)
+		if lastStatus == http.StatusOK && strings.Contains(uiBody, sessionName) {
+			uiOK = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if !uiOK {
+		t.Fatalf("web UI verification failed: status=%d, expected 200 OK and body to contain session name %q; got body:\n%s",
+			lastStatus, sessionName, uiBody)
+	}
+	t.Logf("PASS: web UI returned 200 OK and contained session name %q", sessionName)
+
+	// 5. Verify sandbox exists in ao-sandboxes with shutdownPolicy: Delete and shutdownTime
 	sbJSON, err := subH.Kubectl("get", "sandbox", "-n", "ao-sandboxes", sessionName, "-o", "jsonpath={.spec.shutdownPolicy} {.metadata.creationTimestamp}")
 	if err != nil {
 		t.Fatalf("failed to get sandbox %s in ao-sandboxes: %v", sessionName, err)
@@ -651,7 +689,7 @@ func TestSessionAPIInCluster(t *testing.T) {
 		t.Errorf("shutdownPolicy = %q, want Delete", shutdownPolicy)
 	}
 
-	// 5. Assert the in-cluster server did the work:
+	// 6. Assert the in-cluster server did the work:
 	// The sandbox's creation must postdate the test start.
 	creationTime, err := time.Parse(time.RFC3339, creationTimestampStr)
 	if err != nil {

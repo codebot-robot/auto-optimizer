@@ -75,7 +75,7 @@ Installs all cluster infrastructure and prerequisites needed by `auto-optimizer`
      - `Role` and `RoleBinding` in `ao-sandboxes` granting least-privilege access to manage `sandboxes` and sandbox execution.
      - `ConfigMap` `ao-config` in `ao-system` setting server and sandbox configuration.
      - `Deployment` `ao` in `ao-system` running `ao serve` with an `emptyDir` state volume and read-only root filesystem.
-     - `Service` `ao` ClusterIP on port 8081 named `grpc`.
+     - `Service` `ao` ClusterIP on port 8080 named `http` and port 8081 named `grpc`.
    - Builds container images (`ao`, `geminicli-toolbox`) and loads them into kind (or pushes to `IMAGE_PREFIX`).
    - Runs `ap deploy` to apply manifests with image tags replaced.
    - On kind, configures `OPENAI_MODEL=fake-eliza` and `SANDBOX_IMAGE=${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}` in `ao-config` by default.
@@ -104,6 +104,16 @@ kubectl get sandboxes -n ao-sandboxes
 ```
 
 Client commands default to `--server 127.0.0.1:8081` (configurable via `--server` or the `AO_SERVER` environment variable).
+
+##### Accessing the Web UI
+
+To access the server-rendered web UI running in the cluster:
+
+```bash
+kubectl -n ao-system port-forward svc/ao 8080:8080
+```
+
+Open `http://localhost:8080/` in your browser to view sessions and transcripts.
 
 ##### Configuring a Real Model (e.g. Gemini)
 
