@@ -612,6 +612,13 @@ func TestWebMethods_StartTurnAndBusy(t *testing.T) {
 		t.Fatalf("StartTurn: %v", err)
 	}
 
+	// Wait until sandbox starts execution
+	select {
+	case <-sb.startedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for turn to start")
+	}
+
 	// Verify session is marked busy immediately
 	detail, err := srv.GetSessionDetail(ctx, "turnsess")
 	if err != nil {
@@ -645,7 +652,7 @@ func TestWebMethods_StartTurnAndBusy(t *testing.T) {
 		t.Fatalf("GetSessionDetail: %v", err)
 	}
 	if detail.Summary.InFlight {
-		t.Error("turn still in flight after unblocking")
+		t.Fatal("turn still in flight after unblocking")
 	}
 	if len(detail.Messages) == 0 {
 		t.Error("expected messages in detail after turn finished")
