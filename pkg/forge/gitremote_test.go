@@ -117,6 +117,9 @@ func TestGitRemoteBareRepo(t *testing.T) {
 	if !foundBranch {
 		t.Errorf("commit %s not found in listed refs: %+v", commitHex, refs)
 	}
+	if _, ok := refs["HEAD"]; ok {
+		t.Errorf("expected no synthetic HEAD entry in refs map, got %+v", refs)
+	}
 
 	// 2. DefaultBranch
 	branch, err := client.DefaultBranch(ctx, bareDir)
@@ -275,8 +278,8 @@ func TestSmartHTTP_ProtocolV2(t *testing.T) {
 		t.Fatalf("ListRefs failed: %v", err)
 	}
 
-	if refs["HEAD"] != "1111111111111111111111111111111111111111" {
-		t.Errorf("expected HEAD ref to be 1111..., got %q", refs["HEAD"])
+	if _, ok := refs["HEAD"]; ok {
+		t.Errorf("expected no HEAD ref in advertised refs map, got %q", refs["HEAD"])
 	}
 	if refs["refs/heads/main"] != "1111111111111111111111111111111111111111" {
 		t.Errorf("expected refs/heads/main to be 1111..., got %q", refs["refs/heads/main"])
@@ -342,8 +345,8 @@ func TestSmartHTTP_ProtocolV0(t *testing.T) {
 		t.Errorf("expected 0 POST calls for protocol v0, got %d", postCount)
 	}
 
-	if refs["HEAD"] != "3333333333333333333333333333333333333333" {
-		t.Errorf("expected HEAD 3333..., got %q", refs["HEAD"])
+	if _, ok := refs["HEAD"]; ok {
+		t.Errorf("expected no HEAD ref in advertised refs map, got %q", refs["HEAD"])
 	}
 	if refs["refs/heads/master"] != "3333333333333333333333333333333333333333" {
 		t.Errorf("expected master 3333..., got %q", refs["refs/heads/master"])
@@ -410,8 +413,11 @@ func TestSmartHTTP_Conditional304(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initial ListRefs failed: %v", err)
 	}
-	if refs1["HEAD"] != "9999999999999999999999999999999999999999" {
-		t.Errorf("unexpected initial HEAD: %q", refs1["HEAD"])
+	if _, ok := refs1["HEAD"]; ok {
+		t.Errorf("unexpected HEAD in initial refs: %q", refs1["HEAD"])
+	}
+	if refs1["refs/heads/main"] != "9999999999999999999999999999999999999999" {
+		t.Errorf("unexpected initial refs/heads/main: %q", refs1["refs/heads/main"])
 	}
 
 	// Second request: server returns 304 Not Modified
@@ -419,8 +425,11 @@ func TestSmartHTTP_Conditional304(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Second ListRefs on 304 failed: %v", err)
 	}
-	if refs2["HEAD"] != "9999999999999999999999999999999999999999" {
+	if _, ok := refs2["HEAD"]; ok {
 		t.Errorf("unexpected cached HEAD after 304: %q", refs2["HEAD"])
+	}
+	if refs2["refs/heads/main"] != "9999999999999999999999999999999999999999" {
+		t.Errorf("unexpected cached refs/heads/main after 304: %q", refs2["refs/heads/main"])
 	}
 
 	branch, err := client.DefaultBranch(ctx, repoURL)
@@ -499,8 +508,11 @@ func TestSmartHTTP_401Unauthorized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticated ListRefs failed: %v", err)
 	}
-	if refs["HEAD"] != "abcdef1234567890abcdef1234567890abcdef12" {
-		t.Errorf("expected ref hash abcdef..., got %q", refs["HEAD"])
+	if _, ok := refs["HEAD"]; ok {
+		t.Errorf("unexpected HEAD in refs: %q", refs["HEAD"])
+	}
+	if refs["refs/heads/main"] != "abcdef1234567890abcdef1234567890abcdef12" {
+		t.Errorf("expected refs/heads/main hash abcdef..., got %q", refs["refs/heads/main"])
 	}
 }
 
@@ -541,8 +553,8 @@ func TestSmartHTTP_LiveGitHub(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRefs failed: %v", err)
 	}
-	if refs["HEAD"] == "" {
-		t.Errorf("expected non-empty HEAD from live github")
+	if _, ok := refs["HEAD"]; ok {
+		t.Errorf("expected no HEAD ref from live github, got %q", refs["HEAD"])
 	}
 	if refs["refs/heads/main"] == "" {
 		t.Errorf("expected refs/heads/main from live github")

@@ -187,19 +187,9 @@ func (g *GitRemote) listRefsGoGit(ctx context.Context, repoURL string) (map[stri
 	}
 
 	result := make(map[string]string, len(refs))
-	var headTarget plumbing.ReferenceName
 	for _, ref := range refs {
-		if ref.Name() == plumbing.HEAD && ref.Type() == plumbing.SymbolicReference {
-			headTarget = ref.Target()
-		}
-	}
-
-	for _, ref := range refs {
-		if ref.Type() == plumbing.HashReference {
+		if ref.Type() == plumbing.HashReference && ref.Name() != plumbing.HEAD {
 			result[ref.Name().String()] = ref.Hash().String()
-			if headTarget != "" && ref.Name() == headTarget {
-				result["HEAD"] = ref.Hash().String()
-			}
 		}
 	}
 
@@ -500,7 +490,6 @@ func (g *GitRemote) discoverSmartHTTP(ctx context.Context, repoURL string) (map[
 		}
 
 		refs := make(map[string]string)
-		var headTarget string
 		var defaultBranch string
 
 		for _, line := range respLines {
@@ -518,20 +507,13 @@ func (g *GitRemote) discoverSmartHTTP(ctx context.Context, repoURL string) (map[
 				if strings.HasPrefix(attr, "symref-target:") {
 					target := strings.TrimPrefix(attr, "symref-target:")
 					if refname == "HEAD" {
-						headTarget = target
 						defaultBranch = strings.TrimPrefix(target, "refs/heads/")
 					}
 				}
 			}
 
-			if oid != "unborn" {
+			if oid != "unborn" && refname != "HEAD" {
 				refs[refname] = oid
-			}
-		}
-
-		if refs["HEAD"] == "" && headTarget != "" {
-			if targetOID, ok := refs[headTarget]; ok {
-				refs["HEAD"] = targetOID
 			}
 		}
 
@@ -582,16 +564,10 @@ func (g *GitRemote) discoverSmartHTTP(ctx context.Context, repoURL string) (map[
 		}
 		oid := fields[0]
 		refname := fields[1]
-		if refname == "capabilities^{}" || strings.HasSuffix(refname, "^{}") {
+		if refname == "HEAD" || refname == "capabilities^{}" || strings.HasSuffix(refname, "^{}") {
 			continue
 		}
 		refs[refname] = oid
-	}
-
-	if refs["HEAD"] == "" && headTarget != "" {
-		if targetOID, ok := refs[headTarget]; ok {
-			refs["HEAD"] = targetOID
-		}
 	}
 
 	g.mu.Lock()
