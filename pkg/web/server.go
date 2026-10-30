@@ -30,6 +30,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
 //go:embed static/*
@@ -47,17 +48,19 @@ type SessionService interface {
 
 // Server handles HTTP requests for the web UI.
 type Server struct {
-	service SessionService
+	service    SessionService
+	stateStore state.Store
 }
 
-// NewServer creates a new web Server backed by the given SessionService.
-func NewServer(service SessionService) (*Server, error) {
+// NewServer creates a new web Server backed by the given SessionService and state.Store.
+func NewServer(service SessionService, stateStore state.Store) (*Server, error) {
 	if service == nil {
 		return nil, errors.New("service is required")
 	}
 
 	return &Server{
-		service: service,
+		service:    service,
+		stateStore: stateStore,
 	}, nil
 }
 
@@ -97,6 +100,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/" && r.Method == http.MethodGet:
 		s.handleListSessions(w, r)
+	case r.URL.Path == "/repos" && r.Method == http.MethodGet:
+		s.handleListRepos(w, r)
+	case strings.HasPrefix(r.URL.Path, "/repos/"):
+		rest := strings.TrimPrefix(r.URL.Path, "/repos/")
+		parts := strings.Split(rest, "/")
+		if len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] != "" && r.Method == http.MethodGet {
+			s.handleGetRepo(w, r, parts[0], parts[1], parts[2])
+			return
+		}
+		s.render404(w, r, "Repository not found")
+	case strings.HasPrefix(r.URL.Path, "/runs/"):
+		rest := strings.TrimPrefix(r.URL.Path, "/runs/")
+		parts := strings.Split(rest, "/")
+		if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodGet {
+			s.handleGetRun(w, r, parts[0])
+			return
+		}
+		s.render404(w, r, "Run not found")
 	case r.URL.Path == "/sessions" && r.Method == http.MethodPost:
 		s.handleCreateSession(w, r)
 	case strings.HasPrefix(r.URL.Path, "/sessions/"):
@@ -148,6 +169,148 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 
 	if err := RenderSessionListPage(r.Context(), w, SessionListPageData{Sessions: summaries}); err != nil {
 		scoped.Log(r.Context()).Error(err, "rendering session list page")
+	}
+}
+
+func (s *Server) handleListRepos(w http.ResponseWriter, r *http.Request) {
+	if s.stateStore == nil {
+		if err := RenderReposPage(r.Context(), w, ReposPageData{}); err != nil {
+			scoped.Log(r.Context()).Error(err, "rendering repos page")
+		}
+		return
+	}
+
+	repos, err := s.stateStore.ListRepos(r.Context())
+	if err != nil {
+		scoped.Log(r.Context()).Error(err, "listing repositories")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var entries []RepoEntry
+	for _, repo := range repos {
+		goals, err := s.stateStore.ListGoals(r.Context(), repo.Key())
+		if err != nil {
+			scoped.Log(r.Context()).Error(err, "listing goals for repo", "repo", repo.Key())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		entries = append(entries, RepoEntry{
+			Repo:      repo,
+			GoalCount: len(goals),
+		})
+	}
+
+	if err := RenderReposPage(r.Context(), w, ReposPageData{Repos: entries}); err != nil {
+		scoped.Log(r.Context()).Error(err, "rendering repos page")
+	}
+}
+
+func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request, host, owner, name string) {
+	if s.stateStore == nil {
+		s.render404(w, r, "Repository not found")
+		return
+	}
+
+	key := state.RepoKey{Host: host, Owner: owner, Name: name}
+	if err := state.ValidateRepoKey(key); err != nil {
+		s.render404(w, r, fmt.Sprintf("Invalid repository %q: %v", key, err))
+		return
+	}
+
+	repo, err := s.stateStore.GetRepo(r.Context(), key)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			s.render404(w, r, fmt.Sprintf("Repository %q not found", key))
+			return
+		}
+		scoped.Log(r.Context()).Error(err, "getting repository", "repo", key)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	goals, err := s.stateStore.ListGoals(r.Context(), key)
+	if err != nil {
+		scoped.Log(r.Context()).Error(err, "listing goals", "repo", key)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var goalEntries []GoalEntry
+	for _, g := range goals {
+		var latestPhase state.RunPhase
+		if g.LastRunID != "" {
+			run, err := s.stateStore.GetRun(r.Context(), key, g.LastRunID)
+			if err != nil {
+				if !errors.Is(err, state.ErrNotFound) {
+					scoped.Log(r.Context()).V(2).Info("getting latest run for goal", "run", g.LastRunID, "error", err)
+				}
+			} else {
+				latestPhase = run.Phase
+			}
+		}
+		goalEntries = append(goalEntries, GoalEntry{
+			Record:      g,
+			LatestPhase: latestPhase,
+		})
+	}
+
+	runs, err := s.stateStore.ListRuns(r.Context(), key)
+	if err != nil {
+		scoped.Log(r.Context()).Error(err, "listing runs", "repo", key)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Reverse runs so newest runs appear first
+	recentRuns := make([]*state.Run, len(runs))
+	for i, run := range runs {
+		recentRuns[len(runs)-1-i] = run
+	}
+
+	if err := RenderRepoPage(r.Context(), w, RepoPageData{
+		Repo:       repo,
+		Goals:      goalEntries,
+		RecentRuns: recentRuns,
+	}); err != nil {
+		scoped.Log(r.Context()).Error(err, "rendering repo page", "repo", key)
+	}
+}
+
+func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request, runID string) {
+	if s.stateStore == nil {
+		s.render404(w, r, "Run not found")
+		return
+	}
+
+	if err := state.ValidateRunID(runID); err != nil {
+		s.render404(w, r, fmt.Sprintf("Invalid run ID %q: %v", runID, err))
+		return
+	}
+
+	run, err := s.stateStore.FindRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			s.render404(w, r, fmt.Sprintf("Run %q not found", runID))
+			return
+		}
+		scoped.Log(r.Context()).Error(err, "finding run", "run", runID)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	events, err := s.stateStore.ReadEvents(r.Context(), run.Repo, run.ID)
+	if err != nil {
+		scoped.Log(r.Context()).Error(err, "reading events for run", "run", runID)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := RenderRunPage(r.Context(), w, RunPageData{
+		Run:    run,
+		Events: events,
+	}); err != nil {
+		scoped.Log(r.Context()).Error(err, "rendering run page", "run", runID)
 	}
 }
 

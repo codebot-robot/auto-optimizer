@@ -1,0 +1,91 @@
+{{define "content"}}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Run: {{.Run.ID}}</h1>
+    <div class="meta-badges">
+      <span class="meta-badge">repo: <a href="/repos/{{.Run.Repo.Host}}/{{.Run.Repo.Owner}}/{{.Run.Repo.Name}}">{{.Run.Repo.Host}}/{{.Run.Repo.Owner}}/{{.Run.Repo.Name}}</a></span>
+      <span class="meta-badge">goal: {{.Run.GoalName}}</span>
+      <span class="badge phase-{{.Run.Phase}}">{{.Run.Phase}}</span>
+      {{if .InFlight}}<span class="badge badge-in-flight">active</span>{{end}}
+    </div>
+  </div>
+</div>
+
+{{if .Run.Error}}
+<div class="card error-banner">
+  <h3>Run Failed</h3>
+  <pre class="error-message">{{.Run.Error}}</pre>
+</div>
+{{end}}
+
+<div class="card">
+  <h2>Run Details</h2>
+  <dl class="details-list">
+    <dt>Base Commit</dt>
+    <dd>{{if .Run.BaseCommit}}<code>{{.Run.BaseCommit}}</code>{{else}}<span class="text-muted">-</span>{{end}}</dd>
+
+    <dt>Branch</dt>
+    <dd>{{if .Run.Branch}}<code>{{.Run.Branch}}</code>{{else}}<span class="text-muted">-</span>{{end}}</dd>
+
+    <dt>Pull Request</dt>
+    <dd>{{if .Run.PRURL}}<a href="{{.Run.PRURL}}" target="_blank">{{.Run.PRURL}}</a>{{else}}<span class="text-muted">-</span>{{end}}</dd>
+
+    <dt>Session Transcript</dt>
+    <dd>{{if .Run.SessionID}}<a href="/sessions/{{.Run.SessionID}}">Session {{.Run.SessionID}}</a>{{else}}<span class="text-muted">-</span>{{end}}</dd>
+
+    {{if .Run.Baseline}}
+    <dt>Baseline</dt>
+    <dd>{{.Run.Baseline}}</dd>
+    {{end}}
+
+    {{if .Run.Candidate}}
+    <dt>Candidate</dt>
+    <dd>{{.Run.Candidate}}</dd>
+    {{end}}
+
+    {{if gt .Run.CostUSD 0.0}}
+    <dt>Cost</dt>
+    <dd>${{printf "%.4f" .Run.CostUSD}}</dd>
+    {{end}}
+  </dl>
+</div>
+
+<div class="card">
+  <h2>Phase Timeline</h2>
+  {{if .Events}}
+  <div class="timeline-container">
+    {{range .Events}}
+    <div class="timeline-event">
+      <div class="event-time">{{formatTime .Time}}</div>
+      <div class="event-body">
+        {{if .Phase}}<span class="badge phase-{{.Phase}}">{{.Phase}}</span>{{end}}
+        {{if .Kind}}<span class="meta-badge">{{.Kind}}</span>{{end}}
+        {{if .Message}}<span class="event-message">{{.Message}}</span>{{end}}
+        {{if .Error}}<div class="event-error">{{.Error}}</div>{{end}}
+      </div>
+    </div>
+    {{end}}
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <p>No events recorded for this run yet.</p>
+  </div>
+  {{end}}
+</div>
+
+{{if .Run.Goal}}
+<div class="card">
+  <h2>Frozen Goal: {{.Run.Goal.Name}}</h2>
+  <div class="goal-definition">
+    <div class="meta-badges" style="margin-bottom: 12px;">
+      <span class="meta-badge">kind: {{.Run.Goal.Kind}}</span>
+      {{if .Run.Goal.Schedule}}<span class="meta-badge">schedule: {{.Run.Goal.Schedule}}</span>{{end}}
+      {{if .Run.Goal.Verify}}<span class="meta-badge">verify: {{.Run.Goal.Verify}}</span>{{end}}
+    </div>
+    <div class="goal-body markdown-body">
+      <pre>{{.Run.Goal.Body}}</pre>
+    </div>
+  </div>
+</div>
+{{end}}
+{{end}}

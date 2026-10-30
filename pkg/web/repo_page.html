@@ -1,0 +1,99 @@
+{{define "content"}}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">{{.Repo.Host}}/{{.Repo.Owner}}/{{.Repo.Name}}</h1>
+    <div class="meta-badges">
+      <span class="meta-badge">branch: {{.Repo.DefaultBranch}}</span>
+      <span class="meta-badge">forge: {{.Repo.ForgeKind}}</span>
+      {{if .Repo.HeadCommit}}<span class="meta-badge">head: {{truncate .Repo.HeadCommit}}</span>{{end}}
+      {{if not .Repo.LastChangeTime.IsZero}}<span class="meta-badge">changed: {{formatTime .Repo.LastChangeTime}}</span>{{end}}
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Goals</h2>
+  {{if .Goals}}
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Kind</th>
+          <th>Hash</th>
+          <th>Base Commit</th>
+          <th>Latest Run</th>
+          <th>Latest Phase</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Goals}}
+        <tr>
+          <td><strong>{{.Record.Goal.Name}}</strong></td>
+          <td><span class="meta-badge">{{.Record.Goal.Kind}}</span></td>
+          <td><code>{{truncate .Record.Hash}}</code></td>
+          <td><code>{{truncate .Record.BaseCommit}}</code></td>
+          <td>
+            {{if .Record.LastRunID}}
+              <a href="/runs/{{.Record.LastRunID}}"><code>{{.Record.LastRunID}}</code></a>
+            {{else}}
+              <span class="text-muted">-</span>
+            {{end}}
+          </td>
+          <td>
+            {{if .LatestPhase}}
+              <span class="badge phase-{{.LatestPhase}}">{{.LatestPhase}}</span>
+            {{else}}
+              <span class="text-muted">-</span>
+            {{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <p>No goals found for this repository.</p>
+  </div>
+  {{end}}
+</div>
+
+<div class="card">
+  <h2>Recent Runs</h2>
+  {{if .RecentRuns}}
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Run ID</th>
+          <th>Goal</th>
+          <th>Phase</th>
+          <th>Base Commit</th>
+          <th>Branch</th>
+          <th>PR</th>
+          <th>Session</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .RecentRuns}}
+        <tr>
+          <td><a href="/runs/{{.ID}}"><strong>{{.ID}}</strong></a></td>
+          <td>{{.GoalName}}</td>
+          <td><span class="badge phase-{{.Phase}}">{{.Phase}}</span></td>
+          <td>{{if .BaseCommit}}<code>{{truncate .BaseCommit}}</code>{{else}}<span class="text-muted">-</span>{{end}}</td>
+          <td>{{if .Branch}}<code>{{.Branch}}</code>{{else}}<span class="text-muted">-</span>{{end}}</td>
+          <td>{{if .PRURL}}<a href="{{.PRURL}}" target="_blank">PR</a>{{else}}<span class="text-muted">-</span>{{end}}</td>
+          <td>{{if .SessionID}}<a href="/sessions/{{.SessionID}}"><code>{{.SessionID}}</code></a>{{else}}<span class="text-muted">-</span>{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <p>No runs recorded for this repository yet.</p>
+  </div>
+  {{end}}
+</div>
+{{end}}
