@@ -46,6 +46,9 @@ service SessionService {
 
   // ListRuns returns runs for a repository.
   rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+
+  // GetRun returns details and events for a run.
+  rpc GetRun(GetRunRequest) returns (GetRunResponse);
 }
 
 // Session carries session metadata and state summary.
@@ -204,9 +207,28 @@ message RunRecord {
   string pr_url = 7;
   string session_id = 8;
   string error = 9;
+  string sandbox_name = 10;
 }
 
 message ListRunsResponse {
   repeated RunRecord runs = 1;
 }
+
+message GetRunRequest {
+  string id = 1;
+}
+
+message RunEvent {
+  google.protobuf.Timestamp time = 1;
+  string phase = 2;
+  string kind = 3;
+  string message = 4;
+  string error = 5;
+}
+
+message GetRunResponse {
+  RunRecord run = 1;
+  repeated RunEvent events = 2;
+}
+
 

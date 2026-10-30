@@ -41,6 +41,7 @@ const (
 	SessionService_ListRepositories_FullMethodName = "/session.v1.SessionService/ListRepositories"
 	SessionService_ListGoals_FullMethodName        = "/session.v1.SessionService/ListGoals"
 	SessionService_ListRuns_FullMethodName         = "/session.v1.SessionService/ListRuns"
+	SessionService_GetRun_FullMethodName           = "/session.v1.SessionService/GetRun"
 )
 
 // SessionServiceClient is the client API for SessionService service.
@@ -66,6 +67,8 @@ type SessionServiceClient interface {
 	ListGoals(ctx context.Context, in *ListGoalsRequest, opts ...grpc.CallOption) (*ListGoalsResponse, error)
 	// ListRuns returns runs for a repository.
 	ListRuns(ctx context.Context, in *ListRunsRequest, opts ...grpc.CallOption) (*ListRunsResponse, error)
+	// GetRun returns details and events for a run.
+	GetRun(ctx context.Context, in *GetRunRequest, opts ...grpc.CallOption) (*GetRunResponse, error)
 }
 
 type sessionServiceClient struct {
@@ -165,6 +168,16 @@ func (c *sessionServiceClient) ListRuns(ctx context.Context, in *ListRunsRequest
 	return out, nil
 }
 
+func (c *sessionServiceClient) GetRun(ctx context.Context, in *GetRunRequest, opts ...grpc.CallOption) (*GetRunResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRunResponse)
+	err := c.cc.Invoke(ctx, SessionService_GetRun_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SessionServiceServer is the server API for SessionService service.
 // All implementations must embed UnimplementedSessionServiceServer
 // for forward compatibility.
@@ -188,6 +201,8 @@ type SessionServiceServer interface {
 	ListGoals(context.Context, *ListGoalsRequest) (*ListGoalsResponse, error)
 	// ListRuns returns runs for a repository.
 	ListRuns(context.Context, *ListRunsRequest) (*ListRunsResponse, error)
+	// GetRun returns details and events for a run.
+	GetRun(context.Context, *GetRunRequest) (*GetRunResponse, error)
 	mustEmbedUnimplementedSessionServiceServer()
 }
 
@@ -221,6 +236,9 @@ func (UnimplementedSessionServiceServer) ListGoals(context.Context, *ListGoalsRe
 }
 func (UnimplementedSessionServiceServer) ListRuns(context.Context, *ListRunsRequest) (*ListRunsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListRuns not implemented")
+}
+func (UnimplementedSessionServiceServer) GetRun(context.Context, *GetRunRequest) (*GetRunResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRun not implemented")
 }
 func (UnimplementedSessionServiceServer) mustEmbedUnimplementedSessionServiceServer() {}
 func (UnimplementedSessionServiceServer) testEmbeddedByValue()                        {}
@@ -380,6 +398,24 @@ func _SessionService_ListRuns_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SessionService_GetRun_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRunRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SessionServiceServer).GetRun(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SessionService_GetRun_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SessionServiceServer).GetRun(ctx, req.(*GetRunRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SessionService_ServiceDesc is the grpc.ServiceDesc for SessionService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -414,6 +450,10 @@ var SessionService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListRuns",
 			Handler:    _SessionService_ListRuns_Handler,
+		},
+		{
+			MethodName: "GetRun",
+			Handler:    _SessionService_GetRun_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
