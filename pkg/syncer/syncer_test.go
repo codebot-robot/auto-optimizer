@@ -77,6 +77,17 @@ func TestSyncerGoalLifecycle(t *testing.T) {
 		t.Fatalf("SyncOnce (step 1): %v", err)
 	}
 
+	// Verify only files under .goals/ were requested; files outside (like README.md) are never read
+	blobs1 := fakeForge.RequestedBlobs()
+	if len(blobs1) != 1 || blobs1[0] != ".goals/hello.md" {
+		t.Errorf("expected requested blobs [.goals/hello.md], got %v", blobs1)
+	}
+	for _, b := range blobs1 {
+		if b == "README.md" {
+			t.Errorf("README.md was unexpectedly requested during sync")
+		}
+	}
+
 	// Verify goal record was created
 	rec1, err := store.GetGoal(ctx, key, "hello")
 	if err != nil {
@@ -113,9 +124,15 @@ func TestSyncerGoalLifecycle(t *testing.T) {
 		".goals/hello.md": helloV2,
 		"README.md":       []byte("# Readme\n"),
 	})
+	fakeForge.ResetRequestedBlobs()
 
 	if err := s.SyncOnce(ctx); err != nil {
 		t.Fatalf("SyncOnce (step 2): %v", err)
+	}
+
+	blobs2 := fakeForge.RequestedBlobs()
+	if len(blobs2) != 1 || blobs2[0] != ".goals/hello.md" {
+		t.Errorf("expected requested blobs [.goals/hello.md], got %v", blobs2)
 	}
 
 	rec2, err := store.GetGoal(ctx, key, "hello")
@@ -140,9 +157,15 @@ func TestSyncerGoalLifecycle(t *testing.T) {
 	fakeForge.SetTree(repoURL, commit3, map[string][]byte{
 		"README.md": []byte("# Readme\n"),
 	})
+	fakeForge.ResetRequestedBlobs()
 
 	if err := s.SyncOnce(ctx); err != nil {
 		t.Fatalf("SyncOnce (step 3): %v", err)
+	}
+
+	blobs3 := fakeForge.RequestedBlobs()
+	if len(blobs3) != 0 {
+		t.Errorf("expected no blobs requested when .goals has no files, got %v", blobs3)
 	}
 
 	rec3, err := store.GetGoal(ctx, key, "hello")
@@ -206,5 +229,78 @@ func TestFindHeadCommit(t *testing.T) {
 	}
 	if got := s.findHeadCommit(refsOnlyHead, "main"); got != "" {
 		t.Errorf("findHeadCommit(only HEAD with default=main) = %q, want empty string", got)
+	}
+}
+
+func TestSyncer_OnlyReadsGoalsSubtree(t *testing.T) {
+	ctx := t.Context()
+
+	store := state.NewFileStore(t.TempDir())
+	fakeForge := forge.NewFake()
+
+	repoURL := "https://github.com/gke-labs/subtree-repo"
+	key := state.RepoKey{
+		Host:  "github.com",
+		Owner: "gke-labs",
+		Name:  "subtree-repo",
+	}
+	repo := &state.Repo{
+		URL:            repoURL,
+		Host:           key.Host,
+		Owner:          key.Owner,
+		Name:           key.Name,
+		DefaultBranch:  "main",
+		ForgeKind:      "fake",
+		RegisteredTime: time.Now(),
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	s, err := New(Options{
+		Store:        store,
+		Forge:        fakeForge,
+		PollInterval: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New syncer: %v", err)
+	}
+
+	commit := "sha-subtree-test"
+	fakeForge.SetRefs(repoURL, map[string]string{
+		"refs/heads/main": commit,
+	})
+	fakeForge.SetTree(repoURL, commit, map[string][]byte{
+		".goals/perf.md":     []byte("# Perf Goal\n"),
+		".goals/sub/eval.md": []byte("# Eval Goal\n"),
+		"README.md":          []byte("# Big Readme\n"),
+		"pkg/main.go":        []byte("package main\n"),
+		"docs/design.md":     []byte("# Design\n"),
+		"data/large.bin":     []byte("lots of binary data"),
+	})
+
+	if err := s.SyncOnce(ctx); err != nil {
+		t.Fatalf("SyncOnce: %v", err)
+	}
+
+	requested := fakeForge.RequestedBlobs()
+	expected := []string{".goals/perf.md", ".goals/sub/eval.md"}
+	if len(requested) != len(expected) {
+		t.Fatalf("expected requested blobs %v, got %v", expected, requested)
+	}
+	for i, exp := range expected {
+		if requested[i] != exp {
+			t.Errorf("blob[%d]: got %q, want %q", i, requested[i], exp)
+		}
+	}
+
+	// Verify files outside .goals/ were never requested
+	outsideFiles := []string{"README.md", "pkg/main.go", "docs/design.md", "data/large.bin"}
+	for _, req := range requested {
+		for _, outside := range outsideFiles {
+			if req == outside {
+				t.Errorf("file outside .goals/ was requested: %q", req)
+			}
+		}
 	}
 }

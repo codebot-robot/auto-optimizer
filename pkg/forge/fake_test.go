@@ -67,18 +67,18 @@ func TestFakeForge(t *testing.T) {
 	}
 
 	// Fetch nonexistent tree
-	_, err = f.FetchTree(ctx, repoURL, "nonexistent")
+	_, err = f.FetchTree(ctx, repoURL, "nonexistent", "")
 	if err == nil {
 		t.Fatal("expected error fetching nonexistent commit, got nil")
 	}
 
-	// Set tree and fetch
+	// Set tree and fetch with empty prefix (full tree)
 	f.SetTree(repoURL, "commit-1", map[string][]byte{
 		".goals/hello.md": []byte("# Hello\n"),
 		"README.md":       []byte("Welcome\n"),
 	})
 
-	treeFS, err := f.FetchTree(ctx, repoURL, "commit-1")
+	treeFS, err := f.FetchTree(ctx, repoURL, "commit-1", "")
 	if err != nil {
 		t.Fatalf("FetchTree: %v", err)
 	}
@@ -94,5 +94,65 @@ func TestFakeForge(t *testing.T) {
 	// Run fstest.TestFS to verify TreeFS implements standard fs.FS
 	if err := fstest.TestFS(treeFS, ".goals/hello.md", "README.md"); err != nil {
 		t.Fatalf("TestFS: %v", err)
+	}
+
+	allBlobs := f.RequestedBlobs()
+	if len(allBlobs) != 2 || allBlobs[0] != ".goals/hello.md" || allBlobs[1] != "README.md" {
+		t.Errorf("expected requested blobs [.goals/hello.md README.md], got %v", allBlobs)
+	}
+
+	// Reset and fetch with prefix
+	f.ResetRequestedBlobs()
+	if len(f.RequestedBlobs()) != 0 {
+		t.Fatalf("expected 0 requested blobs after reset, got %d", len(f.RequestedBlobs()))
+	}
+
+	subFS, err := f.FetchTree(ctx, repoURL, "commit-1", ".goals")
+	if err != nil {
+		t.Fatalf("FetchTree with prefix: %v", err)
+	}
+
+	if _, err := fs.ReadFile(subFS, ".goals/hello.md"); err != nil {
+		t.Fatalf("ReadFile .goals/hello.md from subFS: %v", err)
+	}
+	if _, err := fs.ReadFile(subFS, "README.md"); err == nil {
+		t.Fatal("expected README.md to not exist in subFS, but it was found")
+	}
+
+	subBlobs := f.RequestedBlobs()
+	if len(subBlobs) != 1 || subBlobs[0] != ".goals/hello.md" {
+		t.Errorf("expected requested blobs [.goals/hello.md], got %v", subBlobs)
+	}
+}
+
+func TestPathMatchesPrefix(t *testing.T) {
+	tests := []struct {
+		path   string
+		prefix string
+		want   bool
+	}{
+		{"", "", true},
+		{"README.md", "", true},
+		{"README.md", ".", true},
+		{"README.md", "/", true},
+		{".goals/hello.md", ".goals", true},
+		{".goals/hello.md", ".goals/", true},
+		{".goals/hello.md", "/.goals", true},
+		{".goals/sub/nested.md", ".goals", true},
+		{".goals", ".goals", true},
+		{".goals-other/foo.md", ".goals", false},
+		{"README.md", ".goals", false},
+		{"pkg/forge/gitremote.go", "pkg/forge", true},
+		{"pkg/forge/gitremote.go", "pkg", true},
+		{"pkg/forge/gitremote.go", "pkg/other", false},
+		{"pkg/forge/gitremote.go", "pkg/forge/gitremote.go", true},
+		{"pkg/forge/gitremote.go", "pkg/forge/gitremote_test.go", false},
+	}
+
+	for _, tt := range tests {
+		got := PathMatchesPrefix(tt.path, tt.prefix)
+		if got != tt.want {
+			t.Errorf("PathMatchesPrefix(%q, %q) = %v, want %v", tt.path, tt.prefix, got, tt.want)
+		}
 	}
 }

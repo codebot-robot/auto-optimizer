@@ -69,11 +69,19 @@ func TestGitRemoteBareRepo(t *testing.T) {
 		t.Fatalf("WriteFile hello.md: %v", err)
 	}
 
+	readmeContent := []byte("# Bare Repo Readme\n")
+	if err := os.WriteFile(filepath.Join(workDir, "README.md"), readmeContent, 0644); err != nil {
+		t.Fatalf("WriteFile README.md: %v", err)
+	}
+
 	if _, err := wt.Add(".goals/hello.md"); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
+	if _, err := wt.Add("README.md"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
 
-	commitHash, err := wt.Commit("add hello.md goal", &git.CommitOptions{
+	commitHash, err := wt.Commit("add hello.md goal and readme", &git.CommitOptions{
 		Author: &object.Signature{
 			Name:  "Test Committer",
 			Email: "test@example.com",
@@ -131,8 +139,8 @@ func TestGitRemoteBareRepo(t *testing.T) {
 	}
 	t.Logf("Default branch: %s", branch)
 
-	// 3. FetchTree
-	treeFS, err := client.FetchTree(ctx, bareDir, commitHex)
+	// 3. FetchTree with prefix ".goals"
+	treeFS, err := client.FetchTree(ctx, bareDir, commitHex, ".goals")
 	if err != nil {
 		t.Fatalf("FetchTree: %v", err)
 	}
@@ -144,6 +152,52 @@ func TestGitRemoteBareRepo(t *testing.T) {
 
 	if string(readBytes) != string(goalContent) {
 		t.Errorf("file content mismatch: got %q, want %q", string(readBytes), string(goalContent))
+	}
+
+	// Files outside prefix must not be in treeFS
+	if _, err := fs.ReadFile(treeFS, "README.md"); err == nil {
+		t.Fatal("expected README.md to not exist in treeFS with .goals prefix, but it was found")
+	}
+
+	// FetchTree with empty prefix fetches full tree
+	fullFS, err := client.FetchTree(ctx, bareDir, commitHex, "")
+	if err != nil {
+		t.Fatalf("FetchTree full: %v", err)
+	}
+	if _, err := fs.ReadFile(fullFS, ".goals/hello.md"); err != nil {
+		t.Fatalf("ReadFile .goals/hello.md from full tree: %v", err)
+	}
+	readmeBytes, err := fs.ReadFile(fullFS, "README.md")
+	if err != nil {
+		t.Fatalf("ReadFile README.md from full tree: %v", err)
+	}
+	if string(readmeBytes) != string(readmeContent) {
+		t.Errorf("readme mismatch: got %q, want %q", string(readmeBytes), string(readmeContent))
+	}
+
+	// FetchTree with nonexistent prefix returns empty tree
+	emptyFS, err := client.FetchTree(ctx, bareDir, commitHex, "nonexistent")
+	if err != nil {
+		t.Fatalf("FetchTree nonexistent prefix: %v", err)
+	}
+	if _, err := fs.ReadFile(emptyFS, ".goals/hello.md"); err == nil {
+		t.Fatal("expected .goals/hello.md to not exist in emptyFS, but it was found")
+	}
+
+	// FetchTree with file prefix fetches single file
+	fileFS, err := client.FetchTree(ctx, bareDir, commitHex, ".goals/hello.md")
+	if err != nil {
+		t.Fatalf("FetchTree file prefix: %v", err)
+	}
+	fileBytes, err := fs.ReadFile(fileFS, ".goals/hello.md")
+	if err != nil {
+		t.Fatalf("ReadFile .goals/hello.md from fileFS: %v", err)
+	}
+	if string(fileBytes) != string(goalContent) {
+		t.Errorf("file content mismatch: got %q, want %q", string(fileBytes), string(goalContent))
+	}
+	if _, err := fs.ReadFile(fileFS, "README.md"); err == nil {
+		t.Fatal("expected README.md to not exist in fileFS, but it was found")
 	}
 
 	// Verify DefaultBranch fails when remote has no HEAD symref

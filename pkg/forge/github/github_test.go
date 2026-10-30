@@ -30,7 +30,7 @@ import (
 
 type fakeRemote struct {
 	listRefsFunc      func(ctx context.Context, repoURL string) (map[string]string, error)
-	fetchTreeFunc     func(ctx context.Context, repoURL, commit string) (fs.FS, error)
+	fetchTreeFunc     func(ctx context.Context, repoURL, commit, prefix string) (fs.FS, error)
 	defaultBranchFunc func(ctx context.Context, repoURL string) (string, error)
 }
 
@@ -41,9 +41,9 @@ func (f *fakeRemote) ListRefs(ctx context.Context, repoURL string) (map[string]s
 	return nil, nil
 }
 
-func (f *fakeRemote) FetchTree(ctx context.Context, repoURL, commit string) (fs.FS, error) {
+func (f *fakeRemote) FetchTree(ctx context.Context, repoURL, commit, prefix string) (fs.FS, error) {
 	if f.fetchTreeFunc != nil {
-		return f.fetchTreeFunc(ctx, repoURL, commit)
+		return f.fetchTreeFunc(ctx, repoURL, commit, prefix)
 	}
 	return nil, nil
 }
@@ -389,8 +389,11 @@ func TestForgeDelegation(t *testing.T) {
 			listRefsCalled = true
 			return map[string]string{"refs/heads/main": "sha123"}, nil
 		},
-		fetchTreeFunc: func(ctx context.Context, repoURL, commit string) (fs.FS, error) {
+		fetchTreeFunc: func(ctx context.Context, repoURL, commit, prefix string) (fs.FS, error) {
 			fetchTreeCalled = true
+			if prefix != ".goals" {
+				t.Errorf("expected prefix '.goals', got %q", prefix)
+			}
 			return forge.NewTreeFS(map[string][]byte{"file.txt": []byte("hi")}), nil
 		},
 		defaultBranchFunc: func(ctx context.Context, repoURL string) (string, error) {
@@ -407,7 +410,7 @@ func TestForgeDelegation(t *testing.T) {
 		t.Errorf("ListRefs delegation failed: err=%v, called=%v, refs=%v", err, listRefsCalled, refs)
 	}
 
-	tree, err := client.FetchTree(ctx, "https://github.com/foo/bar", "sha123")
+	tree, err := client.FetchTree(ctx, "https://github.com/foo/bar", "sha123", ".goals")
 	if err != nil || !fetchTreeCalled {
 		t.Errorf("FetchTree delegation failed: err=%v, called=%v", err, fetchTreeCalled)
 	}

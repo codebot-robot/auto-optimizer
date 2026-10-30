@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"sort"
 	"sync"
 )
 
@@ -27,6 +28,7 @@ type FakeForge struct {
 	refs            map[string]map[string]string            // repoURL -> ref -> commit
 	trees           map[string]map[string]map[string][]byte // repoURL -> commit -> path -> content
 	defaultBranches map[string]string                       // repoURL -> default branch
+	requestedBlobs  []string
 }
 
 // NewFake creates a new FakeForge.
@@ -91,16 +93,55 @@ func (f *FakeForge) ListRefs(ctx context.Context, repoURL string) (map[string]st
 }
 
 // FetchTree returns an fs.FS containing the files configured for the commit.
-func (f *FakeForge) FetchTree(ctx context.Context, repoURL string, commit string) (fs.FS, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+// If prefix is non-empty, only files under that path prefix are read;
+// blobs outside the prefix are skipped without reading their contents.
+// If prefix is empty, all files in the tree are fetched.
+func (f *FakeForge) FetchTree(ctx context.Context, repoURL string, commit string, prefix string) (fs.FS, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	repoTrees := f.trees[repoURL]
 	if repoTrees == nil || repoTrees[commit] == nil {
 		return nil, fmt.Errorf("commit %s not found in repo %s", commit, repoURL)
 	}
 
-	return NewTreeFS(repoTrees[commit]), nil
+	commitFiles := repoTrees[commit]
+	paths := make([]string, 0, len(commitFiles))
+	for p := range commitFiles {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	filtered := make(map[string][]byte)
+	for _, p := range paths {
+		if !PathMatchesPrefix(p, prefix) {
+			continue
+		}
+		f.requestedBlobs = append(f.requestedBlobs, p)
+		data := commitFiles[p]
+		fileBytes := make([]byte, len(data))
+		copy(fileBytes, data)
+		filtered[p] = fileBytes
+	}
+
+	return NewTreeFS(filtered), nil
+}
+
+// RequestedBlobs returns a slice of paths for all blobs requested via FetchTree.
+func (f *FakeForge) RequestedBlobs() []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	cpy := make([]string, len(f.requestedBlobs))
+	copy(cpy, f.requestedBlobs)
+	return cpy
+}
+
+// ResetRequestedBlobs clears the recorded list of requested blobs.
+func (f *FakeForge) ResetRequestedBlobs() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requestedBlobs = nil
 }
 
 // DefaultBranch returns the configured default branch or defaults to "main".

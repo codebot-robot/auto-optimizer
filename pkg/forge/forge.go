@@ -54,10 +54,24 @@ type Forge interface {
 	ListRefs(ctx context.Context, repoURL string) (map[string]string, error)
 
 	// FetchTree fetches the repository tree at a specific commit as an fs.FS.
-	FetchTree(ctx context.Context, repoURL string, commit string) (fs.FS, error)
+	// If prefix is non-empty, only files under that path prefix are read;
+	// blobs outside the prefix are skipped without reading their contents.
+	// If prefix is empty, all files in the tree are fetched.
+	FetchTree(ctx context.Context, repoURL string, commit string, prefix string) (fs.FS, error)
 
 	// DefaultBranch returns the default branch name of the remote repository (e.g. "main").
 	DefaultBranch(ctx context.Context, repoURL string) (string, error)
+}
+
+// PathMatchesPrefix reports whether filePath falls under prefix.
+// An empty prefix, ".", or "/" matches all paths.
+func PathMatchesPrefix(filePath, prefix string) bool {
+	cleanPrefix := path.Clean(strings.TrimPrefix(prefix, "/"))
+	if cleanPrefix == "." || cleanPrefix == "" {
+		return true
+	}
+	cleanPath := path.Clean(strings.TrimPrefix(filePath, "/"))
+	return cleanPath == cleanPrefix || strings.HasPrefix(cleanPath, cleanPrefix+"/")
 }
 
 // ChangeRequestCreator creates and lists change requests / pull requests.
