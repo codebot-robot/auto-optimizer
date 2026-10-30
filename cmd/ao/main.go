@@ -68,6 +68,7 @@ func newRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newSessionCommand())
 	rootCmd.AddCommand(newRepoCommand())
 	rootCmd.AddCommand(newGoalCommand())
+	rootCmd.AddCommand(newRunCommand())
 	return rootCmd
 }
 
