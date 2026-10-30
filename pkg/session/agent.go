@@ -69,8 +69,9 @@ const SandboxInactivityTimeout = 5 * time.Minute
 // of blocking the agent loop indefinitely.
 const DefaultToolTimeout = 2 * time.Minute
 
-// DefaultSandboxdImage is the default container image containing the sandboxd binary, pinned by digest.
-const DefaultSandboxdImage = "us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main@sha256:576d312c8e4019a52e58e6adbd1bffb8964ad41ca7fa941cfe8a662c64dca85c"
+// DefaultSandboxdImage is the default container image containing the sandboxd binary.
+// It matches the image built and loaded into kind by dev/tasks/deploy-to-kube.
+const DefaultSandboxdImage = "auto-optimizer.local/sandboxd:dev"
 
 // SandboxClient is a simple low-level client for managing Sandbox resources directly.
 type SandboxClient struct {

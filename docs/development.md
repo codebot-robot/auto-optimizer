@@ -266,29 +266,7 @@ After updating versions, run `./dev/tasks/test-e2e` to verify compatibility.
 
 #### Building `sandboxd` from Source
 
-To test changes made on a fork or branch of `agent-sandbox` instead of using the pinned upstream digest, set `SANDBOXD_SOURCE_REPO` and `SANDBOXD_SOURCE_REF`:
-
-```bash
-SANDBOXD_SOURCE_REPO=https://github.com/kubernetes-sigs/agent-sandbox \
-SANDBOXD_SOURCE_REF=main \
-./dev/tasks/deploy-to-kube
-```
-
-Or when running end-to-end tests:
-
-```bash
-SANDBOXD_SOURCE_REPO=https://github.com/kubernetes-sigs/agent-sandbox \
-SANDBOXD_SOURCE_REF=main \
-./dev/tasks/test-e2e
-```
-
-When both variables are set:
-- The repository is cloned or updated at that ref into the cache directory (`${XDG_CACHE_HOME:-$HOME/.cache}/auto-optimizer/agent-sandbox/<ref>`).
-- `packages/sandboxd/Dockerfile` is built from that checkout.
-- On kind clusters, the image is loaded directly into kind (`auto-optimizer.local/sandboxd:dev`). On remote clusters, a multi-arch image (`linux/amd64` and `linux/arm64`) is built and pushed under `IMAGE_PREFIX`.
-- `SANDBOXD_IMAGE` is configured in `ao-config` so the control plane launches sandboxes using the built image.
-
-When unset, behavior is unchanged and the pinned upstream digest is used.
+The `sandboxd` image is built by `ap build` from the pinned repository commit in `images/sandboxd/Dockerfile`. To bump the pin, update the `SANDBOXD_COMMIT` (and optionally `SANDBOXD_REPO`) `ARG` default in `images/sandboxd/Dockerfile`.
 
 ---
 
