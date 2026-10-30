@@ -32,6 +32,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/forge/github"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	"github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
@@ -209,6 +210,18 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	go func() {
 		if err := syncerEngine.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error(err, "syncer loop error")
+		}
+	}()
+
+	scheduler, err := run.NewScheduler(run.SchedulerOptions{
+		Store: stateStore,
+	})
+	if err != nil {
+		return fmt.Errorf("initializing scheduler: %w", err)
+	}
+	go func() {
+		if err := scheduler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error(err, "scheduler loop error")
 		}
 	}()
 

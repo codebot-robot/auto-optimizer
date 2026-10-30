@@ -346,3 +346,71 @@ func newGoalListCommand() *cobra.Command {
 	}
 	return cmd
 }
+
+func newRunCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "run",
+		Short: "Manage runs for registered repositories",
+	}
+	cmd.AddCommand(newRunListCommand())
+	return cmd
+}
+
+func newRunListCommand() *cobra.Command {
+	var serverAddr string
+	var repoURL string
+	var jsonOutput bool
+
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List runs for a repository",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if repoURL == "" {
+				return errors.New("--repo flag is required")
+			}
+
+			conn, err := grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return fmt.Errorf("connecting to server %s: %w", serverAddr, err)
+			}
+			defer closeConnection(cmd.Context(), conn)
+
+			client := sessionv1.NewSessionServiceClient(conn)
+			resp, err := client.ListRuns(cmd.Context(), &sessionv1.ListRunsRequest{RepoUrl: repoURL})
+			if err != nil {
+				return fmt.Errorf("listing runs: %w", err)
+			}
+
+			if jsonOutput {
+				m := protojson.MarshalOptions{Multiline: true, Indent: "  "}
+				data, err := m.Marshal(resp)
+				if err != nil {
+					return fmt.Errorf("serializing to json: %w", err)
+				}
+				if _, err := fmt.Fprintln(cmd.OutOrStdout(), string(data)); err != nil {
+					return err
+				}
+				return nil
+			}
+
+			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 8, 2, ' ', 0)
+			if _, err := fmt.Fprintln(w, "ID\tGOAL\tPHASE\tBASE COMMIT"); err != nil {
+				return err
+			}
+			for _, r := range resp.Runs {
+				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Id, r.GoalName, r.Phase, r.BaseCommit); err != nil {
+					return err
+				}
+			}
+			return w.Flush()
+		},
+	}
+
+	cmd.Flags().StringVar(&serverAddr, "server", defaultServerAddress(), "gRPC server address")
+	cmd.Flags().StringVar(&repoURL, "repo", "", "Repository URL (required)")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output runs as JSON")
+	if err := cmd.MarkFlagRequired("repo"); err != nil {
+		panic(err)
+	}
+	return cmd
+}
