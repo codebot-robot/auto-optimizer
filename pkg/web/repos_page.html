@@ -1,0 +1,48 @@
+{{define "content"}}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Repositories</h1>
+    <p class="page-subtitle">Track, inspect, and monitor registered repositories</p>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Registered Repositories</h2>
+  {{if .Repos}}
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Repository</th>
+          <th>Default Branch</th>
+          <th>Forge</th>
+          <th>Goals</th>
+          <th>Last Change</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Repos}}
+        <tr>
+          <td><a href="/repos/{{.Repo.Host}}/{{.Repo.Owner}}/{{.Repo.Name}}"><strong>{{.Repo.Host}}/{{.Repo.Owner}}/{{.Repo.Name}}</strong></a></td>
+          <td><code>{{.Repo.DefaultBranch}}</code></td>
+          <td><span class="meta-badge">{{.Repo.ForgeKind}}</span></td>
+          <td>{{.GoalCount}}</td>
+          <td>
+            {{if not .Repo.LastChangeTime.IsZero}}
+              {{formatTime .Repo.LastChangeTime}}
+            {{else}}
+              <span class="text-muted">-</span>
+            {{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <p>No registered repositories found.</p>
+  </div>
+  {{end}}
+</div>
+{{end}}

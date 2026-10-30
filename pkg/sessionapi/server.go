@@ -40,6 +40,7 @@ var ErrBusy = errors.New("session is busy")
 // SessionSummary summarizes an agent session for in-process consumers such as the web UI.
 type SessionSummary struct {
 	Name         string
+	RunID        string
 	Toolset      string
 	Parent       string
 	CreatedAt    time.Time
@@ -585,6 +586,11 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 		return nil, fmt.Errorf("listing sessions: %w", err)
 	}
 
+	sessionRuns, err := s.sessionRunsMap(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -594,8 +600,13 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 		if act, ok := s.activeSessions[sum.Name]; ok {
 			msgCount = len(act.Messages())
 		}
+		var runID string
+		if sessionRuns != nil {
+			runID = sessionRuns[sum.Name]
+		}
 		result = append(result, SessionSummary{
 			Name:         sum.Name,
+			RunID:        runID,
 			Toolset:      sum.Metadata.Toolset,
 			Parent:       sum.Metadata.Parent,
 			CreatedAt:    sum.Metadata.CreatedAt,
@@ -609,6 +620,29 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 	})
 
 	return result, nil
+}
+
+func (s *Server) sessionRunsMap(ctx context.Context) (map[string]string, error) {
+	if s.stateStore == nil {
+		return nil, nil
+	}
+	repos, err := s.stateStore.ListRepos(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing repos for session runs: %w", err)
+	}
+	sessionRuns := make(map[string]string)
+	for _, r := range repos {
+		runs, err := s.stateStore.ListRuns(ctx, r.Key())
+		if err != nil {
+			return nil, fmt.Errorf("listing runs for repo %v: %w", r.Key(), err)
+		}
+		for _, run := range runs {
+			if run.SessionID != "" {
+				sessionRuns[run.SessionID] = run.ID
+			}
+		}
+	}
+	return sessionRuns, nil
 }
 
 // GetSessionDetail returns full metadata and messages for a given session.
@@ -661,9 +695,19 @@ func (s *Server) GetSessionDetail(ctx context.Context, name string) (*SessionDet
 		})
 	}
 
+	sessionRuns, err := s.sessionRunsMap(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var runID string
+	if sessionRuns != nil {
+		runID = sessionRuns[name]
+	}
+
 	return &SessionDetail{
 		Summary: SessionSummary{
 			Name:         name,
+			RunID:        runID,
 			Toolset:      meta.Toolset,
 			Parent:       meta.Parent,
 			CreatedAt:    meta.CreatedAt,

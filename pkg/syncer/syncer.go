@@ -226,6 +226,7 @@ func (s *Syncer) SyncRepo(ctx context.Context, repo *state.Repo) error {
 
 	// Update head commit in repo.json
 	repo.HeadCommit = headCommit
+	repo.LastChangeTime = time.Now().UTC()
 	if err := s.store.PutRepo(ctx, repo); err != nil {
 		return fmt.Errorf("updating repo head commit: %w", err)
 	}

@@ -24,7 +24,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
 var update = flag.Bool("update", false, "update golden files")
@@ -284,5 +286,190 @@ func TestGoldenFiles(t *testing.T) {
 			t.Fatalf("RenderConflictPage: %v", err)
 		}
 		assertGolden(t, "conflict.golden.html", rec.Body.String())
+	})
+
+	t.Run("repos_zero", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		data := ReposPageData{}
+		if err := RenderReposPage(ctx, rec, data); err != nil {
+			t.Fatalf("RenderReposPage: %v", err)
+		}
+		assertGolden(t, "repos_zero.golden.html", rec.Body.String())
+	})
+
+	t.Run("repos_list", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		data := ReposPageData{
+			Repos: []RepoEntry{
+				{
+					Repo: &state.Repo{
+						URL:            "https://github.com/gke-labs/auto-optimizer",
+						Host:           "github.com",
+						Owner:          "gke-labs",
+						Name:           "auto-optimizer",
+						DefaultBranch:  "main",
+						ForgeKind:      "github",
+						RegisteredTime: fixedTime,
+						LastChangeTime: fixedTime.Add(2 * time.Hour),
+					},
+					GoalCount: 2,
+				},
+				{
+					Repo: &state.Repo{
+						URL:            "https://github.com/example/demo-service",
+						Host:           "github.com",
+						Owner:          "example",
+						Name:           "demo-service",
+						DefaultBranch:  "master",
+						ForgeKind:      "gitremote",
+						RegisteredTime: fixedTime,
+					},
+					GoalCount: 0,
+				},
+			},
+		}
+		if err := RenderReposPage(ctx, rec, data); err != nil {
+			t.Fatalf("RenderReposPage: %v", err)
+		}
+		assertGolden(t, "repos_list.golden.html", rec.Body.String())
+	})
+
+	t.Run("repo_detail", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		repo := &state.Repo{
+			URL:            "https://github.com/gke-labs/auto-optimizer",
+			Host:           "github.com",
+			Owner:          "gke-labs",
+			Name:           "auto-optimizer",
+			DefaultBranch:  "main",
+			HeadCommit:     "abcdef1234567890",
+			ForgeKind:      "github",
+			RegisteredTime: fixedTime,
+			LastChangeTime: fixedTime.Add(2 * time.Hour),
+		}
+		data := RepoPageData{
+			Repo: repo,
+			Goals: []GoalEntry{
+				{
+					Record: &state.GoalRecord{
+						Goal: &goals.Goal{
+							Name: "throughput",
+						},
+						Hash:       "1122334455667788",
+						BaseCommit: "abcdef1234567890",
+						LastRunID:  "20261024T140000Z-abcd",
+					},
+					LatestPhase: state.PhaseWorking,
+				},
+				{
+					Record: &state.GoalRecord{
+						Goal: &goals.Goal{
+							Name: "cleanup",
+						},
+						Hash:       "8877665544332211",
+						BaseCommit: "abcdef1234567890",
+					},
+				},
+			},
+			RecentRuns: []*state.Run{
+				{
+					ID:         "20261024T140000Z-abcd",
+					Repo:       repo.Key(),
+					GoalName:   "throughput",
+					Phase:      state.PhaseWorking,
+					BaseCommit: "abcdef1234567890",
+					Branch:     "ao/throughput/run-1",
+					PRURL:      "https://github.com/gke-labs/auto-optimizer/pull/10",
+					SessionID:  "sess-run-10",
+				},
+			},
+		}
+		if err := RenderRepoPage(ctx, rec, data); err != nil {
+			t.Fatalf("RenderRepoPage: %v", err)
+		}
+		assertGolden(t, "repo_detail.golden.html", rec.Body.String())
+	})
+
+	t.Run("run_active", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		baseline := 100.0
+		candidate := 85.5
+		data := RunPageData{
+			Run: &state.Run{
+				ID: "20261024T140000Z-abcd",
+				Repo: state.RepoKey{
+					Host:  "github.com",
+					Owner: "gke-labs",
+					Name:  "auto-optimizer",
+				},
+				GoalName:   "throughput",
+				Phase:      state.PhaseWorking,
+				BaseCommit: "abcdef1234567890",
+				Branch:     "ao/throughput/run-1",
+				PRURL:      "https://github.com/gke-labs/auto-optimizer/pull/10",
+				SessionID:  "sess-run-10",
+				Baseline:   &baseline,
+				Candidate:  &candidate,
+				CostUSD:    0.0125,
+				Goal: &goals.Goal{
+					Name:     "throughput",
+					Schedule: "on-change",
+					Verify:   "make test",
+					Body:     "# Throughput\nIncrease request throughput by 10%.\n",
+				},
+			},
+			Events: []state.Event{
+				{
+					Time:    fixedTime,
+					Phase:   state.PhasePreparing,
+					Kind:    "clone",
+					Message: "Cloning repository",
+				},
+				{
+					Time:    fixedTime.Add(1 * time.Minute),
+					Phase:   state.PhaseWorking,
+					Kind:    "session_start",
+					Message: "Agent session started",
+				},
+			},
+		}
+		if err := RenderRunPage(ctx, rec, data); err != nil {
+			t.Fatalf("RenderRunPage: %v", err)
+		}
+		assertGolden(t, "run_active.golden.html", rec.Body.String())
+	})
+
+	t.Run("run_terminal", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		data := RunPageData{
+			Run: &state.Run{
+				ID: "20261024T150000Z-fail",
+				Repo: state.RepoKey{
+					Host:  "github.com",
+					Owner: "gke-labs",
+					Name:  "auto-optimizer",
+				},
+				GoalName: "throughput",
+				Phase:    state.PhaseFailed,
+				Error:    "evaluation script failed: exit status 1",
+			},
+			Events: []state.Event{
+				{
+					Time:    fixedTime,
+					Phase:   state.PhasePreparing,
+					Kind:    "clone",
+					Message: "Cloning repository",
+				},
+				{
+					Time:  fixedTime.Add(2 * time.Minute),
+					Phase: state.PhaseFailed,
+					Error: "evaluation script failed: exit status 1",
+				},
+			},
+		}
+		if err := RenderRunPage(ctx, rec, data); err != nil {
+			t.Fatalf("RenderRunPage: %v", err)
+		}
+		assertGolden(t, "run_terminal.golden.html", rec.Body.String())
 	})
 }

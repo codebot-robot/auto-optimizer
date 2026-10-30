@@ -28,9 +28,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
 )
@@ -107,7 +109,7 @@ func setupTestWebServer(t *testing.T, sb tools.Sandbox) (*httptest.Server, *sess
 		t.Fatalf("sessionapi.NewServer: %v", err)
 	}
 
-	webServer, err := NewServer(srv)
+	webServer, err := NewServer(srv, nil)
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -562,7 +564,7 @@ func TestTranscriptTruncation_UTF8(t *testing.T) {
 		},
 	}
 
-	webServer, err := NewServer(fakeSvc)
+	webServer, err := NewServer(fakeSvc, nil)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -615,5 +617,241 @@ func TestTranscriptTruncation_UTF8(t *testing.T) {
 	}
 	if !strings.Contains(fullBody, `href="/sessions/utf8-session"`) {
 		t.Errorf("expected 'show less' link in full body")
+	}
+}
+
+func TestServer_ReposAndRuns(t *testing.T) {
+	ctx := t.Context()
+	stateDir := t.TempDir()
+
+	sessStore := session.NewFileStore(stateDir)
+	stateStore := state.NewFileStore(stateDir)
+
+	llmClient, err := llm.NewFromEnv("fake-eliza")
+	if err != nil {
+		t.Fatalf("llm.NewFromEnv: %v", err)
+	}
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.ToolTimeout = session.DefaultToolTimeout
+	toolset, err := toolsets.Get("basic")
+	if err != nil {
+		t.Fatalf("toolsets.Get: %v", err)
+	}
+	toolset.RegisterTools(toolsRegistry)
+
+	var opts session.RunOptions
+	opts.InitDefaults()
+	opts.ModelName = "fake-eliza"
+	opts.SystemPrompt = toolset.SystemPrompt()
+	harness := session.NewHarness(llmClient, nil, toolsRegistry, opts)
+
+	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
+		Store:          sessStore,
+		StateStore:     stateStore,
+		DefaultToolset: "basic",
+		Harness:        harness,
+	})
+	if err != nil {
+		t.Fatalf("sessionapi.NewServer: %v", err)
+	}
+
+	webServer, err := NewServer(srv, stateStore)
+	if err != nil {
+		t.Fatalf("web.NewServer: %v", err)
+	}
+
+	ts := httptest.NewServer(webServer)
+	t.Cleanup(ts.Close)
+
+	client := ts.Client()
+
+	// 1. Populate state with a repository, a goal, a run, events, and a session
+	repoKey := state.RepoKey{
+		Host:  "github.com",
+		Owner: "gke-labs",
+		Name:  "auto-optimizer",
+	}
+	syncTime := time.Date(2026, 10, 29, 14, 0, 0, 0, time.UTC)
+	repo := &state.Repo{
+		URL:            "https://github.com/gke-labs/auto-optimizer",
+		Host:           repoKey.Host,
+		Owner:          repoKey.Owner,
+		Name:           repoKey.Name,
+		DefaultBranch:  "main",
+		HeadCommit:     "commit-head-123456",
+		ForgeKind:      "github",
+		RegisteredTime: time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC),
+		LastChangeTime: syncTime,
+	}
+	if err := stateStore.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261029T140000Z-0001"
+	sessionID := "sessrun1"
+
+	goalRec := &state.GoalRecord{
+		Goal: &goals.Goal{
+			Name:     "latency-reduction",
+			Schedule: "on-change",
+			Body:     "# Latency Reduction\nReduce p99 latency by 20%.\n",
+		},
+		Hash:       "goal-hash-9999",
+		BaseCommit: "commit-head-123456",
+		LastRunID:  runID,
+	}
+	if err := stateStore.PutGoal(ctx, repoKey, goalRec); err != nil {
+		t.Fatalf("PutGoal: %v", err)
+	}
+
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repoKey,
+		GoalName:   "latency-reduction",
+		Phase:      state.PhaseWorking,
+		BaseCommit: "commit-head-123456",
+		Branch:     "ao/latency-reduction/run-1",
+		PRURL:      "https://github.com/gke-labs/auto-optimizer/pull/99",
+		SessionID:  sessionID,
+		Goal:       goalRec.Goal,
+	}
+	if err := stateStore.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	if err := stateStore.AppendEvent(ctx, repoKey, runID,
+		state.Event{
+			Time:    syncTime,
+			Phase:   state.PhasePreparing,
+			Kind:    "clone",
+			Message: "Cloning repository",
+		},
+		state.Event{
+			Time:    syncTime.Add(30 * time.Second),
+			Phase:   state.PhaseWorking,
+			Kind:    "session_start",
+			Message: "Session initiated",
+		},
+	); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	// Create session linked to the run
+	if err := srv.CreateNewSession(ctx, sessionID, "basic"); err != nil {
+		t.Fatalf("CreateNewSession: %v", err)
+	}
+
+	// 2. Test GET /repos
+	resp, err := client.Get(ts.URL + "/repos")
+	if err != nil {
+		t.Fatalf("GET /repos: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /repos status = %d, want 200", resp.StatusCode)
+	}
+	bodyStr := string(body)
+	for _, want := range []string{
+		"github.com/gke-labs/auto-optimizer",
+		"main",
+		"github",
+		"2026-10-29 14:00:00 UTC",
+	} {
+		if !strings.Contains(bodyStr, want) {
+			t.Errorf("GET /repos missing expected substring %q", want)
+		}
+	}
+
+	// 3. Test GET /repos/github.com/gke-labs/auto-optimizer
+	resp, err = client.Get(ts.URL + "/repos/github.com/gke-labs/auto-optimizer")
+	if err != nil {
+		t.Fatalf("GET /repos/...: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /repos/... status = %d, want 200", resp.StatusCode)
+	}
+	bodyStr = string(body)
+	for _, want := range []string{
+		"latency-reduction",
+		"Working",
+		runID,
+		"commit-head-123456",
+		"ao/latency-reduction/run-1",
+		"https://github.com/gke-labs/auto-optimizer/pull/99",
+	} {
+		if !strings.Contains(bodyStr, want) {
+			t.Errorf("GET /repos/... missing expected substring %q", want)
+		}
+	}
+
+	// 4. Test GET /repos/missing/repo/here returns 404
+	resp, err = client.Get(ts.URL + "/repos/missing/repo/here")
+	if err != nil {
+		t.Fatalf("GET /repos/missing/repo/here: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for missing repo, got %d", resp.StatusCode)
+	}
+
+	// 5. Test GET /runs/<runID>
+	resp, err = client.Get(ts.URL + "/runs/" + runID)
+	if err != nil {
+		t.Fatalf("GET /runs/<runID>: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /runs/... status = %d, want 200", resp.StatusCode)
+	}
+	bodyStr = string(body)
+	for _, want := range []string{
+		"Run: " + runID,
+		"Working",
+		"Cloning repository",
+		"Session initiated",
+		"ao/latency-reduction/run-1",
+		"https://github.com/gke-labs/auto-optimizer/pull/99",
+		"/sessions/" + sessionID,
+		"Reduce p99 latency by 20%.",
+		"<meta http-equiv=\"refresh\" content=\"2\">",
+	} {
+		if !strings.Contains(bodyStr, want) {
+			t.Errorf("GET /runs/... missing expected substring %q", want)
+		}
+	}
+
+	// 6. Test GET /runs/missing-id returns 404
+	resp, err = client.Get(ts.URL + "/runs/20261029T000000Z-9999")
+	if err != nil {
+		t.Fatalf("GET /runs/missing: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for missing run, got %d", resp.StatusCode)
+	}
+
+	// 7. Test GET / (session list page shows run next to session)
+	resp, err = client.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET / status = %d, want 200", resp.StatusCode)
+	}
+	bodyStr = string(body)
+	if !strings.Contains(bodyStr, sessionID) {
+		t.Errorf("expected session list to contain session ID %q", sessionID)
+	}
+	if !strings.Contains(bodyStr, `/runs/`+runID) {
+		t.Errorf("expected session list to link to run /runs/%s, got:\n%s", runID, bodyStr)
+	}
+	if !strings.Contains(bodyStr, `href="/repos"`) {
+		t.Errorf("expected session list to link to /repos, got:\n%s", bodyStr)
 	}
 }

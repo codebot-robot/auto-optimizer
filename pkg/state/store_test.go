@@ -295,6 +295,73 @@ func TestRun_PutGetList(t *testing.T) {
 	}
 }
 
+func TestRun_FindRun(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := NewFileStore(storeDir)
+
+	// Empty ID returns error
+	if _, err := store.FindRun(ctx, ""); err == nil {
+		t.Error("expected error for empty run ID")
+	}
+
+	// Missing run in empty store
+	if _, err := store.FindRun(ctx, "missing-id"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound for missing run, got %v", err)
+	}
+
+	// Create two repos
+	r1 := &Repo{
+		URL:            "https://github.com/gke-labs/repo-a",
+		Host:           "github.com",
+		Owner:          "gke-labs",
+		Name:           "repo-a",
+		DefaultBranch:  "main",
+		ForgeKind:      "github",
+		RegisteredTime: time.Now(),
+	}
+	r2 := &Repo{
+		URL:            "https://github.com/gke-labs/repo-b",
+		Host:           "github.com",
+		Owner:          "gke-labs",
+		Name:           "repo-b",
+		DefaultBranch:  "main",
+		ForgeKind:      "github",
+		RegisteredTime: time.Now(),
+	}
+	if err := store.PutRepo(ctx, r1); err != nil {
+		t.Fatalf("PutRepo(r1): %v", err)
+	}
+	if err := store.PutRepo(ctx, r2); err != nil {
+		t.Fatalf("PutRepo(r2): %v", err)
+	}
+
+	// Add run to repo-b
+	runB := &Run{
+		ID:       "20261023T150000Z-9999",
+		Repo:     r2.Key(),
+		GoalName: "perf",
+		Phase:    PhaseWorking,
+	}
+	if err := store.PutRun(ctx, runB); err != nil {
+		t.Fatalf("PutRun(runB): %v", err)
+	}
+
+	// Find runB across repos
+	found, err := store.FindRun(ctx, runB.ID)
+	if err != nil {
+		t.Fatalf("FindRun(%s) failed: %v", runB.ID, err)
+	}
+	if diff := cmp.Diff(runB, found); diff != "" {
+		t.Errorf("FindRun mismatch (-want +got):\n%s", diff)
+	}
+
+	// Missing run in non-empty store
+	if _, err := store.FindRun(ctx, "20261023T000000Z-0000"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got %v", err)
+	}
+}
+
 func TestEvents_AppendAndRead(t *testing.T) {
 	ctx := t.Context()
 	storeDir := t.TempDir()
