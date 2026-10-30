@@ -266,7 +266,7 @@ func (g *GitRemote) FetchTree(ctx context.Context, repoURL string, commit string
 		if err != nil {
 			return nil, fmt.Errorf("reading tree files: %w", err)
 		}
-		return NewTreeFS(files), nil
+		return NewInMemoryFS(files), nil
 	}
 
 	subTree, err := tree.Tree(cleanPrefix)
@@ -282,7 +282,7 @@ func (g *GitRemote) FetchTree(ctx context.Context, repoURL string, commit string
 		if err != nil {
 			return nil, fmt.Errorf("reading tree files under %s: %w", cleanPrefix, err)
 		}
-		return NewTreeFS(files), nil
+		return NewInMemoryFS(files), nil
 	}
 
 	if !errors.Is(err, object.ErrDirectoryNotFound) && !errors.Is(err, object.ErrEntryNotFound) {
@@ -296,13 +296,13 @@ func (g *GitRemote) FetchTree(ctx context.Context, repoURL string, commit string
 			return nil, fmt.Errorf("reading file %s: %w", cleanPrefix, err)
 		}
 		files[cleanPrefix] = []byte(contents)
-		return NewTreeFS(files), nil
+		return NewInMemoryFS(files), nil
 	}
 	if !errors.Is(fileErr, object.ErrFileNotFound) && !errors.Is(fileErr, object.ErrEntryNotFound) {
 		return nil, fmt.Errorf("finding file %s: %w", cleanPrefix, fileErr)
 	}
 
-	return NewTreeFS(files), nil
+	return NewInMemoryFS(files), nil
 }
 
 type pktType int

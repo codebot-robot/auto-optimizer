@@ -139,15 +139,15 @@ func (e *RateLimitFloorError) Is(target error) bool {
 	return target == ErrRateLimitExceeded
 }
 
-// TreeFS is an in-memory implementation of fs.FS, fs.ReadDirFS, fs.ReadFileFS, and fs.StatFS.
-type TreeFS struct {
+// InMemoryFS is an in-memory implementation of fs.FS, fs.ReadDirFS, fs.ReadFileFS, and fs.StatFS.
+type InMemoryFS struct {
 	files map[string][]byte
 	dirs  map[string]map[string]bool
 }
 
-// NewTreeFS creates a new TreeFS from a map of relative file paths to their byte contents.
-func NewTreeFS(files map[string][]byte) *TreeFS {
-	t := &TreeFS{
+// NewInMemoryFS creates a new InMemoryFS from a map of relative file paths to their byte contents.
+func NewInMemoryFS(files map[string][]byte) *InMemoryFS {
+	m := &InMemoryFS{
 		files: make(map[string][]byte, len(files)),
 		dirs:  make(map[string]map[string]bool),
 	}
@@ -157,16 +157,16 @@ func NewTreeFS(files map[string][]byte) *TreeFS {
 		if clean == "." || clean == "" {
 			continue
 		}
-		t.files[clean] = data
+		m.files[clean] = data
 
 		// Populate parent directories
 		dir := path.Dir(clean)
 		base := path.Base(clean)
 		for {
-			if t.dirs[dir] == nil {
-				t.dirs[dir] = make(map[string]bool)
+			if m.dirs[dir] == nil {
+				m.dirs[dir] = make(map[string]bool)
 			}
-			t.dirs[dir][base] = true
+			m.dirs[dir][base] = true
 			if dir == "." {
 				break
 			}
@@ -175,17 +175,17 @@ func NewTreeFS(files map[string][]byte) *TreeFS {
 		}
 	}
 
-	return t
+	return m
 }
 
 // Open opens the named file or directory.
-func (t *TreeFS) Open(name string) (fs.File, error) {
+func (m *InMemoryFS) Open(name string) (fs.File, error) {
 	if !fs.ValidPath(name) {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
 	}
 	clean := name
 
-	if data, ok := t.files[clean]; ok {
+	if data, ok := m.files[clean]; ok {
 		return &memFile{
 			name:   path.Base(clean),
 			reader: bytes.NewReader(data),
@@ -193,8 +193,8 @@ func (t *TreeFS) Open(name string) (fs.File, error) {
 		}, nil
 	}
 
-	if clean == "." || t.dirs[clean] != nil {
-		entries, err := t.ReadDir(clean)
+	if clean == "." || m.dirs[clean] != nil {
+		entries, err := m.ReadDir(clean)
 		if err != nil {
 			return nil, err
 		}
@@ -208,12 +208,12 @@ func (t *TreeFS) Open(name string) (fs.File, error) {
 }
 
 // ReadDir returns the contents of the directory.
-func (t *TreeFS) ReadDir(name string) ([]fs.DirEntry, error) {
+func (m *InMemoryFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	if !fs.ValidPath(name) {
 		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrInvalid}
 	}
 	clean := name
-	children := t.dirs[clean]
+	children := m.dirs[clean]
 	if children == nil && clean != "." {
 		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
 	}
@@ -227,11 +227,11 @@ func (t *TreeFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	var entries []fs.DirEntry
 	for _, n := range names {
 		childPath := path.Join(clean, n)
-		if _, isFile := t.files[childPath]; isFile {
+		if _, isFile := m.files[childPath]; isFile {
 			entries = append(entries, &memDirEntry{
 				name:  n,
 				isDir: false,
-				size:  int64(len(t.files[childPath])),
+				size:  int64(len(m.files[childPath])),
 			})
 		} else {
 			entries = append(entries, &memDirEntry{
@@ -245,12 +245,12 @@ func (t *TreeFS) ReadDir(name string) ([]fs.DirEntry, error) {
 }
 
 // ReadFile returns the contents of the named file.
-func (t *TreeFS) ReadFile(name string) ([]byte, error) {
+func (m *InMemoryFS) ReadFile(name string) ([]byte, error) {
 	if !fs.ValidPath(name) {
 		return nil, &fs.PathError{Op: "readfile", Path: name, Err: fs.ErrInvalid}
 	}
 	clean := name
-	data, ok := t.files[clean]
+	data, ok := m.files[clean]
 	if !ok {
 		return nil, &fs.PathError{Op: "readfile", Path: name, Err: fs.ErrNotExist}
 	}
@@ -260,19 +260,19 @@ func (t *TreeFS) ReadFile(name string) ([]byte, error) {
 }
 
 // Stat returns the FileInfo for the named file or directory.
-func (t *TreeFS) Stat(name string) (fs.FileInfo, error) {
+func (m *InMemoryFS) Stat(name string) (fs.FileInfo, error) {
 	if !fs.ValidPath(name) {
 		return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrInvalid}
 	}
 	clean := name
-	if data, ok := t.files[clean]; ok {
+	if data, ok := m.files[clean]; ok {
 		return &memFileInfo{
 			name: path.Base(clean),
 			size: int64(len(data)),
 			mode: 0644,
 		}, nil
 	}
-	if clean == "." || t.dirs[clean] != nil {
+	if clean == "." || m.dirs[clean] != nil {
 		return &memFileInfo{
 			name: path.Base(clean),
 			mode: fs.ModeDir | 0755,

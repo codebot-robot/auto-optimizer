@@ -124,7 +124,7 @@ func (f *FakeForge) FetchTree(ctx context.Context, repoURL string, commit string
 		filtered[p] = fileBytes
 	}
 
-	return NewTreeFS(filtered), nil
+	return NewInMemoryFS(filtered), nil
 }
 
 // RequestedBlobs returns a slice of paths for all blobs requested via FetchTree.
