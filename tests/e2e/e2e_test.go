@@ -331,15 +331,6 @@ func TestSession(t *testing.T) {
 		t.Errorf("expected sandbox pod logs to show sandboxd, got:\n%s", podLogs)
 	}
 
-	// Verify bearer token secret was stored in the control plane's namespace (ao-system)
-	secretToken, err := subH.Kubectl("get", "secret", "-n", "ao-system", fmt.Sprintf("sandbox-token-%s", sessionName), "-o", "jsonpath={.data.token}")
-	if err != nil {
-		t.Errorf("failed to get bearer token secret in ao-system: %v", err)
-	}
-	if strings.TrimSpace(secretToken) == "" {
-		t.Errorf("expected bearer token secret to contain data.token")
-	}
-
 	// Verify control plane RBAC does NOT include pods/exec or pods/portforward
 	canExec, err := subH.Kubectl("auth", "can-i", "create", "pods", "--subresource=exec", "--as=system:serviceaccount:ao-system:ao", "-n", "ao-sandboxes")
 	if err != nil && !strings.Contains(canExec, "no") {

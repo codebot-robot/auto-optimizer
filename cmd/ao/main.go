@@ -181,6 +181,12 @@ func runSession(ctx context.Context, flags sessionRunFlags) error {
 	opts.StateDir = stateDir
 	opts.SystemPrompt = toolset.SystemPrompt()
 
+	signingKey, err := session.LoadOrGenerateSigningKey(filepath.Join(stateDir, "sandbox-signing-key"))
+	if err != nil {
+		return fmt.Errorf("loading sandbox signing key: %w", err)
+	}
+	opts.SigningKey = signingKey
+
 	image := flags.image
 	if image == "" {
 		image = toolset.DefaultImage()

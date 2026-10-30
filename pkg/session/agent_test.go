@@ -15,7 +15,11 @@
 package session
 
 import (
+	"crypto/ed25519"
+	cryptorand "crypto/rand"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -547,5 +551,121 @@ func TestWaitForReady_FailsFast_InitContainer_ImagePullBackOff(t *testing.T) {
 	}
 	if !strings.Contains(errMsg, "ImagePullBackOff") {
 		t.Errorf("expected error to contain 'ImagePullBackOff', got: %s", errMsg)
+	}
+}
+
+func TestCreateSandbox_AsymmetricAuth_NoSecret(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+	sbName := "test-session-123"
+	cpNamespace := "ao-system"
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+
+	client := &SandboxClient{
+		agentsClient: agentsCS,
+		coreClient:   coreCS.CoreV1(),
+		sandboxes:    make(map[types.NamespacedName]*Sandbox),
+	}
+
+	pub, priv, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	opts := RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: cpNamespace,
+		SigningKey:            priv,
+	}
+
+	harness := NewHarness(nil, client, nil, opts)
+
+	sess := &Session{
+		Name:      sbName,
+		client:    client,
+		sandboxID: types.NamespacedName{Namespace: ns, Name: sbName},
+	}
+
+	sb, err := harness.CreateSandbox(ctx, sess)
+	if err != nil {
+		t.Fatalf("CreateSandbox failed: %v", err)
+	}
+
+	if !sb.created {
+		t.Error("expected sb.created to be true")
+	}
+	if len(sb.signingKey) == 0 {
+		t.Error("expected sb.signingKey to be set")
+	}
+	wantAudience := fmt.Sprintf("%s/%s", ns, sbName)
+	if sb.audience != wantAudience {
+		t.Errorf("sb.audience = %q, want %q", sb.audience, wantAudience)
+	}
+
+	// 1. Verify Sandbox resource in fake agents client has --auth-public-key and --auth-audience
+	createdSB, err := agentsCS.AgentsV1beta1().Sandboxes(ns).Get(ctx, sbName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get created Sandbox from fake clientset: %v", err)
+	}
+
+	var sandboxContainer *corev1.Container
+	for i := range createdSB.Spec.PodTemplate.Spec.Containers {
+		c := &createdSB.Spec.PodTemplate.Spec.Containers[i]
+		if c.Name == "sandbox" {
+			sandboxContainer = c
+			break
+		}
+	}
+	if sandboxContainer == nil {
+		t.Fatal("sandbox container not found in pod template")
+	}
+
+	cmdJoined := strings.Join(sandboxContainer.Command, " ")
+	wantPubKeyArg := fmt.Sprintf("--auth-public-key=%s", base64.StdEncoding.EncodeToString(pub))
+	wantAudArg := fmt.Sprintf("--auth-audience=%s", wantAudience)
+
+	if !strings.Contains(cmdJoined, wantPubKeyArg) {
+		t.Errorf("expected container command to contain %q, got: %s", wantPubKeyArg, cmdJoined)
+	}
+	if !strings.Contains(cmdJoined, wantAudArg) {
+		t.Errorf("expected container command to contain %q, got: %s", wantAudArg, cmdJoined)
+	}
+	if strings.Contains(cmdJoined, "--auth-token-sha256") {
+		t.Errorf("expected container command to NOT contain --auth-token-sha256, got: %s", cmdJoined)
+	}
+
+	// 2. Verify NO secrets were created in the control plane namespace
+	secrets, err := coreCS.CoreV1().Secrets(cpNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list secrets: %v", err)
+	}
+	if len(secrets.Items) != 0 {
+		t.Errorf("expected 0 secrets in %s, got %d", cpNamespace, len(secrets.Items))
+	}
+
+	// 3. Verify DeleteSandbox deletes the Sandbox and succeeds without secrets
+	if err := client.DeleteSandbox(ctx, sb); err != nil {
+		t.Fatalf("DeleteSandbox failed: %v", err)
+	}
+	_, err = agentsCS.AgentsV1beta1().Sandboxes(ns).Get(ctx, sbName, metav1.GetOptions{})
+	if err == nil {
+		t.Errorf("expected Sandbox to be deleted, but it still exists")
+	}
+}
+
+func TestCreateSandbox_MissingSigningKey_Fails(t *testing.T) {
+	ctx := t.Context()
+	harness := NewHarness(nil, &SandboxClient{}, nil, RunOptions{
+		ControlPlaneNamespace: "ao-system",
+	})
+	sess := &Session{
+		Name:      "test-sess",
+		sandboxID: types.NamespacedName{Namespace: "ns", Name: "test-sess"},
+	}
+	_, err := harness.CreateSandbox(ctx, sess)
+	if err == nil || !strings.Contains(err.Error(), "SigningKey must be configured in RunOptions") {
+		t.Fatalf("expected error mentioning SigningKey must be configured, got: %v", err)
 	}
 }
