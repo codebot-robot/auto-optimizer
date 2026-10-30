@@ -19,6 +19,7 @@ package forge
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -38,6 +39,71 @@ type Forge interface {
 
 	// DefaultBranch returns the default branch name of the remote repository (e.g. "main").
 	DefaultBranch(ctx context.Context, repoURL string) (string, error)
+}
+
+// ChangeRequestCreator creates and lists change requests / pull requests.
+type ChangeRequestCreator interface {
+	// OpenPullRequest opens a pull request on the forge repository.
+	OpenPullRequest(ctx context.Context, repoURL, head, base, title, body string) (*PullRequest, error)
+
+	// ListPullRequests lists pull requests for the repository, optionally filtering by head branch prefix.
+	ListPullRequests(ctx context.Context, repoURL, headPrefix string) ([]PullRequest, error)
+}
+
+// PushCredentialer provides credentials needed for control-plane git push operations.
+type PushCredentialer interface {
+	// PushCredentials returns username and password for pushing to repoURL.
+	PushCredentials(repoURL string) (username, password string)
+}
+
+// PullRequest represents a pull request or change request on a forge.
+type PullRequest struct {
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	Head   string `json:"head"`
+	Base   string `json:"base"`
+	URL    string `json:"url"`
+	State  string `json:"state"`
+}
+
+// ErrPullRequestExists is a sentinel error indicating that a pull request already exists.
+var ErrPullRequestExists = errors.New("pull request already exists")
+
+// PullRequestExistsError is returned when a pull request already exists for a head/base branch.
+type PullRequestExistsError struct {
+	Repo    string
+	Head    string
+	Base    string
+	Message string
+}
+
+func (e *PullRequestExistsError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("pull request already exists for %s (%s -> %s): %s", e.Repo, e.Head, e.Base, e.Message)
+	}
+	return fmt.Sprintf("pull request already exists for %s (%s -> %s)", e.Repo, e.Head, e.Base)
+}
+
+func (e *PullRequestExistsError) Is(target error) bool {
+	return target == ErrPullRequestExists
+}
+
+// ErrRateLimitExceeded is a sentinel error indicating that the forge rate limit floor was reached.
+var ErrRateLimitExceeded = errors.New("rate limit floor reached")
+
+// RateLimitFloorError is returned when remaining API rate limit is below the configured floor.
+type RateLimitFloorError struct {
+	Remaining int
+	Floor     int
+}
+
+func (e *RateLimitFloorError) Error() string {
+	return fmt.Sprintf("rate limit remaining (%d) is below floor (%d)", e.Remaining, e.Floor)
+}
+
+func (e *RateLimitFloorError) Is(target error) bool {
+	return target == ErrRateLimitExceeded
 }
 
 // TreeFS is an in-memory implementation of fs.FS, fs.ReadDirFS, fs.ReadFileFS, and fs.StatFS.

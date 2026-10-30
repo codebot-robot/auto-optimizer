@@ -23,15 +23,46 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/transport"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
 )
 
-// GitRemote implements Forge using go-git for ref advertisement and depth-1 in-memory fetches.
-type GitRemote struct{}
+// GitRemote implements Forge and PushCredentialer using go-git for ref advertisement and depth-1 in-memory fetches.
+type GitRemote struct {
+	username string
+	password string
+}
+
+var _ Forge = (*GitRemote)(nil)
+var _ PushCredentialer = (*GitRemote)(nil)
 
 // NewGitRemote creates a new GitRemote forge instance.
 func NewGitRemote() *GitRemote {
 	return &GitRemote{}
+}
+
+// NewGitRemoteWithCredentials creates a GitRemote forge instance with HTTP basic auth credentials.
+func NewGitRemoteWithCredentials(username, password string) *GitRemote {
+	return &GitRemote{
+		username: username,
+		password: password,
+	}
+}
+
+// PushCredentials returns the HTTP basic auth credentials configured for git operations.
+func (g *GitRemote) PushCredentials(repoURL string) (username, password string) {
+	return g.username, g.password
+}
+
+func (g *GitRemote) auth() transport.AuthMethod {
+	if g.username != "" || g.password != "" {
+		return &http.BasicAuth{
+			Username: g.username,
+			Password: g.password,
+		}
+	}
+	return nil
 }
 
 // ListRefs queries the remote repository's ref advertisement.
@@ -41,7 +72,9 @@ func (g *GitRemote) ListRefs(ctx context.Context, repoURL string) (map[string]st
 		URLs: []string{repoURL},
 	})
 
-	refs, err := rem.ListContext(ctx, &git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{
+		Auth: g.auth(),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("listing remote refs for %s: %w", repoURL, err)
 	}
@@ -73,7 +106,9 @@ func (g *GitRemote) DefaultBranch(ctx context.Context, repoURL string) (string, 
 		URLs: []string{repoURL},
 	})
 
-	refs, err := rem.ListContext(ctx, &git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{
+		Auth: g.auth(),
+	})
 	if err != nil {
 		return "", fmt.Errorf("querying default branch for %s: %w", repoURL, err)
 	}
@@ -96,6 +131,7 @@ func (g *GitRemote) FetchTree(ctx context.Context, repoURL string, commit string
 	r, err := git.CloneContext(ctx, storer, nil, &git.CloneOptions{
 		URL:   repoURL,
 		Depth: 1,
+		Auth:  g.auth(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cloning %s: %w", repoURL, err)
