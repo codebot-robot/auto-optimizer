@@ -71,6 +71,9 @@ type Store interface {
 	// GetRun retrieves a run record by repository key and run ID.
 	GetRun(ctx context.Context, key RepoKey, runID string) (*Run, error)
 
+	// FindRun searches across all registered repositories for a run by its ID.
+	FindRun(ctx context.Context, runID string) (*Run, error)
+
 	// ListRuns returns all runs for a repository sorted chronologically by run ID.
 	ListRuns(ctx context.Context, key RepoKey) ([]*Run, error)
 
@@ -517,6 +520,30 @@ func (s *FileStore) ListRuns(ctx context.Context, key RepoKey) ([]*Run, error) {
 	})
 
 	return runs, nil
+}
+
+// FindRun searches across all registered repositories for a run by its ID.
+func (s *FileStore) FindRun(ctx context.Context, runID string) (*Run, error) {
+	if runID == "" {
+		return nil, errors.New("run id cannot be empty")
+	}
+
+	repos, err := s.ListRepos(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing repositories to find run: %w", err)
+	}
+
+	for _, repo := range repos {
+		run, err := s.GetRun(ctx, repo.Key(), runID)
+		if err == nil {
+			return run, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+	}
+
+	return nil, fmt.Errorf("run %q: %w", runID, ErrNotFound)
 }
 
 // AppendEvent appends one or more events to events.jsonl.

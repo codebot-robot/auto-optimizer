@@ -49,6 +49,7 @@ type Repo struct {
 	HeadCommit     string    `json:"headCommit,omitempty"`
 	ForgeKind      string    `json:"forgeKind"`
 	RegisteredTime time.Time `json:"registeredTime"`
+	LastChangeTime time.Time `json:"lastChangeTime,omitempty"`
 }
 
 // Key returns the RepoKey corresponding to this repository.
