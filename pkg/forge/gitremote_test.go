@@ -140,12 +140,12 @@ func TestGitRemoteBareRepo(t *testing.T) {
 	t.Logf("Default branch: %s", branch)
 
 	// 3. FetchTree with prefix ".goals"
-	treeFS, err := client.FetchTree(ctx, bareDir, commitHex, ".goals")
+	inMemoryFS, err := client.FetchTree(ctx, bareDir, commitHex, ".goals")
 	if err != nil {
 		t.Fatalf("FetchTree: %v", err)
 	}
 
-	readBytes, err := fs.ReadFile(treeFS, ".goals/hello.md")
+	readBytes, err := fs.ReadFile(inMemoryFS, ".goals/hello.md")
 	if err != nil {
 		t.Fatalf("ReadFile from fetched tree: %v", err)
 	}
@@ -154,9 +154,9 @@ func TestGitRemoteBareRepo(t *testing.T) {
 		t.Errorf("file content mismatch: got %q, want %q", string(readBytes), string(goalContent))
 	}
 
-	// Files outside prefix must not be in treeFS
-	if _, err := fs.ReadFile(treeFS, "README.md"); err == nil {
-		t.Fatal("expected README.md to not exist in treeFS with .goals prefix, but it was found")
+	// Files outside prefix must not be in inMemoryFS
+	if _, err := fs.ReadFile(inMemoryFS, "README.md"); err == nil {
+		t.Fatal("expected README.md to not exist in inMemoryFS with .goals prefix, but it was found")
 	}
 
 	// FetchTree with empty prefix fetches full tree

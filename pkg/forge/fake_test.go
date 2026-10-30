@@ -78,12 +78,12 @@ func TestFakeForge(t *testing.T) {
 		"README.md":       []byte("Welcome\n"),
 	})
 
-	treeFS, err := f.FetchTree(ctx, repoURL, "commit-1", "")
+	inMemoryFS, err := f.FetchTree(ctx, repoURL, "commit-1", "")
 	if err != nil {
 		t.Fatalf("FetchTree: %v", err)
 	}
 
-	data, err := fs.ReadFile(treeFS, ".goals/hello.md")
+	data, err := fs.ReadFile(inMemoryFS, ".goals/hello.md")
 	if err != nil {
 		t.Fatalf("ReadFile .goals/hello.md: %v", err)
 	}
@@ -91,8 +91,8 @@ func TestFakeForge(t *testing.T) {
 		t.Errorf("unexpected content: %q", string(data))
 	}
 
-	// Run fstest.TestFS to verify TreeFS implements standard fs.FS
-	if err := fstest.TestFS(treeFS, ".goals/hello.md", "README.md"); err != nil {
+	// Run fstest.TestFS to verify InMemoryFS implements standard fs.FS
+	if err := fstest.TestFS(inMemoryFS, ".goals/hello.md", "README.md"); err != nil {
 		t.Fatalf("TestFS: %v", err)
 	}
 

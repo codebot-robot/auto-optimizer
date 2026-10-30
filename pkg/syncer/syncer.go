@@ -165,12 +165,12 @@ func (s *Syncer) SyncRepo(ctx context.Context, repo *state.Repo) error {
 		return nil
 	}
 
-	treeFS, err := s.forge.FetchTree(ctx, repo.URL, headCommit, ".goals")
+	inMemoryFS, err := s.forge.FetchTree(ctx, repo.URL, headCommit, ".goals")
 	if err != nil {
 		return fmt.Errorf("fetching tree at commit %s: %w", headCommit, err)
 	}
 
-	discoveredGoals, err := goals.LoadDir(treeFS, ".goals")
+	discoveredGoals, err := goals.LoadDir(inMemoryFS, ".goals")
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("loading goals: %w", err)
 	}

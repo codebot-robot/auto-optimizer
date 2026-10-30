@@ -394,7 +394,7 @@ func TestForgeDelegation(t *testing.T) {
 			if prefix != ".goals" {
 				t.Errorf("expected prefix '.goals', got %q", prefix)
 			}
-			return forge.NewTreeFS(map[string][]byte{"file.txt": []byte("hi")}), nil
+			return forge.NewInMemoryFS(map[string][]byte{"file.txt": []byte("hi")}), nil
 		},
 		defaultBranchFunc: func(ctx context.Context, repoURL string) (string, error) {
 			defaultBranchCalled = true
