@@ -1,0 +1,4 @@
+---
+schedule: hourly
+---
+# Invalid Schedule
