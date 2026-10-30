@@ -43,6 +43,9 @@ service SessionService {
 
   // ListGoals returns goals for a repository.
   rpc ListGoals(ListGoalsRequest) returns (ListGoalsResponse);
+
+  // ListRuns returns runs for a repository.
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
 }
 
 // Session carries session metadata and state summary.
@@ -185,5 +188,25 @@ message GoalRecord {
 
 message ListGoalsResponse {
   repeated GoalRecord goals = 1;
+}
+
+message ListRunsRequest {
+  string repo_url = 1;
+}
+
+message RunRecord {
+  string id = 1;
+  string repo_url = 2;
+  string goal_name = 3;
+  string phase = 4;
+  string base_commit = 5;
+  string branch = 6;
+  string pr_url = 7;
+  string session_id = 8;
+  string error = 9;
+}
+
+message ListRunsResponse {
+  repeated RunRecord runs = 1;
 }
 
