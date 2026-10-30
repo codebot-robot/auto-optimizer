@@ -17,6 +17,10 @@ package session
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	cryptorand "crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"net"
 	"strings"
 	"sync"
@@ -173,7 +177,7 @@ func (f *fakeProcessServer) SendSignal(ctx context.Context, req *processv1.SendS
 	return &processv1.SendSignalResponse{}, nil
 }
 
-func setupTestProcessClient(t *testing.T, srv *fakeProcessServer, authToken string) (*Sandbox, func()) {
+func setupTestProcessClient(t *testing.T, srv *fakeProcessServer, key ed25519.PrivateKey, aud string) (*Sandbox, func()) {
 	t.Helper()
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
@@ -190,14 +194,22 @@ func setupTestProcessClient(t *testing.T, srv *fakeProcessServer, authToken stri
 		}),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
-	if authToken != "" {
+	if len(key) > 0 {
 		dialOpts = append(dialOpts,
 			grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, callOpts ...grpc.CallOption) error {
-				ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+authToken)
+				token, err := MintSandboxToken(key, aud, 5*time.Minute)
+				if err != nil {
+					return err
+				}
+				ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 				return invoker(ctx, method, req, reply, cc, callOpts...)
 			}),
 			grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, callOpts ...grpc.CallOption) (grpc.ClientStream, error) {
-				ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+authToken)
+				token, err := MintSandboxToken(key, aud, 5*time.Minute)
+				if err != nil {
+					return nil, err
+				}
+				ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 				return streamer(ctx, desc, cc, method, callOpts...)
 			}),
 		)
@@ -209,7 +221,8 @@ func setupTestProcessClient(t *testing.T, srv *fakeProcessServer, authToken stri
 	}
 
 	sb := &Sandbox{
-		authToken:     authToken,
+		signingKey:    key,
+		audience:      aud,
 		grpcConn:      conn,
 		processClient: processv1.NewProcessServiceClient(conn),
 	}
@@ -224,6 +237,12 @@ func setupTestProcessClient(t *testing.T, srv *fakeProcessServer, authToken stri
 }
 
 func TestExecCommand_Execute_ShortCommand(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	aud := "ao-sandboxes/test-session-short"
+
 	srv := &fakeProcessServer{
 		executeResp: &processv1.ExecuteResponse{
 			ExitCode: 0,
@@ -231,7 +250,7 @@ func TestExecCommand_Execute_ShortCommand(t *testing.T) {
 			Stderr:   nil,
 		},
 	}
-	sb, cleanup := setupTestProcessClient(t, srv, "test-secret-token")
+	sb, cleanup := setupTestProcessClient(t, srv, priv, aud)
 	defer cleanup()
 
 	ctx := t.Context()
@@ -259,10 +278,33 @@ func TestExecCommand_Execute_ShortCommand(t *testing.T) {
 	if diff := cmp.Diff([]string{"uname", "-a"}, srv.executeCalls[0].GetConfig().GetCommand()); diff != "" {
 		t.Errorf("Execute command mismatch (-want +got):\n%s", diff)
 	}
-	// Verify bearer token was sent in authorization metadata header
+	// Verify bearer token was sent in authorization metadata header and verifies with public key
 	authHeader := srv.capturedMD.Get("authorization")
-	if len(authHeader) == 0 || authHeader[0] != "Bearer test-secret-token" {
-		t.Errorf("authorization header = %v, want [Bearer test-secret-token]", authHeader)
+	if len(authHeader) == 0 {
+		t.Fatal("missing authorization header")
+	}
+	rawToken := strings.TrimPrefix(authHeader[0], "Bearer ")
+	parts := strings.Split(rawToken, ".")
+	if len(parts) != 3 || parts[0] != "v1" {
+		t.Fatalf("unexpected token format: %s", rawToken)
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var payload SignedTokenPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.Aud != aud {
+		t.Errorf("payload.Aud = %q, want %q", payload.Aud, aud)
+	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		t.Fatalf("decode sig: %v", err)
+	}
+	if !ed25519.Verify(pub, payloadBytes, sigBytes) {
+		t.Error("signature verification failed")
 	}
 }
 
@@ -274,7 +316,7 @@ func TestExecCommand_Execute_NonZeroExit(t *testing.T) {
 			Stderr:   []byte("exit status 42\n"),
 		},
 	}
-	sb, cleanup := setupTestProcessClient(t, srv, "")
+	sb, cleanup := setupTestProcessClient(t, srv, nil, "")
 	defer cleanup()
 
 	res, err := sb.ExecCommand(t.Context(), tools.ExecCommandOptions{
@@ -295,6 +337,12 @@ func TestExecCommand_Execute_NonZeroExit(t *testing.T) {
 }
 
 func TestExecCommand_Start_StreamedOutput(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	aud := "ao-sandboxes/test-session-stream"
+
 	srv := &fakeProcessServer{
 		startPID: 4321,
 		startStdout: [][]byte{
@@ -306,7 +354,7 @@ func TestExecCommand_Start_StreamedOutput(t *testing.T) {
 		},
 		startExit: 0,
 	}
-	sb, cleanup := setupTestProcessClient(t, srv, "token-stream")
+	sb, cleanup := setupTestProcessClient(t, srv, priv, aud)
 	defer cleanup()
 
 	var stdoutBuf, stderrBuf bytes.Buffer
@@ -336,6 +384,33 @@ func TestExecCommand_Start_StreamedOutput(t *testing.T) {
 	if len(srv.startCalls) != 1 {
 		t.Fatalf("Start calls = %d, want 1", len(srv.startCalls))
 	}
+	authHeader := srv.capturedMD.Get("authorization")
+	if len(authHeader) == 0 {
+		t.Fatal("missing authorization header")
+	}
+	rawToken := strings.TrimPrefix(authHeader[0], "Bearer ")
+	parts := strings.Split(rawToken, ".")
+	if len(parts) != 3 || parts[0] != "v1" {
+		t.Fatalf("unexpected token format: %s", rawToken)
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var payload SignedTokenPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.Aud != aud {
+		t.Errorf("payload.Aud = %q, want %q", payload.Aud, aud)
+	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		t.Fatalf("decode sig: %v", err)
+	}
+	if !ed25519.Verify(pub, payloadBytes, sigBytes) {
+		t.Error("signature verification failed")
+	}
 }
 
 func TestExecCommand_Start_WithStdin(t *testing.T) {
@@ -347,7 +422,7 @@ func TestExecCommand_Start_WithStdin(t *testing.T) {
 		startExit:       0,
 		stdinReceivedCh: make(chan struct{}),
 	}
-	sb, cleanup := setupTestProcessClient(t, srv, "")
+	sb, cleanup := setupTestProcessClient(t, srv, nil, "")
 	defer cleanup()
 
 	stdinData := strings.NewReader("hello from stdin")
@@ -380,7 +455,7 @@ func TestExecCommand_Start_ContextCancellationDeliversSignal(t *testing.T) {
 		startBlockCh: make(chan struct{}),
 		startExit:    137, // SIGKILL
 	}
-	sb, cleanup := setupTestProcessClient(t, srv, "")
+	sb, cleanup := setupTestProcessClient(t, srv, nil, "")
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(t.Context())

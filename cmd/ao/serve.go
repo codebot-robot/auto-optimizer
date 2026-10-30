@@ -135,6 +135,12 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	baseOpts.ToolTimeout = flags.toolTimeout
 	baseOpts.StateDir = stateDir
 
+	signingKey, err := session.LoadOrGenerateSigningKey(filepath.Join(stateDir, "sandbox-signing-key"))
+	if err != nil {
+		return fmt.Errorf("loading sandbox signing key: %w", err)
+	}
+	baseOpts.SigningKey = signingKey
+
 	llmClient, err := llm.NewFromEnv(baseOpts.ModelName)
 	if err != nil {
 		return fmt.Errorf("initializing LLM client: %w", err)

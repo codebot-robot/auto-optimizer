@@ -27,6 +27,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/auto-optimizer/pkg/session"
 )
 
 func getSandboxdImage(t *testing.T, subH *Harness) string {
@@ -38,7 +40,7 @@ func getSandboxdImage(t *testing.T, subH *Harness) string {
 	if err == nil && strings.TrimSpace(out) != "" {
 		return strings.TrimSpace(out)
 	}
-	return "us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main"
+	return session.DefaultSandboxdImage
 }
 
 func TestSmoke(t *testing.T) {
@@ -265,9 +267,6 @@ func TestSession(t *testing.T) {
 		"--state-dir", stateDir,
 	)
 	runCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
-	if sbdImg := getSandboxdImage(t, subH); sbdImg != "" {
-		runCmd.Env = append(runCmd.Env, "SANDBOXD_IMAGE="+sbdImg)
-	}
 
 	var stdout, stderr bytes.Buffer
 	runCmd.Stdout = &stdout
@@ -313,6 +312,14 @@ func TestSession(t *testing.T) {
 	if initContainerName != "install-sandboxd" {
 		t.Errorf("expected initContainer 'install-sandboxd', got %q", initContainerName)
 	}
+	initContainerImage, err := subH.Kubectl("get", "pod", "-n", "ao-sandboxes", sessionName, "-o", "jsonpath={.spec.initContainers[0].image}")
+	if err != nil {
+		t.Fatalf("failed to get pod initContainer image: %v", err)
+	}
+	expectedSandboxdImage := getSandboxdImage(t, subH)
+	if initContainerImage != expectedSandboxdImage {
+		t.Errorf("expected initContainer image %q, got %q", expectedSandboxdImage, initContainerImage)
+	}
 
 	// Verify pod logs show sandboxd running
 	podLogs, err := subH.Kubectl("logs", "-n", "ao-sandboxes", sessionName, "-c", "sandbox")
@@ -322,15 +329,6 @@ func TestSession(t *testing.T) {
 	t.Logf("sandbox pod logs:\n%s", podLogs)
 	if !strings.Contains(podLogs, "sandboxd") {
 		t.Errorf("expected sandbox pod logs to show sandboxd, got:\n%s", podLogs)
-	}
-
-	// Verify bearer token secret was stored in the control plane's namespace (ao-system)
-	secretToken, err := subH.Kubectl("get", "secret", "-n", "ao-system", fmt.Sprintf("sandbox-token-%s", sessionName), "-o", "jsonpath={.data.token}")
-	if err != nil {
-		t.Errorf("failed to get bearer token secret in ao-system: %v", err)
-	}
-	if strings.TrimSpace(secretToken) == "" {
-		t.Errorf("expected bearer token secret to contain data.token")
 	}
 
 	// Verify control plane RBAC does NOT include pods/exec or pods/portforward
@@ -468,9 +466,6 @@ func TestSessionAPI(t *testing.T) {
 		"--state-dir", stateDir,
 	)
 	serveCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
-	if sbdImg := getSandboxdImage(t, subH); sbdImg != "" {
-		serveCmd.Env = append(serveCmd.Env, "SANDBOXD_IMAGE="+sbdImg)
-	}
 
 	var serveStdout, serveStderr bytes.Buffer
 	serveCmd.Stdout = &serveStdout
@@ -523,6 +518,15 @@ func TestSessionAPI(t *testing.T) {
 
 	if !strings.Contains(sendOutput, "Linux") {
 		t.Fatalf("expected output to contain 'Linux', got:\n%s", sendOutput)
+	}
+
+	initContainerImage, err := subH.Kubectl("get", "pod", "-n", "ao-sandboxes", sessionName, "-o", "jsonpath={.spec.initContainers[0].image}")
+	if err != nil {
+		t.Fatalf("failed to get pod initContainer image: %v", err)
+	}
+	expectedSandboxdImage := getSandboxdImage(t, subH)
+	if initContainerImage != expectedSandboxdImage {
+		t.Errorf("expected initContainer image %q, got %q", expectedSandboxdImage, initContainerImage)
 	}
 
 	// 2. ao session list --server <serverAddr>

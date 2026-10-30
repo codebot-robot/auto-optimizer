@@ -22,9 +22,8 @@ package session
 import (
 	"bytes"
 	"context"
-	cryptorand "crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -69,8 +68,9 @@ const SandboxInactivityTimeout = 5 * time.Minute
 // of blocking the agent loop indefinitely.
 const DefaultToolTimeout = 2 * time.Minute
 
-// DefaultSandboxdImage is the default container image containing the sandboxd binary, pinned by digest.
-const DefaultSandboxdImage = "us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main@sha256:576d312c8e4019a52e58e6adbd1bffb8964ad41ca7fa941cfe8a662c64dca85c"
+// DefaultSandboxdImage is the default container image containing the sandboxd binary.
+// It matches the image built and loaded into kind by dev/tasks/deploy-to-kube.
+const DefaultSandboxdImage = "auto-optimizer.local/sandboxd:dev"
 
 // SandboxClient is a simple low-level client for managing Sandbox resources directly.
 type SandboxClient struct {
@@ -197,7 +197,8 @@ type Sandbox struct {
 	podName string
 	podIP   string
 
-	authToken             string
+	signingKey            ed25519.PrivateKey
+	audience              string
 	controlPlaneNamespace string
 
 	// grpcMu guards gRPC connection and process client initialization
@@ -542,19 +543,6 @@ func (s *Sandbox) ensureClient(ctx context.Context) error {
 		return nil
 	}
 
-	// Retrieve auth token from Secret if not held in memory
-	if s.authToken == "" && s.session != nil && s.session.client != nil && s.session.client.coreClient != nil {
-		cpNamespace := s.controlPlaneNamespace
-		if cpNamespace == "" {
-			cpNamespace = "ao-system"
-		}
-		secretName := fmt.Sprintf("sandbox-token-%s", s.id.Name)
-		secret, err := s.session.client.coreClient.Secrets(cpNamespace).Get(ctx, secretName, metav1.GetOptions{})
-		if err == nil && len(secret.Data["token"]) > 0 {
-			s.authToken = string(secret.Data["token"])
-		}
-	}
-
 	target, stopFn, err := s.resolveTarget(ctx)
 	if err != nil {
 		return fmt.Errorf("resolving sandbox endpoint: %w", err)
@@ -566,14 +554,26 @@ func (s *Sandbox) ensureClient(ctx context.Context) error {
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(32*1024*1024)),
 	)
 
-	token := s.authToken
-	if token != "" {
+	if len(s.signingKey) > 0 {
+		key := s.signingKey
+		aud := s.audience
+		if aud == "" {
+			aud = fmt.Sprintf("%s/%s", s.id.Namespace, s.id.Name)
+		}
 		dialOpts = append(dialOpts,
 			grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, callOpts ...grpc.CallOption) error {
+				token, err := MintSandboxToken(key, aud, 5*time.Minute)
+				if err != nil {
+					return fmt.Errorf("signing sandboxd token: %w", err)
+				}
 				ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 				return invoker(ctx, method, req, reply, cc, callOpts...)
 			}),
 			grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, callOpts ...grpc.CallOption) (grpc.ClientStream, error) {
+				token, err := MintSandboxToken(key, aud, 5*time.Minute)
+				if err != nil {
+					return nil, fmt.Errorf("signing sandboxd token: %w", err)
+				}
 				ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 				return streamer(ctx, desc, cc, method, callOpts...)
 			}),
@@ -993,54 +993,19 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 	// access files with the agent container's privileges. The bearer token restricts
 	// execution to the control plane that minted it.
 	//
-	// Symmetric SHA-256 vs Asymmetric ed25519:
-	// sandboxd currently verifies bearer tokens against a SHA-256 digest (--auth-token-sha256).
-	// We pass only the SHA-256 digest so the raw token never appears in the pod spec or
-	// container environment, and store the token in a Secret in the control plane's namespace.
-	// (An ideal future upstream enhancement for sandboxd is ed25519 public key verification,
-	// allowing the public key to be passed in args while keeping the private key only in
-	// control plane memory, eliminating Secrets entirely).
-
-	// 1. Mint a random bearer token per sandbox.
-	tokenBytes := make([]byte, 32)
-	if _, err := cryptorand.Read(tokenBytes); err != nil {
-		return nil, fmt.Errorf("generating auth token: %w", err)
+	// Asymmetric ed25519 authentication:
+	// sandboxd verifies bearer tokens against the control plane's ed25519 public key.
+	// The public key and expected audience are passed in container arguments, while
+	// the private key stays solely in the control plane.
+	if len(h.opts.SigningKey) == 0 {
+		return nil, errors.New("SigningKey must be configured in RunOptions")
 	}
-	token := hex.EncodeToString(tokenBytes)
-
-	// 2. Store the bearer token in a Secret in the control plane's namespace.
-	secretName := fmt.Sprintf("sandbox-token-%s", id.Name)
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: cpNamespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/managed-by":        "auto-optimizer",
-				"auto-optimizer.gke-labs.dev/sandbox": id.Name,
-			},
-		},
-		Type: corev1.SecretTypeOpaque,
-		StringData: map[string]string{
-			"token": token,
-		},
+	pubKey, ok := h.opts.SigningKey.Public().(ed25519.PublicKey)
+	if !ok {
+		return nil, errors.New("invalid ed25519 signing key in RunOptions")
 	}
-	if h.sandboxClient.coreClient != nil {
-		_, err := h.sandboxClient.coreClient.Secrets(cpNamespace).Create(ctx, secret, metav1.CreateOptions{})
-		if err != nil {
-			if k8serrors.IsAlreadyExists(err) {
-				existing, getErr := h.sandboxClient.coreClient.Secrets(cpNamespace).Get(ctx, secretName, metav1.GetOptions{})
-				if getErr == nil && len(existing.Data["token"]) > 0 {
-					token = string(existing.Data["token"])
-				}
-			} else {
-				return nil, fmt.Errorf("failed to create sandbox token secret in %s: %w", cpNamespace, err)
-			}
-		}
-	}
-
-	// 3. Pass only the SHA-256 digest of the token to sandboxd so the token never appears in the pod spec.
-	tokenDigest := sha256.Sum256([]byte(token))
-	tokenSHA256 := hex.EncodeToString(tokenDigest[:])
+	pubKeyBase64 := base64.StdEncoding.EncodeToString(pubKey)
+	audience := fmt.Sprintf("%s/%s", id.Namespace, id.Name)
 
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	sb := &sandboxv1beta1.Sandbox{
@@ -1096,7 +1061,8 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 									"--listen-host=0.0.0.0",
 									"--grpc-port=9090",
 									"--rest-port=8080",
-									fmt.Sprintf("--auth-token-sha256=%s", tokenSHA256),
+									fmt.Sprintf("--auth-public-key=%s", pubKeyBase64),
+									fmt.Sprintf("--auth-audience=%s", audience),
 								},
 								SecurityContext: &corev1.SecurityContext{
 									RunAsUser:                new(int64(1000)),
@@ -1192,7 +1158,8 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 		session:               session,
 		id:                    id,
 		created:               true,
-		authToken:             token,
+		signingKey:            h.opts.SigningKey,
+		audience:              audience,
 		controlPlaneNamespace: cpNamespace,
 	}
 
@@ -1203,7 +1170,7 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 	return sandbox, nil
 }
 
-// DeleteSandbox deletes the Sandbox resource and its bearer token Secret.
+// DeleteSandbox deletes the Sandbox resource.
 func (c *SandboxClient) DeleteSandbox(ctx context.Context, sb *Sandbox) error {
 	if closeErr := sb.Close(); closeErr != nil {
 		scoped.Log(ctx).V(2).Info("error closing sandbox connection", "error", closeErr)
@@ -1213,18 +1180,6 @@ func (c *SandboxClient) DeleteSandbox(ctx context.Context, sb *Sandbox) error {
 		return nil
 	}
 	id := sb.NamespacedName()
-
-	// Delete bearer token secret in control plane namespace
-	cpNamespace := sb.controlPlaneNamespace
-	if cpNamespace == "" {
-		cpNamespace = "ao-system"
-	}
-	secretName := fmt.Sprintf("sandbox-token-%s", id.Name)
-	if c.coreClient != nil {
-		if err := c.coreClient.Secrets(cpNamespace).Delete(ctx, secretName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
-			scoped.Log(ctx).V(1).Info("failed to delete auth token secret", "secret", secretName, "error", err)
-		}
-	}
 
 	// NotFound means the sandbox already expired (ShutdownPolicy Delete),
 	// which is success for our purposes.
@@ -1282,6 +1237,9 @@ type RunOptions struct {
 	// ToolTimeout bounds how long a single tool invocation may run before it
 	// is cancelled. <= 0 disables the timeout. Default: DefaultToolTimeout.
 	ToolTimeout time.Duration
+
+	// SigningKey is the ed25519 private key used to sign per-call tokens for sandboxd.
+	SigningKey ed25519.PrivateKey
 }
 
 // DefaultImage is the sandbox image used when neither the flags, the
