@@ -536,7 +536,29 @@ Each one becomes an issue in the respective project, not a workaround here.
   managed policy admits only the router. A per-sandbox `env` or Secret volume
   forces a cold start from a warm pool, which conflicts with per-run portal
   rules and sandboxd tokens. sandboxd as PID 1 does not reap orphans. `Start`
-  needs a way to bound output, or the client has to.
+  needs a way to bound output, or the client has to. Specific gaps in the Go SDK
+  (`sigs.k8s.io/agent-sandbox/clients/go/sandbox`):
+  - Attaching to a plain `Sandbox` without a `WarmPoolName`/`ClaimName`: the SDK
+    strictly requires `WarmPoolName` and binds to `SandboxClaim` resources. When
+    an orchestrator manages raw `Sandbox` CRDs directly, the SDK provides no
+    constructor (e.g. `NewForSandbox(ctx, name, namespace)`) to attach to an
+    existing sandbox.
+  - Bearer token authentication: `sandbox.Options` provides no option for passing
+    bearer credentials, preventing client requests to `sandboxd` when running
+    with `--auth-token-sha256` or `--auth-token-file` (which requires passing
+    `authorization: Bearer <token>` in gRPC metadata and HTTP headers).
+  - Stdin streaming: while `Commands.Start` returns a `ProcessHandle` with
+    `Recv` and `SendSignal`, it does not support streaming standard input via
+    `ProcessService.WriteStdin`.
+  - Asymmetric authentication in sandboxd: sandboxd currently only verifies
+    symmetric bearer tokens against a SHA-256 digest (`--auth-token-sha256`).
+    Supporting ed25519 public key verification would allow passing the public
+    key in container args (`--auth-public-key`) while keeping the private key
+    solely in control plane memory, eliminating the need for Kubernetes Secret
+    objects and symmetric token management.
+  - Multi-platform image import: staging images built with multi-platform
+    manifests can fail `kind load docker-image` (`ctr: content digest ... not found`),
+    requiring in-node pulls (`crictl pull`) as a workaround.
 - service-portals. The sidecar reads its rules from a mounted Secret at start
   and on `SIGHUP`. A configuration API would allow warm pools and token
   rotation without a Secret per pod. We must verify the git smart-HTTP
