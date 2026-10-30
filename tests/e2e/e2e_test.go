@@ -29,6 +29,18 @@ import (
 	"time"
 )
 
+func getSandboxdImage(t *testing.T, subH *Harness) string {
+	t.Helper()
+	if img := os.Getenv("SANDBOXD_IMAGE"); img != "" {
+		return img
+	}
+	out, err := subH.Kubectl("get", "configmap", "-n", "ao-system", "ao-config", "-o", "jsonpath={.data.SANDBOXD_IMAGE}")
+	if err == nil && strings.TrimSpace(out) != "" {
+		return strings.TrimSpace(out)
+	}
+	return "us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main"
+}
+
 func TestSmoke(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e smoke tests")
@@ -47,6 +59,7 @@ func TestSmoke(t *testing.T) {
 		sandboxName := "smoke-test-sandbox"
 		subH.DeleteWithCleanup("ao-sandboxes", "sandbox", sandboxName)
 
+		sandboxdImage := getSandboxdImage(t, subH)
 		shutdownTime := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339)
 		sandboxManifest := fmt.Sprintf(`
 apiVersion: agents.x-k8s.io/v1beta1
@@ -61,14 +74,14 @@ spec:
     spec:
       containers:
         - name: sandboxd
-          image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main
+          image: %s
           ports:
             - containerPort: 8080
           readinessProbe:
             httpGet:
               path: /v1/health
               port: 8080
-`, sandboxName, shutdownTime)
+`, sandboxName, shutdownTime, sandboxdImage)
 
 		subH.ApplyManifest(sandboxManifest)
 
@@ -252,6 +265,9 @@ func TestSession(t *testing.T) {
 		"--state-dir", stateDir,
 	)
 	runCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
+	if sbdImg := getSandboxdImage(t, subH); sbdImg != "" {
+		runCmd.Env = append(runCmd.Env, "SANDBOXD_IMAGE="+sbdImg)
+	}
 
 	var stdout, stderr bytes.Buffer
 	runCmd.Stdout = &stdout
@@ -452,6 +468,9 @@ func TestSessionAPI(t *testing.T) {
 		"--state-dir", stateDir,
 	)
 	serveCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
+	if sbdImg := getSandboxdImage(t, subH); sbdImg != "" {
+		serveCmd.Env = append(serveCmd.Env, "SANDBOXD_IMAGE="+sbdImg)
+	}
 
 	var serveStdout, serveStderr bytes.Buffer
 	serveCmd.Stdout = &serveStdout

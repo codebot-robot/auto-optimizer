@@ -37,6 +37,10 @@ for arg in "$@"; do
       echo "Options:"
       echo "  --cleanup, -c  Delete the kind cluster '${CLUSTER_NAME}' and exit"
       echo "  --delete, -d   Delete any existing kind cluster '${CLUSTER_NAME}' before creating a fresh one"
+      echo ""
+      echo "Environment variables:"
+      echo "  SANDBOXD_SOURCE_REPO  Git repository URL to build sandboxd from source"
+      echo "  SANDBOXD_SOURCE_REF   Git branch or commit to build sandboxd from source"
       exit 0
       ;;
     *)

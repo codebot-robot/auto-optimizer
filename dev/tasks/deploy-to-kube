@@ -29,6 +29,17 @@ AGENT_SANDBOX_VERSION="v1.0.8"
 SERVICE_PORTALS_COMMIT="686b34d8aa74546af1039119bbfa6e05ead15f53"
 IN_CLUSTER_STORAGE_COMMIT="923578df519c02cd0da1b7455d8a1e0278a103c4"
 SANDBOXD_IMAGE="${SANDBOXD_IMAGE:-us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main@sha256:576d312c8e4019a52e58e6adbd1bffb8964ad41ca7fa941cfe8a662c64dca85c}"
+SANDBOXD_SOURCE_REPO="${SANDBOXD_SOURCE_REPO:-}"
+SANDBOXD_SOURCE_REF="${SANDBOXD_SOURCE_REF:-}"
+
+if [[ -n "${SANDBOXD_SOURCE_REPO}" && -z "${SANDBOXD_SOURCE_REF}" ]]; then
+  echo "ERROR: SANDBOXD_SOURCE_REF must be set when SANDBOXD_SOURCE_REPO is set" >&2
+  exit 1
+fi
+if [[ -z "${SANDBOXD_SOURCE_REPO}" && -n "${SANDBOXD_SOURCE_REF}" ]]; then
+  echo "ERROR: SANDBOXD_SOURCE_REPO must be set when SANDBOXD_SOURCE_REF is set" >&2
+  exit 1
+fi
 
 GOBIN="${REPO_ROOT}/.build/bin" GOTOOLCHAIN=auto go install github.com/gke-labs/gke-labs-infra/ap@latest
 "${REPO_ROOT}/.build/bin/ap" tool install "${REPO_ROOT}/.build/bin"
@@ -78,6 +89,10 @@ while [[ $# -gt 0 ]]; do
       echo "                      Available components: agent-sandbox, service-portals, objectfs, ao"
       echo "                      Can be passed multiple times or specified via COMPONENTS env var."
       echo "  -h, --help          Show this help text"
+      echo ""
+      echo "Environment variables:"
+      echo "  SANDBOXD_SOURCE_REPO  Git repository URL to build sandboxd from source"
+      echo "  SANDBOXD_SOURCE_REF   Git branch or commit to build sandboxd from source"
       exit 0
       ;;
     *)
@@ -175,6 +190,10 @@ else
   export IMAGE_TAG="${IMAGE_TAG:-latest}"
 fi
 
+if [[ -n "${SANDBOXD_SOURCE_REPO}" && -n "${SANDBOXD_SOURCE_REF}" ]]; then
+  export SANDBOXD_IMAGE="${IMAGE_PREFIX}/sandboxd:${IMAGE_TAG}"
+fi
+
 # Cache directory for sibling repositories outside the source tree
 CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/auto-optimizer"
 
@@ -185,6 +204,11 @@ ensure_cached_repo() {
   local target_dir="${CACHE_DIR}/${repo_name}/${commit}"
 
   if [[ -d "${target_dir}/.git" ]]; then
+    local current_url
+    current_url="$(git -C "${target_dir}" remote get-url origin 2>/dev/null || true)"
+    if [[ -n "${current_url}" && "${current_url}" != "${repo_url}" ]]; then
+      git -C "${target_dir}" remote set-url origin "${repo_url}" >&2
+    fi
     local current_commit
     current_commit="$(git -C "${target_dir}" rev-parse HEAD 2>/dev/null || true)"
     if [[ "${current_commit}" == "${commit}"* ]]; then
@@ -193,15 +217,37 @@ ensure_cached_repo() {
     fi
   fi
 
-  echo "Cloning ${repo_name} at commit ${commit}..." >&2
+  echo "Cloning ${repo_name} at ref ${commit}..." >&2
   mkdir -p "${target_dir}"
   if [[ ! -d "${target_dir}/.git" ]]; then
     git clone "${repo_url}" "${target_dir}" >&2
   fi
   git -C "${target_dir}" fetch origin >&2
   git -C "${target_dir}" checkout "${commit}" >&2
+  if git -C "${target_dir}" show-ref --verify --quiet "refs/remotes/origin/${commit}"; then
+    git -C "${target_dir}" reset --hard "origin/${commit}" >&2
+  fi
 
   echo "${target_dir}"
+}
+
+supports_multi_platform() {
+  local driver
+  driver="$(docker buildx inspect 2>/dev/null | grep -i '^driver:' | awk '{print $2}')"
+  if [[ "${driver}" == "docker" || -z "${driver}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+ensure_multi_arch_builder() {
+  if supports_multi_platform; then
+    return 0
+  fi
+  if docker buildx use ap-builder 2>/dev/null && supports_multi_platform; then
+    return 0
+  fi
+  docker buildx create --name ap-builder --driver docker-container --driver-opt network=host --use >/dev/null
 }
 
 # ------------------------------------------------------------------------------
@@ -405,6 +451,24 @@ fi
 # ------------------------------------------------------------------------------
 # 5. auto-optimizer (ao)
 # ------------------------------------------------------------------------------
+if has_component "ao" || has_component "agent-sandbox"; then
+  if [[ -n "${SANDBOXD_SOURCE_REPO}" && -n "${SANDBOXD_SOURCE_REF}" ]]; then
+    echo "--- Building sandboxd image from source (${SANDBOXD_SOURCE_REPO}@${SANDBOXD_SOURCE_REF}) ---"
+    SANDBOXD_DIR="$(ensure_cached_repo "agent-sandbox" "${SANDBOXD_SOURCE_REPO}" "${SANDBOXD_SOURCE_REF}")"
+
+    if [[ "${IS_KIND}" == "true" ]]; then
+      echo "Building sandboxd image locally with docker buildx..."
+      (cd "${SANDBOXD_DIR}" && docker buildx build --load -t "${SANDBOXD_IMAGE}" -f packages/sandboxd/Dockerfile .)
+      echo "Loading sandboxd image into kind cluster ${KIND_CLUSTER_NAME}..."
+      kind load docker-image "${SANDBOXD_IMAGE}" --name "${KIND_CLUSTER_NAME}"
+    else
+      echo "Building and pushing multi-arch sandboxd image to ${IMAGE_PREFIX} with docker buildx..."
+      ensure_multi_arch_builder
+      (cd "${SANDBOXD_DIR}" && docker buildx build --platform linux/amd64,linux/arm64 --push -t "${SANDBOXD_IMAGE}" -f packages/sandboxd/Dockerfile .)
+    fi
+  fi
+fi
+
 if has_component "ao"; then
   echo "--- Deploying auto-optimizer with ap ---"
   kubectl create namespace ao-system --dry-run=client -o yaml | kubectl apply -f -
@@ -413,8 +477,10 @@ if has_component "ao"; then
   SANDBOX_IMAGE="${SANDBOX_IMAGE:-${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}}"
 
   if [[ "${IS_KIND}" == "true" ]]; then
-    echo "Pre-pulling sandboxd image into kind cluster ${KIND_CLUSTER_NAME}..."
-    docker exec "${KIND_CLUSTER_NAME}-control-plane" crictl pull "${SANDBOXD_IMAGE}" || true
+    if [[ -z "${SANDBOXD_SOURCE_REPO}" || -z "${SANDBOXD_SOURCE_REF}" ]]; then
+      echo "Pre-pulling sandboxd image into kind cluster ${KIND_CLUSTER_NAME}..."
+      docker exec "${KIND_CLUSTER_NAME}-control-plane" crictl pull "${SANDBOXD_IMAGE}" || true
+    fi
 
     echo "Building auto-optimizer images..."
     (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
@@ -431,7 +497,7 @@ if has_component "ao"; then
     VERTEX_PROJECT="${VERTEX_PROJECT:-}"
     VERTEX_LOCATION="${VERTEX_LOCATION:-}"
 
-    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE}, VERTEX_PROJECT=${VERTEX_PROJECT}, VERTEX_LOCATION=${VERTEX_LOCATION})..."
+    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE}, VERTEX_PROJECT=${VERTEX_PROJECT}, VERTEX_LOCATION=${VERTEX_LOCATION})..."
     cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -444,6 +510,7 @@ data:
   SANDBOX_NAMESPACE: "ao-sandboxes"
   OPENAI_MODEL: "${OPENAI_MODEL}"
   SANDBOX_IMAGE: "${SANDBOX_IMAGE}"
+  SANDBOXD_IMAGE: "${SANDBOXD_IMAGE}"
   VERTEX_PROJECT: "${VERTEX_PROJECT}"
   VERTEX_LOCATION: "${VERTEX_LOCATION}"
 EOF
@@ -465,8 +532,8 @@ EOF
     fi
     VERTEX_LOCATION="${VERTEX_LOCATION:-}"
 
-    if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" || -n "${VERTEX_PROJECT:-}" || -n "${VERTEX_LOCATION:-}" ]]; then
-      echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-}, VERTEX_PROJECT=${VERTEX_PROJECT:-}, VERTEX_LOCATION=${VERTEX_LOCATION:-})..."
+    if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" || -n "${VERTEX_PROJECT:-}" || -n "${VERTEX_LOCATION:-}" || -n "${SANDBOXD_IMAGE:-}" ]]; then
+      echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE:-}, VERTEX_PROJECT=${VERTEX_PROJECT:-}, VERTEX_LOCATION=${VERTEX_LOCATION:-})..."
       cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -479,6 +546,7 @@ data:
   SANDBOX_NAMESPACE: "ao-sandboxes"
   OPENAI_MODEL: "${OPENAI_MODEL:-}"
   SANDBOX_IMAGE: "${SANDBOX_IMAGE:-}"
+  SANDBOXD_IMAGE: "${SANDBOXD_IMAGE}"
   VERTEX_PROJECT: "${VERTEX_PROJECT}"
   VERTEX_LOCATION: "${VERTEX_LOCATION}"
 EOF
