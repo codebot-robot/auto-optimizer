@@ -146,4 +146,16 @@ func TestGitRemoteBareRepo(t *testing.T) {
 	if _, err := client.DefaultBranch(ctx, noHeadDir); err == nil {
 		t.Error("expected error from DefaultBranch when HEAD symref is missing, got nil")
 	}
+
+	// 4. PushCredentials
+	u, p := client.PushCredentials(bareDir)
+	if u != "" || p != "" {
+		t.Errorf("expected empty push credentials, got (%q, %q)", u, p)
+	}
+
+	credClient := NewGitRemoteWithCredentials("user", "pass")
+	u, p = credClient.PushCredentials(bareDir)
+	if u != "user" || p != "pass" {
+		t.Errorf("expected ('user', 'pass'), got (%q, %q)", u, p)
+	}
 }
