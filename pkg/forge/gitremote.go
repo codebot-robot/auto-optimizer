@@ -17,11 +17,13 @@ package forge
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -222,7 +224,10 @@ func (g *GitRemote) defaultBranchGoGit(ctx context.Context, repoURL string) (str
 }
 
 // FetchTree performs a depth-1 in-memory fetch of the commit and returns its tree as an fs.FS.
-func (g *GitRemote) FetchTree(ctx context.Context, repoURL string, commit string) (fs.FS, error) {
+// If prefix is non-empty, only files under that path prefix are read by finding the subtree;
+// blobs outside the prefix are skipped without reading their contents. If prefix is empty,
+// all files in the tree are fetched.
+func (g *GitRemote) FetchTree(ctx context.Context, repoURL string, commit string, prefix string) (fs.FS, error) {
 	storer := memory.NewStorage()
 	r, err := git.CloneContext(ctx, storer, nil, &git.CloneOptions{
 		URL:   repoURL,
@@ -245,16 +250,53 @@ func (g *GitRemote) FetchTree(ctx context.Context, repoURL string, commit string
 	}
 
 	files := make(map[string][]byte)
-	err = tree.Files().ForEach(func(f *object.File) error {
-		contents, err := f.Contents()
+	cleanPrefix := path.Clean(strings.TrimPrefix(prefix, "/"))
+	if cleanPrefix == "." || cleanPrefix == "" {
+		err = tree.Files().ForEach(func(f *object.File) error {
+			contents, err := f.Contents()
+			if err != nil {
+				return err
+			}
+			files[f.Name] = []byte(contents)
+			return nil
+		})
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("reading tree files: %w", err)
 		}
-		files[f.Name] = []byte(contents)
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("reading tree files: %w", err)
+		return NewTreeFS(files), nil
+	}
+
+	subTree, err := tree.Tree(cleanPrefix)
+	if err == nil {
+		err = subTree.Files().ForEach(func(f *object.File) error {
+			contents, err := f.Contents()
+			if err != nil {
+				return err
+			}
+			files[path.Join(cleanPrefix, f.Name)] = []byte(contents)
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("reading tree files under %s: %w", cleanPrefix, err)
+		}
+		return NewTreeFS(files), nil
+	}
+
+	if !errors.Is(err, object.ErrDirectoryNotFound) && !errors.Is(err, object.ErrEntryNotFound) {
+		return nil, fmt.Errorf("finding subtree %s: %w", cleanPrefix, err)
+	}
+
+	file, fileErr := tree.File(cleanPrefix)
+	if fileErr == nil {
+		contents, err := file.Contents()
+		if err != nil {
+			return nil, fmt.Errorf("reading file %s: %w", cleanPrefix, err)
+		}
+		files[cleanPrefix] = []byte(contents)
+		return NewTreeFS(files), nil
+	}
+	if !errors.Is(fileErr, object.ErrFileNotFound) && !errors.Is(fileErr, object.ErrEntryNotFound) {
+		return nil, fmt.Errorf("finding file %s: %w", cleanPrefix, fileErr)
 	}
 
 	return NewTreeFS(files), nil

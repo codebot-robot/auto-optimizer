@@ -165,7 +165,7 @@ func (s *Syncer) SyncRepo(ctx context.Context, repo *state.Repo) error {
 		return nil
 	}
 
-	treeFS, err := s.forge.FetchTree(ctx, repo.URL, headCommit)
+	treeFS, err := s.forge.FetchTree(ctx, repo.URL, headCommit, ".goals")
 	if err != nil {
 		return fmt.Errorf("fetching tree at commit %s: %w", headCommit, err)
 	}

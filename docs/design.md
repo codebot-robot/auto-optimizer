@@ -190,7 +190,7 @@ development possible without a GitHub App.
 ```go
 type Forge interface {
 	ListRefs(ctx context.Context, repoURL string) (map[string]string, error)
-	FetchTree(ctx context.Context, repoURL string, commit string) (fs.FS, error)
+	FetchTree(ctx context.Context, repoURL string, commit string, prefix string) (fs.FS, error)
 	DefaultBranch(ctx context.Context, repoURL string) (string, error)
 }
 

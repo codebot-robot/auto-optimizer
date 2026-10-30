@@ -134,8 +134,11 @@ func (f *Forge) ListRefs(ctx context.Context, repoURL string) (map[string]string
 }
 
 // FetchTree retrieves the file tree at the given commit using the underlying gitremote forge.
-func (f *Forge) FetchTree(ctx context.Context, repoURL string, commit string) (fs.FS, error) {
-	return f.remote.FetchTree(ctx, repoURL, commit)
+// If prefix is non-empty, only files under that path prefix are read;
+// blobs outside the prefix are skipped without reading their contents.
+// If prefix is empty, all files in the tree are fetched.
+func (f *Forge) FetchTree(ctx context.Context, repoURL string, commit string, prefix string) (fs.FS, error) {
+	return f.remote.FetchTree(ctx, repoURL, commit, prefix)
 }
 
 // DefaultBranch queries the repository's default branch using the underlying gitremote forge.
