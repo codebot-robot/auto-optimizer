@@ -289,7 +289,52 @@ func TestSession(t *testing.T) {
 		t.Errorf("shutdownTime is empty")
 	}
 
-	t.Logf("PASS: ao session run successfully executed in sandbox, verified output contains Linux, shutdownPolicy=%s, shutdownTime=%s", shutdownPolicy, shutdownTime)
+	// Verify the sandbox pod ran sandboxd via topology B (install-sandboxd init container)
+	initContainerName, err := subH.Kubectl("get", "pod", "-n", "ao-sandboxes", sessionName, "-o", "jsonpath={.spec.initContainers[0].name}")
+	if err != nil {
+		t.Fatalf("failed to get pod initContainers: %v", err)
+	}
+	if initContainerName != "install-sandboxd" {
+		t.Errorf("expected initContainer 'install-sandboxd', got %q", initContainerName)
+	}
+
+	// Verify pod logs show sandboxd running
+	podLogs, err := subH.Kubectl("logs", "-n", "ao-sandboxes", sessionName, "-c", "sandbox")
+	if err != nil {
+		t.Fatalf("failed to get sandbox pod logs: %v", err)
+	}
+	t.Logf("sandbox pod logs:\n%s", podLogs)
+	if !strings.Contains(podLogs, "sandboxd") {
+		t.Errorf("expected sandbox pod logs to show sandboxd, got:\n%s", podLogs)
+	}
+
+	// Verify bearer token secret was stored in the control plane's namespace (ao-system)
+	secretToken, err := subH.Kubectl("get", "secret", "-n", "ao-system", fmt.Sprintf("sandbox-token-%s", sessionName), "-o", "jsonpath={.data.token}")
+	if err != nil {
+		t.Errorf("failed to get bearer token secret in ao-system: %v", err)
+	}
+	if strings.TrimSpace(secretToken) == "" {
+		t.Errorf("expected bearer token secret to contain data.token")
+	}
+
+	// Verify control plane RBAC does NOT include pods/exec or pods/portforward
+	canExec, err := subH.Kubectl("auth", "can-i", "create", "pods", "--subresource=exec", "--as=system:serviceaccount:ao-system:ao", "-n", "ao-sandboxes")
+	if err != nil && !strings.Contains(canExec, "no") {
+		t.Fatalf("kubectl auth can-i failed: %v (output: %s)", err, canExec)
+	}
+	if strings.TrimSpace(canExec) != "no" {
+		t.Errorf("expected control plane RBAC to not include pods/exec, got auth can-i result: %q", canExec)
+	}
+
+	canPortForward, err := subH.Kubectl("auth", "can-i", "create", "pods", "--subresource=portforward", "--as=system:serviceaccount:ao-system:ao", "-n", "ao-sandboxes")
+	if err != nil && !strings.Contains(canPortForward, "no") {
+		t.Fatalf("kubectl auth can-i failed: %v (output: %s)", err, canPortForward)
+	}
+	if strings.TrimSpace(canPortForward) != "no" {
+		t.Errorf("expected control plane RBAC to not include pods/portforward, got auth can-i result: %q", canPortForward)
+	}
+
+	t.Logf("PASS: ao session run successfully executed in sandbox over sandboxd, verified output contains Linux, shutdownPolicy=%s, shutdownTime=%s, no pods/exec or pods/portforward RBAC", shutdownPolicy, shutdownTime)
 }
 
 func TestSessionUnpullableImageFailsFast(t *testing.T) {

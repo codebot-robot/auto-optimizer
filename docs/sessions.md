@@ -24,6 +24,12 @@ The session implementation was forked from `examples/sandboxed-tools` in the [ku
    - `GetRESTConfig` prefers local kubeconfig (or `KUBECONFIG`) if present and valid, falling back to in-cluster configuration. This allows running `ao` from dev containers or laptops against local kind clusters even when running within a container.
 6. **Sandbox Lifecycle**:
    - Sandboxes persist after process exit and expire automatically via `shutdownPolicy: Delete` and inactivity timeout `shutdownTime`, allowing subsequent CLI commands to reuse active sandboxes without recreate latency.
+7. **Sandbox Transport (`sandboxd`)**:
+   - The transport uses `sandboxd` gRPC `ProcessService` (port 9090) instead of SPDY `kubectl exec` (`pods/exec`).
+   - Sandbox pods deploy using Topology B: an `install-sandboxd` init container copies the `sandboxd` binary into a shared volume, and the worker container runs it with `tini` as PID 1 and a readiness probe on `/v1/health` (port 8080).
+   - Each sandbox mints a random bearer token stored in a Secret in `ao-system`; only its SHA-256 digest is passed to sandboxd via `--auth-token-sha256`, keeping secrets out of the pod spec.
+   - Connections use direct Pod IP connectivity in-cluster, with automatic fallback to SPDY port-forwarding when executed outside the cluster (e.g. from developer laptops).
+   - Authentication protects sandboxd via per-sandbox bearer tokens, avoiding expensive per-pod NetworkPolicies at sandbox scale.
 
 ## Relationship to Upstream
 

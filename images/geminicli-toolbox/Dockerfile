@@ -28,7 +28,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -buildvcs=fal
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git curl procps \
+    && apt-get install -y --no-install-recommends ca-certificates git curl procps tini \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /geminicli-toolbox /usr/local/bin/geminicli-toolbox
 
