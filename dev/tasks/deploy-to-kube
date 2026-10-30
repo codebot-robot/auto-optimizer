@@ -24,9 +24,11 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 # - AGENT_SANDBOX_VERSION: Check latest release at https://github.com/kubernetes-sigs/agent-sandbox/releases
 # - SERVICE_PORTALS_COMMIT: Check latest commit at https://github.com/gke-labs/service-portals/commits/main
 # - IN_CLUSTER_STORAGE_COMMIT: Check latest commit at https://github.com/gke-labs/in-cluster-storage/commits/main
+# - SANDBOXD_IMAGE: Check latest release/digest in kubernetes-sigs/agent-sandbox
 AGENT_SANDBOX_VERSION="v1.0.8"
 SERVICE_PORTALS_COMMIT="686b34d8aa74546af1039119bbfa6e05ead15f53"
 IN_CLUSTER_STORAGE_COMMIT="923578df519c02cd0da1b7455d8a1e0278a103c4"
+SANDBOXD_IMAGE="${SANDBOXD_IMAGE:-us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main@sha256:576d312c8e4019a52e58e6adbd1bffb8964ad41ca7fa941cfe8a662c64dca85c}"
 
 GOBIN="${REPO_ROOT}/.build/bin" GOTOOLCHAIN=auto go install github.com/gke-labs/gke-labs-infra/ap@latest
 "${REPO_ROOT}/.build/bin/ap" tool install "${REPO_ROOT}/.build/bin"
@@ -411,6 +413,9 @@ if has_component "ao"; then
   SANDBOX_IMAGE="${SANDBOX_IMAGE:-${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}}"
 
   if [[ "${IS_KIND}" == "true" ]]; then
+    echo "Pre-pulling sandboxd image into kind cluster ${KIND_CLUSTER_NAME}..."
+    docker exec "${KIND_CLUSTER_NAME}-control-plane" crictl pull "${SANDBOXD_IMAGE}" || true
+
     echo "Building auto-optimizer images..."
     (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
     echo "Loading auto-optimizer images into kind cluster ${KIND_CLUSTER_NAME}..."

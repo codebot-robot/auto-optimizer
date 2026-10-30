@@ -22,6 +22,35 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: ao
+  namespace: ao-system
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+      - get
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ao
+  namespace: ao-system
+subjects:
+  - kind: ServiceAccount
+    name: ao
+    namespace: ao-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ao
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ao
   namespace: ao-sandboxes
 rules:
   - apiGroups:
@@ -44,13 +73,6 @@ rules:
       - get
       - list
       - watch
-  # pods/exec is required for the exec-based transport we have today; goes away with epic #30 (sandboxd).
-  - apiGroups:
-      - ""
-    resources:
-      - pods/exec
-    verbs:
-      - create
   - apiGroups:
       - ""
     resources:
