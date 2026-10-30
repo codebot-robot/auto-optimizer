@@ -353,6 +353,7 @@ func newRunCommand() *cobra.Command {
 		Short: "Manage runs for registered repositories",
 	}
 	cmd.AddCommand(newRunListCommand())
+	cmd.AddCommand(newRunGetCommand())
 	return cmd
 }
 
@@ -412,5 +413,126 @@ func newRunListCommand() *cobra.Command {
 	if err := cmd.MarkFlagRequired("repo"); err != nil {
 		panic(err)
 	}
+	return cmd
+}
+
+func newRunGetCommand() *cobra.Command {
+	var serverAddr string
+	var jsonOutput bool
+
+	cmd := &cobra.Command{
+		Use:   "get <id>",
+		Short: "Get details and events of a run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runID := args[0]
+
+			conn, err := grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return fmt.Errorf("connecting to server %s: %w", serverAddr, err)
+			}
+			defer closeConnection(cmd.Context(), conn)
+
+			client := sessionv1.NewSessionServiceClient(conn)
+			resp, err := client.GetRun(cmd.Context(), &sessionv1.GetRunRequest{Id: runID})
+			if err != nil {
+				return fmt.Errorf("getting run %s: %w", runID, err)
+			}
+
+			if jsonOutput {
+				m := protojson.MarshalOptions{Multiline: true, Indent: "  "}
+				data, err := m.Marshal(resp)
+				if err != nil {
+					return fmt.Errorf("serializing to json: %w", err)
+				}
+				if _, err := fmt.Fprintln(cmd.OutOrStdout(), string(data)); err != nil {
+					return err
+				}
+				return nil
+			}
+
+			r := resp.Run
+			out := cmd.OutOrStdout()
+			printField := func(label, val string) error {
+				_, err := fmt.Fprintf(out, "%-14s%s\n", label+":", val)
+				return err
+			}
+			if err := printField("ID", r.Id); err != nil {
+				return err
+			}
+			if err := printField("Repo", r.RepoUrl); err != nil {
+				return err
+			}
+			if err := printField("Goal", r.GoalName); err != nil {
+				return err
+			}
+			if err := printField("Phase", r.Phase); err != nil {
+				return err
+			}
+			if r.BaseCommit != "" {
+				if err := printField("Base Commit", r.BaseCommit); err != nil {
+					return err
+				}
+			}
+			if r.Branch != "" {
+				if err := printField("Branch", r.Branch); err != nil {
+					return err
+				}
+			}
+			if r.PrUrl != "" {
+				if err := printField("PR URL", r.PrUrl); err != nil {
+					return err
+				}
+			}
+			if r.SessionId != "" {
+				if err := printField("Session", r.SessionId); err != nil {
+					return err
+				}
+			}
+			if r.SandboxName != "" {
+				if err := printField("Sandbox", r.SandboxName); err != nil {
+					return err
+				}
+			}
+			if r.Error != "" {
+				if err := printField("Error", r.Error); err != nil {
+					return err
+				}
+			}
+
+			if len(resp.Events) > 0 {
+				if _, err := fmt.Fprintln(out, "\nEvents:"); err != nil {
+					return err
+				}
+				w := tabwriter.NewWriter(out, 0, 8, 2, ' ', 0)
+				if _, err := fmt.Fprintln(w, "  TIME\tPHASE\tKIND\tMESSAGE"); err != nil {
+					return err
+				}
+				for _, e := range resp.Events {
+					tStr := ""
+					if e.Time != nil {
+						tStr = e.Time.AsTime().Format(time.RFC3339)
+					}
+					msg := e.Message
+					if e.Error != "" {
+						if msg != "" {
+							msg = fmt.Sprintf("%s (%s)", msg, e.Error)
+						} else {
+							msg = e.Error
+						}
+					}
+					if _, err := fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", tStr, e.Phase, e.Kind, msg); err != nil {
+						return err
+					}
+				}
+				return w.Flush()
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&serverAddr, "server", defaultServerAddress(), "gRPC server address")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output run as JSON")
 	return cmd
 }

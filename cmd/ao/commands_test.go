@@ -19,6 +19,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -87,6 +88,18 @@ func TestRunCommand(t *testing.T) {
 	}
 	if listCmd.Flag("json") == nil {
 		t.Error("expected --json flag on ao run list")
+	}
+
+	getCmd, _, err := cmd.Find([]string{"get"})
+	if err != nil || getCmd == nil || getCmd.Name() != "get" {
+		t.Fatalf("expected get subcommand on run command")
+	}
+
+	if getCmd.Flag("server") == nil {
+		t.Error("expected --server flag on ao run get")
+	}
+	if getCmd.Flag("json") == nil {
+		t.Error("expected --json flag on ao run get")
 	}
 }
 
@@ -216,5 +229,120 @@ func TestRunListCommand_Execution(t *testing.T) {
 	}
 	if !strings.Contains(output, "commit-abc1234") {
 		t.Errorf("expected output to contain base commit 'commit-abc1234', got:\n%s", output)
+	}
+}
+
+func TestRunGetCommand_Execution(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	stateStore := state.NewFileStore(dir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/example-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "example-repo",
+		DefaultBranch: "main",
+	}
+	if err := stateStore.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T100000Z-1234"
+	runRecord := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "latency-reduction",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "commit-abc1234",
+		SandboxName: "run-20261030t100000z-1234",
+	}
+	if err := stateStore.PutRun(ctx, runRecord); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	if err := stateStore.AppendEvent(ctx, repo.Key(), runID,
+		state.Event{
+			Time:    time.Now().UTC(),
+			Phase:   state.PhasePreparing,
+			Kind:    "command",
+			Message: "Cloned repo",
+		},
+		state.Event{
+			Time:    time.Now().UTC(),
+			Phase:   state.PhaseWorking,
+			Kind:    "phase",
+			Message: "Entered working phase",
+		},
+	); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	// Start test gRPC server
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer listener.Close()
+
+	sessionStore := session.NewFileStore(dir)
+	grpcServer := grpc.NewServer()
+	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
+		Store:          sessionStore,
+		StateStore:     stateStore,
+		DefaultToolset: "basic",
+		HarnessFactory: func(_ string) (*session.Harness, error) {
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	sessionv1.RegisterSessionServiceServer(grpcServer, srv)
+	go grpcServer.Serve(listener)
+	defer grpcServer.Stop()
+
+	// Execute `ao run get <id> --server <addr>`
+	cmd := newRunCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"get", runID, "--server", listener.Addr().String()})
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("cmd.ExecuteContext: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, runID) {
+		t.Errorf("expected output to contain run ID %q, got:\n%s", runID, output)
+	}
+	if !strings.Contains(output, "latency-reduction") {
+		t.Errorf("expected output to contain goal 'latency-reduction', got:\n%s", output)
+	}
+	if !strings.Contains(output, "Working") {
+		t.Errorf("expected output to contain phase 'Working', got:\n%s", output)
+	}
+	if !strings.Contains(output, "run-20261030t100000z-1234") {
+		t.Errorf("expected output to contain sandbox name 'run-20261030t100000z-1234', got:\n%s", output)
+	}
+	if !strings.Contains(output, "Cloned repo") {
+		t.Errorf("expected output to contain event message 'Cloned repo', got:\n%s", output)
+	}
+
+	// Also verify --json output
+	jsonCmd := newRunCommand()
+	var jsonBuf bytes.Buffer
+	jsonCmd.SetOut(&jsonBuf)
+	jsonCmd.SetErr(&jsonBuf)
+	jsonCmd.SetArgs([]string{"get", runID, "--server", listener.Addr().String(), "--json"})
+
+	if err := jsonCmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("jsonCmd.ExecuteContext: %v", err)
+	}
+
+	jsonOutput := jsonBuf.String()
+	if !strings.Contains(jsonOutput, "sandboxName") || !strings.Contains(jsonOutput, "run-20261030t100000z-1234") {
+		t.Errorf("expected JSON to contain sandboxName and 'run-20261030t100000z-1234', got:\n%s", jsonOutput)
 	}
 }

@@ -16,10 +16,12 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/cgi"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -778,4 +780,286 @@ func TestSessionAPIInCluster(t *testing.T) {
 	}
 
 	t.Logf("PASS: in-cluster ao server successfully handled turn for session %s (sandbox created at %s, found in pod %s logs)", sessionName, creationTimestampStr, aoPodName)
+}
+
+func TestRunLifecycle(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("RUN_E2E env var not set, skipping e2e run lifecycle tests")
+	}
+
+	clusterName := os.Getenv("KIND_CLUSTER_NAME")
+	if clusterName == "" {
+		clusterName = "auto-optimizer"
+	}
+
+	h := NewHarness(t, clusterName)
+	h.Setup()
+
+	gitRoot, err := h.getGitRoot()
+	if err != nil {
+		t.Fatalf("failed to get git root: %v", err)
+	}
+
+	aoBin := filepath.Join(t.TempDir(), "ao")
+	buildCmd := exec.Command("go", "build", "-o", aoBin, "./cmd/ao")
+	buildCmd.Dir = gitRoot
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
+	}
+
+	// 1. Create a bare git repository with a goal in .goals/hello.md
+	gitBaseDir := t.TempDir()
+	bareRepoDir := filepath.Join(gitBaseDir, "hello-repo.git")
+	if out, err := exec.Command("git", "init", "--bare", bareRepoDir).CombinedOutput(); err != nil {
+		t.Fatalf("failed to init bare git repo: %v\n%s", err, string(out))
+	}
+
+	workDir := t.TempDir()
+	if out, err := exec.Command("git", "clone", bareRepoDir, workDir).CombinedOutput(); err != nil {
+		t.Fatalf("failed to clone bare repo: %v\n%s", err, string(out))
+	}
+
+	goalsDir := filepath.Join(workDir, ".goals")
+	if err := os.MkdirAll(goalsDir, 0755); err != nil {
+		t.Fatalf("failed to create .goals dir: %v", err)
+	}
+	goalContent := "# Hello\n\nAdd a line to README\n"
+	if err := os.WriteFile(filepath.Join(goalsDir, "hello.md"), []byte(goalContent), 0644); err != nil {
+		t.Fatalf("failed to write goal file: %v", err)
+	}
+
+	runGit := func(dir string, args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v in %s failed: %v\nOutput: %s", args, dir, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit(workDir, "add", ".")
+	runGit(workDir, "-c", "user.name=test", "-c", "user.email=test@test.com", "commit", "-m", "add hello goal")
+	baseCommit := runGit(workDir, "rev-parse", "HEAD")
+	runGit(workDir, "push", "origin", "HEAD:main")
+	runGit(bareRepoDir, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	// 2. Locate git-http-backend via git --exec-path and kind IPv4 gateway via docker network inspect kind
+	execPathOut, err := exec.Command("git", "--exec-path").CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to locate git exec-path: %v\nOutput: %s", err, string(execPathOut))
+	}
+	execPath := strings.TrimSpace(string(execPathOut))
+	gitHTTPBackend := filepath.Join(execPath, "git-http-backend")
+	if _, err := os.Stat(gitHTTPBackend); err != nil {
+		t.Fatalf("git-http-backend binary not found at %s (checked git --exec-path): %v", gitHTTPBackend, err)
+	}
+
+	dockerCmd := exec.Command("docker", "network", "inspect", "kind")
+	var netInspectErr bytes.Buffer
+	dockerCmd.Stderr = &netInspectErr
+	netInspectOut, err := dockerCmd.Output()
+	if err != nil {
+		t.Fatalf("failed to inspect docker network kind: %v\nStderr: %s", err, netInspectErr.String())
+	}
+	if idx := bytes.IndexByte(netInspectOut, '['); idx >= 0 {
+		netInspectOut = netInspectOut[idx:]
+	}
+
+	type dockerNetConfig struct {
+		IPAM struct {
+			Config []struct {
+				Subnet  string `json:"Subnet"`
+				Gateway string `json:"Gateway"`
+			} `json:"Config"`
+		} `json:"IPAM"`
+	}
+	var dockerNets []dockerNetConfig
+	if err := json.Unmarshal(netInspectOut, &dockerNets); err != nil || len(dockerNets) == 0 {
+		t.Fatalf("failed to parse docker network inspect kind output: %v\nOutput: %s", err, string(netInspectOut))
+	}
+
+	var kindGatewayIPv4 string
+	for _, cfg := range dockerNets[0].IPAM.Config {
+		ip := net.ParseIP(cfg.Gateway)
+		if ip != nil && ip.To4() != nil && cfg.Gateway != "" {
+			kindGatewayIPv4 = cfg.Gateway
+			break
+		}
+	}
+	if kindGatewayIPv4 == "" {
+		t.Fatalf("could not find IPv4 gateway in docker network inspect kind: %s", string(netInspectOut))
+	}
+
+	// Start HTTP git server accessible to kind nodes at kindGatewayIPv4
+	gitListener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("failed to listen for git HTTP server: %v", err)
+	}
+	defer gitListener.Close()
+
+	gitPort := gitListener.Addr().(*net.TCPAddr).Port
+	gitHandler := &cgi.Handler{
+		Path: gitHTTPBackend,
+		Env: []string{
+			"GIT_PROJECT_ROOT=" + gitBaseDir,
+			"GIT_HTTP_EXPORT_ALL=1",
+		},
+	}
+	gitServer := &http.Server{Handler: gitHandler}
+	go func() { _ = gitServer.Serve(gitListener) }()
+	t.Cleanup(func() { _ = gitServer.Close() })
+
+	repoURL := fmt.Sprintf("http://%s:%d/hello-repo.git", kindGatewayIPv4, gitPort)
+	t.Logf("Git repository available at %s (base commit %s, backend %s)", repoURL, baseCommit, gitHTTPBackend)
+
+	// 3. Start ao serve with the repository registered
+	aoListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate free port for ao serve: %v", err)
+	}
+	serverAddr := aoListener.Addr().String()
+	_ = aoListener.Close()
+
+	stateDir := t.TempDir()
+	serveCmd := exec.Command(aoBin, "serve",
+		"--listen", serverAddr,
+		"--state-dir", stateDir,
+		"--repo", repoURL,
+	)
+	serveCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
+
+	var serveStdout, serveStderr bytes.Buffer
+	serveCmd.Stdout = &serveStdout
+	serveCmd.Stderr = &serveStderr
+
+	t.Logf("Starting ao serve on %s with registered repo %s...", serverAddr, repoURL)
+	if err := serveCmd.Start(); err != nil {
+		t.Fatalf("failed to start ao serve: %v", err)
+	}
+	t.Cleanup(func() {
+		if serveCmd.Process != nil {
+			_ = serveCmd.Process.Signal(syscall.SIGTERM)
+			_ = serveCmd.Wait()
+		}
+	})
+
+	// Wait for server to accept connections
+	serverReady := false
+	for range 50 {
+		conn, err := net.DialTimeout("tcp", serverAddr, 100*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			serverReady = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !serverReady {
+		t.Fatalf("timed out waiting for ao serve on %s\nStderr: %s", serverAddr, serveStderr.String())
+	}
+
+	// 4. Poll for run to reach Working phase
+	type jsonRun struct {
+		ID          string `json:"id"`
+		Phase       string `json:"phase"`
+		BaseCommit  string `json:"baseCommit"`
+		SandboxName string `json:"sandboxName"`
+		Error       string `json:"error"`
+	}
+	type jsonGetRunResponse struct {
+		Run jsonRun `json:"run"`
+	}
+	type jsonListRunsResponse struct {
+		Runs []jsonRun `json:"runs"`
+	}
+
+	var runID string
+	var workingRun *jsonRun
+
+	t.Log("Waiting for run to reach Working phase...")
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		// List runs
+		listCmd := exec.Command(aoBin, "run", "list",
+			"--server", serverAddr,
+			"--repo", repoURL,
+			"--json",
+		)
+		out, err := listCmd.CombinedOutput()
+		if err == nil {
+			var listResp jsonListRunsResponse
+			if jsonErr := json.Unmarshal(out, &listResp); jsonErr == nil && len(listResp.Runs) > 0 {
+				runID = listResp.Runs[0].ID
+				// Get run details
+				getCmd := exec.Command(aoBin, "run", "get", runID,
+					"--server", serverAddr,
+					"--json",
+				)
+				getOut, getErr := getCmd.CombinedOutput()
+				if getErr == nil {
+					var getResp jsonGetRunResponse
+					if unmarshalErr := json.Unmarshal(getOut, &getResp); unmarshalErr == nil {
+						if getResp.Run.Phase == "Working" {
+							workingRun = &getResp.Run
+							break
+						} else if getResp.Run.Phase == "Failed" {
+							t.Fatalf("run failed prematurely with error: %s", getResp.Run.Error)
+						}
+					}
+				}
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	if workingRun == nil {
+		t.Fatalf("timed out waiting for run to reach Working phase. Serve stderr:\n%s", serveStderr.String())
+	}
+
+	t.Logf("PASS: Run %s reached phase %s with sandbox %s", workingRun.ID, workingRun.Phase, workingRun.SandboxName)
+	if workingRun.BaseCommit != baseCommit {
+		t.Errorf("expected base commit %s, got %s", baseCommit, workingRun.BaseCommit)
+	}
+
+	sandboxName := workingRun.SandboxName
+	subH := h.WithT(t)
+	t.Cleanup(func() {
+		subH.DeleteWithCleanup("ao-sandboxes", "sandbox", sandboxName)
+	})
+
+	// 5. Verify sandbox in Kubernetes is Ready
+	subH.WaitForCondition("ao-sandboxes", "sandbox/"+sandboxName, "condition=Ready", 60*time.Second)
+
+	// 6. Verify sandbox contains clone at baseCommit using kubectl exec
+	headOut, err := subH.Kubectl("exec", "-n", "ao-sandboxes", sandboxName, "-c", "sandbox", "--", "git", "-C", "/workspace/repo", "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("failed to get cloned repo HEAD inside sandbox: %v\nOutput: %s", err, headOut)
+	}
+	gotHead := strings.TrimSpace(headOut)
+	if gotHead != baseCommit {
+		t.Errorf("cloned repository inside sandbox has commit %s, want base commit %s", gotHead, baseCommit)
+	}
+
+	// Verify goal file is in cloned repository inside sandbox
+	goalCatOut, err := subH.Kubectl("exec", "-n", "ao-sandboxes", sandboxName, "-c", "sandbox", "--", "cat", "/workspace/repo/.goals/hello.md")
+	if err != nil {
+		t.Fatalf("failed to read .goals/hello.md inside sandbox: %v\nOutput: %s", err, goalCatOut)
+	}
+	if !strings.Contains(goalCatOut, "Add a line to README") {
+		t.Errorf("unexpected content in cloned .goals/hello.md: %s", goalCatOut)
+	}
+
+	// 7. Verify ao run get prints formatted run and events
+	getFmtCmd := exec.Command(aoBin, "run", "get", runID, "--server", serverAddr)
+	getFmtOut, err := getFmtCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ao run get failed: %v\nOutput: %s", err, string(getFmtOut))
+	}
+	fmtStr := string(getFmtOut)
+	if !strings.Contains(fmtStr, "Working") || !strings.Contains(fmtStr, sandboxName) || !strings.Contains(fmtStr, "Events:") {
+		t.Errorf("expected formatted run output to contain Working, sandbox name, and Events, got:\n%s", fmtStr)
+	}
+
+	t.Logf("PASS: sandbox %s contains clone at base commit %s with .goals/hello.md", sandboxName, baseCommit)
 }
