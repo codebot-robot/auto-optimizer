@@ -55,7 +55,6 @@ func TestFakeForge(t *testing.T) {
 
 	// Set refs
 	f.SetRefs(repoURL, map[string]string{
-		"HEAD":              "commit-1",
 		"refs/heads/master": "commit-1",
 	})
 
@@ -63,7 +62,7 @@ func TestFakeForge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRefs: %v", err)
 	}
-	if refs["HEAD"] != "commit-1" || refs["refs/heads/master"] != "commit-1" {
+	if refs["refs/heads/master"] != "commit-1" || len(refs) != 1 {
 		t.Errorf("unexpected refs: %+v", refs)
 	}
 

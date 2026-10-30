@@ -387,7 +387,7 @@ func TestForgeDelegation(t *testing.T) {
 	remote := &fakeRemote{
 		listRefsFunc: func(ctx context.Context, repoURL string) (map[string]string, error) {
 			listRefsCalled = true
-			return map[string]string{"HEAD": "sha123"}, nil
+			return map[string]string{"refs/heads/main": "sha123"}, nil
 		},
 		fetchTreeFunc: func(ctx context.Context, repoURL, commit string) (fs.FS, error) {
 			fetchTreeCalled = true
@@ -403,7 +403,7 @@ func TestForgeDelegation(t *testing.T) {
 	ctx := t.Context()
 
 	refs, err := client.ListRefs(ctx, "https://github.com/foo/bar")
-	if err != nil || !listRefsCalled || refs["HEAD"] != "sha123" {
+	if err != nil || !listRefsCalled || refs["refs/heads/main"] != "sha123" {
 		t.Errorf("ListRefs delegation failed: err=%v, called=%v, refs=%v", err, listRefsCalled, refs)
 	}
 

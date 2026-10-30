@@ -242,9 +242,6 @@ func (s *Syncer) findHeadCommit(refs map[string]string, defaultBranch string) st
 			return c
 		}
 	}
-	if c, ok := refs["HEAD"]; ok {
-		return c
-	}
 	if c, ok := refs["refs/heads/main"]; ok {
 		return c
 	}
