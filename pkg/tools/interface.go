@@ -67,4 +67,8 @@ type ExecCommandOptions struct {
 	// Stderr is an optional writer where standard error will be written.
 	// If nil, Stderr will be captured internally and returned as a string in the ExecCommandResult.
 	Stderr io.Writer
+
+	// Stream, if true, forces streamed execution over ProcessService.Start even when
+	// Stdin, Stdout, and Stderr are nil.
+	Stream bool
 }

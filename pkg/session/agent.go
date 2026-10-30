@@ -22,8 +22,14 @@ package session
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -31,16 +37,20 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/emptypb"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/util/exec"
+	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/transport/spdy"
 	"k8s.io/client-go/util/retry"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
@@ -48,6 +58,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	agentsclientset "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned"
+	processv1 "sigs.k8s.io/agent-sandbox/packages/sandboxd/spec/process/v1"
 )
 
 // SandboxInactivityTimeout is how long we keep sandboxes around after we last used them.
@@ -58,11 +69,15 @@ const SandboxInactivityTimeout = 5 * time.Minute
 // of blocking the agent loop indefinitely.
 const DefaultToolTimeout = 2 * time.Minute
 
+// DefaultSandboxdImage is the default container image containing the sandboxd binary, pinned by digest.
+const DefaultSandboxdImage = "us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandboxd:latest-main@sha256:576d312c8e4019a52e58e6adbd1bffb8964ad41ca7fa941cfe8a662c64dca85c"
+
 // SandboxClient is a simple low-level client for managing Sandbox resources directly.
 type SandboxClient struct {
 	agentsClient agentsclientset.Interface
 	coreClient   corev1client.CoreV1Interface
 	restConfig   *rest.Config
+	connectivity string
 
 	// mutex guards the mutable values below
 	mutex sync.Mutex
@@ -110,6 +125,7 @@ func NewSandboxClient(restConfig *rest.Config) (*SandboxClient, error) {
 		agentsClient: agentsCS,
 		coreClient:   coreClient,
 		restConfig:   restConfig,
+		connectivity: os.Getenv("AO_SANDBOX_CONNECTIVITY"),
 		sandboxes:    make(map[types.NamespacedName]*Sandbox),
 	}, nil
 }
@@ -179,6 +195,16 @@ type Sandbox struct {
 	id types.NamespacedName
 
 	podName string
+	podIP   string
+
+	authToken             string
+	controlPlaneNamespace string
+
+	// grpcMu guards gRPC connection and process client initialization
+	grpcMu          sync.Mutex
+	grpcConn        *grpc.ClientConn
+	processClient   processv1.ProcessServiceClient
+	portForwardStop func()
 
 	// created is true if we have created the sandbox (and not deleted it)
 	created bool
@@ -200,6 +226,26 @@ func (s *Sandbox) PodNamespacedName() types.NamespacedName {
 		Namespace: s.id.Namespace,
 		Name:      s.podName,
 	}
+}
+
+// Close closes any active gRPC connection and stops any port-forward associated with the sandbox.
+func (s *Sandbox) Close() error {
+	s.grpcMu.Lock()
+	defer s.grpcMu.Unlock()
+
+	var errs []error
+	if s.grpcConn != nil {
+		if err := s.grpcConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.grpcConn = nil
+		s.processClient = nil
+	}
+	if s.portForwardStop != nil {
+		s.portForwardStop()
+		s.portForwardStop = nil
+	}
+	return errors.Join(errs...)
 }
 
 // ExtendLifecycle updates the ShutdownTime of the Sandbox in Kubernetes to now + inactivityTimeout.
@@ -254,6 +300,9 @@ readyLoop:
 			}
 			if ready {
 				s.podName = latest.Name
+				if len(latest.Status.PodIPs) > 0 {
+					s.podIP = latest.Status.PodIPs[0]
+				}
 				break readyLoop
 			}
 
@@ -337,63 +386,376 @@ func (s *Sandbox) getPodPullEventMessage(ctx context.Context, pod *corev1.Pod) s
 	return ""
 }
 
-// ExecCommand executes a command inside the sandbox container with specified options.
-// If Stdout or Stderr are nil in tools.ExecCommandOptions, they are captured internally and returned in the tools.ExecCommandResult.
-// If the command returns a non-zero exit code, that is _not_ treated as an error; the exit code is returned in the result.
-func (s *Sandbox) ExecCommand(ctx context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
+// startPortForward establishes a SPDY port-forward to targetPort on the sandbox pod,
+// returning the local forwarded port number and a function to stop the forwarding tunnel.
+//
+// Why this is needed:
+// While in-cluster services (such as the `ao serve` deployment running in ao-system) can dial
+// sandbox pod IPs directly on port 9090, the `ao` binary is also run as a CLI tool (`ao session run`,
+// `ao session send`). When executed outside the cluster (e.g. from developer workstations,
+// laptops, dev containers, or CI test harnesses), cluster pod CIDRs (such as 10.244.0.0/16 in
+// kind) are unrouted and unreachable directly from the host. In those out-of-cluster scenarios,
+// startPortForward tunnels traffic to sandboxd through the Kubernetes API server and kubelet.
+func (s *Sandbox) startPortForward(ctx context.Context, targetPort int) (int, func(), error) {
+	if s.session == nil || s.session.client == nil || s.session.client.coreClient == nil {
+		return 0, nil, errors.New("kubernetes client is not available for port-forwarding")
+	}
+
 	coreClient := s.session.client.coreClient
 	restConfig := s.session.client.restConfig
-
-	podID := s.PodNamespacedName()
-
-	if podID.Name == "" {
-		return nil, fmt.Errorf("pod name not resolved yet")
+	podName := s.PodNamespacedName().Name
+	if podName == "" {
+		podName = s.id.Name
 	}
-
-	stdout := opts.Stdout
-	var stdoutBuf bytes.Buffer
-	if stdout == nil {
-		stdout = &stdoutBuf
-	}
-
-	stderr := opts.Stderr
-	var stderrBuf bytes.Buffer
-	if stderr == nil {
-		stderr = &stderrBuf
-	}
+	namespace := s.id.Namespace
 
 	req := coreClient.RESTClient().Post().
 		Resource("pods").
-		Name(podID.Name).
-		Namespace(podID.Namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: "sandbox",
-			Command:   opts.Command,
-			Stdin:     opts.Stdin != nil,
-			Stdout:    true,
-			Stderr:    true,
-			TTY:       false,
-		}, scheme.ParameterCodec)
+		Namespace(namespace).
+		Name(podName).
+		SubResource("portforward")
 
-	executor, err := remotecommand.NewSPDYExecutor(restConfig, "POST", req.URL())
+	transport, upgrader, err := spdy.RoundTripperFor(restConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create SPDY executor: %w", err)
+		return 0, nil, fmt.Errorf("failed to create SPDY round tripper: %w", err)
 	}
 
-	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdin:  opts.Stdin,
-		Stdout: stdout,
-		Stderr: stderr,
-		Tty:    false,
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())
+	stopChan := make(chan struct{})
+	readyChan := make(chan struct{})
+
+	ports := []string{fmt.Sprintf("0:%d", targetPort)}
+	var out, errOut bytes.Buffer
+
+	fw, err := portforward.New(dialer, ports, stopChan, readyChan, &out, &errOut)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to create port-forwarder: %w", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- fw.ForwardPorts()
+	}()
+
+	select {
+	case <-readyChan:
+	case pfErr := <-errChan:
+		close(stopChan)
+		return 0, nil, fmt.Errorf("port-forward failed to start: %w (stderr: %s)", pfErr, errOut.String())
+	case <-time.After(30 * time.Second):
+		close(stopChan)
+		return 0, nil, fmt.Errorf("timed out waiting for port-forward to be ready (stderr: %s)", errOut.String())
+	case <-ctx.Done():
+		close(stopChan)
+		return 0, nil, ctx.Err()
+	}
+
+	forwardedPorts, err := fw.GetPorts()
+	if err != nil || len(forwardedPorts) == 0 {
+		close(stopChan)
+		return 0, nil, fmt.Errorf("failed to get forwarded ports: %w", err)
+	}
+
+	localPort := int(forwardedPorts[0].Local)
+	var stopOnce sync.Once
+	stopFn := func() {
+		stopOnce.Do(func() {
+			close(stopChan)
+		})
+	}
+
+	return localPort, stopFn, nil
+}
+
+// resolveTarget determines the gRPC address for reaching sandboxd.
+//
+// Connectivity behavior:
+//  1. In-cluster: When ao runs inside Kubernetes, podIP is directly routable. resolveTarget
+//     dials podIP:9090 directly without port-forward overhead.
+//  2. Out-of-cluster: When running outside the cluster (developer laptops, CLI session runs,
+//     or e2e tests), dialing podIP directly times out, so resolveTarget transparently falls back
+//     to establishing a SPDY port-forwarding tunnel via startPortForward.
+//
+// Can also be explicitly forced via AO_SANDBOX_CONNECTIVITY ("pod-ip" or "port-forward").
+func (s *Sandbox) resolveTarget(ctx context.Context) (string, func(), error) {
+	connMode := ""
+	if s.session != nil && s.session.client != nil {
+		connMode = s.session.client.connectivity
+	}
+
+	podIP := s.podIP
+	if podIP == "" && s.session != nil && s.session.client != nil && s.session.client.coreClient != nil {
+		podName := s.PodNamespacedName().Name
+		if podName == "" {
+			podName = s.id.Name
+		}
+		pod, err := s.session.client.coreClient.Pods(s.id.Namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err == nil && pod != nil {
+			podIP = pod.Status.PodIP
+			s.podIP = podIP
+		}
+	}
+
+	if connMode == "pod-ip" {
+		if podIP == "" {
+			return "", nil, fmt.Errorf("sandbox pod IP not found for %s", s.id)
+		}
+		return net.JoinHostPort(podIP, "9090"), nil, nil
+	}
+
+	if connMode == "port-forward" {
+		localPort, stopFn, err := s.startPortForward(ctx, 9090)
+		if err != nil {
+			return "", nil, err
+		}
+		return fmt.Sprintf("127.0.0.1:%d", localPort), stopFn, nil
+	}
+
+	// Auto-detection: test direct Pod IP connection first with a brief timeout.
+	if podIP != "" {
+		dialer := net.Dialer{Timeout: 300 * time.Millisecond}
+		conn, dialErr := dialer.DialContext(ctx, "tcp", net.JoinHostPort(podIP, "9090"))
+		if dialErr != nil {
+			// Pod IP was unreachable directly (e.g. outside cluster); fall through to port-forwarding.
+		} else {
+			if closeErr := conn.Close(); closeErr != nil {
+				scoped.Log(ctx).V(2).Info("failed to close probe connection", "error", closeErr)
+			}
+			return net.JoinHostPort(podIP, "9090"), nil, nil
+		}
+	}
+
+	// Direct Pod IP connection was unreachable (e.g. outside the cluster). Fall back to port-forwarding.
+	localPort, stopFn, err := s.startPortForward(ctx, 9090)
+	if err != nil {
+		return "", nil, err
+	}
+	return fmt.Sprintf("127.0.0.1:%d", localPort), stopFn, nil
+}
+
+// ensureClient initializes the gRPC client to sandboxd if it is not already connected.
+func (s *Sandbox) ensureClient(ctx context.Context) error {
+	s.grpcMu.Lock()
+	defer s.grpcMu.Unlock()
+
+	if s.processClient != nil {
+		return nil
+	}
+
+	// Retrieve auth token from Secret if not held in memory
+	if s.authToken == "" && s.session != nil && s.session.client != nil && s.session.client.coreClient != nil {
+		cpNamespace := s.controlPlaneNamespace
+		if cpNamespace == "" {
+			cpNamespace = "ao-system"
+		}
+		secretName := fmt.Sprintf("sandbox-token-%s", s.id.Name)
+		secret, err := s.session.client.coreClient.Secrets(cpNamespace).Get(ctx, secretName, metav1.GetOptions{})
+		if err == nil && len(secret.Data["token"]) > 0 {
+			s.authToken = string(secret.Data["token"])
+		}
+	}
+
+	target, stopFn, err := s.resolveTarget(ctx)
+	if err != nil {
+		return fmt.Errorf("resolving sandbox endpoint: %w", err)
+	}
+
+	var dialOpts []grpc.DialOption
+	dialOpts = append(dialOpts,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(32*1024*1024)),
+	)
+
+	token := s.authToken
+	if token != "" {
+		dialOpts = append(dialOpts,
+			grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, callOpts ...grpc.CallOption) error {
+				ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+				return invoker(ctx, method, req, reply, cc, callOpts...)
+			}),
+			grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, callOpts ...grpc.CallOption) (grpc.ClientStream, error) {
+				ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+				return streamer(ctx, desc, cc, method, callOpts...)
+			}),
+		)
+	}
+
+	conn, err := grpc.NewClient(target, dialOpts...)
+	if err != nil {
+		if stopFn != nil {
+			stopFn()
+		}
+		return fmt.Errorf("creating gRPC client for %s: %w", target, err)
+	}
+
+	s.grpcConn = conn
+	s.processClient = processv1.NewProcessServiceClient(conn)
+	s.portForwardStop = stopFn
+	return nil
+}
+
+// execExecute executes a short-lived command synchronously via ProcessService.Execute.
+// On context cancellation (such as tool timeout or turn cancellation), sandboxd's
+// ProcessServer.Execute invokes killProcessGroupOnContextDone to terminate the entire
+// process group with SIGKILL, ensuring clean cancellation on the unary path without
+// requiring explicit client signal delivery.
+func (s *Sandbox) execExecute(ctx context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
+	req := &processv1.ExecuteRequest{
+		Config: &processv1.ProcessConfig{
+			Command: opts.Command,
+		},
+	}
+
+	resp, err := s.processClient.Execute(ctx, req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("sandboxd execute failed: %w", err)
+	}
+
+	return &tools.ExecCommandResult{
+		ExitCode: int(resp.GetExitCode()),
+		Stdout:   string(resp.GetStdout()),
+		Stderr:   string(resp.GetStderr()),
+	}, nil
+}
+
+// execStart executes a command via ProcessService.Start, streaming stdout/stderr events
+// and delivering a cancellation signal if ctx expires or is cancelled.
+func (s *Sandbox) execStart(ctx context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
+	stream, err := s.processClient.Start(ctx, &processv1.StartRequest{
+		Config: &processv1.ProcessConfig{
+			Command: opts.Command,
+		},
 	})
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("sandboxd start failed: %w", err)
+	}
+
+	// The first event from sandboxd must be InitEvent containing the process ID.
+	firstResp, err := stream.Recv()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("failed to receive init event from sandboxd: %w", err)
+	}
+
+	initEvent := firstResp.GetInit()
+	if initEvent == nil {
+		return nil, fmt.Errorf("expected InitEvent as first message, got: %v", firstResp)
+	}
+	pid := initEvent.GetProcessId()
+
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+
+	// Watch for context cancellation / tool timeout and signal the process group.
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-doneCh:
+		}
+		if ctx.Err() != nil {
+			sigCtx, sigCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer sigCancel()
+			if _, sigErr := s.processClient.SendSignal(sigCtx, &processv1.SendSignalRequest{
+				ProcessId: pid,
+				Signal:    processv1.Signal_SIGNAL_SIGKILL,
+			}); sigErr != nil {
+				scoped.Log(ctx).V(2).Info("failed to deliver cancellation signal to sandboxd", "error", sigErr)
+			}
+		}
+	}()
+
+	// Feed standard input concurrently if provided.
+	if opts.Stdin != nil {
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+
+				select {
+				case <-doneCh:
+					return
+				default:
+				}
+
+				n, readErr := opts.Stdin.Read(buf)
+				if n > 0 {
+					_, wErr := s.processClient.WriteStdin(ctx, &processv1.WriteStdinRequest{
+						ProcessId: pid,
+						Payload: &processv1.WriteStdinRequest_Input{
+							Input: buf[:n],
+						},
+					})
+					if wErr != nil {
+						return
+					}
+				}
+				if readErr != nil {
+					if errors.Is(readErr, io.EOF) {
+						if _, eofErr := s.processClient.WriteStdin(ctx, &processv1.WriteStdinRequest{
+							ProcessId: pid,
+							Payload: &processv1.WriteStdinRequest_Eof{
+								Eof: &emptypb.Empty{},
+							},
+						}); eofErr != nil {
+							scoped.Log(ctx).V(2).Info("failed to send eof to sandboxd stdin", "error", eofErr)
+						}
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	stdoutWriter := opts.Stdout
+	if stdoutWriter == nil {
+		stdoutWriter = &stdoutBuf
+	}
+	stderrWriter := opts.Stderr
+	if stderrWriter == nil {
+		stderrWriter = &stderrBuf
+	}
 
 	exitCode := 0
-	if err != nil {
-		if exitErr, ok := errors.AsType[exec.ExitError](err); ok {
-			exitCode = exitErr.ExitStatus()
-		} else {
-			return nil, fmt.Errorf("kubernetes exec failed: %w", err)
+	for {
+		resp, recvErr := stream.Recv()
+		if recvErr != nil {
+			if errors.Is(recvErr, io.EOF) {
+				break
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, fmt.Errorf("error reading sandboxd process stream: %w", recvErr)
+		}
+
+		switch ev := resp.GetEvent().(type) {
+		case *processv1.StartResponse_Stdout:
+			if len(ev.Stdout) > 0 {
+				if _, err := stdoutWriter.Write(ev.Stdout); err != nil {
+					return nil, fmt.Errorf("writing stdout: %w", err)
+				}
+			}
+		case *processv1.StartResponse_Stderr:
+			if len(ev.Stderr) > 0 {
+				if _, err := stderrWriter.Write(ev.Stderr); err != nil {
+					return nil, fmt.Errorf("writing stderr: %w", err)
+				}
+			}
+		case *processv1.StartResponse_Exit:
+			exitCode = int(ev.Exit.GetExitCode())
+		default:
+			scoped.Log(ctx).V(2).Info("received unknown event from sandboxd process stream", "event", resp.GetEvent())
 		}
 	}
 
@@ -408,6 +770,21 @@ func (s *Sandbox) ExecCommand(ctx context.Context, opts tools.ExecCommandOptions
 	}
 
 	return res, nil
+}
+
+// ExecCommand executes a command inside the sandbox container with specified options.
+// If Stdout or Stderr are nil in tools.ExecCommandOptions, they are captured internally and returned in the tools.ExecCommandResult.
+// If the command returns a non-zero exit code, that is _not_ treated as an error; the exit code is returned in the result.
+func (s *Sandbox) ExecCommand(ctx context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
+	if err := s.ensureClient(ctx); err != nil {
+		return nil, err
+	}
+
+	if opts.Stdin != nil || opts.Stdout != nil || opts.Stderr != nil || opts.Stream {
+		return s.execStart(ctx, opts)
+	}
+
+	return s.execExecute(ctx, opts)
 }
 
 // SetStateDir configures the state directory for this session.
@@ -589,13 +966,81 @@ func (s *Sandbox) SnapshotFS(ctx context.Context) error {
 	return nil
 }
 
-// CreateSandbox creates a Sandbox resource for the session.
+// CreateSandbox creates a Sandbox resource for the session using topology B
+// (an init container copies sandboxd into a shared volume, and the worker container runs it with tini as PID 1).
 func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox, error) {
 	agentsClient := h.sandboxClient.agentsClient
 
 	id := session.sandboxID
 	image := h.opts.Image
+	if image == "" {
+		image = DefaultImage
+	}
+	sandboxdImage := h.opts.SandboxdImage
+	if sandboxdImage == "" {
+		sandboxdImage = DefaultSandboxdImage
+	}
 	homeDir := h.opts.HomeDir
+	cpNamespace := h.opts.ControlPlaneNamespace
+	if cpNamespace == "" {
+		return nil, errors.New("ControlPlaneNamespace must be specified in RunOptions")
+	}
+
+	// Why we include an authentication token:
+	// Without authentication, any process that can reach sandboxd on port 8080/9090
+	// (other pods in the cluster or unauthorized processes if port-forwarded) could
+	// invoke ProcessService or FilesystemService to execute arbitrary commands or
+	// access files with the agent container's privileges. The bearer token restricts
+	// execution to the control plane that minted it.
+	//
+	// Symmetric SHA-256 vs Asymmetric ed25519:
+	// sandboxd currently verifies bearer tokens against a SHA-256 digest (--auth-token-sha256).
+	// We pass only the SHA-256 digest so the raw token never appears in the pod spec or
+	// container environment, and store the token in a Secret in the control plane's namespace.
+	// (An ideal future upstream enhancement for sandboxd is ed25519 public key verification,
+	// allowing the public key to be passed in args while keeping the private key only in
+	// control plane memory, eliminating Secrets entirely).
+
+	// 1. Mint a random bearer token per sandbox.
+	tokenBytes := make([]byte, 32)
+	if _, err := cryptorand.Read(tokenBytes); err != nil {
+		return nil, fmt.Errorf("generating auth token: %w", err)
+	}
+	token := hex.EncodeToString(tokenBytes)
+
+	// 2. Store the bearer token in a Secret in the control plane's namespace.
+	secretName := fmt.Sprintf("sandbox-token-%s", id.Name)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: cpNamespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by":        "auto-optimizer",
+				"auto-optimizer.gke-labs.dev/sandbox": id.Name,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		StringData: map[string]string{
+			"token": token,
+		},
+	}
+	if h.sandboxClient.coreClient != nil {
+		_, err := h.sandboxClient.coreClient.Secrets(cpNamespace).Create(ctx, secret, metav1.CreateOptions{})
+		if err != nil {
+			if k8serrors.IsAlreadyExists(err) {
+				existing, getErr := h.sandboxClient.coreClient.Secrets(cpNamespace).Get(ctx, secretName, metav1.GetOptions{})
+				if getErr == nil && len(existing.Data["token"]) > 0 {
+					token = string(existing.Data["token"])
+				}
+			} else {
+				return nil, fmt.Errorf("failed to create sandbox token secret in %s: %w", cpNamespace, err)
+			}
+		}
+	}
+
+	// 3. Pass only the SHA-256 digest of the token to sandboxd so the token never appears in the pod spec.
+	tokenDigest := sha256.Sum256([]byte(token))
+	tokenSHA256 := hex.EncodeToString(tokenDigest[:])
 
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	sb := &sandboxv1beta1.Sandbox{
@@ -605,15 +1050,93 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 		},
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				Service: new(true),
 				PodTemplate: sandboxv1beta1.PodTemplate{
 					Spec: corev1.PodSpec{
 						AutomountServiceAccountToken: new(false),
+						SecurityContext: &corev1.PodSecurityContext{
+							RunAsNonRoot: new(true),
+							FSGroup:      new(int64(1000)),
+						},
+						InitContainers: []corev1.Container{
+							{
+								Name:  "install-sandboxd",
+								Image: sandboxdImage,
+								Command: []string{
+									"/bin/sh", "-c", "cp /usr/local/bin/sandboxd /sandboxd-bin/sandboxd",
+								},
+								SecurityContext: &corev1.SecurityContext{
+									RunAsUser:                new(int64(1000)),
+									RunAsGroup:               new(int64(1000)),
+									RunAsNonRoot:             new(true),
+									AllowPrivilegeEscalation: new(false),
+									Capabilities: &corev1.Capabilities{
+										Drop: []corev1.Capability{"ALL"},
+									},
+								},
+								VolumeMounts: []corev1.VolumeMount{
+									{
+										Name:      "sandboxd-bin",
+										MountPath: "/sandboxd-bin",
+									},
+								},
+							},
+						},
 						Containers: []corev1.Container{
 							{
-								Name:    "sandbox",
-								Image:   image,
-								Command: []string{"sleep", "infinity"},
+								Name:  "sandbox",
+								Image: image,
+								// tini runs as PID 1 to act as a proper subreaper for child processes
+								// spawned by commands executed via sandboxd, ensuring orphan zombie
+								// process reaping, signal forwarding to process groups, and graceful cleanup.
+								Command: []string{
+									"tini", "-g", "--",
+									"/sandboxd-bin/sandboxd",
+									"--root-dir=/workspace",
+									"--listen-host=0.0.0.0",
+									"--grpc-port=9090",
+									"--rest-port=8080",
+									fmt.Sprintf("--auth-token-sha256=%s", tokenSHA256),
+								},
+								SecurityContext: &corev1.SecurityContext{
+									RunAsUser:                new(int64(1000)),
+									RunAsGroup:               new(int64(1000)),
+									RunAsNonRoot:             new(true),
+									AllowPrivilegeEscalation: new(false),
+									Capabilities: &corev1.Capabilities{
+										Drop: []corev1.Capability{"ALL"},
+									},
+								},
+								Ports: []corev1.ContainerPort{
+									{
+										Name:          "rest",
+										ContainerPort: 8080,
+									},
+									{
+										Name:          "grpc",
+										ContainerPort: 9090,
+									},
+								},
+								ReadinessProbe: &corev1.Probe{
+									ProbeHandler: corev1.ProbeHandler{
+										HTTPGet: &corev1.HTTPGetAction{
+											Path: "/v1/health",
+											Port: intstr.FromInt32(8080),
+										},
+									},
+									InitialDelaySeconds: 1,
+									PeriodSeconds:       1,
+								},
 								VolumeMounts: []corev1.VolumeMount{
+									{
+										Name:      "sandboxd-bin",
+										MountPath: "/sandboxd-bin",
+										ReadOnly:  true,
+									},
+									{
+										Name:      "workspace",
+										MountPath: "/workspace",
+									},
 									{
 										Name:      "home",
 										MountPath: homeDir,
@@ -628,6 +1151,18 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 							},
 						},
 						Volumes: []corev1.Volume{
+							{
+								Name: "sandboxd-bin",
+								VolumeSource: corev1.VolumeSource{
+									EmptyDir: &corev1.EmptyDirVolumeSource{},
+								},
+							},
+							{
+								Name: "workspace",
+								VolumeSource: corev1.VolumeSource{
+									EmptyDir: &corev1.EmptyDirVolumeSource{},
+								},
+							},
 							{
 								Name: "home",
 								VolumeSource: corev1.VolumeSource{
@@ -654,9 +1189,11 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 	}
 
 	sandbox := &Sandbox{
-		session: session,
-		id:      id,
-		created: true,
+		session:               session,
+		id:                    id,
+		created:               true,
+		authToken:             token,
+		controlPlaneNamespace: cpNamespace,
 	}
 
 	h.sandboxClient.mutex.Lock()
@@ -666,12 +1203,29 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 	return sandbox, nil
 }
 
-// DeleteSandbox deletes the Sandbox resource.
+// DeleteSandbox deletes the Sandbox resource and its bearer token Secret.
 func (c *SandboxClient) DeleteSandbox(ctx context.Context, sb *Sandbox) error {
+	if closeErr := sb.Close(); closeErr != nil {
+		scoped.Log(ctx).V(2).Info("error closing sandbox connection", "error", closeErr)
+	}
+
 	if !sb.created {
 		return nil
 	}
 	id := sb.NamespacedName()
+
+	// Delete bearer token secret in control plane namespace
+	cpNamespace := sb.controlPlaneNamespace
+	if cpNamespace == "" {
+		cpNamespace = "ao-system"
+	}
+	secretName := fmt.Sprintf("sandbox-token-%s", id.Name)
+	if c.coreClient != nil {
+		if err := c.coreClient.Secrets(cpNamespace).Delete(ctx, secretName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+			scoped.Log(ctx).V(1).Info("failed to delete auth token secret", "secret", secretName, "error", err)
+		}
+	}
+
 	// NotFound means the sandbox already expired (ShutdownPolicy Delete),
 	// which is success for our purposes.
 	if err := c.agentsClient.AgentsV1beta1().Sandboxes(id.Namespace).Delete(ctx, id.Name, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
@@ -708,9 +1262,11 @@ func (c *SandboxClient) DeleteAllSandboxes(ctx context.Context) error {
 
 // RunOptions are the options for running the agent.
 type RunOptions struct {
-	StateDir  string
-	Namespace string
-	Image     string
+	StateDir              string
+	Namespace             string
+	ControlPlaneNamespace string
+	Image                 string
+	SandboxdImage         string
 
 	// HomeDir is the home directory inside the sandbox.
 	// This is currently the only path that we persist between execs in the sandbox.
@@ -730,7 +1286,7 @@ type RunOptions struct {
 
 // DefaultImage is the sandbox image used when neither the flags, the
 // environment, nor the selected toolset specify one.
-const DefaultImage = "debian:bookworm-slim"
+const DefaultImage = "auto-optimizer.local/geminicli-toolbox:dev"
 
 // InitDefaults populates the options from environment variables and defaults.
 // Image is left empty when SANDBOX_IMAGE is unset, so callers can
@@ -742,6 +1298,16 @@ func (o *RunOptions) InitDefaults() {
 	o.Namespace = os.Getenv("SANDBOX_NAMESPACE")
 	if o.Namespace == "" {
 		o.Namespace = "ao-sandboxes"
+	}
+
+	o.ControlPlaneNamespace = os.Getenv("AO_NAMESPACE")
+	if o.ControlPlaneNamespace == "" {
+		o.ControlPlaneNamespace = "ao-system"
+	}
+
+	o.SandboxdImage = os.Getenv("SANDBOXD_IMAGE")
+	if o.SandboxdImage == "" {
+		o.SandboxdImage = DefaultSandboxdImage
 	}
 
 	o.HomeDir = os.Getenv("SANDBOX_HOME_DIR")
@@ -1018,6 +1584,9 @@ func (h *Harness) ensureSandbox(ctx context.Context, session *Session) (tools.Sa
 		if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {
 			if k8serrors.IsNotFound(err) {
 				log.Info("Active sandbox was deleted or expired, will recreate it", "sandbox.name", session.sandboxID.Name)
+				if closeErr := sb.Close(); closeErr != nil {
+					log.V(2).Info("error closing expired sandbox connection", "error", closeErr)
+				}
 				session.activeSandbox = nil
 			} else {
 				return nil, fmt.Errorf("extending sandbox TTL: %w", err)
