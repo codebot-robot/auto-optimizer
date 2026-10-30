@@ -43,6 +43,47 @@ func getSandboxdImage(t *testing.T, subH *Harness) string {
 	return session.DefaultSandboxdImage
 }
 
+// assertSandboxdAuthAndNoSecretsRBAC asserts:
+// 1. The sandbox pod's init container command/args do NOT contain --auth-token-sha256.
+// 2. The sandbox pod's sandbox container command/args contain --auth-public-key and --auth-audience, and no --auth-token-sha256.
+// 3. The control plane service account has no permissions to create secrets in ao-system.
+func assertSandboxdAuthAndNoSecretsRBAC(t *testing.T, subH *Harness, sessionName string) {
+	t.Helper()
+
+	// Verify init container command/args do NOT contain --auth-token-sha256
+	initArgs, err := subH.Kubectl("get", "pod", "-n", "ao-sandboxes", sessionName, "-o", "jsonpath={.spec.initContainers[0].command} {.spec.initContainers[0].args}")
+	if err != nil {
+		t.Fatalf("failed to get pod initContainer command/args: %v", err)
+	}
+	if strings.Contains(initArgs, "--auth-token-sha256") {
+		t.Errorf("expected initContainer command/args to not contain '--auth-token-sha256', got: %s", initArgs)
+	}
+
+	// Verify sandbox container command/args contain --auth-public-key and --auth-audience, and no --auth-token-sha256
+	sandboxArgs, err := subH.Kubectl("get", "pod", "-n", "ao-sandboxes", sessionName, "-o", "jsonpath={.spec.containers[0].command} {.spec.containers[0].args}")
+	if err != nil {
+		t.Fatalf("failed to get sandbox container command/args: %v", err)
+	}
+	if !strings.Contains(sandboxArgs, "--auth-public-key") {
+		t.Errorf("expected sandbox container command/args to contain '--auth-public-key', got: %s", sandboxArgs)
+	}
+	if !strings.Contains(sandboxArgs, "--auth-audience") {
+		t.Errorf("expected sandbox container command/args to contain '--auth-audience', got: %s", sandboxArgs)
+	}
+	if strings.Contains(sandboxArgs, "--auth-token-sha256") {
+		t.Errorf("expected sandbox container command/args to not contain '--auth-token-sha256', got: %s", sandboxArgs)
+	}
+
+	// Verify control plane RBAC does NOT include create secrets in ao-system
+	canCreateSecrets, err := subH.Kubectl("auth", "can-i", "create", "secrets", "--as=system:serviceaccount:ao-system:ao", "-n", "ao-system")
+	if err != nil && !strings.Contains(canCreateSecrets, "no") {
+		t.Fatalf("kubectl auth can-i create secrets failed: %v (output: %s)", err, canCreateSecrets)
+	}
+	if strings.TrimSpace(canCreateSecrets) != "no" {
+		t.Errorf("expected control plane RBAC to not include create secrets in ao-system, got auth can-i result: %q", canCreateSecrets)
+	}
+}
+
 func TestSmoke(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e smoke tests")
@@ -330,6 +371,9 @@ func TestSession(t *testing.T) {
 	if !strings.Contains(podLogs, "sandboxd") {
 		t.Errorf("expected sandbox pod logs to show sandboxd, got:\n%s", podLogs)
 	}
+
+	// Verify sandboxd asymmetric auth container args and control plane Secrets RBAC
+	assertSandboxdAuthAndNoSecretsRBAC(t, subH, sessionName)
 
 	// Verify control plane RBAC does NOT include pods/exec or pods/portforward
 	canExec, err := subH.Kubectl("auth", "can-i", "create", "pods", "--subresource=exec", "--as=system:serviceaccount:ao-system:ao", "-n", "ao-sandboxes")
@@ -756,6 +800,9 @@ func TestSessionAPIInCluster(t *testing.T) {
 	if shutdownPolicy != "Delete" {
 		t.Errorf("shutdownPolicy = %q, want Delete", shutdownPolicy)
 	}
+
+	// Verify sandboxd asymmetric auth container args and control plane Secrets RBAC
+	assertSandboxdAuthAndNoSecretsRBAC(t, subH, sessionName)
 
 	// 6. Assert the in-cluster server did the work:
 	// The sandbox's creation must postdate the test start.

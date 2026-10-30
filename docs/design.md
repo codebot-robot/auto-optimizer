@@ -76,7 +76,7 @@ token-only first cut, so a token and an App both work from day one.
  |   web UI (html/template)                  |                      |
  +-------------------------------------------|----------------------+
                                              | sandboxd gRPC :9090 + REST :8080
-                                             | (bearer token, NetworkPolicy)
+                                             | (signed token; #102 tracks TLS)
                                              v
  +------------------------------------------------------------------+
  |  Sandbox (agents.x-k8s.io/v1beta1), namespace ao-sandboxes        |
@@ -326,8 +326,9 @@ image ships `tini`, so sandboxd is not PID 1 in a long-lived sandbox.
 `/workspace` is the sandboxd root. It is an ObjectFS volume declared in
 `volumeClaimTemplates` with the `objectfs-exclusive-local` StorageClass,
 `ReadWriteOncePod` access, and a periodic checkpoint. sandboxd runs with
-`--auth-token-file` pointing at a per-run Secret. The control plane holds the
-token, and the pod spec never contains it.
+`--auth-public-key` and `--auth-audience`. The control plane signs short-lived
+tokens per call with its ed25519 key, and no Secrets are created for sandbox
+authentication.
 
 The **portal** sidecar runs `all-in-one-portal` as uid 1337 and reads its
 rules from a per-run Secret. The `init-service-portals` init container
@@ -339,10 +340,10 @@ registries the repository needs. Agent CLIs therefore need no base-URL
 changes. They only need the pod CA in `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`,
 and git's `http.sslCAInfo`.
 
-A **NetworkPolicy** admits ingress to ports 8080 and 9090 only from `ao serve`
-pods. The portal's iptables rules and a deny-by-default policy handle egress.
-We replace the template's managed policy with our own, because the default
-policy admits only `sandbox-router`.
+There is no per-sandbox ingress **NetworkPolicy** (removed as too expensive at
+sandbox scale); the signed token gates access to sandboxd, and transport
+security (TLS) is tracked in #102. The portal's iptables rules and a
+deny-by-default policy handle egress.
 
 The control plane connects to sandboxd in-cluster, by Pod IP or by the
 headless Service that `spec.service: true` creates. We do not use
@@ -367,12 +368,12 @@ Pending -> Preparing -> Working -> Selecting -> OpeningPR -> Succeeded
 1. **Pending.** A goal needs a run because its schedule is due, its content
    changed, or someone asked. The scheduler allows one active run per goal
    and enforces the repository's budget cap.
-2. **Preparing.** The orchestrator creates the workspace PVC, the sandboxd
-   token Secret, the portal rules Secret, and the Sandbox. It mints the
-   installation token now. The token is valid for one hour, and the portal
-   re-reads its rules on `SIGHUP` when the control plane rotates it. The
-   orchestrator waits for `Ready`, clones the repository at the base commit,
-   freezes the goal file, and measures the baseline for a metric goal.
+2. **Preparing.** The orchestrator creates the workspace PVC, the portal
+   rules Secret, and the Sandbox. It mints the installation token now. The
+   token is valid for one hour, and the portal re-reads its rules on `SIGHUP`
+   when the control plane rotates it. The orchestrator waits for `Ready`,
+   clones the repository at the base commit, freezes the goal file, and
+   measures the baseline for a metric goal.
 3. **Working.** The session manager runs the session turn by turn. The
    session ends when it calls `open_pull_request` or `finish`, when the model
    stops, or when a limit is hit. The limits are `maxDuration`, `maxCostUSD`,
@@ -387,11 +388,11 @@ Pending -> Preparing -> Working -> Selecting -> OpeningPR -> Succeeded
    The harness writes the body. The body names the goal and the base commit,
    gives the baseline and candidate numbers and the improvement, states the
    cost, links to the run page, and then quotes the session's own summary.
-6. **Terminal.** The orchestrator deletes the Sandbox. The portal and token
-   Secrets go with it through owner references. The workspace volume stays
-   for the retention window, so the session can resume with review feedback.
-   The orchestrator deletes the volume when the PR is closed or merged, or
-   when the window passes.
+6. **Terminal.** The orchestrator deletes the Sandbox. The portal Secret goes
+   with it through owner references. The workspace volume stays for the
+   retention window, so the session can resume with review feedback. The
+   orchestrator deletes the volume when the PR is closed or merged, or when the
+   window passes.
 
 A run has one deterministic branch name, so re-running the OpeningPR step
 updates the existing PR instead of opening another. The scheduler skips a goal
@@ -430,9 +431,29 @@ owns `repo.json` and `goal.json`.
 - The sandbox cannot reach the control plane, other sandboxes, the metadata
   server, or arbitrary hosts. Egress is an iptables allowlist owned by a UID
   the workload cannot become, plus a NetworkPolicy.
-- The control plane reaches sandboxd with a per-run bearer token over the pod
-  network, and a NetworkPolicy restricts who can connect. If we deploy where
-  NetworkPolicy is not enforced, we add mTLS as eval-runner did.
+- The control plane reaches sandboxd over the pod network using asymmetric
+  ed25519 authentication. There is no per-sandbox NetworkPolicy (removed as too
+  expensive at sandbox scale); the signed token is what gates access. Transport
+  security (TLS between the control plane and sandboxd) is tracked in #102:
+  - The control plane holds an ed25519 signing key in memory and on its
+    persistent state volume (`<state-dir>/sandbox-signing-key` in mode `0600`).
+    The private key never leaves the process or volume, and no Kubernetes
+    Secret is created for sandbox authentication; the control plane's
+    ServiceAccount holds no RBAC permissions on Secrets.
+  - When creating a sandbox, only the base64-encoded public key
+    (`--auth-public-key`) and expected audience
+    (`--auth-audience=<namespace>/<sandbox-name>`) are passed to sandboxd in
+    container arguments.
+  - For every gRPC call, the client signs a fresh token in
+    `v1.<base64url(payload)>.<base64url(signature)>` format with a 5-minute
+    lifetime (`exp`) and audience claim matching the target sandbox.
+  - **What a captured token can and cannot do**: Within its 5-minute validity
+    window, a captured token can only invoke gRPC operations on the specific
+    sandbox instance designated by its audience claim (`<namespace>/<sandbox-name>`).
+    It cannot authenticate to any other sandbox (the audience check will reject
+    it), cannot be used after the 5-minute window expires, cannot be used to
+    forge or mint new tokens without the ed25519 private key, and cannot
+    access the Kubernetes API or any control plane Secrets.
 - Prompt-injected code in a repository can waste budget and produce a bad PR.
   It cannot exfiltrate tokens or touch other repositories. The orchestrator
   enforces the budgets, not the prompt.
@@ -568,12 +589,15 @@ Each one becomes an issue in the respective project, not a workaround here.
   - Stdin streaming: while `Commands.Start` returns a `ProcessHandle` with
     `Recv` and `SendSignal`, it does not support streaming standard input via
     `ProcessService.WriteStdin`.
-  - Asymmetric authentication in sandboxd: sandboxd currently only verifies
+  - Asymmetric authentication in sandboxd: sandboxd upstream only verified
     symmetric bearer tokens against a SHA-256 digest (`--auth-token-sha256`).
-    Supporting ed25519 public key verification would allow passing the public
-    key in container args (`--auth-public-key`) while keeping the private key
-    solely in control plane memory, eliminating the need for Kubernetes Secret
-    objects and symmetric token management.
+    Supporting ed25519 public key verification allows passing the public key in
+    container args (`--auth-public-key`) along with `--auth-audience` while
+    keeping the private key solely in control plane memory, eliminating the need
+    for Kubernetes Secret objects and symmetric token management. This change
+    lives on the fork branch `justinsb/agent-sandbox:sandboxd-asymmetric-auth`
+    (at commit `76156ce`) until it is merged and released upstream in
+    `kubernetes-sigs/agent-sandbox`.
   - Multi-platform image import: staging images built with multi-platform
     manifests can fail `kind load docker-image` (`ctr: content digest ... not found`),
     requiring in-node pulls (`crictl pull`) as a workaround.

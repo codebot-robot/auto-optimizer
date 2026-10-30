@@ -24,12 +24,18 @@ The session implementation was forked from `examples/sandboxed-tools` in the [ku
    - `GetRESTConfig` prefers local kubeconfig (or `KUBECONFIG`) if present and valid, falling back to in-cluster configuration. This allows running `ao` from dev containers or laptops against local kind clusters even when running within a container.
 6. **Sandbox Lifecycle**:
    - Sandboxes persist after process exit and expire automatically via `shutdownPolicy: Delete` and inactivity timeout `shutdownTime`, allowing subsequent CLI commands to reuse active sandboxes without recreate latency.
-7. **Sandbox Transport (`sandboxd`)**:
+7. **Sandbox Transport (`sandboxd`) and Asymmetric Authentication**:
    - The transport uses `sandboxd` gRPC `ProcessService` (port 9090) instead of SPDY `kubectl exec` (`pods/exec`).
    - Sandbox pods deploy using Topology B: an `install-sandboxd` init container copies the `sandboxd` binary into a shared volume, and the worker container runs it with `tini` as PID 1 and a readiness probe on `/v1/health` (port 8080).
-   - Each sandbox mints a random bearer token stored in a Secret in `ao-system`; only its SHA-256 digest is passed to sandboxd via `--auth-token-sha256`, keeping secrets out of the pod spec.
+   - Asymmetric authentication (`ed25519`):
+     - **Signing key**: The control plane (both `ao serve` and the `ao` CLI) loads or generates a 64-byte raw ed25519 signing key at `<state-dir>/sandbox-signing-key` with `0600` permissions. The private key remains exclusively in control plane memory and on its local state disk; it is never transmitted over the network or stored in Kubernetes Secret resources.
+     - **Public key and audience injection**: `CreateSandbox` passes only the base64-encoded public key via `--auth-public-key` and the target audience via `--auth-audience=<namespace>/<sandbox-name>` to `sandboxd` in the pod template args. No Kubernetes Secret is created, and the control plane's ServiceAccount has no RBAC permissions for Secrets in its namespace.
+     - **Per-call signed tokens**: For every gRPC call to `sandboxd`, the client interceptor mints a fresh token signed by the control plane's private key in `v1.<base64url(payload)>.<base64url(signature)>` format. The payload carries the target `aud` (`<namespace>/<sandbox-name>`), issuance time `iat`, and expiration `exp` with a 5-minute token lifetime.
+     - **Captured token scope**:
+       - *What it can do*: Within its 5-minute lifetime, a captured token can only invoke gRPC operations on the specific sandbox instance matching its audience claim (`<namespace>/<sandbox-name>`).
+       - *What it cannot do*: It cannot authenticate against any other sandbox (mismatched audience is rejected by sandboxd), cannot be used after the 5-minute validity window expires, cannot be used to forge new tokens (which requires the private signing key), and cannot access the Kubernetes API or any control plane Secrets.
    - Connections use direct Pod IP connectivity in-cluster, with automatic fallback to SPDY port-forwarding when executed outside the cluster (e.g. from developer laptops).
-   - Authentication protects sandboxd via per-sandbox bearer tokens, avoiding expensive per-pod NetworkPolicies at sandbox scale.
+   - Upstream status: The asymmetric authentication support in `sandboxd` (`--auth-public-key`, `--auth-audience`, `--auth-max-token-ttl`) currently lives on the fork branch `justinsb/agent-sandbox:sandboxd-asymmetric-auth` (at commit `76156ce`) until it is accepted and released upstream in `kubernetes-sigs/agent-sandbox`.
 
 ## Relationship to Upstream
 
