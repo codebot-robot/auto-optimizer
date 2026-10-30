@@ -813,4 +813,45 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 	if r.Id != runID || r.GoalName != "benchmark" || r.Phase != string(state.PhasePending) || r.BaseCommit != "c0ffee" {
 		t.Errorf("unexpected run: %+v", r)
 	}
+
+	// Test GetRun with empty ID
+	if _, err := client.GetRun(ctx, &sessionv1.GetRunRequest{Id: ""}); err == nil {
+		t.Error("expected error for empty id in GetRun")
+	}
+
+	// Test GetRun with non-existent ID
+	if _, err := client.GetRun(ctx, &sessionv1.GetRunRequest{Id: "nonexistent"}); err == nil {
+		t.Error("expected error for nonexistent run in GetRun")
+	}
+
+	// Add event to run
+	now := time.Now().Truncate(time.Second)
+	event := state.Event{
+		Time:    now,
+		Phase:   state.PhasePending,
+		Kind:    "created",
+		Message: "Run created",
+	}
+	if err := stateStore.AppendEvent(ctx, key, runID, event); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	// Test GetRun for existing run
+	getRunResp, err := client.GetRun(ctx, &sessionv1.GetRunRequest{Id: runID})
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if getRunResp.Run == nil {
+		t.Fatal("expected run record in GetRun response")
+	}
+	if getRunResp.Run.Id != runID || getRunResp.Run.GoalName != "benchmark" || getRunResp.Run.RepoUrl != repo.URL {
+		t.Errorf("unexpected run in GetRun: %+v", getRunResp.Run)
+	}
+	if len(getRunResp.Events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(getRunResp.Events))
+	}
+	ev := getRunResp.Events[0]
+	if ev.Kind != "created" || ev.Message != "Run created" || ev.Phase != string(state.PhasePending) {
+		t.Errorf("unexpected event in GetRun: %+v", ev)
+	}
 }
