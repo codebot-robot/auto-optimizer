@@ -774,4 +774,43 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 	if g.Name != "benchmark" || g.Hash != "hash123" || g.BaseCommit != "c0ffee" || g.BestValue != "42.5" {
 		t.Errorf("unexpected goal: %+v", g)
 	}
+
+	// ListRuns with empty repo_url should fail
+	if _, err := client.ListRuns(ctx, &sessionv1.ListRunsRequest{RepoUrl: ""}); err == nil {
+		t.Error("expected error for empty repo_url")
+	}
+
+	// ListRuns should be empty initially
+	runsResp, err := client.ListRuns(ctx, &sessionv1.ListRunsRequest{RepoUrl: repo.URL})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runsResp.Runs) != 0 {
+		t.Fatalf("expected 0 runs, got %d", len(runsResp.Runs))
+	}
+
+	// Create a run in stateStore
+	runID := "20261029T120000Z-abcd"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       key,
+		GoalName:   "benchmark",
+		Phase:      state.PhasePending,
+		BaseCommit: "c0ffee",
+	}
+	if err := stateStore.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	runsResp, err = client.ListRuns(ctx, &sessionv1.ListRunsRequest{RepoUrl: repo.URL})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runsResp.Runs) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(runsResp.Runs))
+	}
+	r := runsResp.Runs[0]
+	if r.Id != runID || r.GoalName != "benchmark" || r.Phase != string(state.PhasePending) || r.BaseCommit != "c0ffee" {
+		t.Errorf("unexpected run: %+v", r)
+	}
 }

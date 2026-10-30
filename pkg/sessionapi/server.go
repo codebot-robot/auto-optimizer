@@ -536,6 +536,45 @@ func (s *Server) ListGoals(ctx context.Context, req *sessionv1.ListGoalsRequest)
 	return &sessionv1.ListGoalsResponse{Goals: pbGoals}, nil
 }
 
+// ListRuns returns runs for a repository.
+func (s *Server) ListRuns(ctx context.Context, req *sessionv1.ListRunsRequest) (*sessionv1.ListRunsResponse, error) {
+	if s.stateStore == nil {
+		return &sessionv1.ListRunsResponse{}, nil
+	}
+
+	repoURL := req.GetRepoUrl()
+	if repoURL == "" {
+		return nil, status.Error(codes.InvalidArgument, "repo_url is required")
+	}
+
+	key, err := state.ParseRepoURL(repoURL)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid repo_url %q: %v", repoURL, err)
+	}
+
+	runs, err := s.stateStore.ListRuns(ctx, key)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "listing runs: %v", err)
+	}
+
+	var pbRuns []*sessionv1.RunRecord
+	for _, r := range runs {
+		pbRuns = append(pbRuns, &sessionv1.RunRecord{
+			Id:         r.ID,
+			RepoUrl:    repoURL,
+			GoalName:   r.GoalName,
+			Phase:      string(r.Phase),
+			BaseCommit: r.BaseCommit,
+			Branch:     r.Branch,
+			PrUrl:      r.PRURL,
+			SessionId:  r.SessionID,
+			Error:      r.Error,
+		})
+	}
+
+	return &sessionv1.ListRunsResponse{Runs: pbRuns}, nil
+}
+
 func (s *Server) getOrLoadSession(ctx context.Context, name string) (*session.Session, *session.Harness, error) {
 	s.mu.Lock()
 	sess := s.activeSessions[name]
