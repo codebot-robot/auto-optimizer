@@ -297,8 +297,240 @@ func TestSmartHTTP_ProtocolV2(t *testing.T) {
 		t.Errorf("expected default branch 'main', got %q", branch)
 	}
 
-	if atomic.LoadInt32(&getCalled) == 0 || atomic.LoadInt32(&postCalled) == 0 {
-		t.Errorf("expected GET and POST calls, got GET=%d POST=%d", getCalled, postCalled)
+	// First call (ListRefs) did GET + POST. Second call (DefaultBranch) skipped GET
+	// and did only POST because protocol v2 was remembered.
+	if get := atomic.LoadInt32(&getCalled); get != 1 {
+		t.Errorf("expected exactly 1 GET call, got %d", get)
+	}
+	if post := atomic.LoadInt32(&postCalled); post != 2 {
+		t.Errorf("expected 2 POST calls (1 per operation), got %d", post)
+	}
+}
+
+func TestSmartHTTP_ProtocolV2_SingleRequestPollingAndRediscovery(t *testing.T) {
+	ctx := t.Context()
+
+	var getCount, postCount int32
+	var postFailCode atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repo.git/info/refs":
+			atomic.AddInt32(&getCount, 1)
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+			var buf bytes.Buffer
+			_ = writePktLine(&buf, "# service=git-upload-pack\n")
+			_ = writePktFlush(&buf)
+			_ = writePktLine(&buf, "version 2\n")
+			_ = writePktLine(&buf, "agent=git/test\n")
+			_ = writePktLine(&buf, "ls-refs=unborn\n")
+			_ = writePktFlush(&buf)
+			_, _ = w.Write(buf.Bytes())
+
+		case r.Method == http.MethodPost && r.URL.Path == "/repo.git/git-upload-pack":
+			atomic.AddInt32(&postCount, 1)
+			if code := postFailCode.Swap(0); code != 0 {
+				http.Error(w, "simulated post failure", int(code))
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+			var buf bytes.Buffer
+			_ = writePktLine(&buf, "1111111111111111111111111111111111111111 HEAD symref-target:refs/heads/main\n")
+			_ = writePktLine(&buf, "1111111111111111111111111111111111111111 refs/heads/main\n")
+			_ = writePktFlush(&buf)
+			_, _ = w.Write(buf.Bytes())
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	repoURL := server.URL + "/repo.git"
+	client := NewGitRemote(WithHTTPClient(server.Client()))
+
+	// Poll 1: First call does GET then POST (initial capability discovery + ls-refs)
+	refs, err := client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 1 ListRefs failed: %v", err)
+	}
+	if _, ok := refs["HEAD"]; ok {
+		t.Errorf("expected no HEAD ref in advertised refs map, got %q", refs["HEAD"])
+	}
+	if refs["refs/heads/main"] != "1111111111111111111111111111111111111111" {
+		t.Errorf("unexpected refs/heads/main ref: %q", refs["refs/heads/main"])
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 1 || p != 1 {
+		t.Fatalf("Poll 1 expected GET=1 POST=1, got GET=%d POST=%d", g, p)
+	}
+
+	// Poll 2: Second call does only POST (discovery skipped)
+	refs, err = client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 2 ListRefs failed: %v", err)
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 1 || p != 2 {
+		t.Fatalf("Poll 2 expected GET=1 POST=2 (1 request for poll 2), got GET=%d POST=%d", g, p)
+	}
+
+	// Poll 3: Third call does only POST
+	refs, err = client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 3 ListRefs failed: %v", err)
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 1 || p != 3 {
+		t.Fatalf("Poll 3 expected GET=1 POST=3 (1 request for poll 3), got GET=%d POST=%d", g, p)
+	}
+
+	// Poll 4: Direct POST fails with HTTP 400 Bad Request (suggesting server no longer speaks v2).
+	// This must trigger rediscovery: client forgets v2, sends GET /info/refs, then renegotiated POST.
+	postFailCode.Store(http.StatusBadRequest)
+	refs, err = client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 4 ListRefs failed after rediscovery: %v", err)
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 2 || p != 5 {
+		t.Fatalf("Poll 4 expected GET=2 POST=5 (failed direct POST + GET rediscovery + POST), got GET=%d POST=%d", g, p)
+	}
+
+	// Poll 5: After successful rediscovery, server is known to speak v2 again; next poll costs only 1 POST.
+	refs, err = client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 5 ListRefs failed: %v", err)
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 2 || p != 6 {
+		t.Fatalf("Poll 5 expected GET=2 POST=6 (1 request for poll 5), got GET=%d POST=%d", g, p)
+	}
+
+	// Poll 6: Direct POST fails with HTTP 404 Not Found.
+	// This also triggers rediscovery.
+	postFailCode.Store(http.StatusNotFound)
+	refs, err = client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 6 ListRefs failed after rediscovery: %v", err)
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 3 || p != 8 {
+		t.Fatalf("Poll 6 expected GET=3 POST=8 (failed direct POST + GET rediscovery + POST), got GET=%d POST=%d", g, p)
+	}
+
+	// Poll 7: After 404 rediscovery, next poll costs only 1 POST.
+	refs, err = client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 7 ListRefs failed: %v", err)
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 3 || p != 9 {
+		t.Fatalf("Poll 7 expected GET=3 POST=9 (1 request for poll 7), got GET=%d POST=%d", g, p)
+	}
+}
+
+func TestSmartHTTP_ProtocolV2_RediscoveryFallbackToV0(t *testing.T) {
+	ctx := t.Context()
+
+	var getCount, postCount int32
+	var v2Enabled atomic.Bool
+	v2Enabled.Store(true)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repo.git/info/refs":
+			atomic.AddInt32(&getCount, 1)
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+
+			var buf bytes.Buffer
+			_ = writePktLine(&buf, "# service=git-upload-pack\n")
+			_ = writePktFlush(&buf)
+
+			if v2Enabled.Load() {
+				_ = writePktLine(&buf, "version 2\n")
+				_ = writePktLine(&buf, "ls-refs=unborn\n")
+				_ = writePktFlush(&buf)
+			} else {
+				// Server downgraded to protocol v0
+				_ = writePktLine(&buf, "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111 HEAD\x00multi_ack thin-pack symref=HEAD:refs/heads/master agent=git/test\n")
+				_ = writePktLine(&buf, "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111 refs/heads/master\n")
+				_ = writePktFlush(&buf)
+			}
+			_, _ = w.Write(buf.Bytes())
+
+		case r.Method == http.MethodPost && r.URL.Path == "/repo.git/git-upload-pack":
+			atomic.AddInt32(&postCount, 1)
+			if !v2Enabled.Load() {
+				// Protocol v0 server rejects v2 git-upload-pack POST with 404
+				http.NotFound(w, r)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+			var buf bytes.Buffer
+			_ = writePktLine(&buf, "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222 HEAD symref-target:refs/heads/main\n")
+			_ = writePktLine(&buf, "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222 refs/heads/main\n")
+			_ = writePktFlush(&buf)
+			_, _ = w.Write(buf.Bytes())
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	repoURL := server.URL + "/repo.git"
+	client := NewGitRemote(WithHTTPClient(server.Client()))
+
+	// Poll 1: Initial discovery under v2 -> GET + POST
+	refs, err := client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 1 ListRefs failed: %v", err)
+	}
+	if _, ok := refs["HEAD"]; ok {
+		t.Errorf("expected no HEAD ref in advertised refs map, got %q", refs["HEAD"])
+	}
+	if refs["refs/heads/main"] != "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222" {
+		t.Errorf("unexpected ref hash: %v", refs["refs/heads/main"])
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 1 || p != 1 {
+		t.Fatalf("Poll 1 expected GET=1 POST=1, got GET=%d POST=%d", g, p)
+	}
+
+	// Poll 2: Direct POST under v2 -> only POST
+	refs, err = client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 2 ListRefs failed: %v", err)
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 1 || p != 2 {
+		t.Fatalf("Poll 2 expected GET=1 POST=2, got GET=%d POST=%d", g, p)
+	}
+
+	// Server downgrades to v0
+	v2Enabled.Store(false)
+
+	// Poll 3: Direct POST fails with 404 -> forgets v2 -> rediscovers via GET -> gets v0 response
+	refs, err = client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 3 ListRefs failed on v0 fallback: %v", err)
+	}
+	if _, ok := refs["HEAD"]; ok {
+		t.Errorf("expected no HEAD ref in advertised refs map, got %q", refs["HEAD"])
+	}
+	if refs["refs/heads/master"] != "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111" {
+		t.Errorf("unexpected v0 ref hash: %v", refs["refs/heads/master"])
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 2 || p != 3 {
+		t.Fatalf("Poll 3 expected GET=2 POST=3 (failed direct POST + GET rediscovery), got GET=%d POST=%d", g, p)
+	}
+
+	// Poll 4: Since repo is now known to be v0, it uses GET (1 request per poll for v0)
+	refs, err = client.ListRefs(ctx, repoURL)
+	if err != nil {
+		t.Fatalf("Poll 4 ListRefs failed: %v", err)
+	}
+	if _, ok := refs["HEAD"]; ok {
+		t.Errorf("expected no HEAD ref in advertised refs map, got %q", refs["HEAD"])
+	}
+	if refs["refs/heads/master"] != "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111" {
+		t.Errorf("unexpected v0 ref hash: %v", refs["refs/heads/master"])
+	}
+	if g, p := atomic.LoadInt32(&getCount), atomic.LoadInt32(&postCount); g != 3 || p != 3 {
+		t.Fatalf("Poll 4 expected GET=3 POST=3 (1 GET request, no POST), got GET=%d POST=%d", g, p)
 	}
 }
 
@@ -386,7 +618,7 @@ func TestSmartHTTP_Conditional304(t *testing.T) {
 			return
 		}
 
-		if r.Method == http.MethodGet {
+		if r.Header.Get("If-None-Match") != "" {
 			if r.Header.Get("If-None-Match") != etag {
 				http.Error(w, "missing or incorrect If-None-Match header", http.StatusBadRequest)
 				return
