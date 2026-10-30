@@ -66,7 +66,6 @@ func TestSyncerGoalLifecycle(t *testing.T) {
 	expectedHash1 := hex.EncodeToString(h1[:])
 
 	fakeForge.SetRefs(repoURL, map[string]string{
-		"HEAD":            commit1,
 		"refs/heads/main": commit1,
 	})
 	fakeForge.SetTree(repoURL, commit1, map[string][]byte{
@@ -108,7 +107,6 @@ func TestSyncerGoalLifecycle(t *testing.T) {
 	expectedHash2 := hex.EncodeToString(h2[:])
 
 	fakeForge.SetRefs(repoURL, map[string]string{
-		"HEAD":            commit2,
 		"refs/heads/main": commit2,
 	})
 	fakeForge.SetTree(repoURL, commit2, map[string][]byte{
@@ -137,7 +135,6 @@ func TestSyncerGoalLifecycle(t *testing.T) {
 	// 3. Deleting it removes the record
 	commit3 := "commit-sha-3"
 	fakeForge.SetRefs(repoURL, map[string]string{
-		"HEAD":            commit3,
 		"refs/heads/main": commit3,
 	})
 	fakeForge.SetTree(repoURL, commit3, map[string][]byte{
@@ -161,5 +158,53 @@ func TestSyncerGoalLifecycle(t *testing.T) {
 	}
 	if len(goalsList) != 0 {
 		t.Errorf("expected 0 goals after deletion, got %d", len(goalsList))
+	}
+}
+
+func TestFindHeadCommit(t *testing.T) {
+	s := &Syncer{}
+	refs := map[string]string{
+		"refs/heads/main":    "sha-main",
+		"refs/heads/master":  "sha-master",
+		"refs/heads/feature": "sha-feature",
+		"HEAD":               "sha-head",
+	}
+
+	// 1. Explicit default branch match
+	if got := s.findHeadCommit(refs, "feature"); got != "sha-feature" {
+		t.Errorf("findHeadCommit(feature) = %q, want %q", got, "sha-feature")
+	}
+
+	// 2. Full ref path match
+	if got := s.findHeadCommit(refs, "refs/heads/main"); got != "sha-main" {
+		t.Errorf("findHeadCommit(refs/heads/main) = %q, want %q", got, "sha-main")
+	}
+
+	// 3. Fallback to main when default branch is not found or empty
+	if got := s.findHeadCommit(refs, "nonexistent"); got != "sha-main" {
+		t.Errorf("findHeadCommit(nonexistent) = %q, want %q", got, "sha-main")
+	}
+	if got := s.findHeadCommit(refs, ""); got != "sha-main" {
+		t.Errorf("findHeadCommit('') = %q, want %q", got, "sha-main")
+	}
+
+	// 4. Fallback to master when main is not present
+	refsNoMain := map[string]string{
+		"refs/heads/master": "sha-master",
+		"HEAD":              "sha-head",
+	}
+	if got := s.findHeadCommit(refsNoMain, ""); got != "sha-master" {
+		t.Errorf("findHeadCommit(no main) = %q, want %q", got, "sha-master")
+	}
+
+	// 5. Must NOT fall back to HEAD even if present in map
+	refsOnlyHead := map[string]string{
+		"HEAD": "sha-head",
+	}
+	if got := s.findHeadCommit(refsOnlyHead, ""); got != "" {
+		t.Errorf("findHeadCommit(only HEAD) = %q, want empty string", got)
+	}
+	if got := s.findHeadCommit(refsOnlyHead, "main"); got != "" {
+		t.Errorf("findHeadCommit(only HEAD with default=main) = %q, want empty string", got)
 	}
 }
