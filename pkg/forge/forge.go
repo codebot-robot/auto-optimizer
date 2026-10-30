@@ -14,6 +14,25 @@
 
 // Package forge defines the interface and implementations for interacting
 // with remote git repositories and forge hosts.
+//
+// Ref Advertisement and Caching:
+// GitRemote implements ListRefs and DefaultBranch for http:// and https:// remotes
+// using net/http over smart HTTP (Git protocol v2 with fallback to v0).
+//
+// Observed caching behavior of ref advertisement endpoints:
+// Neither GitHub nor a standard git http-backend returns an ETag header for
+// /info/refs?service=git-upload-pack or /git-upload-pack endpoints. Both servers
+// emit "Cache-Control: no-cache, max-age=0, must-revalidate" (along with
+// "Expires: Fri, 01 Jan 1980 00:00:00 GMT" and "Pragma: no-cache"). Consequently,
+// conditional requests (If-None-Match) cannot bypass ref listing on GitHub or
+// plain git http-backend, so the syncer's 60-second poll makes an un-cached ref
+// advertisement request every polling interval. However, if a server or proxy does
+// provide an ETag, GitRemote caches it and sends If-None-Match, treating 304 Not
+// Modified as "no change" without parsing.
+//
+// Non-HTTP schemes (such as file:// or local filesystem paths) continue to use
+// go-git's Remote.ListContext so that local repositories in tests and offline
+// environments keep working.
 package forge
 
 import (
