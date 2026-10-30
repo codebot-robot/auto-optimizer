@@ -29,10 +29,13 @@ import (
 	"google.golang.org/grpc"
 
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
+	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
+	"github.com/gke-labs/auto-optimizer/pkg/syncer"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
 	"github.com/gke-labs/auto-optimizer/pkg/web"
@@ -47,6 +50,7 @@ type serveFlags struct {
 	homeDir     string
 	toolTimeout time.Duration
 	stateDir    string
+	repos       []string
 }
 
 func newServeCommand() *cobra.Command {
@@ -101,6 +105,7 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&flags.homeDir, "homedir", defaultHomeDir, "Home directory inside the sandbox persisted via snapshot/restore")
 	cmd.Flags().DurationVar(&flags.toolTimeout, "tool-timeout", session.DefaultToolTimeout, "Maximum duration for a single tool execution")
 	cmd.Flags().StringVar(&flags.stateDir, "state-dir", defaultStateDir, "Directory where session state and snapshots are saved")
+	cmd.Flags().StringArrayVar(&flags.repos, "repo", nil, "Repository URL to register with the forge (repeatable, or AO_REPOS env var)")
 
 	return cmd
 }
@@ -144,6 +149,65 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	}
 
 	sessionStore := session.NewFileStore(stateDir)
+	stateStore := state.NewFileStore(stateDir)
+	forgeClient := forge.NewGitRemote()
+
+	var repoURLs []string
+	repoURLs = append(repoURLs, flags.repos...)
+	if envRepos := os.Getenv("AO_REPOS"); envRepos != "" {
+		for _, r := range strings.Split(envRepos, ",") {
+			if r = strings.TrimSpace(r); r != "" {
+				repoURLs = append(repoURLs, r)
+			}
+		}
+	}
+
+	for _, repoURL := range repoURLs {
+		key, err := state.ParseRepoURL(repoURL)
+		if err != nil {
+			log.Error(err, "invalid repository URL", "url", repoURL)
+			continue
+		}
+		_, err = stateStore.GetRepo(ctx, key)
+		if err != nil {
+			if errors.Is(err, state.ErrNotFound) {
+				defBranch, err := forgeClient.DefaultBranch(ctx, repoURL)
+				if err != nil {
+					log.Error(err, "querying default branch; defaulting to main", "url", repoURL)
+					defBranch = "main"
+				}
+				r := &state.Repo{
+					URL:            repoURL,
+					Host:           key.Host,
+					Owner:          key.Owner,
+					Name:           key.Name,
+					DefaultBranch:  defBranch,
+					ForgeKind:      "gitremote",
+					RegisteredTime: time.Now(),
+				}
+				if err := stateStore.PutRepo(ctx, r); err != nil {
+					log.Error(err, "registering repository", "url", repoURL)
+				} else {
+					log.Info("registered repository", "repo", repoURL, "defaultBranch", defBranch)
+				}
+			} else {
+				log.Error(err, "checking existing repository", "url", repoURL)
+			}
+		}
+	}
+
+	syncerEngine, err := syncer.New(syncer.Options{
+		Store: stateStore,
+		Forge: forgeClient,
+	})
+	if err != nil {
+		return fmt.Errorf("initializing syncer: %w", err)
+	}
+	go func() {
+		if err := syncerEngine.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error(err, "syncer loop error")
+		}
+	}()
 
 	harnessFactory := func(toolsetName string) (*session.Harness, error) {
 		toolset, err := toolsets.Get(toolsetName)
@@ -172,6 +236,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 
 	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
 		Store:          sessionStore,
+		StateStore:     stateStore,
 		DefaultToolset: flags.toolset,
 		HarnessFactory: harnessFactory,
 	})

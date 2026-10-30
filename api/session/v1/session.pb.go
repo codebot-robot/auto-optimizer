@@ -991,6 +991,375 @@ func (x *Error) GetMessage() string {
 	return ""
 }
 
+// Repository represents a registered repository.
+type Repository struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Url            string                 `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
+	Host           string                 `protobuf:"bytes,2,opt,name=host,proto3" json:"host,omitempty"`
+	Owner          string                 `protobuf:"bytes,3,opt,name=owner,proto3" json:"owner,omitempty"`
+	Name           string                 `protobuf:"bytes,4,opt,name=name,proto3" json:"name,omitempty"`
+	DefaultBranch  string                 `protobuf:"bytes,5,opt,name=default_branch,json=defaultBranch,proto3" json:"default_branch,omitempty"`
+	ForgeKind      string                 `protobuf:"bytes,6,opt,name=forge_kind,json=forgeKind,proto3" json:"forge_kind,omitempty"`
+	RegisteredTime *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=registered_time,json=registeredTime,proto3" json:"registered_time,omitempty"`
+	HeadCommit     string                 `protobuf:"bytes,8,opt,name=head_commit,json=headCommit,proto3" json:"head_commit,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *Repository) Reset() {
+	*x = Repository{}
+	mi := &file_api_session_v1_session_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Repository) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Repository) ProtoMessage() {}
+
+func (x *Repository) ProtoReflect() protoreflect.Message {
+	mi := &file_api_session_v1_session_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Repository.ProtoReflect.Descriptor instead.
+func (*Repository) Descriptor() ([]byte, []int) {
+	return file_api_session_v1_session_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *Repository) GetUrl() string {
+	if x != nil {
+		return x.Url
+	}
+	return ""
+}
+
+func (x *Repository) GetHost() string {
+	if x != nil {
+		return x.Host
+	}
+	return ""
+}
+
+func (x *Repository) GetOwner() string {
+	if x != nil {
+		return x.Owner
+	}
+	return ""
+}
+
+func (x *Repository) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Repository) GetDefaultBranch() string {
+	if x != nil {
+		return x.DefaultBranch
+	}
+	return ""
+}
+
+func (x *Repository) GetForgeKind() string {
+	if x != nil {
+		return x.ForgeKind
+	}
+	return ""
+}
+
+func (x *Repository) GetRegisteredTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RegisteredTime
+	}
+	return nil
+}
+
+func (x *Repository) GetHeadCommit() string {
+	if x != nil {
+		return x.HeadCommit
+	}
+	return ""
+}
+
+type ListRepositoriesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListRepositoriesRequest) Reset() {
+	*x = ListRepositoriesRequest{}
+	mi := &file_api_session_v1_session_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListRepositoriesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListRepositoriesRequest) ProtoMessage() {}
+
+func (x *ListRepositoriesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_session_v1_session_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListRepositoriesRequest.ProtoReflect.Descriptor instead.
+func (*ListRepositoriesRequest) Descriptor() ([]byte, []int) {
+	return file_api_session_v1_session_proto_rawDescGZIP(), []int{18}
+}
+
+type ListRepositoriesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Repositories  []*Repository          `protobuf:"bytes,1,rep,name=repositories,proto3" json:"repositories,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListRepositoriesResponse) Reset() {
+	*x = ListRepositoriesResponse{}
+	mi := &file_api_session_v1_session_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListRepositoriesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListRepositoriesResponse) ProtoMessage() {}
+
+func (x *ListRepositoriesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_session_v1_session_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListRepositoriesResponse.ProtoReflect.Descriptor instead.
+func (*ListRepositoriesResponse) Descriptor() ([]byte, []int) {
+	return file_api_session_v1_session_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *ListRepositoriesResponse) GetRepositories() []*Repository {
+	if x != nil {
+		return x.Repositories
+	}
+	return nil
+}
+
+type ListGoalsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RepoUrl       string                 `protobuf:"bytes,1,opt,name=repo_url,json=repoUrl,proto3" json:"repo_url,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListGoalsRequest) Reset() {
+	*x = ListGoalsRequest{}
+	mi := &file_api_session_v1_session_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListGoalsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListGoalsRequest) ProtoMessage() {}
+
+func (x *ListGoalsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_session_v1_session_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListGoalsRequest.ProtoReflect.Descriptor instead.
+func (*ListGoalsRequest) Descriptor() ([]byte, []int) {
+	return file_api_session_v1_session_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ListGoalsRequest) GetRepoUrl() string {
+	if x != nil {
+		return x.RepoUrl
+	}
+	return ""
+}
+
+type GoalRecord struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Kind          string                 `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
+	Hash          string                 `protobuf:"bytes,3,opt,name=hash,proto3" json:"hash,omitempty"`
+	BaseCommit    string                 `protobuf:"bytes,4,opt,name=base_commit,json=baseCommit,proto3" json:"base_commit,omitempty"`
+	Schedule      string                 `protobuf:"bytes,5,opt,name=schedule,proto3" json:"schedule,omitempty"`
+	Verify        string                 `protobuf:"bytes,6,opt,name=verify,proto3" json:"verify,omitempty"`
+	BestValue     string                 `protobuf:"bytes,7,opt,name=best_value,json=bestValue,proto3" json:"best_value,omitempty"`
+	LastRunId     string                 `protobuf:"bytes,8,opt,name=last_run_id,json=lastRunId,proto3" json:"last_run_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GoalRecord) Reset() {
+	*x = GoalRecord{}
+	mi := &file_api_session_v1_session_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GoalRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GoalRecord) ProtoMessage() {}
+
+func (x *GoalRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_api_session_v1_session_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GoalRecord.ProtoReflect.Descriptor instead.
+func (*GoalRecord) Descriptor() ([]byte, []int) {
+	return file_api_session_v1_session_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *GoalRecord) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *GoalRecord) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+func (x *GoalRecord) GetHash() string {
+	if x != nil {
+		return x.Hash
+	}
+	return ""
+}
+
+func (x *GoalRecord) GetBaseCommit() string {
+	if x != nil {
+		return x.BaseCommit
+	}
+	return ""
+}
+
+func (x *GoalRecord) GetSchedule() string {
+	if x != nil {
+		return x.Schedule
+	}
+	return ""
+}
+
+func (x *GoalRecord) GetVerify() string {
+	if x != nil {
+		return x.Verify
+	}
+	return ""
+}
+
+func (x *GoalRecord) GetBestValue() string {
+	if x != nil {
+		return x.BestValue
+	}
+	return ""
+}
+
+func (x *GoalRecord) GetLastRunId() string {
+	if x != nil {
+		return x.LastRunId
+	}
+	return ""
+}
+
+type ListGoalsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Goals         []*GoalRecord          `protobuf:"bytes,1,rep,name=goals,proto3" json:"goals,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListGoalsResponse) Reset() {
+	*x = ListGoalsResponse{}
+	mi := &file_api_session_v1_session_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListGoalsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListGoalsResponse) ProtoMessage() {}
+
+func (x *ListGoalsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_session_v1_session_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListGoalsResponse.ProtoReflect.Descriptor instead.
+func (*ListGoalsResponse) Descriptor() ([]byte, []int) {
+	return file_api_session_v1_session_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ListGoalsResponse) GetGoals() []*GoalRecord {
+	if x != nil {
+		return x.Goals
+	}
+	return nil
+}
+
 var File_api_session_v1_session_proto protoreflect.FileDescriptor
 
 const file_api_session_v1_session_proto_rawDesc = "" +
@@ -1050,14 +1419,47 @@ const file_api_session_v1_session_proto_rawDesc = "" +
 	"\fTurnFinished\x12\x12\n" +
 	"\x04text\x18\x01 \x01(\tR\x04text\"!\n" +
 	"\x05Error\x12\x18\n" +
-	"\amessage\x18\x01 \x01(\tR\amessage2\x8b\x03\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\"\x88\x02\n" +
+	"\n" +
+	"Repository\x12\x10\n" +
+	"\x03url\x18\x01 \x01(\tR\x03url\x12\x12\n" +
+	"\x04host\x18\x02 \x01(\tR\x04host\x12\x14\n" +
+	"\x05owner\x18\x03 \x01(\tR\x05owner\x12\x12\n" +
+	"\x04name\x18\x04 \x01(\tR\x04name\x12%\n" +
+	"\x0edefault_branch\x18\x05 \x01(\tR\rdefaultBranch\x12\x1d\n" +
+	"\n" +
+	"forge_kind\x18\x06 \x01(\tR\tforgeKind\x12C\n" +
+	"\x0fregistered_time\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\x0eregisteredTime\x12\x1f\n" +
+	"\vhead_commit\x18\b \x01(\tR\n" +
+	"headCommit\"\x19\n" +
+	"\x17ListRepositoriesRequest\"V\n" +
+	"\x18ListRepositoriesResponse\x12:\n" +
+	"\frepositories\x18\x01 \x03(\v2\x16.session.v1.RepositoryR\frepositories\"-\n" +
+	"\x10ListGoalsRequest\x12\x19\n" +
+	"\brepo_url\x18\x01 \x01(\tR\arepoUrl\"\xdc\x01\n" +
+	"\n" +
+	"GoalRecord\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
+	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x12\n" +
+	"\x04hash\x18\x03 \x01(\tR\x04hash\x12\x1f\n" +
+	"\vbase_commit\x18\x04 \x01(\tR\n" +
+	"baseCommit\x12\x1a\n" +
+	"\bschedule\x18\x05 \x01(\tR\bschedule\x12\x16\n" +
+	"\x06verify\x18\x06 \x01(\tR\x06verify\x12\x1d\n" +
+	"\n" +
+	"best_value\x18\a \x01(\tR\tbestValue\x12\x1e\n" +
+	"\vlast_run_id\x18\b \x01(\tR\tlastRunId\"A\n" +
+	"\x11ListGoalsResponse\x12,\n" +
+	"\x05goals\x18\x01 \x03(\v2\x16.session.v1.GoalRecordR\x05goals2\xb4\x04\n" +
 	"\x0eSessionService\x12F\n" +
 	"\rCreateSession\x12 .session.v1.CreateSessionRequest\x1a\x13.session.v1.Session\x12Q\n" +
 	"\fListSessions\x12\x1f.session.v1.ListSessionsRequest\x1a .session.v1.ListSessionsResponse\x12@\n" +
 	"\n" +
 	"GetSession\x12\x1d.session.v1.GetSessionRequest\x1a\x13.session.v1.Session\x12Q\n" +
 	"\fListMessages\x12\x1f.session.v1.ListMessagesRequest\x1a .session.v1.ListMessagesResponse\x12I\n" +
-	"\vSendMessage\x12\x1e.session.v1.SendMessageRequest\x1a\x18.session.v1.SessionEvent0\x01B=Z;github.com/gke-labs/auto-optimizer/api/session/v1;sessionv1b\x06proto3"
+	"\vSendMessage\x12\x1e.session.v1.SendMessageRequest\x1a\x18.session.v1.SessionEvent0\x01\x12]\n" +
+	"\x10ListRepositories\x12#.session.v1.ListRepositoriesRequest\x1a$.session.v1.ListRepositoriesResponse\x12H\n" +
+	"\tListGoals\x12\x1c.session.v1.ListGoalsRequest\x1a\x1d.session.v1.ListGoalsResponseB=Z;github.com/gke-labs/auto-optimizer/api/session/v1;sessionv1b\x06proto3"
 
 var (
 	file_api_session_v1_session_proto_rawDescOnce sync.Once
@@ -1071,29 +1473,35 @@ func file_api_session_v1_session_proto_rawDescGZIP() []byte {
 	return file_api_session_v1_session_proto_rawDescData
 }
 
-var file_api_session_v1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_api_session_v1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_api_session_v1_session_proto_goTypes = []any{
-	(*Session)(nil),               // 0: session.v1.Session
-	(*CreateSessionRequest)(nil),  // 1: session.v1.CreateSessionRequest
-	(*ListSessionsRequest)(nil),   // 2: session.v1.ListSessionsRequest
-	(*ListSessionsResponse)(nil),  // 3: session.v1.ListSessionsResponse
-	(*GetSessionRequest)(nil),     // 4: session.v1.GetSessionRequest
-	(*ListMessagesRequest)(nil),   // 5: session.v1.ListMessagesRequest
-	(*ListMessagesResponse)(nil),  // 6: session.v1.ListMessagesResponse
-	(*SendMessageRequest)(nil),    // 7: session.v1.SendMessageRequest
-	(*Message)(nil),               // 8: session.v1.Message
-	(*ToolCall)(nil),              // 9: session.v1.ToolCall
-	(*FunctionCall)(nil),          // 10: session.v1.FunctionCall
-	(*SessionEvent)(nil),          // 11: session.v1.SessionEvent
-	(*MessageAppended)(nil),       // 12: session.v1.MessageAppended
-	(*ToolCallStarted)(nil),       // 13: session.v1.ToolCallStarted
-	(*ToolCallFinished)(nil),      // 14: session.v1.ToolCallFinished
-	(*TurnFinished)(nil),          // 15: session.v1.TurnFinished
-	(*Error)(nil),                 // 16: session.v1.Error
-	(*timestamppb.Timestamp)(nil), // 17: google.protobuf.Timestamp
+	(*Session)(nil),                  // 0: session.v1.Session
+	(*CreateSessionRequest)(nil),     // 1: session.v1.CreateSessionRequest
+	(*ListSessionsRequest)(nil),      // 2: session.v1.ListSessionsRequest
+	(*ListSessionsResponse)(nil),     // 3: session.v1.ListSessionsResponse
+	(*GetSessionRequest)(nil),        // 4: session.v1.GetSessionRequest
+	(*ListMessagesRequest)(nil),      // 5: session.v1.ListMessagesRequest
+	(*ListMessagesResponse)(nil),     // 6: session.v1.ListMessagesResponse
+	(*SendMessageRequest)(nil),       // 7: session.v1.SendMessageRequest
+	(*Message)(nil),                  // 8: session.v1.Message
+	(*ToolCall)(nil),                 // 9: session.v1.ToolCall
+	(*FunctionCall)(nil),             // 10: session.v1.FunctionCall
+	(*SessionEvent)(nil),             // 11: session.v1.SessionEvent
+	(*MessageAppended)(nil),          // 12: session.v1.MessageAppended
+	(*ToolCallStarted)(nil),          // 13: session.v1.ToolCallStarted
+	(*ToolCallFinished)(nil),         // 14: session.v1.ToolCallFinished
+	(*TurnFinished)(nil),             // 15: session.v1.TurnFinished
+	(*Error)(nil),                    // 16: session.v1.Error
+	(*Repository)(nil),               // 17: session.v1.Repository
+	(*ListRepositoriesRequest)(nil),  // 18: session.v1.ListRepositoriesRequest
+	(*ListRepositoriesResponse)(nil), // 19: session.v1.ListRepositoriesResponse
+	(*ListGoalsRequest)(nil),         // 20: session.v1.ListGoalsRequest
+	(*GoalRecord)(nil),               // 21: session.v1.GoalRecord
+	(*ListGoalsResponse)(nil),        // 22: session.v1.ListGoalsResponse
+	(*timestamppb.Timestamp)(nil),    // 23: google.protobuf.Timestamp
 }
 var file_api_session_v1_session_proto_depIdxs = []int32{
-	17, // 0: session.v1.Session.creation_time:type_name -> google.protobuf.Timestamp
+	23, // 0: session.v1.Session.creation_time:type_name -> google.protobuf.Timestamp
 	0,  // 1: session.v1.ListSessionsResponse.sessions:type_name -> session.v1.Session
 	8,  // 2: session.v1.ListMessagesResponse.messages:type_name -> session.v1.Message
 	9,  // 3: session.v1.Message.tool_calls:type_name -> session.v1.ToolCall
@@ -1106,21 +1514,28 @@ var file_api_session_v1_session_proto_depIdxs = []int32{
 	8,  // 10: session.v1.MessageAppended.message:type_name -> session.v1.Message
 	9,  // 11: session.v1.ToolCallStarted.tool_call:type_name -> session.v1.ToolCall
 	9,  // 12: session.v1.ToolCallFinished.tool_call:type_name -> session.v1.ToolCall
-	1,  // 13: session.v1.SessionService.CreateSession:input_type -> session.v1.CreateSessionRequest
-	2,  // 14: session.v1.SessionService.ListSessions:input_type -> session.v1.ListSessionsRequest
-	4,  // 15: session.v1.SessionService.GetSession:input_type -> session.v1.GetSessionRequest
-	5,  // 16: session.v1.SessionService.ListMessages:input_type -> session.v1.ListMessagesRequest
-	7,  // 17: session.v1.SessionService.SendMessage:input_type -> session.v1.SendMessageRequest
-	0,  // 18: session.v1.SessionService.CreateSession:output_type -> session.v1.Session
-	3,  // 19: session.v1.SessionService.ListSessions:output_type -> session.v1.ListSessionsResponse
-	0,  // 20: session.v1.SessionService.GetSession:output_type -> session.v1.Session
-	6,  // 21: session.v1.SessionService.ListMessages:output_type -> session.v1.ListMessagesResponse
-	11, // 22: session.v1.SessionService.SendMessage:output_type -> session.v1.SessionEvent
-	18, // [18:23] is the sub-list for method output_type
-	13, // [13:18] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	23, // 13: session.v1.Repository.registered_time:type_name -> google.protobuf.Timestamp
+	17, // 14: session.v1.ListRepositoriesResponse.repositories:type_name -> session.v1.Repository
+	21, // 15: session.v1.ListGoalsResponse.goals:type_name -> session.v1.GoalRecord
+	1,  // 16: session.v1.SessionService.CreateSession:input_type -> session.v1.CreateSessionRequest
+	2,  // 17: session.v1.SessionService.ListSessions:input_type -> session.v1.ListSessionsRequest
+	4,  // 18: session.v1.SessionService.GetSession:input_type -> session.v1.GetSessionRequest
+	5,  // 19: session.v1.SessionService.ListMessages:input_type -> session.v1.ListMessagesRequest
+	7,  // 20: session.v1.SessionService.SendMessage:input_type -> session.v1.SendMessageRequest
+	18, // 21: session.v1.SessionService.ListRepositories:input_type -> session.v1.ListRepositoriesRequest
+	20, // 22: session.v1.SessionService.ListGoals:input_type -> session.v1.ListGoalsRequest
+	0,  // 23: session.v1.SessionService.CreateSession:output_type -> session.v1.Session
+	3,  // 24: session.v1.SessionService.ListSessions:output_type -> session.v1.ListSessionsResponse
+	0,  // 25: session.v1.SessionService.GetSession:output_type -> session.v1.Session
+	6,  // 26: session.v1.SessionService.ListMessages:output_type -> session.v1.ListMessagesResponse
+	11, // 27: session.v1.SessionService.SendMessage:output_type -> session.v1.SessionEvent
+	19, // 28: session.v1.SessionService.ListRepositories:output_type -> session.v1.ListRepositoriesResponse
+	22, // 29: session.v1.SessionService.ListGoals:output_type -> session.v1.ListGoalsResponse
+	23, // [23:30] is the sub-list for method output_type
+	16, // [16:23] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_api_session_v1_session_proto_init() }
@@ -1141,7 +1556,7 @@ func file_api_session_v1_session_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_session_v1_session_proto_rawDesc), len(file_api_session_v1_session_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   17,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

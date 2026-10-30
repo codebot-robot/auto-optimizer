@@ -25,8 +25,10 @@ import (
 	"time"
 
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
+	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
 	"google.golang.org/grpc"
@@ -656,5 +658,120 @@ func TestWebMethods_StartTurnAndBusy(t *testing.T) {
 	}
 	if len(detail.Messages) == 0 {
 		t.Error("expected messages in detail after turn finished")
+	}
+}
+
+func TestListRepositoriesAndGoals(t *testing.T) {
+	ctx := t.Context()
+	stateStore := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	srv, err := NewServer(ServerOptions{
+		Store:          sessionStore,
+		StateStore:     stateStore,
+		DefaultToolset: "basic",
+		HarnessFactory: func(_ string) (*session.Harness, error) {
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	sessionv1.RegisterSessionServiceServer(grpcServer, srv)
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+	})
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+
+	client := sessionv1.NewSessionServiceClient(conn)
+
+	// List on empty store
+	reposResp, err := client.ListRepositories(ctx, &sessionv1.ListRepositoriesRequest{})
+	if err != nil {
+		t.Fatalf("ListRepositories empty: %v", err)
+	}
+	if len(reposResp.Repositories) != 0 {
+		t.Fatalf("expected 0 repos, got %d", len(reposResp.Repositories))
+	}
+
+	// Add a repo and a goal
+	key := state.RepoKey{
+		Host:  "github.com",
+		Owner: "gke-labs",
+		Name:  "test-repo",
+	}
+	repo := &state.Repo{
+		URL:            "https://github.com/gke-labs/test-repo",
+		Host:           key.Host,
+		Owner:          key.Owner,
+		Name:           key.Name,
+		DefaultBranch:  "main",
+		ForgeKind:      "gitremote",
+		RegisteredTime: time.Now(),
+		HeadCommit:     "c0ffee",
+	}
+	if err := stateStore.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	bestVal := 42.5
+	goalRec := &state.GoalRecord{
+		Goal: &goals.Goal{
+			Name:     "benchmark",
+			Body:     "Speed up sorting",
+			Schedule: "daily",
+			Verify:   "go test ./...",
+		},
+		Hash:       "hash123",
+		BaseCommit: "c0ffee",
+		BestValue:  &bestVal,
+		LastRunID:  "20261029T120000Z-abcd",
+	}
+	if err := stateStore.PutGoal(ctx, key, goalRec); err != nil {
+		t.Fatalf("PutGoal: %v", err)
+	}
+
+	// ListRepositories should now return 1 repo
+	reposResp, err = client.ListRepositories(ctx, &sessionv1.ListRepositoriesRequest{})
+	if err != nil {
+		t.Fatalf("ListRepositories: %v", err)
+	}
+	if len(reposResp.Repositories) != 1 {
+		t.Fatalf("expected 1 repo, got %d", len(reposResp.Repositories))
+	}
+	if reposResp.Repositories[0].Url != repo.URL || reposResp.Repositories[0].HeadCommit != "c0ffee" {
+		t.Errorf("unexpected repo: %+v", reposResp.Repositories[0])
+	}
+
+	// ListGoals should return the goal
+	goalsResp, err := client.ListGoals(ctx, &sessionv1.ListGoalsRequest{RepoUrl: repo.URL})
+	if err != nil {
+		t.Fatalf("ListGoals: %v", err)
+	}
+	if len(goalsResp.Goals) != 1 {
+		t.Fatalf("expected 1 goal, got %d", len(goalsResp.Goals))
+	}
+	g := goalsResp.Goals[0]
+	if g.Name != "benchmark" || g.Hash != "hash123" || g.BaseCommit != "c0ffee" || g.BestValue != "42.5" {
+		t.Errorf("unexpected goal: %+v", g)
 	}
 }
