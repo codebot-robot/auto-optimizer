@@ -17,7 +17,7 @@
 # It will be removed once an upstream release includes these changes.
 
 ARG SANDBOXD_REPO=https://github.com/justinsb/agent-sandbox
-ARG SANDBOXD_COMMIT=ecc7a6cf2e2fc4363afeb4ac2da960401efd4a72
+ARG SANDBOXD_COMMIT=76156ce957a58d6d82e1cdd60e75d5be0d80a94f
 
 FROM --platform=$BUILDPLATFORM golang:1.27.3 AS builder
 ARG TARGETARCH
