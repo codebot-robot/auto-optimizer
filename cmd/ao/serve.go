@@ -30,6 +30,7 @@ import (
 
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
+	"github.com/gke-labs/auto-optimizer/pkg/forge/github"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -162,6 +163,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		}
 	}
 
+	githubToken := os.Getenv("GITHUB_TOKEN")
 	for _, repoURL := range repoURLs {
 		key, err := state.ParseRepoURL(repoURL)
 		if err != nil {
@@ -171,7 +173,8 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		_, err = stateStore.GetRepo(ctx, key)
 		if err != nil {
 			if errors.Is(err, state.ErrNotFound) {
-				defBranch, err := forgeClient.DefaultBranch(ctx, repoURL)
+				repoForge, forgeKind := selectForge(repoURL, githubToken)
+				defBranch, err := repoForge.DefaultBranch(ctx, repoURL)
 				if err != nil {
 					log.Error(err, "querying default branch; defaulting to main", "url", repoURL)
 					defBranch = "main"
@@ -182,13 +185,13 @@ func runServe(ctx context.Context, flags serveFlags) error {
 					Owner:          key.Owner,
 					Name:           key.Name,
 					DefaultBranch:  defBranch,
-					ForgeKind:      "gitremote",
+					ForgeKind:      forgeKind,
 					RegisteredTime: time.Now(),
 				}
 				if err := stateStore.PutRepo(ctx, r); err != nil {
 					log.Error(err, "registering repository", "url", repoURL)
 				} else {
-					log.Info("registered repository", "repo", repoURL, "defaultBranch", defBranch)
+					log.Info("registered repository", "repo", repoURL, "forge", forgeKind, "defaultBranch", defBranch)
 				}
 			} else {
 				log.Error(err, "checking existing repository", "url", repoURL)
@@ -309,4 +312,12 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func selectForge(repoURL, githubToken string) (forge.Forge, string) {
+	key, err := state.ParseRepoURL(repoURL)
+	if err == nil && (key.Host == "github.com" || strings.HasSuffix(key.Host, ".github.com")) && githubToken != "" {
+		return github.New(githubToken), "github"
+	}
+	return forge.NewGitRemote(), "gitremote"
 }

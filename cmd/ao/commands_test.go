@@ -66,3 +66,39 @@ func TestServeFlags(t *testing.T) {
 		t.Error("expected --repo flag on ao serve")
 	}
 }
+
+func TestSelectForge(t *testing.T) {
+	tests := []struct {
+		repoURL     string
+		githubToken string
+		wantForge   string
+	}{
+		{
+			repoURL:     "https://github.com/gke-labs/auto-optimizer",
+			githubToken: "ghp_secret",
+			wantForge:   "github",
+		},
+		{
+			repoURL:     "https://github.com/gke-labs/auto-optimizer",
+			githubToken: "",
+			wantForge:   "gitremote",
+		},
+		{
+			repoURL:     "https://gitlab.com/example/repo",
+			githubToken: "ghp_secret",
+			wantForge:   "gitremote",
+		},
+		{
+			repoURL:     "/path/to/bare/repo.git",
+			githubToken: "ghp_secret",
+			wantForge:   "gitremote",
+		},
+	}
+
+	for _, tt := range tests {
+		_, name := selectForge(tt.repoURL, tt.githubToken)
+		if name != tt.wantForge {
+			t.Errorf("selectForge(%q, token=%q) = %q; want %q", tt.repoURL, tt.githubToken, name, tt.wantForge)
+		}
+	}
+}

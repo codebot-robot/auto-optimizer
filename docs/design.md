@@ -177,14 +177,32 @@ script, the orchestrator rejects it.
 The forge layer isolates everything GitHub-specific. It also makes
 development possible without a GitHub App.
 
-- `gitremote` lists refs with go-git's ref advertisement. It is free,
-  unmetered, and works for any HTTPS git remote, including a local git daemon
-  in tests. It cannot open PRs.
-- `github` is a REST client. It authenticates with an App installation token
-  or a personal access token. It implements `Reporter` and
-  `ChangeRequestCreator`. Its reads use conditional requests and respect a
-  rate-limit floor.
+- `gitremote` lists refs with go-git's ref advertisement and fetches trees at
+  depth 1. It is free, unmetered, and works for any HTTPS git remote, including
+  a local git daemon in tests. It cannot open PRs.
+- `github` is a REST client using `net/http` only. It authenticates with an App
+  installation token or a personal access token (`GITHUB_TOKEN`). It reuses
+  `gitremote` for `ListRefs`, `FetchTree`, and `DefaultBranch` with HTTP basic auth,
+  and implements `ChangeRequestCreator` and `PushCredentialer`. Its reads use
+  conditional requests and respect a rate-limit floor.
 - `fake` is in-memory and serves unit tests.
+
+```go
+type Forge interface {
+	ListRefs(ctx context.Context, repoURL string) (map[string]string, error)
+	FetchTree(ctx context.Context, repoURL string, commit string) (fs.FS, error)
+	DefaultBranch(ctx context.Context, repoURL string) (string, error)
+}
+
+type ChangeRequestCreator interface {
+	OpenPullRequest(ctx context.Context, repoURL, head, base, title, body string) (*PullRequest, error)
+	ListPullRequests(ctx context.Context, repoURL, headPrefix string) ([]PullRequest, error)
+}
+
+type PushCredentialer interface {
+	PushCredentials(repoURL string) (username, password string)
+}
+```
 
 Polling follows eval-runner's three tiers. The syncer runs `ls-remote` every
 60 seconds with jitter to detect changes. It calls the API only for refs that
