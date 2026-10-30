@@ -72,6 +72,10 @@ const DefaultToolTimeout = 2 * time.Minute
 // It matches the image built and loaded into kind by dev/tasks/deploy-to-kube.
 const DefaultSandboxdImage = "auto-optimizer.local/sandboxd:dev"
 
+// ProcessClientFactory is a function that creates a processv1.ProcessServiceClient for a sandbox.
+// Used in tests to connect to mock/fake sandboxd servers without network port-forwarding.
+type ProcessClientFactory func(ctx context.Context, sb *Sandbox) (processv1.ProcessServiceClient, func(), error)
+
 // SandboxClient is a simple low-level client for managing Sandbox resources directly.
 type SandboxClient struct {
 	agentsClient agentsclientset.Interface
@@ -79,11 +83,31 @@ type SandboxClient struct {
 	restConfig   *rest.Config
 	connectivity string
 
+	processClientFactory ProcessClientFactory
+
 	// mutex guards the mutable values below
 	mutex sync.Mutex
 
 	// sandboxes is a map of sandboxes we have created and not yet deleted.
 	sandboxes map[types.NamespacedName]*Sandbox
+}
+
+// SetProcessClientFactory configures a custom factory for creating ProcessServiceClient connections.
+// Primarily used in tests to connect to mock/fake sandboxd servers.
+func (c *SandboxClient) SetProcessClientFactory(f ProcessClientFactory) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.processClientFactory = f
+}
+
+// NewSandboxClientWithClients creates a SandboxClient with explicit Kubernetes clients,
+// primarily for testing with fake clientsets.
+func NewSandboxClientWithClients(agentsClient agentsclientset.Interface, coreClient corev1client.CoreV1Interface) *SandboxClient {
+	return &SandboxClient{
+		agentsClient: agentsClient,
+		coreClient:   coreClient,
+		sandboxes:    make(map[types.NamespacedName]*Sandbox),
+	}
 }
 
 // GetRESTConfig loads the kubernetes client configuration, preferring
@@ -190,6 +214,7 @@ func (s *Session) AddMessages(ctx context.Context, messages ...llm.Message) erro
 
 // Sandbox represents an active sandbox instance.
 type Sandbox struct {
+	client  *SandboxClient
 	session *Session
 
 	id types.NamespacedName
@@ -272,13 +297,67 @@ func (s *Sandbox) ExtendLifecycle(ctx context.Context, inactivityTimeout time.Du
 	})
 }
 
+func (s *Sandbox) coreClient() corev1client.CoreV1Interface {
+	if s.client != nil {
+		return s.client.coreClient
+	}
+	if s.session != nil && s.session.client != nil {
+		return s.session.client.coreClient
+	}
+	return nil
+}
+
+func (s *Sandbox) agentsClient() agentsclientset.Interface {
+	if s.client != nil {
+		return s.client.agentsClient
+	}
+	if s.session != nil && s.session.client != nil {
+		return s.session.client.agentsClient
+	}
+	return nil
+}
+
 // WaitForReady polls the Sandbox resource until it becomes ready and resolves the underlying Pod name.
 func (s *Sandbox) WaitForReady(ctx context.Context) error {
+	agentsClient := s.agentsClient()
+	if agentsClient == nil {
+		return errors.New("no agentsClient available on sandbox")
+	}
+
+	check := func() (bool, error) {
+		latest, err := agentsClient.AgentsV1beta1().Sandboxes(s.NamespacedName().Namespace).Get(ctx, s.NamespacedName().Name, metav1.GetOptions{})
+		if err != nil {
+			return false, fmt.Errorf("error polling state of sandbox: %w", err)
+		}
+		ready := false
+		for _, cond := range latest.Status.Conditions {
+			if cond.Type == string(sandboxv1beta1.SandboxConditionReady) && cond.Status == metav1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if ready {
+			s.podName = latest.Name
+			if len(latest.Status.PodIPs) > 0 {
+				s.podIP = latest.Status.PodIPs[0]
+			}
+			return true, nil
+		}
+		if err := s.checkPodImagePullStatus(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	if isReady, err := check(); isReady {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
 	timeout := time.After(3 * time.Minute)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
-	agentsClient := s.session.client.agentsClient
 
 readyLoop:
 	for {
@@ -288,27 +367,12 @@ readyLoop:
 		case <-timeout:
 			return fmt.Errorf("timed out waiting for Sandbox %s to become ready", s.SandboxName())
 		case <-ticker.C:
-			latest, err := agentsClient.AgentsV1beta1().Sandboxes(s.NamespacedName().Namespace).Get(ctx, s.NamespacedName().Name, metav1.GetOptions{})
+			isReady, err := check()
 			if err != nil {
-				return fmt.Errorf("error polling state of sandbox: %w", err)
-			}
-			ready := false
-			for _, cond := range latest.Status.Conditions {
-				if cond.Type == string(sandboxv1beta1.SandboxConditionReady) && cond.Status == metav1.ConditionTrue {
-					ready = true
-					break
-				}
-			}
-			if ready {
-				s.podName = latest.Name
-				if len(latest.Status.PodIPs) > 0 {
-					s.podIP = latest.Status.PodIPs[0]
-				}
-				break readyLoop
-			}
-
-			if err := s.checkPodImagePullStatus(ctx); err != nil {
 				return err
+			}
+			if isReady {
+				break readyLoop
 			}
 		}
 	}
@@ -318,11 +382,12 @@ readyLoop:
 // checkPodImagePullStatus inspects the backing Pod's container statuses to fail fast
 // if any container is stuck in ImagePullBackOff or ErrImagePull.
 func (s *Sandbox) checkPodImagePullStatus(ctx context.Context) error {
-	if s.session == nil || s.session.client == nil || s.session.client.coreClient == nil {
+	coreClient := s.coreClient()
+	if coreClient == nil {
 		return nil
 	}
 
-	pod, err := s.session.client.coreClient.Pods(s.NamespacedName().Namespace).Get(ctx, s.NamespacedName().Name, metav1.GetOptions{})
+	pod, err := coreClient.Pods(s.NamespacedName().Namespace).Get(ctx, s.NamespacedName().Name, metav1.GetOptions{})
 	if err != nil {
 		return nil
 	}
@@ -353,7 +418,11 @@ func (s *Sandbox) checkPodImagePullStatus(ctx context.Context) error {
 
 // getPodPullEventMessage searches for an event associated with the pod that describes an image pull failure.
 func (s *Sandbox) getPodPullEventMessage(ctx context.Context, pod *corev1.Pod) string {
-	events, err := s.session.client.coreClient.Events(pod.Namespace).List(ctx, metav1.ListOptions{
+	coreClient := s.coreClient()
+	if coreClient == nil {
+		return ""
+	}
+	events, err := coreClient.Events(pod.Namespace).List(ctx, metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("involvedObject.name=%s", pod.Name),
 	})
 	if err != nil || events == nil {
@@ -398,12 +467,19 @@ func (s *Sandbox) getPodPullEventMessage(ctx context.Context, pod *corev1.Pod) s
 // kind) are unrouted and unreachable directly from the host. In those out-of-cluster scenarios,
 // startPortForward tunnels traffic to sandboxd through the Kubernetes API server and kubelet.
 func (s *Sandbox) startPortForward(ctx context.Context, targetPort int) (int, func(), error) {
-	if s.session == nil || s.session.client == nil || s.session.client.coreClient == nil {
+	var coreClient corev1client.CoreV1Interface
+	var restConfig *rest.Config
+	if s.client != nil {
+		coreClient = s.client.coreClient
+		restConfig = s.client.restConfig
+	} else if s.session != nil && s.session.client != nil {
+		coreClient = s.session.client.coreClient
+		restConfig = s.session.client.restConfig
+	}
+	if coreClient == nil || restConfig == nil {
 		return 0, nil, errors.New("kubernetes client is not available for port-forwarding")
 	}
 
-	coreClient := s.session.client.coreClient
-	restConfig := s.session.client.restConfig
 	podName := s.PodNamespacedName().Name
 	if podName == "" {
 		podName = s.id.Name
@@ -540,6 +616,23 @@ func (s *Sandbox) ensureClient(ctx context.Context) error {
 	defer s.grpcMu.Unlock()
 
 	if s.processClient != nil {
+		return nil
+	}
+
+	var client *SandboxClient
+	if s.client != nil {
+		client = s.client
+	} else if s.session != nil {
+		client = s.session.client
+	}
+
+	if client != nil && client.processClientFactory != nil {
+		pClient, stopFn, err := client.processClientFactory(ctx, s)
+		if err != nil {
+			return fmt.Errorf("creating process client: %w", err)
+		}
+		s.processClient = pClient
+		s.portForwardStop = stopFn
 		return nil
 	}
 
@@ -969,9 +1062,56 @@ func (s *Sandbox) SnapshotFS(ctx context.Context) error {
 // CreateSandbox creates a Sandbox resource for the session using topology B
 // (an init container copies sandboxd into a shared volume, and the worker container runs it with tini as PID 1).
 func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox, error) {
-	agentsClient := h.sandboxClient.agentsClient
+	return h.createSandboxResource(ctx, session.sandboxID, session)
+}
 
-	id := session.sandboxID
+// CreateSandboxNamed creates a Sandbox resource with the specified name using topology B.
+func (h *Harness) CreateSandboxNamed(ctx context.Context, sandboxName string) (*Sandbox, error) {
+	id := types.NamespacedName{
+		Namespace: h.opts.Namespace,
+		Name:      sandboxName,
+	}
+	return h.createSandboxResource(ctx, id, nil)
+}
+
+// StartSandbox creates a Sandbox resource with the specified name and waits for it to become ready.
+// If waiting for readiness fails, the created sandbox is deleted and an error is returned.
+func (h *Harness) StartSandbox(ctx context.Context, sandboxName string) (*Sandbox, error) {
+	sb, err := h.CreateSandboxNamed(ctx, sandboxName)
+	if err != nil {
+		return nil, fmt.Errorf("creating sandbox: %w", err)
+	}
+
+	if err := sb.WaitForReady(ctx); err != nil {
+		if delErr := h.sandboxClient.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+			scoped.Log(ctx).Error(delErr, "failed to delete unready sandbox")
+		}
+		return nil, err
+	}
+
+	return sb, nil
+}
+
+// DeleteSandbox deletes the specified sandbox.
+func (h *Harness) DeleteSandbox(ctx context.Context, sb *Sandbox) error {
+	if h.sandboxClient == nil {
+		return nil
+	}
+	return h.sandboxClient.DeleteSandbox(ctx, sb)
+}
+
+// SandboxClient returns the harness's underlying SandboxClient.
+func (h *Harness) SandboxClient() *SandboxClient {
+	return h.sandboxClient
+}
+
+// Namespace returns the Kubernetes namespace configured for sandboxes in RunOptions.
+func (h *Harness) Namespace() string {
+	return h.opts.Namespace
+}
+
+func (h *Harness) createSandboxResource(ctx context.Context, id types.NamespacedName, session *Session) (*Sandbox, error) {
+	agentsClient := h.sandboxClient.agentsClient
 	image := h.opts.Image
 	if image == "" {
 		image = DefaultImage
@@ -1155,6 +1295,7 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 	}
 
 	sandbox := &Sandbox{
+		client:                h.sandboxClient,
 		session:               session,
 		id:                    id,
 		created:               true,
@@ -1192,6 +1333,23 @@ func (c *SandboxClient) DeleteSandbox(ctx context.Context, sb *Sandbox) error {
 	delete(c.sandboxes, sb.NamespacedName())
 	c.mutex.Unlock()
 
+	return nil
+}
+
+// DeleteSandboxByName deletes a sandbox by namespace and name.
+func (c *SandboxClient) DeleteSandboxByName(ctx context.Context, namespace, name string) error {
+	id := types.NamespacedName{Namespace: namespace, Name: name}
+	c.mutex.Lock()
+	sb := c.sandboxes[id]
+	c.mutex.Unlock()
+
+	if sb != nil {
+		return c.DeleteSandbox(ctx, sb)
+	}
+
+	if err := c.agentsClient.AgentsV1beta1().Sandboxes(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete Sandbox: %w", err)
+	}
 	return nil
 }
 

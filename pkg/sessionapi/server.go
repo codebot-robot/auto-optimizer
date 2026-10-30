@@ -560,19 +560,83 @@ func (s *Server) ListRuns(ctx context.Context, req *sessionv1.ListRunsRequest) (
 	var pbRuns []*sessionv1.RunRecord
 	for _, r := range runs {
 		pbRuns = append(pbRuns, &sessionv1.RunRecord{
-			Id:         r.ID,
-			RepoUrl:    repoURL,
-			GoalName:   r.GoalName,
-			Phase:      string(r.Phase),
-			BaseCommit: r.BaseCommit,
-			Branch:     r.Branch,
-			PrUrl:      r.PRURL,
-			SessionId:  r.SessionID,
-			Error:      r.Error,
+			Id:          r.ID,
+			RepoUrl:     repoURL,
+			GoalName:    r.GoalName,
+			Phase:       string(r.Phase),
+			BaseCommit:  r.BaseCommit,
+			Branch:      r.Branch,
+			PrUrl:       r.PRURL,
+			SessionId:   r.SessionID,
+			SandboxName: r.SandboxName,
+			Error:       r.Error,
 		})
 	}
 
 	return &sessionv1.ListRunsResponse{Runs: pbRuns}, nil
+}
+
+// GetRun returns details and events for a run.
+func (s *Server) GetRun(ctx context.Context, req *sessionv1.GetRunRequest) (*sessionv1.GetRunResponse, error) {
+	if s.stateStore == nil {
+		return nil, status.Error(codes.FailedPrecondition, "state store not configured")
+	}
+
+	runID := req.GetId()
+	if runID == "" {
+		return nil, status.Error(codes.InvalidArgument, "id is required")
+	}
+
+	run, err := s.stateStore.FindRun(ctx, runID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "run %q not found", runID)
+		}
+		return nil, status.Errorf(codes.Internal, "finding run: %v", err)
+	}
+
+	repoURL := run.Repo.String()
+	if repo, err := s.stateStore.GetRepo(ctx, run.Repo); err == nil && repo != nil && repo.URL != "" {
+		repoURL = repo.URL
+	}
+
+	events, err := s.stateStore.ReadEvents(ctx, run.Repo, run.ID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "reading events for run: %v", err)
+	}
+
+	pbRun := &sessionv1.RunRecord{
+		Id:          run.ID,
+		RepoUrl:     repoURL,
+		GoalName:    run.GoalName,
+		Phase:       string(run.Phase),
+		BaseCommit:  run.BaseCommit,
+		Branch:      run.Branch,
+		PrUrl:       run.PRURL,
+		SessionId:   run.SessionID,
+		SandboxName: run.SandboxName,
+		Error:       run.Error,
+	}
+
+	var pbEvents []*sessionv1.RunEvent
+	for _, e := range events {
+		var pbTime *timestamppb.Timestamp
+		if !e.Time.IsZero() {
+			pbTime = timestamppb.New(e.Time)
+		}
+		pbEvents = append(pbEvents, &sessionv1.RunEvent{
+			Time:    pbTime,
+			Phase:   string(e.Phase),
+			Kind:    e.Kind,
+			Message: e.Message,
+			Error:   e.Error,
+		})
+	}
+
+	return &sessionv1.GetRunResponse{
+		Run:    pbRun,
+		Events: pbEvents,
+	}, nil
 }
 
 func (s *Server) getOrLoadSession(ctx context.Context, name string) (*session.Session, *session.Harness, error) {

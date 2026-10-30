@@ -1415,6 +1415,7 @@ type RunRecord struct {
 	PrUrl         string                 `protobuf:"bytes,7,opt,name=pr_url,json=prUrl,proto3" json:"pr_url,omitempty"`
 	SessionId     string                 `protobuf:"bytes,8,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
 	Error         string                 `protobuf:"bytes,9,opt,name=error,proto3" json:"error,omitempty"`
+	SandboxName   string                 `protobuf:"bytes,10,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1512,6 +1513,13 @@ func (x *RunRecord) GetError() string {
 	return ""
 }
 
+func (x *RunRecord) GetSandboxName() string {
+	if x != nil {
+		return x.SandboxName
+	}
+	return ""
+}
+
 type ListRunsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Runs          []*RunRecord           `protobuf:"bytes,1,rep,name=runs,proto3" json:"runs,omitempty"`
@@ -1552,6 +1560,178 @@ func (*ListRunsResponse) Descriptor() ([]byte, []int) {
 func (x *ListRunsResponse) GetRuns() []*RunRecord {
 	if x != nil {
 		return x.Runs
+	}
+	return nil
+}
+
+type GetRunRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRunRequest) Reset() {
+	*x = GetRunRequest{}
+	mi := &file_api_session_v1_session_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRunRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRunRequest) ProtoMessage() {}
+
+func (x *GetRunRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_session_v1_session_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRunRequest.ProtoReflect.Descriptor instead.
+func (*GetRunRequest) Descriptor() ([]byte, []int) {
+	return file_api_session_v1_session_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *GetRunRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type RunEvent struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Time          *timestamppb.Timestamp `protobuf:"bytes,1,opt,name=time,proto3" json:"time,omitempty"`
+	Phase         string                 `protobuf:"bytes,2,opt,name=phase,proto3" json:"phase,omitempty"`
+	Kind          string                 `protobuf:"bytes,3,opt,name=kind,proto3" json:"kind,omitempty"`
+	Message       string                 `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
+	Error         string                 `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RunEvent) Reset() {
+	*x = RunEvent{}
+	mi := &file_api_session_v1_session_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RunEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RunEvent) ProtoMessage() {}
+
+func (x *RunEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_api_session_v1_session_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RunEvent.ProtoReflect.Descriptor instead.
+func (*RunEvent) Descriptor() ([]byte, []int) {
+	return file_api_session_v1_session_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *RunEvent) GetTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Time
+	}
+	return nil
+}
+
+func (x *RunEvent) GetPhase() string {
+	if x != nil {
+		return x.Phase
+	}
+	return ""
+}
+
+func (x *RunEvent) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+func (x *RunEvent) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *RunEvent) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+type GetRunResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Run           *RunRecord             `protobuf:"bytes,1,opt,name=run,proto3" json:"run,omitempty"`
+	Events        []*RunEvent            `protobuf:"bytes,2,rep,name=events,proto3" json:"events,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRunResponse) Reset() {
+	*x = GetRunResponse{}
+	mi := &file_api_session_v1_session_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRunResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRunResponse) ProtoMessage() {}
+
+func (x *GetRunResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_session_v1_session_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRunResponse.ProtoReflect.Descriptor instead.
+func (*GetRunResponse) Descriptor() ([]byte, []int) {
+	return file_api_session_v1_session_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *GetRunResponse) GetRun() *RunRecord {
+	if x != nil {
+		return x.Run
+	}
+	return nil
+}
+
+func (x *GetRunResponse) GetEvents() []*RunEvent {
+	if x != nil {
+		return x.Events
 	}
 	return nil
 }
@@ -1648,7 +1828,7 @@ const file_api_session_v1_session_proto_rawDesc = "" +
 	"\x11ListGoalsResponse\x12,\n" +
 	"\x05goals\x18\x01 \x03(\v2\x16.session.v1.GoalRecordR\x05goals\",\n" +
 	"\x0fListRunsRequest\x12\x19\n" +
-	"\brepo_url\x18\x01 \x01(\tR\arepoUrl\"\xee\x01\n" +
+	"\brepo_url\x18\x01 \x01(\tR\arepoUrl\"\x91\x02\n" +
 	"\tRunRecord\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x19\n" +
 	"\brepo_url\x18\x02 \x01(\tR\arepoUrl\x12\x1b\n" +
@@ -1660,9 +1840,22 @@ const file_api_session_v1_session_proto_rawDesc = "" +
 	"\x06pr_url\x18\a \x01(\tR\x05prUrl\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\b \x01(\tR\tsessionId\x12\x14\n" +
-	"\x05error\x18\t \x01(\tR\x05error\"=\n" +
+	"\x05error\x18\t \x01(\tR\x05error\x12!\n" +
+	"\fsandbox_name\x18\n" +
+	" \x01(\tR\vsandboxName\"=\n" +
 	"\x10ListRunsResponse\x12)\n" +
-	"\x04runs\x18\x01 \x03(\v2\x15.session.v1.RunRecordR\x04runs2\xfb\x04\n" +
+	"\x04runs\x18\x01 \x03(\v2\x15.session.v1.RunRecordR\x04runs\"\x1f\n" +
+	"\rGetRunRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x94\x01\n" +
+	"\bRunEvent\x12.\n" +
+	"\x04time\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\x04time\x12\x14\n" +
+	"\x05phase\x18\x02 \x01(\tR\x05phase\x12\x12\n" +
+	"\x04kind\x18\x03 \x01(\tR\x04kind\x12\x18\n" +
+	"\amessage\x18\x04 \x01(\tR\amessage\x12\x14\n" +
+	"\x05error\x18\x05 \x01(\tR\x05error\"g\n" +
+	"\x0eGetRunResponse\x12'\n" +
+	"\x03run\x18\x01 \x01(\v2\x15.session.v1.RunRecordR\x03run\x12,\n" +
+	"\x06events\x18\x02 \x03(\v2\x14.session.v1.RunEventR\x06events2\xbc\x05\n" +
 	"\x0eSessionService\x12F\n" +
 	"\rCreateSession\x12 .session.v1.CreateSessionRequest\x1a\x13.session.v1.Session\x12Q\n" +
 	"\fListSessions\x12\x1f.session.v1.ListSessionsRequest\x1a .session.v1.ListSessionsResponse\x12@\n" +
@@ -1672,7 +1865,8 @@ const file_api_session_v1_session_proto_rawDesc = "" +
 	"\vSendMessage\x12\x1e.session.v1.SendMessageRequest\x1a\x18.session.v1.SessionEvent0\x01\x12]\n" +
 	"\x10ListRepositories\x12#.session.v1.ListRepositoriesRequest\x1a$.session.v1.ListRepositoriesResponse\x12H\n" +
 	"\tListGoals\x12\x1c.session.v1.ListGoalsRequest\x1a\x1d.session.v1.ListGoalsResponse\x12E\n" +
-	"\bListRuns\x12\x1b.session.v1.ListRunsRequest\x1a\x1c.session.v1.ListRunsResponseB=Z;github.com/gke-labs/auto-optimizer/api/session/v1;sessionv1b\x06proto3"
+	"\bListRuns\x12\x1b.session.v1.ListRunsRequest\x1a\x1c.session.v1.ListRunsResponse\x12?\n" +
+	"\x06GetRun\x12\x19.session.v1.GetRunRequest\x1a\x1a.session.v1.GetRunResponseB=Z;github.com/gke-labs/auto-optimizer/api/session/v1;sessionv1b\x06proto3"
 
 var (
 	file_api_session_v1_session_proto_rawDescOnce sync.Once
@@ -1686,7 +1880,7 @@ func file_api_session_v1_session_proto_rawDescGZIP() []byte {
 	return file_api_session_v1_session_proto_rawDescData
 }
 
-var file_api_session_v1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
+var file_api_session_v1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
 var file_api_session_v1_session_proto_goTypes = []any{
 	(*Session)(nil),                  // 0: session.v1.Session
 	(*CreateSessionRequest)(nil),     // 1: session.v1.CreateSessionRequest
@@ -1714,10 +1908,13 @@ var file_api_session_v1_session_proto_goTypes = []any{
 	(*ListRunsRequest)(nil),          // 23: session.v1.ListRunsRequest
 	(*RunRecord)(nil),                // 24: session.v1.RunRecord
 	(*ListRunsResponse)(nil),         // 25: session.v1.ListRunsResponse
-	(*timestamppb.Timestamp)(nil),    // 26: google.protobuf.Timestamp
+	(*GetRunRequest)(nil),            // 26: session.v1.GetRunRequest
+	(*RunEvent)(nil),                 // 27: session.v1.RunEvent
+	(*GetRunResponse)(nil),           // 28: session.v1.GetRunResponse
+	(*timestamppb.Timestamp)(nil),    // 29: google.protobuf.Timestamp
 }
 var file_api_session_v1_session_proto_depIdxs = []int32{
-	26, // 0: session.v1.Session.creation_time:type_name -> google.protobuf.Timestamp
+	29, // 0: session.v1.Session.creation_time:type_name -> google.protobuf.Timestamp
 	0,  // 1: session.v1.ListSessionsResponse.sessions:type_name -> session.v1.Session
 	8,  // 2: session.v1.ListMessagesResponse.messages:type_name -> session.v1.Message
 	9,  // 3: session.v1.Message.tool_calls:type_name -> session.v1.ToolCall
@@ -1730,31 +1927,36 @@ var file_api_session_v1_session_proto_depIdxs = []int32{
 	8,  // 10: session.v1.MessageAppended.message:type_name -> session.v1.Message
 	9,  // 11: session.v1.ToolCallStarted.tool_call:type_name -> session.v1.ToolCall
 	9,  // 12: session.v1.ToolCallFinished.tool_call:type_name -> session.v1.ToolCall
-	26, // 13: session.v1.Repository.registered_time:type_name -> google.protobuf.Timestamp
+	29, // 13: session.v1.Repository.registered_time:type_name -> google.protobuf.Timestamp
 	17, // 14: session.v1.ListRepositoriesResponse.repositories:type_name -> session.v1.Repository
 	21, // 15: session.v1.ListGoalsResponse.goals:type_name -> session.v1.GoalRecord
 	24, // 16: session.v1.ListRunsResponse.runs:type_name -> session.v1.RunRecord
-	1,  // 17: session.v1.SessionService.CreateSession:input_type -> session.v1.CreateSessionRequest
-	2,  // 18: session.v1.SessionService.ListSessions:input_type -> session.v1.ListSessionsRequest
-	4,  // 19: session.v1.SessionService.GetSession:input_type -> session.v1.GetSessionRequest
-	5,  // 20: session.v1.SessionService.ListMessages:input_type -> session.v1.ListMessagesRequest
-	7,  // 21: session.v1.SessionService.SendMessage:input_type -> session.v1.SendMessageRequest
-	18, // 22: session.v1.SessionService.ListRepositories:input_type -> session.v1.ListRepositoriesRequest
-	20, // 23: session.v1.SessionService.ListGoals:input_type -> session.v1.ListGoalsRequest
-	23, // 24: session.v1.SessionService.ListRuns:input_type -> session.v1.ListRunsRequest
-	0,  // 25: session.v1.SessionService.CreateSession:output_type -> session.v1.Session
-	3,  // 26: session.v1.SessionService.ListSessions:output_type -> session.v1.ListSessionsResponse
-	0,  // 27: session.v1.SessionService.GetSession:output_type -> session.v1.Session
-	6,  // 28: session.v1.SessionService.ListMessages:output_type -> session.v1.ListMessagesResponse
-	11, // 29: session.v1.SessionService.SendMessage:output_type -> session.v1.SessionEvent
-	19, // 30: session.v1.SessionService.ListRepositories:output_type -> session.v1.ListRepositoriesResponse
-	22, // 31: session.v1.SessionService.ListGoals:output_type -> session.v1.ListGoalsResponse
-	25, // 32: session.v1.SessionService.ListRuns:output_type -> session.v1.ListRunsResponse
-	25, // [25:33] is the sub-list for method output_type
-	17, // [17:25] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	29, // 17: session.v1.RunEvent.time:type_name -> google.protobuf.Timestamp
+	24, // 18: session.v1.GetRunResponse.run:type_name -> session.v1.RunRecord
+	27, // 19: session.v1.GetRunResponse.events:type_name -> session.v1.RunEvent
+	1,  // 20: session.v1.SessionService.CreateSession:input_type -> session.v1.CreateSessionRequest
+	2,  // 21: session.v1.SessionService.ListSessions:input_type -> session.v1.ListSessionsRequest
+	4,  // 22: session.v1.SessionService.GetSession:input_type -> session.v1.GetSessionRequest
+	5,  // 23: session.v1.SessionService.ListMessages:input_type -> session.v1.ListMessagesRequest
+	7,  // 24: session.v1.SessionService.SendMessage:input_type -> session.v1.SendMessageRequest
+	18, // 25: session.v1.SessionService.ListRepositories:input_type -> session.v1.ListRepositoriesRequest
+	20, // 26: session.v1.SessionService.ListGoals:input_type -> session.v1.ListGoalsRequest
+	23, // 27: session.v1.SessionService.ListRuns:input_type -> session.v1.ListRunsRequest
+	26, // 28: session.v1.SessionService.GetRun:input_type -> session.v1.GetRunRequest
+	0,  // 29: session.v1.SessionService.CreateSession:output_type -> session.v1.Session
+	3,  // 30: session.v1.SessionService.ListSessions:output_type -> session.v1.ListSessionsResponse
+	0,  // 31: session.v1.SessionService.GetSession:output_type -> session.v1.Session
+	6,  // 32: session.v1.SessionService.ListMessages:output_type -> session.v1.ListMessagesResponse
+	11, // 33: session.v1.SessionService.SendMessage:output_type -> session.v1.SessionEvent
+	19, // 34: session.v1.SessionService.ListRepositories:output_type -> session.v1.ListRepositoriesResponse
+	22, // 35: session.v1.SessionService.ListGoals:output_type -> session.v1.ListGoalsResponse
+	25, // 36: session.v1.SessionService.ListRuns:output_type -> session.v1.ListRunsResponse
+	28, // 37: session.v1.SessionService.GetRun:output_type -> session.v1.GetRunResponse
+	29, // [29:38] is the sub-list for method output_type
+	20, // [20:29] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_api_session_v1_session_proto_init() }
@@ -1775,7 +1977,7 @@ func file_api_session_v1_session_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_session_v1_session_proto_rawDesc), len(file_api_session_v1_session_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   26,
+			NumMessages:   29,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

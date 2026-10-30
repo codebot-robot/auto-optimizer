@@ -256,6 +256,24 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		return session.NewHarness(llmClient, sandboxClient, toolsRegistry, opts), nil
 	}
 
+	orchestratorHarness, err := harnessFactory(flags.toolset)
+	if err != nil {
+		return fmt.Errorf("initializing orchestrator harness: %w", err)
+	}
+
+	orchestrator, err := run.NewOrchestrator(run.OrchestratorOptions{
+		Store:   stateStore,
+		Harness: orchestratorHarness,
+	})
+	if err != nil {
+		return fmt.Errorf("initializing orchestrator: %w", err)
+	}
+	go func() {
+		if err := orchestrator.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error(err, "orchestrator loop error")
+		}
+	}()
+
 	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
 		Store:          sessionStore,
 		StateStore:     stateStore,
