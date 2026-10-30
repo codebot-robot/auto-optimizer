@@ -60,8 +60,9 @@ type GitRemote struct {
 	timeout    time.Duration
 	httpClient *http.Client
 
-	mu    sync.Mutex
-	cache map[string]httpCacheEntry
+	mu        sync.Mutex
+	cache     map[string]httpCacheEntry
+	v2Servers map[string]bool
 }
 
 var _ Forge = (*GitRemote)(nil)
@@ -87,8 +88,9 @@ func WithHTTPClient(client *http.Client) GitRemoteOption {
 // NewGitRemote creates a new GitRemote forge instance.
 func NewGitRemote(opts ...GitRemoteOption) *GitRemote {
 	g := &GitRemote{
-		timeout: defaultRequestTimeout,
-		cache:   make(map[string]httpCacheEntry),
+		timeout:   defaultRequestTimeout,
+		cache:     make(map[string]httpCacheEntry),
+		v2Servers: make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -99,10 +101,11 @@ func NewGitRemote(opts ...GitRemoteOption) *GitRemote {
 // NewGitRemoteWithCredentials creates a GitRemote forge instance with HTTP basic auth credentials.
 func NewGitRemoteWithCredentials(username, password string, opts ...GitRemoteOption) *GitRemote {
 	g := &GitRemote{
-		username: username,
-		password: password,
-		timeout:  defaultRequestTimeout,
-		cache:    make(map[string]httpCacheEntry),
+		username:  username,
+		password:  password,
+		timeout:   defaultRequestTimeout,
+		cache:     make(map[string]httpCacheEntry),
+		v2Servers: make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -332,6 +335,145 @@ func parsePktLines(data []byte) ([]pktLine, error) {
 	return lines, nil
 }
 
+func isV2UnsupportedStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusBadRequest,
+		http.StatusNotFound,
+		http.StatusMethodNotAllowed,
+		http.StatusUnsupportedMediaType,
+		http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
+}
+
+// The Git smart HTTP specification describes discovery first (a GET to /info/refs
+// followed by a POST to /git-upload-pack). While protocol v0 answers in a single GET,
+// that response carries every ref unfiltered (including refs/pull/* and tags, which
+// on hosts like GitHub can be massive). Protocol v2 allows ref-prefix filtering, but
+// requires version negotiation on first contact. Once the server is known to support
+// protocol v2, discovery is skipped after the first success and later polls go straight
+// to the ls-refs POST, saving a round trip.
+func (g *GitRemote) postLsRefs(ctx context.Context, client *http.Client, baseURL, repoURL string, timeout time.Duration, cached httpCacheEntry, hasCached bool) (map[string]string, string, int, error) {
+	var postBuf bytes.Buffer
+	if err := writePktLine(&postBuf, "command=ls-refs\n"); err != nil {
+		return nil, "", 0, err
+	}
+	if err := writePktDelim(&postBuf); err != nil {
+		return nil, "", 0, err
+	}
+	if err := writePktLine(&postBuf, "peel\n"); err != nil {
+		return nil, "", 0, err
+	}
+	if err := writePktLine(&postBuf, "symrefs\n"); err != nil {
+		return nil, "", 0, err
+	}
+	if err := writePktLine(&postBuf, "ref-prefix HEAD\n"); err != nil {
+		return nil, "", 0, err
+	}
+	if err := writePktLine(&postBuf, "ref-prefix refs/heads/\n"); err != nil {
+		return nil, "", 0, err
+	}
+	if err := writePktFlush(&postBuf); err != nil {
+		return nil, "", 0, err
+	}
+
+	postURL := baseURL + "/git-upload-pack"
+	postCtx, cancelPost := context.WithTimeout(ctx, timeout)
+	defer cancelPost()
+
+	postReq, err := http.NewRequestWithContext(postCtx, http.MethodPost, postURL, &postBuf)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("creating git smart HTTP POST request for %s: %w", repoURL, err)
+	}
+	postReq.Header.Set("Git-Protocol", "version=2")
+	postReq.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+	postReq.Header.Set("Accept", "application/x-git-upload-pack-result")
+	postReq.Header.Set("User-Agent", gitUserAgent)
+	if g.username != "" || g.password != "" {
+		postReq.SetBasicAuth(g.username, g.password)
+	}
+	if hasCached && cached.etag != "" {
+		postReq.Header.Set("If-None-Match", cached.etag)
+	}
+
+	postResp, err := client.Do(postReq)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("git smart HTTP POST request failed for %s: %w", repoURL, err)
+	}
+	defer func() {
+		if closeErr := postResp.Body.Close(); closeErr != nil {
+			scoped.Log(ctx).V(2).Info("failed to close response body", "error", closeErr)
+		}
+	}()
+
+	if postResp.StatusCode == http.StatusNotModified {
+		if hasCached {
+			return copyRefs(cached.refs), cached.defaultBranch, postResp.StatusCode, nil
+		}
+		return nil, "", postResp.StatusCode, fmt.Errorf("git smart HTTP POST returned 304 without cached data for %s", repoURL)
+	}
+
+	postBody, err := io.ReadAll(postResp.Body)
+	if err != nil {
+		return nil, "", postResp.StatusCode, fmt.Errorf("reading git smart HTTP POST response for %s: %w", repoURL, err)
+	}
+
+	if postResp.StatusCode < 200 || postResp.StatusCode >= 300 {
+		return nil, "", postResp.StatusCode, fmt.Errorf("git smart HTTP POST request for %s failed with status %d: %s", repoURL, postResp.StatusCode, string(postBody))
+	}
+
+	etag := cached.etag
+	if postETag := postResp.Header.Get("ETag"); postETag != "" {
+		etag = postETag
+	}
+
+	respLines, err := parsePktLines(postBody)
+	if err != nil {
+		return nil, "", postResp.StatusCode, fmt.Errorf("parsing git smart HTTP POST pkt-lines for %s: %w", repoURL, err)
+	}
+
+	refs := make(map[string]string)
+	var defaultBranch string
+
+	for _, line := range respLines {
+		if line.pType != pktData {
+			continue
+		}
+		fields := strings.Fields(string(line.payload))
+		if len(fields) < 2 {
+			continue
+		}
+		oid := fields[0]
+		refname := fields[1]
+
+		for _, attr := range fields[2:] {
+			if strings.HasPrefix(attr, "symref-target:") {
+				target := strings.TrimPrefix(attr, "symref-target:")
+				if refname == "HEAD" {
+					defaultBranch = strings.TrimPrefix(target, "refs/heads/")
+				}
+			}
+		}
+
+		if oid != "unborn" && refname != "HEAD" {
+			refs[refname] = oid
+		}
+	}
+
+	g.mu.Lock()
+	g.v2Servers[baseURL] = true
+	g.cache[baseURL] = httpCacheEntry{
+		etag:          etag,
+		refs:          refs,
+		defaultBranch: defaultBranch,
+	}
+	g.mu.Unlock()
+
+	return refs, defaultBranch, postResp.StatusCode, nil
+}
+
 func (g *GitRemote) discoverSmartHTTP(ctx context.Context, repoURL string) (map[string]string, string, error) {
 	client := g.httpClient
 	if client == nil {
@@ -347,8 +489,29 @@ func (g *GitRemote) discoverSmartHTTP(ctx context.Context, repoURL string) (map[
 	infoURL := baseURL + "/info/refs?service=git-upload-pack"
 
 	g.mu.Lock()
+	isV2 := g.v2Servers[baseURL]
 	cached, hasCached := g.cache[baseURL]
 	g.mu.Unlock()
+
+	if isV2 {
+		refs, defaultBranch, status, err := g.postLsRefs(ctx, client, baseURL, repoURL, timeout, cached, hasCached)
+		if err == nil {
+			return copyRefs(refs), defaultBranch, nil
+		}
+		if !isV2UnsupportedStatus(status) {
+			return nil, "", err
+		}
+
+		// The POST failed with a status suggesting the server no longer speaks v2 (e.g. 400 or 404).
+		// Forget the entry and fall through to redo discovery.
+		scoped.Log(ctx).V(2).Info("git protocol v2 POST failed, forgetting v2 support and redoing discovery", "repo", repoURL, "status", status, "error", err)
+		g.mu.Lock()
+		delete(g.v2Servers, baseURL)
+		delete(g.cache, baseURL)
+		g.mu.Unlock()
+		hasCached = false
+		cached = httpCacheEntry{}
+	}
 
 	getCtx, cancelGet := context.WithTimeout(ctx, timeout)
 	defer cancelGet()
@@ -392,13 +555,16 @@ func (g *GitRemote) discoverSmartHTTP(ctx context.Context, repoURL string) (map[
 		return nil, "", fmt.Errorf("git smart HTTP GET request for %s failed with status %d: %s", repoURL, getResp.StatusCode, string(getBody))
 	}
 	etag := getResp.Header.Get("ETag")
+	if etag != "" {
+		cached.etag = etag
+	}
 
 	lines, err := parsePktLines(getBody)
 	if err != nil {
 		return nil, "", fmt.Errorf("parsing git smart HTTP GET response pkt-lines for %s: %w", repoURL, err)
 	}
 
-	isV2 := false
+	discoveredV2 := false
 	idx := 0
 	if idx < len(lines) && lines[idx].pType == pktData && strings.HasPrefix(string(lines[idx].payload), "# service=") {
 		idx++
@@ -409,126 +575,23 @@ func (g *GitRemote) discoverSmartHTTP(ctx context.Context, repoURL string) (map[
 	if idx < len(lines) && lines[idx].pType == pktData {
 		payloadStr := string(lines[idx].payload)
 		if payloadStr == "version 2" || strings.HasPrefix(payloadStr, "version 2") {
-			isV2 = true
+			discoveredV2 = true
 		}
 	}
 
-	if isV2 {
-		var postBuf bytes.Buffer
-		if err := writePktLine(&postBuf, "command=ls-refs\n"); err != nil {
-			return nil, "", err
-		}
-		if err := writePktDelim(&postBuf); err != nil {
-			return nil, "", err
-		}
-		if err := writePktLine(&postBuf, "peel\n"); err != nil {
-			return nil, "", err
-		}
-		if err := writePktLine(&postBuf, "symrefs\n"); err != nil {
-			return nil, "", err
-		}
-		if err := writePktLine(&postBuf, "ref-prefix HEAD\n"); err != nil {
-			return nil, "", err
-		}
-		if err := writePktLine(&postBuf, "ref-prefix refs/heads/\n"); err != nil {
-			return nil, "", err
-		}
-		if err := writePktFlush(&postBuf); err != nil {
-			return nil, "", err
-		}
-
-		// Git smart HTTP requires two HTTP requests for protocol v2:
-		// 1. Initial GET to /info/refs?service=git-upload-pack: discovers capabilities and negotiates
-		//    protocol version (gitprotocol-v2 / gitprotocol-http). Unlike protocol v0, the v2 GET
-		//    response advertises only capabilities (e.g. "version 2", "ls-refs") without ref data.
-		// 2. This POST to /git-upload-pack: executes the negotiated "command=ls-refs" with ref-prefix
-		//    filters to retrieve the actual refs.
-		// The two requests are mandatory per the Git smart HTTP specification: a client cannot skip
-		// the initial GET because smart HTTP is stateless and the client must discover whether the
-		// server supports protocol v2 or requires the v0 fallback.
-		postURL := baseURL + "/git-upload-pack"
-		postCtx, cancelPost := context.WithTimeout(ctx, timeout)
-		defer cancelPost()
-
-		postReq, err := http.NewRequestWithContext(postCtx, http.MethodPost, postURL, &postBuf)
+	if discoveredV2 {
+		refs, defaultBranch, _, err := g.postLsRefs(ctx, client, baseURL, repoURL, timeout, cached, hasCached)
 		if err != nil {
-			return nil, "", fmt.Errorf("creating git smart HTTP POST request for %s: %w", repoURL, err)
+			return nil, "", err
 		}
-		postReq.Header.Set("Git-Protocol", "version=2")
-		postReq.Header.Set("Content-Type", "application/x-git-upload-pack-request")
-		postReq.Header.Set("Accept", "application/x-git-upload-pack-result")
-		postReq.Header.Set("User-Agent", gitUserAgent)
-		if g.username != "" || g.password != "" {
-			postReq.SetBasicAuth(g.username, g.password)
-		}
-
-		postResp, err := client.Do(postReq)
-		if err != nil {
-			return nil, "", fmt.Errorf("git smart HTTP POST request failed for %s: %w", repoURL, err)
-		}
-		defer func() {
-			if closeErr := postResp.Body.Close(); closeErr != nil {
-				scoped.Log(ctx).V(2).Info("failed to close response body", "error", closeErr)
-			}
-		}()
-
-		postBody, err := io.ReadAll(postResp.Body)
-		if err != nil {
-			return nil, "", fmt.Errorf("reading git smart HTTP POST response for %s: %w", repoURL, err)
-		}
-
-		if postResp.StatusCode < 200 || postResp.StatusCode >= 300 {
-			return nil, "", fmt.Errorf("git smart HTTP POST request for %s failed with status %d: %s", repoURL, postResp.StatusCode, string(postBody))
-		}
-		if postETag := postResp.Header.Get("ETag"); postETag != "" {
-			etag = postETag
-		}
-
-		respLines, err := parsePktLines(postBody)
-		if err != nil {
-			return nil, "", fmt.Errorf("parsing git smart HTTP POST pkt-lines for %s: %w", repoURL, err)
-		}
-
-		refs := make(map[string]string)
-		var defaultBranch string
-
-		for _, line := range respLines {
-			if line.pType != pktData {
-				continue
-			}
-			fields := strings.Fields(string(line.payload))
-			if len(fields) < 2 {
-				continue
-			}
-			oid := fields[0]
-			refname := fields[1]
-
-			for _, attr := range fields[2:] {
-				if strings.HasPrefix(attr, "symref-target:") {
-					target := strings.TrimPrefix(attr, "symref-target:")
-					if refname == "HEAD" {
-						defaultBranch = strings.TrimPrefix(target, "refs/heads/")
-					}
-				}
-			}
-
-			if oid != "unborn" && refname != "HEAD" {
-				refs[refname] = oid
-			}
-		}
-
-		g.mu.Lock()
-		g.cache[baseURL] = httpCacheEntry{
-			etag:          etag,
-			refs:          refs,
-			defaultBranch: defaultBranch,
-		}
-		g.mu.Unlock()
-
 		return copyRefs(refs), defaultBranch, nil
 	}
 
 	// Protocol v0 fallback
+	g.mu.Lock()
+	delete(g.v2Servers, baseURL)
+	g.mu.Unlock()
+
 	refs := make(map[string]string)
 	var headTarget string
 	var defaultBranch string
