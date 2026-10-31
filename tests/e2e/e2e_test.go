@@ -866,11 +866,16 @@ func TestRunLifecycle(t *testing.T) {
 		t.Fatalf("failed to clone bare repo: %v\n%s", err, string(out))
 	}
 
+	readmeContent := "# Hello Repo\n\nThis is a sample README to read and summarise.\n"
+	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte(readmeContent), 0644); err != nil {
+		t.Fatalf("failed to write README.md: %v", err)
+	}
+
 	goalsDir := filepath.Join(workDir, ".goals")
 	if err := os.MkdirAll(goalsDir, 0755); err != nil {
 		t.Fatalf("failed to create .goals dir: %v", err)
 	}
-	goalContent := "# Hello\n\nAdd a line to README\n"
+	goalContent := "# Hello\n\nread the README and summarise it\n"
 	if err := os.WriteFile(filepath.Join(goalsDir, "hello.md"), []byte(goalContent), 0644); err != nil {
 		t.Fatalf("failed to write goal file: %v", err)
 	}
@@ -1011,6 +1016,7 @@ func TestRunLifecycle(t *testing.T) {
 		ID          string `json:"id"`
 		Phase       string `json:"phase"`
 		BaseCommit  string `json:"baseCommit"`
+		SessionID   string `json:"sessionId"`
 		SandboxName string `json:"sandboxName"`
 		Error       string `json:"error"`
 	}
@@ -1022,9 +1028,9 @@ func TestRunLifecycle(t *testing.T) {
 	}
 
 	var runID string
-	var workingRun *jsonRun
+	var finalRun *jsonRun
 
-	t.Log("Waiting for run to reach Working phase...")
+	t.Log("Waiting for run to reach Working and then NoImprovement phase...")
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		// List runs
@@ -1047,8 +1053,8 @@ func TestRunLifecycle(t *testing.T) {
 				if getErr == nil {
 					var getResp jsonGetRunResponse
 					if unmarshalErr := json.Unmarshal(getOut, &getResp); unmarshalErr == nil {
-						if getResp.Run.Phase == "Working" {
-							workingRun = &getResp.Run
+						if getResp.Run.Phase == "NoImprovement" {
+							finalRun = &getResp.Run
 							break
 						} else if getResp.Run.Phase == "Failed" {
 							t.Fatalf("run failed prematurely with error: %s", getResp.Run.Error)
@@ -1060,41 +1066,58 @@ func TestRunLifecycle(t *testing.T) {
 		time.Sleep(1 * time.Second)
 	}
 
-	if workingRun == nil {
-		t.Fatalf("timed out waiting for run to reach Working phase. Serve stderr:\n%s", serveStderr.String())
+	if finalRun == nil {
+		t.Fatalf("timed out waiting for run to reach NoImprovement phase. Serve stderr:\n%s", serveStderr.String())
 	}
 
-	t.Logf("PASS: Run %s reached phase %s with sandbox %s", workingRun.ID, workingRun.Phase, workingRun.SandboxName)
-	if workingRun.BaseCommit != baseCommit {
-		t.Errorf("expected base commit %s, got %s", baseCommit, workingRun.BaseCommit)
+	t.Logf("PASS: Run %s reached phase %s with session %s", finalRun.ID, finalRun.Phase, finalRun.SessionID)
+	if finalRun.BaseCommit != baseCommit {
+		t.Errorf("expected base commit %s, got %s", baseCommit, finalRun.BaseCommit)
+	}
+	if finalRun.SessionID == "" {
+		t.Errorf("expected non-empty SessionID on run")
 	}
 
-	sandboxName := workingRun.SandboxName
+	sandboxName := finalRun.SandboxName
 	subH := h.WithT(t)
-	t.Cleanup(func() {
-		subH.DeleteWithCleanup("ao-sandboxes", "sandbox", sandboxName)
-	})
 
-	// 5. Verify sandbox in Kubernetes is Ready
-	subH.WaitForCondition("ao-sandboxes", "sandbox/"+sandboxName, "condition=Ready", 60*time.Second)
+	// 5. Verify sandbox was deleted in Kubernetes after session ended
+	deleteDeadline := time.Now().Add(30 * time.Second)
+	var sbDeleted bool
+	for time.Now().Before(deleteDeadline) {
+		_, getErr := subH.Kubectl("get", "-n", "ao-sandboxes", "sandbox", sandboxName)
+		if getErr != nil {
+			sbDeleted = true
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if !sbDeleted {
+		t.Errorf("expected sandbox %s to be deleted after session ended, but it still exists", sandboxName)
+	}
 
-	// 6. Verify sandbox contains clone at baseCommit using kubectl exec
-	headOut, err := subH.Kubectl("exec", "-n", "ao-sandboxes", sandboxName, "-c", "sandbox", "--", "git", "-C", "/workspace/repo", "rev-parse", "HEAD")
+	// 6. Verify session transcript in stateDir shows the agent reading the cloned repository
+	sessStore := session.NewFileStore(stateDir)
+	msgs, _, err := sessStore.LoadSession(t.Context(), finalRun.SessionID)
 	if err != nil {
-		t.Fatalf("failed to get cloned repo HEAD inside sandbox: %v\nOutput: %s", err, headOut)
+		t.Fatalf("failed to load session %s from stateDir %s: %v", finalRun.SessionID, stateDir, err)
 	}
-	gotHead := strings.TrimSpace(headOut)
-	if gotHead != baseCommit {
-		t.Errorf("cloned repository inside sandbox has commit %s, want base commit %s", gotHead, baseCommit)
+	var foundReadToolCall, foundToolResult bool
+	for _, msg := range msgs {
+		for _, tc := range msg.ToolCalls {
+			if strings.Contains(tc.Function.Arguments, "README.md") {
+				foundReadToolCall = true
+			}
+		}
+		if msg.Role == "tool" && msg.Content != nil && strings.Contains(*msg.Content, "This is a sample README to read and summarise.") {
+			foundToolResult = true
+		}
 	}
-
-	// Verify goal file is in cloned repository inside sandbox
-	goalCatOut, err := subH.Kubectl("exec", "-n", "ao-sandboxes", sandboxName, "-c", "sandbox", "--", "cat", "/workspace/repo/.goals/hello.md")
-	if err != nil {
-		t.Fatalf("failed to read .goals/hello.md inside sandbox: %v\nOutput: %s", err, goalCatOut)
+	if !foundReadToolCall {
+		t.Errorf("expected session transcript to contain tool call reading README.md, messages: %+v", msgs)
 	}
-	if !strings.Contains(goalCatOut, "Add a line to README") {
-		t.Errorf("unexpected content in cloned .goals/hello.md: %s", goalCatOut)
+	if !foundToolResult {
+		t.Errorf("expected session transcript to contain tool result with README contents, messages: %+v", msgs)
 	}
 
 	// 7. Verify ao run get prints formatted run and events
@@ -1104,9 +1127,9 @@ func TestRunLifecycle(t *testing.T) {
 		t.Fatalf("ao run get failed: %v\nOutput: %s", err, string(getFmtOut))
 	}
 	fmtStr := string(getFmtOut)
-	if !strings.Contains(fmtStr, "Working") || !strings.Contains(fmtStr, sandboxName) || !strings.Contains(fmtStr, "Events:") {
-		t.Errorf("expected formatted run output to contain Working, sandbox name, and Events, got:\n%s", fmtStr)
+	if !strings.Contains(fmtStr, "NoImprovement") || !strings.Contains(fmtStr, "session ended without a pull request") || !strings.Contains(fmtStr, "Events:") {
+		t.Errorf("expected formatted run output to contain NoImprovement, event message, and Events, got:\n%s", fmtStr)
 	}
 
-	t.Logf("PASS: sandbox %s contains clone at base commit %s with .goals/hello.md", sandboxName, baseCommit)
+	t.Logf("PASS: session transcript for run %s shows agent reading cloned repository README", runID)
 }

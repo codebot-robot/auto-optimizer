@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +54,7 @@ type serveFlags struct {
 	toolTimeout time.Duration
 	stateDir    string
 	repos       []string
+	maxTurns    int
 }
 
 func newServeCommand() *cobra.Command {
@@ -108,6 +110,14 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().DurationVar(&flags.toolTimeout, "tool-timeout", session.DefaultToolTimeout, "Maximum duration for a single tool execution")
 	cmd.Flags().StringVar(&flags.stateDir, "state-dir", defaultStateDir, "Directory where session state and snapshots are saved")
 	cmd.Flags().StringArrayVar(&flags.repos, "repo", nil, "Repository URL to register with the forge (repeatable, or AO_REPOS env var)")
+
+	defaultMaxTurns := 30
+	if envMaxTurns := os.Getenv("AO_MAX_TURNS"); envMaxTurns != "" {
+		if v, err := strconv.Atoi(envMaxTurns); err == nil && v > 0 {
+			defaultMaxTurns = v
+		}
+	}
+	cmd.Flags().IntVar(&flags.maxTurns, "max-turns", defaultMaxTurns, "Maximum number of session turns before ending a run")
 
 	return cmd
 }
@@ -262,8 +272,10 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	}
 
 	orchestrator, err := run.NewOrchestrator(run.OrchestratorOptions{
-		Store:   stateStore,
-		Harness: orchestratorHarness,
+		Store:        stateStore,
+		SessionStore: sessionStore,
+		Harness:      orchestratorHarness,
+		MaxTurns:     flags.maxTurns,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing orchestrator: %w", err)
