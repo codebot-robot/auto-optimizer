@@ -27,6 +27,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
+	"github.com/gke-labs/auto-optimizer/pkg/toolsets/ao"
 )
 
 // OrchestratorOptions configures the run Orchestrator.
@@ -448,6 +449,29 @@ func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, r
 	return errors.New(errMsg)
 }
 
+func (o *Orchestrator) finishRunNoImprovement(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, kind, message string) error {
+	endTime := o.clock().UTC()
+	run.SetPhase(state.PhaseNoImprovement, endTime)
+	if err := o.store.PutRun(ctx, run); err != nil {
+		scoped.Log(ctx).Error(err, "failed to update run to NoImprovement", "run", run.ID)
+	}
+
+	event := state.Event{
+		Time:    endTime,
+		Phase:   state.PhaseNoImprovement,
+		Kind:    kind,
+		Message: message,
+	}
+	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, event); err != nil {
+		scoped.Log(ctx).Error(err, "failed to append event", "kind", kind, "run", run.ID)
+	}
+
+	if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+		scoped.Log(ctx).V(2).Info("error deleting sandbox after session", "sandbox", run.SandboxName, "error", delErr)
+	}
+	return nil
+}
+
 func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
 	log := scoped.Log(ctx)
 
@@ -562,30 +586,17 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	}()
 
 	events := &orchestratorTurnEvents{}
-	harness := o.harness.WithMaxTurns(o.maxTurns)
+	finishTool := ao.NewFinishTool()
+	harness := o.harness.WithMaxTurns(o.maxTurns).WithTools(finishTool)
 	turnErr := harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
 
+	if errors.Is(turnErr, session.ErrSessionFinished) {
+		run.Summary = finishTool.Summary
+		return o.finishRunNoImprovement(ctx, repo, run, sb, "finished", finishTool.Summary)
+	}
+
 	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
-		endTime := o.clock().UTC()
-		run.SetPhase(state.PhaseNoImprovement, endTime)
-		if err := o.store.PutRun(ctx, run); err != nil {
-			log.Error(err, "failed to update run to NoImprovement", "run", run.ID)
-		}
-
-		event := state.Event{
-			Time:    endTime,
-			Phase:   state.PhaseNoImprovement,
-			Kind:    "no_improvement",
-			Message: "session ended without a pull request",
-		}
-		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, event); err != nil {
-			log.Error(err, "failed to append NoImprovement event", "run", run.ID)
-		}
-
-		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-			log.V(2).Info("error deleting sandbox after session", "sandbox", run.SandboxName, "error", delErr)
-		}
-		return nil
+		return o.finishRunNoImprovement(ctx, repo, run, sb, "no_improvement", "session ended without a pull request")
 	}
 
 	heartbeatMu.Lock()
@@ -624,7 +635,7 @@ func buildSystemPrompt(basePrompt string, repo *state.Repo, run *state.Run, goal
 	sb.WriteString("# Rules\n\n")
 	sb.WriteString("- Never edit .goals/ or the metric script.\n")
 	sb.WriteString("- Keep changes focused.\n")
-	sb.WriteString("- End with a summary written for maintainers.\n")
+	sb.WriteString("- Call the finish tool with a summary written for maintainers when you have nothing more to do.\n")
 
 	return sb.String()
 }

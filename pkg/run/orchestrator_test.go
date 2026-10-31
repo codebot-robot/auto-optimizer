@@ -19,6 +19,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -982,5 +983,341 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 	}
 	if !foundNoImpEvent {
 		t.Errorf("expected event 'session ended without a pull request', got events: %+v", events)
+	}
+}
+
+type scriptedFinishLLM struct {
+	summary string
+}
+
+func (s *scriptedFinishLLM) CreateChatCompletion(_ context.Context, _ llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	args, _ := json.Marshal(map[string]string{"summary": s.summary})
+	return &llm.ChatCompletionResponse{
+		ID: "finish-llm",
+		Choices: []llm.Choice{
+			{
+				Message: llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{
+						{
+							ID:   "call-finish-1",
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "finish",
+								Arguments: string(args),
+							},
+						},
+					},
+				},
+				FinishReason: "tool_calls",
+			},
+		},
+	}, nil
+}
+
+func TestOrchestrator_Working_FinishTool_EndsSession_RecordsSummary(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-finishrun"
+	sandboxName := "run-20261030t120000z-finishrun"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "finish-goal",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha-finish",
+		SandboxName: sandboxName,
+		Goal: &goals.Goal{
+			Name: "finish-goal",
+			Body: "achieve optimization and finish",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	finishSummary := "Successfully investigated and finished with no PR needed."
+	finishLLM := &scriptedFinishLLM{summary: finishSummary}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, finishLLM)
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   &metav1.Time{Time: time.Now().Add(5 * time.Minute)},
+				ShutdownPolicy: &policy,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox in fake k8s: %v", err)
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     30,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if err := orch.Tick(ctx); err != nil {
+		t.Fatalf("orch.Tick: %v", err)
+	}
+
+	// 1. Verify run is in NoImprovement and has the summary recorded
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
+	}
+	if gotRun.Summary != finishSummary {
+		t.Errorf("expected run.Summary %q, got %q", finishSummary, gotRun.Summary)
+	}
+
+	// 2. Verify events recorded "finished" event with the summary as message
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundFinishedEvent bool
+	for _, e := range events {
+		if e.Phase == state.PhaseNoImprovement && e.Kind == "finished" && e.Message == finishSummary {
+			foundFinishedEvent = true
+			break
+		}
+	}
+	if !foundFinishedEvent {
+		t.Errorf("expected finished event with message %q, got events: %+v", finishSummary, events)
+	}
+
+	// 3. Verify sandbox was deleted
+	_, err = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sandboxName, metav1.GetOptions{})
+	if err == nil {
+		t.Errorf("expected sandbox %s to be deleted, but still exists", sandboxName)
+	} else if !k8serrors.IsNotFound(err) {
+		t.Errorf("expected NotFound error, got: %v", err)
+	}
+
+	// 4. Verify session transcript in sessionStore contains system prompt, user prompt, finish call, and tool result
+	msgs, _, err := sessionStore.LoadSession(ctx, gotRun.SessionID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 messages in 1 turn, got %d: %+v", len(msgs), msgs)
+	}
+	if len(msgs[2].ToolCalls) == 0 || msgs[2].ToolCalls[0].Function.Name != "finish" {
+		t.Errorf("tool call = %+v, want finish", msgs[2].ToolCalls)
+	}
+	if msgs[3].Role != "tool" || msgs[3].Content == nil || *msgs[3].Content != finishSummary {
+		t.Errorf("tool message = %+v, want role tool and content %q", msgs[3], finishSummary)
+	}
+}
+
+type scriptedErrorThenFinishLLM struct {
+	mu        sync.Mutex
+	callCount int
+	summary   string
+}
+
+func (s *scriptedErrorThenFinishLLM) CreateChatCompletion(_ context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	s.mu.Lock()
+	s.callCount++
+	count := s.callCount
+	s.mu.Unlock()
+
+	if count == 1 {
+		args, _ := json.Marshal(map[string]string{"command": "failing-cmd"})
+		return &llm.ChatCompletionResponse{
+			ID: "err-llm-1",
+			Choices: []llm.Choice{
+				{
+					Message: llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:   "call-err-1",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "run_command",
+									Arguments: string(args),
+								},
+							},
+						},
+					},
+					FinishReason: "tool_calls",
+				},
+			},
+		}, nil
+	}
+
+	// Verify we received the tool error in message history, then call finish
+	var sawToolError bool
+	for _, m := range req.Messages {
+		if m.Role == "tool" && m.Content != nil && strings.Contains(*m.Content, "failed") {
+			sawToolError = true
+			break
+		}
+	}
+	if !sawToolError {
+		return nil, fmt.Errorf("expected tool error in messages on second turn, got: %+v", req.Messages)
+	}
+
+	args, _ := json.Marshal(map[string]string{"summary": s.summary})
+	return &llm.ChatCompletionResponse{
+		ID: "err-llm-2",
+		Choices: []llm.Choice{
+			{
+				Message: llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{
+						{
+							ID:   "call-finish-2",
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "finish",
+								Arguments: string(args),
+							},
+						},
+					},
+				},
+				FinishReason: "tool_calls",
+			},
+		},
+	}, nil
+}
+
+func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-errfinishrun"
+	sandboxName := "run-20261030t120000z-errfinishrun"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "errfinish-goal",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha-errfinish",
+		SandboxName: sandboxName,
+		Goal: &goals.Goal{
+			Name: "errfinish-goal",
+			Body: "recover from error and finish",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	finishSummary := "Finished after recovering from command error."
+	errLLM := &scriptedErrorThenFinishLLM{summary: finishSummary}
+	procSrv := &mockProcessServer{err: errors.New("command execution failed")}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, errLLM)
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   &metav1.Time{Time: time.Now().Add(5 * time.Minute)},
+				ShutdownPolicy: &policy,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox in fake k8s: %v", err)
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     30,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if err := orch.Tick(ctx); err != nil {
+		t.Fatalf("orch.Tick: %v", err)
+	}
+
+	// 1. Verify session completed and run has the finish summary
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
+	}
+	if gotRun.Summary != finishSummary {
+		t.Errorf("expected run.Summary %q, got %q", finishSummary, gotRun.Summary)
+	}
+
+	// 2. Verify events recorded "finished" event
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundFinishedEvent bool
+	for _, e := range events {
+		if e.Phase == state.PhaseNoImprovement && e.Kind == "finished" && e.Message == finishSummary {
+			foundFinishedEvent = true
+			break
+		}
+	}
+	if !foundFinishedEvent {
+		t.Errorf("expected finished event with message %q, got events: %+v", finishSummary, events)
+	}
+
+	// 3. Verify sandbox was deleted
+	_, err = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sandboxName, metav1.GetOptions{})
+	if err == nil {
+		t.Errorf("expected sandbox %s to be deleted, but still exists", sandboxName)
+	} else if !k8serrors.IsNotFound(err) {
+		t.Errorf("expected NotFound error, got: %v", err)
 	}
 }
