@@ -92,3 +92,54 @@ func TestElizaReportsToolResult(t *testing.T) {
 		t.Errorf("reply = %q, want %q", got, want)
 	}
 }
+
+func TestElizaReadReadme(t *testing.T) {
+	client := &ElizaClient{}
+
+	systemMsg := Message{Role: "system", Content: ptr("read the README and summarise it")}
+	userMsg := Message{Role: "user", Content: ptr("Please work on the goal.")}
+
+	// 1. With read_file in tools
+	resp, err := client.CreateChatCompletion(t.Context(), ChatCompletionRequest{
+		Messages: []Message{systemMsg, userMsg},
+		Tools: []Tool{
+			{Function: ToolFunction{Name: "read_file"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletion: %v", err)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(resp.Choices[0].Message.ToolCalls))
+	}
+	tc := resp.Choices[0].Message.ToolCalls[0]
+	if tc.Function.Name != "read_file" {
+		t.Errorf("tool name = %q, want read_file", tc.Function.Name)
+	}
+	if tc.Function.Arguments != `{"file_path":"/workspace/repo/README.md"}` {
+		t.Errorf("arguments = %q, want file_path", tc.Function.Arguments)
+	}
+
+	// 2. Tool result produces final summary
+	toolOutput := "# My Project\nThis is a cool project."
+	resp, err = client.CreateChatCompletion(t.Context(), ChatCompletionRequest{
+		Messages: []Message{
+			systemMsg,
+			userMsg,
+			{Role: "tool", ToolCallID: tc.ID, Content: &toolOutput},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletion: %v", err)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 0 {
+		t.Errorf("expected 0 tool calls after tool result, got %d", len(resp.Choices[0].Message.ToolCalls))
+	}
+	if resp.Choices[0].FinishReason != "stop" {
+		t.Errorf("finish reason = %q, want stop", resp.Choices[0].FinishReason)
+	}
+}
+
+func ptr(s string) *string {
+	return &s
+}

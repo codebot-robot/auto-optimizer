@@ -60,6 +60,14 @@ import (
 	processv1 "sigs.k8s.io/agent-sandbox/packages/sandboxd/spec/process/v1"
 )
 
+var (
+	// ErrMaxTurns is returned when a session reaches its configured maximum turns limit.
+	ErrMaxTurns = errors.New("maximum turns reached")
+
+	// ErrSandboxExpired is returned when a sandbox has expired or been deleted.
+	ErrSandboxExpired = errors.New("sandbox expired or deleted")
+)
+
 // SandboxInactivityTimeout is how long we keep sandboxes around after we last used them.
 const SandboxInactivityTimeout = 5 * time.Minute
 
@@ -108,6 +116,16 @@ func NewSandboxClientWithClients(agentsClient agentsclientset.Interface, coreCli
 		coreClient:   coreClient,
 		sandboxes:    make(map[types.NamespacedName]*Sandbox),
 	}
+}
+
+// AgentsClient returns the underlying Kubernetes agents clientset.
+func (c *SandboxClient) AgentsClient() agentsclientset.Interface {
+	return c.agentsClient
+}
+
+// CoreClient returns the underlying Kubernetes core v1 client.
+func (c *SandboxClient) CoreClient() corev1client.CoreV1Interface {
+	return c.coreClient
 }
 
 // GetRESTConfig loads the kubernetes client configuration, preferring
@@ -191,6 +209,24 @@ type Session struct {
 	// activeSandbox is the sandbox currently provisioned for this session,
 	// or nil when no sandbox is running (e.g. before the first tool call).
 	activeSandbox *Sandbox
+
+	// FailOnSandboxExpiry if true causes ensureSandbox to fail with ErrSandboxExpired
+	// instead of recreating an expired or deleted sandbox.
+	FailOnSandboxExpiry bool
+}
+
+// SetActiveSandbox binds an existing sandbox to the session.
+func (s *Session) SetActiveSandbox(sb *Sandbox) {
+	s.activeSandbox = sb
+	if sb != nil {
+		sb.session = s
+		s.sandboxID = sb.NamespacedName()
+	}
+}
+
+// ActiveSandbox returns the active sandbox bound to the session, if any.
+func (s *Session) ActiveSandbox() *Sandbox {
+	return s.activeSandbox
 }
 
 // Messages returns a copy of the messages in the session so far.
@@ -276,7 +312,10 @@ func (s *Sandbox) Close() error {
 
 // ExtendLifecycle updates the ShutdownTime of the Sandbox in Kubernetes to now + inactivityTimeout.
 func (s *Sandbox) ExtendLifecycle(ctx context.Context, inactivityTimeout time.Duration) error {
-	agentsClient := s.session.client.agentsClient
+	agentsClient := s.agentsClient()
+	if agentsClient == nil {
+		return errors.New("agentsClient not available")
+	}
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Fetch latest spec
@@ -294,6 +333,33 @@ func (s *Sandbox) ExtendLifecycle(ctx context.Context, inactivityTimeout time.Du
 		}
 
 		return nil
+	})
+}
+
+// CheckAliveAndExtendLifecycle verifies that the sandbox exists and has not expired past now,
+// and updates the shutdownTime to time.Now() + inactivityTimeout.
+func (s *Sandbox) CheckAliveAndExtendLifecycle(ctx context.Context, now time.Time, inactivityTimeout time.Duration) error {
+	agentsClient := s.agentsClient()
+	if agentsClient == nil {
+		return errors.New("agentsClient not available")
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, err := agentsClient.AgentsV1beta1().Sandboxes(s.id.Namespace).Get(ctx, s.id.Name, metav1.GetOptions{})
+		if err != nil {
+			if k8serrors.IsNotFound(err) {
+				return fmt.Errorf("%w: sandbox %s not found in namespace %s", ErrSandboxExpired, s.id.Name, s.id.Namespace)
+			}
+			return err
+		}
+
+		if latest.Spec.ShutdownTime != nil && now.After(latest.Spec.ShutdownTime.Time) {
+			return fmt.Errorf("%w: sandbox %s expired at %s", ErrSandboxExpired, s.id.Name, latest.Spec.ShutdownTime.Time)
+		}
+
+		latest.Spec.ShutdownTime = &metav1.Time{Time: time.Now().Add(inactivityTimeout)}
+		_, err = agentsClient.AgentsV1beta1().Sandboxes(s.id.Namespace).Update(ctx, latest, metav1.UpdateOptions{})
+		return err
 	})
 }
 
@@ -956,6 +1022,9 @@ func (s *Session) PruneBackups(ctx context.Context, keepCount int) error {
 
 // RestoreFS restores the filesystem in the sandbox from the latest local backup tarball, if one exists.
 func (s *Sandbox) RestoreFS(ctx context.Context) error {
+	if s.session == nil {
+		return nil
+	}
 	log := scoped.Log(ctx)
 
 	latestBackup, err := s.session.FindLatestBackup()
@@ -995,6 +1064,9 @@ func (s *Sandbox) RestoreFS(ctx context.Context) error {
 
 // SnapshotFS archives the filesystem in the sandbox and saves it to a new timestamped backup inside the session's backup directory.
 func (s *Sandbox) SnapshotFS(ctx context.Context) error {
+	if s.session == nil {
+		return nil
+	}
 	log := scoped.Log(ctx)
 
 	dir, err := s.session.getBackupDir()
@@ -1396,6 +1468,10 @@ type RunOptions struct {
 	// is cancelled. <= 0 disables the timeout. Default: DefaultToolTimeout.
 	ToolTimeout time.Duration
 
+	// MaxTurns bounds the number of LLM turns in a session.
+	// <= 0 means unlimited turns.
+	MaxTurns int
+
 	// SigningKey is the ed25519 private key used to sign per-call tokens for sandboxd.
 	SigningKey ed25519.PrivateKey
 }
@@ -1492,6 +1568,50 @@ type Harness struct {
 // (e.g. for testing without a Kubernetes cluster or network).
 func (h *Harness) SetSandboxOverride(sb tools.Sandbox) {
 	h.sandboxOverride = sb
+}
+
+// LLMClient returns the LLM client configured on the harness.
+func (h *Harness) LLMClient() llm.ChatClient {
+	return h.llmClient
+}
+
+// RunOptions returns the options used to construct the harness.
+func (h *Harness) RunOptions() RunOptions {
+	return h.opts
+}
+
+// WithMaxTurns returns a shallow copy of the harness with MaxTurns set.
+func (h *Harness) WithMaxTurns(maxTurns int) *Harness {
+	c := *h
+	c.opts.MaxTurns = maxTurns
+	return &c
+}
+
+// GetOrAttachSandbox returns an existing tracked Sandbox or creates a handle
+// to an existing sandbox in Kubernetes.
+func (h *Harness) GetOrAttachSandbox(sandboxName string) *Sandbox {
+	if h.sandboxClient == nil {
+		return nil
+	}
+	id := types.NamespacedName{
+		Namespace: h.opts.Namespace,
+		Name:      sandboxName,
+	}
+	h.sandboxClient.mutex.Lock()
+	defer h.sandboxClient.mutex.Unlock()
+	if sb, ok := h.sandboxClient.sandboxes[id]; ok {
+		return sb
+	}
+	sb := &Sandbox{
+		client:                h.sandboxClient,
+		id:                    id,
+		created:               true,
+		signingKey:            h.opts.SigningKey,
+		audience:              fmt.Sprintf("%s/%s", id.Namespace, id.Name),
+		controlPlaneNamespace: h.opts.ControlPlaneNamespace,
+	}
+	h.sandboxClient.sandboxes[id] = sb
+	return sb
 }
 
 // NewHarness constructs a Harness.
@@ -1594,7 +1714,14 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 	events.MessageAppended(ctx, userMsg)
 
 	shouldSnapshot := false
+	turnCount := 0
 	for {
+		if h.opts.MaxTurns > 0 && turnCount >= h.opts.MaxTurns {
+			log.Info("maximum turns reached", "maxTurns", h.opts.MaxTurns)
+			return ErrMaxTurns
+		}
+		turnCount++
+
 		req := llm.ChatCompletionRequest{
 			Model:    h.opts.ModelName,
 			Messages: session.Messages(),
@@ -1699,6 +1826,9 @@ func (h *Harness) ensureSandbox(ctx context.Context, session *Session) (tools.Sa
 	if sb := session.activeSandbox; sb != nil {
 		if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {
 			if k8serrors.IsNotFound(err) {
+				if session.FailOnSandboxExpiry {
+					return nil, fmt.Errorf("%w: active sandbox %s expired or was deleted", ErrSandboxExpired, session.sandboxID.Name)
+				}
 				log.Info("Active sandbox was deleted or expired, will recreate it", "sandbox.name", session.sandboxID.Name)
 				if closeErr := sb.Close(); closeErr != nil {
 					log.V(2).Info("error closing expired sandbox connection", "error", closeErr)
