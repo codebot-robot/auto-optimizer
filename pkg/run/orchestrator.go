@@ -19,8 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
@@ -29,18 +31,26 @@ import (
 
 // OrchestratorOptions configures the run Orchestrator.
 type OrchestratorOptions struct {
-	Store    state.Store
-	Harness  *session.Harness
-	Interval time.Duration
-	Clock    func() time.Time
+	Store        state.Store
+	SessionStore session.Store
+	Harness      *session.Harness
+	Interval     time.Duration
+	Clock        func() time.Time
+	MaxTurns     int
 }
 
-// Orchestrator picks runs in phase Pending and drives them through Preparing.
+// Orchestrator picks runs in phase Pending and drives them through Preparing
+// and Working.
 type Orchestrator struct {
-	store    state.Store
-	harness  *session.Harness
-	interval time.Duration
-	clock    func() time.Time
+	store        state.Store
+	sessionStore session.Store
+	harness      *session.Harness
+	interval     time.Duration
+	clock        func() time.Time
+	maxTurns     int
+
+	activeRunsMu sync.Mutex
+	activeRuns   map[string]bool
 }
 
 // NewOrchestrator creates a new run Orchestrator.
@@ -62,11 +72,19 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		clock = time.Now
 	}
 
+	maxTurns := opts.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = 30
+	}
+
 	return &Orchestrator{
-		store:    opts.Store,
-		harness:  opts.Harness,
-		interval: interval,
-		clock:    clock,
+		store:        opts.Store,
+		sessionStore: opts.SessionStore,
+		harness:      opts.Harness,
+		interval:     interval,
+		clock:        clock,
+		maxTurns:     maxTurns,
+		activeRuns:   make(map[string]bool),
 	}, nil
 }
 
@@ -173,12 +191,17 @@ func (o *Orchestrator) tickRepo(ctx context.Context, repo *state.Repo) error {
 	}
 
 	for _, run := range runs {
-		if run.Phase != state.PhasePending {
-			continue
-		}
-
-		if err := o.prepareRun(ctx, repo, run); err != nil {
-			scoped.Log(ctx).Error(err, "preparing run failed", "repo", repo.URL, "run", run.ID)
+		switch run.Phase {
+		case state.PhasePending:
+			if err := o.prepareRun(ctx, repo, run); err != nil {
+				scoped.Log(ctx).Error(err, "preparing run failed", "repo", repo.URL, "run", run.ID)
+			}
+		case state.PhaseWorking:
+			if o.sessionStore != nil && o.harness != nil && o.harness.LLMClient() != nil {
+				if err := o.workRun(ctx, repo, run); err != nil {
+					scoped.Log(ctx).Error(err, "working run failed", "repo", repo.URL, "run", run.ID)
+				}
+			}
 		}
 	}
 
@@ -382,5 +405,259 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 	}
 
 	log.Info("run successfully prepared and entered Working phase", "run", run.ID, "sandbox", sandboxName)
+
+	if o.sessionStore != nil && o.harness != nil && o.harness.LLMClient() != nil {
+		return o.workRun(ctx, repo, run)
+	}
 	return nil
 }
+
+func (o *Orchestrator) setRunActive(runID string, active bool) bool {
+	o.activeRunsMu.Lock()
+	defer o.activeRunsMu.Unlock()
+	if active {
+		if o.activeRuns[runID] {
+			return false
+		}
+		o.activeRuns[runID] = true
+		return true
+	}
+	delete(o.activeRuns, runID)
+	return true
+}
+
+func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
+	failTime := o.clock().UTC()
+	run.SetPhase(state.PhaseFailed, failTime)
+	run.Error = errMsg
+	if err := o.store.PutRun(ctx, run); err != nil {
+		scoped.Log(ctx).Error(err, "failed to update run to Failed", "run", run.ID)
+	}
+
+	event := state.Event{
+		Time:    failTime,
+		Phase:   state.PhaseFailed,
+		Kind:    "failed",
+		Message: fmt.Sprintf("Run failed: %s", errMsg),
+		Error:   errMsg,
+	}
+	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, event); err != nil {
+		scoped.Log(ctx).Error(err, "failed to append failure event", "run", run.ID)
+	}
+
+	return errors.New(errMsg)
+}
+
+func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
+	log := scoped.Log(ctx)
+
+	if !o.setRunActive(run.ID, true) {
+		log.V(2).Info("run is already actively executing a session", "run", run.ID)
+		return nil
+	}
+	defer o.setRunActive(run.ID, false)
+
+	sandboxName := run.SandboxName
+	if sandboxName == "" {
+		return o.failRunWithEvent(ctx, repo, run, "sandbox name is empty for working run")
+	}
+
+	sb := o.harness.GetOrAttachSandbox(sandboxName)
+	if sb == nil {
+		return o.failRunWithEvent(ctx, repo, run, "failed to get sandbox handle")
+	}
+
+	// Verify sandbox exists in Kubernetes and has not expired.
+	// If expired or deleted, fail the run with a clear event.
+	if err := sb.CheckAliveAndExtendLifecycle(ctx, o.clock().UTC(), session.SandboxInactivityTimeout); err != nil {
+		return o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s expired or deleted: %v", sandboxName, err))
+	}
+
+	// Assign session ID if not already assigned and persist in run.json
+	sessionID := run.SessionID
+	if sessionID == "" {
+		sessionID = generateSessionID(run.ID)
+		run.SessionID = sessionID
+		if err := o.store.PutRun(ctx, run); err != nil {
+			return fmt.Errorf("updating run with session ID: %w", err)
+		}
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    o.clock().UTC(),
+			Phase:   state.PhaseWorking,
+			Kind:    "session_started",
+			Message: fmt.Sprintf("Started session %s", sessionID),
+			Data:    map[string]any{"session_id": sessionID},
+		}); err != nil {
+			log.Error(err, "failed to append session_started event", "run", run.ID)
+		}
+	}
+
+	goalBody := ""
+	if run.Goal != nil {
+		goalBody = run.Goal.Body
+	} else if run.GoalName != "" {
+		goalRec, err := o.store.GetGoal(ctx, repo.Key(), run.GoalName)
+		if err == nil && goalRec != nil && goalRec.Goal != nil {
+			goalBody = goalRec.Goal.Body
+		}
+	}
+
+	sess, err := o.harness.LoadSession(ctx, o.sessionStore, sessionID)
+	if err != nil {
+		if errors.Is(err, session.ErrNotFound) {
+			sess, err = o.harness.NewSession(ctx, o.sessionStore, sessionID, session.Metadata{
+				CreatedAt: o.clock().UTC(),
+			})
+			if err != nil {
+				return fmt.Errorf("creating session %s: %w", sessionID, err)
+			}
+		} else {
+			return fmt.Errorf("loading session %s: %w", sessionID, err)
+		}
+	}
+
+	// Bind sandbox to session
+	sess.SetActiveSandbox(sb)
+	sess.FailOnSandboxExpiry = true
+
+	// Seed system prompt if new session
+	if len(sess.Messages()) == 0 {
+		sysPrompt := buildSystemPrompt(o.harness.RunOptions().SystemPrompt, repo, run, goalBody)
+		if err := sess.AddMessages(ctx, llm.Message{
+			Role:    "system",
+			Content: &sysPrompt,
+		}); err != nil {
+			return fmt.Errorf("seeding system prompt: %w", err)
+		}
+	}
+
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var heartbeatErr error
+	var heartbeatMu sync.Mutex
+
+	stopHeartbeat := make(chan struct{})
+	defer close(stopHeartbeat)
+
+	go func() {
+		ticker := time.NewTicker(session.SandboxInactivityTimeout / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-sessionCtx.Done():
+				return
+			case <-ticker.C:
+				if err := sb.CheckAliveAndExtendLifecycle(sessionCtx, o.clock().UTC(), session.SandboxInactivityTimeout); err != nil {
+					heartbeatMu.Lock()
+					heartbeatErr = err
+					heartbeatMu.Unlock()
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	events := &orchestratorTurnEvents{}
+	harness := o.harness.WithMaxTurns(o.maxTurns)
+	turnErr := harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
+
+	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
+		endTime := o.clock().UTC()
+		run.SetPhase(state.PhaseNoImprovement, endTime)
+		if err := o.store.PutRun(ctx, run); err != nil {
+			log.Error(err, "failed to update run to NoImprovement", "run", run.ID)
+		}
+
+		event := state.Event{
+			Time:    endTime,
+			Phase:   state.PhaseNoImprovement,
+			Kind:    "no_improvement",
+			Message: "session ended without a pull request",
+		}
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, event); err != nil {
+			log.Error(err, "failed to append NoImprovement event", "run", run.ID)
+		}
+
+		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+			log.V(2).Info("error deleting sandbox after session", "sandbox", run.SandboxName, "error", delErr)
+		}
+		return nil
+	}
+
+	heartbeatMu.Lock()
+	hbErr := heartbeatErr
+	heartbeatMu.Unlock()
+	if errors.Is(turnErr, session.ErrSandboxExpired) || errors.Is(hbErr, session.ErrSandboxExpired) {
+		return o.failRunWithEvent(ctx, repo, run, "sandbox expired or was deleted during session")
+	}
+
+	return o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("session error: %v", turnErr))
+}
+
+func buildSystemPrompt(basePrompt string, repo *state.Repo, run *state.Run, goalBody string) string {
+	var sb strings.Builder
+	if basePrompt != "" {
+		sb.WriteString(basePrompt)
+		sb.WriteString("\n\n")
+	}
+
+	sb.WriteString("# Goal\n\n")
+	sb.WriteString(strings.TrimSpace(goalBody))
+	sb.WriteString("\n\n")
+
+	sb.WriteString("# Repository Facts\n\n")
+	if repo != nil {
+		sb.WriteString(fmt.Sprintf("- URL: %s\n", repo.URL))
+		if repo.DefaultBranch != "" {
+			sb.WriteString(fmt.Sprintf("- Default Branch: %s\n", repo.DefaultBranch))
+		}
+	}
+	if run != nil && run.BaseCommit != "" {
+		sb.WriteString(fmt.Sprintf("- Base Commit: %s\n", run.BaseCommit))
+	}
+	sb.WriteString("- Working Directory: /workspace/repo\n\n")
+
+	sb.WriteString("# Rules\n\n")
+	sb.WriteString("- Never edit .goals/ or the metric script.\n")
+	sb.WriteString("- Keep changes focused.\n")
+	sb.WriteString("- End with a summary written for maintainers.\n")
+
+	return sb.String()
+}
+
+func generateSessionID(runID string) string {
+	var sb strings.Builder
+	sb.WriteString("run")
+	for _, r := range strings.ToLower(runID) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		}
+	}
+	id := sb.String()
+	if len(id) > 40 {
+		id = id[:40]
+	}
+	return id
+}
+
+type orchestratorTurnEvents struct{}
+
+func (e *orchestratorTurnEvents) AssistantMessage(_ context.Context, _ string) {}
+
+func (e *orchestratorTurnEvents) ApproveToolCall(_ context.Context, _ llm.ToolCall) (bool, error) {
+	return true, nil
+}
+
+func (e *orchestratorTurnEvents) ToolCallStarted(ctx context.Context, call llm.ToolCall) {
+	scoped.Log(ctx).V(1).Info("tool call started", "tool", call.Function.Name)
+}
+
+func (e *orchestratorTurnEvents) ToolCallFinished(ctx context.Context, call llm.ToolCall, err error) {
+	scoped.Log(ctx).V(1).Info("tool call finished", "tool", call.Function.Name, "error", err)
+}
+
+func (e *orchestratorTurnEvents) MessageAppended(_ context.Context, _ llm.Message) {}
