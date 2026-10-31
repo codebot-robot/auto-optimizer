@@ -117,6 +117,7 @@ type Run struct {
 	PRURL           string                 `json:"prURL,omitempty"`
 	SessionID       string                 `json:"sessionId,omitempty"`
 	SandboxName     string                 `json:"sandboxName,omitempty"`
+	Summary         string                 `json:"summary,omitempty"`
 	Error           string                 `json:"error,omitempty"`
 
 	// Goal holds the frozen goal definition captured for this run.
