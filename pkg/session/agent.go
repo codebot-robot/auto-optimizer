@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -66,6 +67,9 @@ var (
 
 	// ErrSandboxExpired is returned when a sandbox has expired or been deleted.
 	ErrSandboxExpired = errors.New("sandbox expired or deleted")
+
+	// ErrSessionFinished is returned when a tool signals that the session should end.
+	ErrSessionFinished = errors.New("session finished")
 )
 
 // SandboxInactivityTimeout is how long we keep sandboxes around after we last used them.
@@ -1562,6 +1566,9 @@ type Harness struct {
 	// sandboxOverride allows substituting a custom tools.Sandbox implementation
 	// (e.g. for testing without a Kubernetes cluster).
 	sandboxOverride tools.Sandbox
+
+	// extraTools holds run-scoped tools attached to this harness instance.
+	extraTools []tools.Tool
 }
 
 // SetSandboxOverride allows setting a custom tools.Sandbox implementation
@@ -1585,6 +1592,46 @@ func (h *Harness) WithMaxTurns(maxTurns int) *Harness {
 	c := *h
 	c.opts.MaxTurns = maxTurns
 	return &c
+}
+
+// WithTools returns a shallow copy of the harness with additional run-scoped
+// tools. Run-scoped tools run in the control plane, do not require sandbox
+// access, and must not touch the sandbox.
+func (h *Harness) WithTools(extra ...tools.Tool) *Harness {
+	c := *h
+	c.extraTools = append(slices.Clone(h.extraTools), extra...)
+	return &c
+}
+
+// tools returns schemas for all tools available to this harness (both registry
+// tools and run-scoped extra tools), sorted by function name.
+func (h *Harness) tools() []llm.Tool {
+	var list []llm.Tool
+	if h.toolsRegistry != nil {
+		list = append(list, h.toolsRegistry.All()...)
+	}
+	for _, t := range h.extraTools {
+		list = append(list, t.Schema())
+	}
+	slices.SortFunc(list, func(a, b llm.Tool) int {
+		if a.Function.Name < b.Function.Name {
+			return -1
+		}
+		if a.Function.Name > b.Function.Name {
+			return 1
+		}
+		return 0
+	})
+	return list
+}
+
+func (h *Harness) findExtraTool(name string) tools.Tool {
+	for _, t := range h.extraTools {
+		if t.Schema().Function.Name == name {
+			return t
+		}
+	}
+	return nil
 }
 
 // GetOrAttachSandbox returns an existing tracked Sandbox or creates a handle
@@ -1725,7 +1772,7 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 		req := llm.ChatCompletionRequest{
 			Model:    h.opts.ModelName,
 			Messages: session.Messages(),
-			Tools:    h.toolsRegistry.All(),
+			Tools:    h.tools(),
 		}
 
 		assistantResponse, err := h.llmClient.CreateChatCompletion(ctx, req)
@@ -1767,10 +1814,27 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 			}
 
 			var toolMsg llm.Message
+			var callErr error
 			if !approved {
 				log.Info("tool call denied by user", "tool", tc.Function.Name)
 				content := fmt.Sprintf("The user denied permission to run tool %q.", tc.Function.Name)
 				toolMsg = llm.Message{Role: "tool", ToolCallID: tc.ID, Content: &content}
+			} else if extraTool := h.findExtraTool(tc.Function.Name); extraTool != nil {
+				events.ToolCallStarted(ctx, tc)
+				args := tc.Function.Arguments
+				if args == "" {
+					args = "{}"
+				}
+				if err := json.Unmarshal([]byte(args), extraTool); err != nil {
+					callErr = fmt.Errorf("failed to parse arguments: %w", err)
+				} else {
+					var sb tools.Sandbox
+					if session.activeSandbox != nil {
+						sb = session.activeSandbox
+					}
+					toolMsg, callErr = extraTool.Run(ctx, sb)
+				}
+				events.ToolCallFinished(ctx, tc, callErr)
 			} else {
 				sandbox, err := h.ensureSandbox(ctx, session)
 				if err != nil {
@@ -1778,21 +1842,13 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 				}
 
 				events.ToolCallStarted(ctx, tc)
-				result, err := h.toolsRegistry.Call(ctx, sandbox, tc)
-				events.ToolCallFinished(ctx, tc, err)
+				toolMsg, callErr = h.toolsRegistry.Call(ctx, sandbox, tc)
+				events.ToolCallFinished(ctx, tc, callErr)
 
 				// The filesystem may have changed (even on error), so
 				// snapshot at the next boundary to keep the persisted
 				// filesystem state consistent with the session state.
 				shouldSnapshot = true
-
-				if err != nil {
-					log.Error(err, "error calling tool", "tool", tc.Function.Name)
-					content := fmt.Sprintf("Error calling tool %q: %v", tc.Function.Name, err)
-					toolMsg = llm.Message{Role: "tool", ToolCallID: tc.ID, Content: &content}
-				} else {
-					toolMsg = result
-				}
 
 				// The tool call could take a while, so extend the lifecycle.
 				// This might need more careful handling later; what if the command takes 20 minutes to run?
@@ -1803,10 +1859,36 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 				}
 			}
 
+			if approved {
+				if errors.Is(callErr, ErrSessionFinished) {
+					if toolMsg.Role == "" {
+						toolMsg.Role = "tool"
+					}
+					toolMsg.ToolCallID = tc.ID
+					if toolMsg.Content == nil {
+						content := "Session finished."
+						toolMsg.Content = &content
+					}
+				} else if callErr != nil {
+					log.Error(callErr, "error calling tool", "tool", tc.Function.Name)
+					content := fmt.Sprintf("Error calling tool %q: %v", tc.Function.Name, callErr)
+					toolMsg = llm.Message{Role: "tool", ToolCallID: tc.ID, Content: &content}
+				} else {
+					if toolMsg.Role == "" {
+						toolMsg.Role = "tool"
+					}
+					toolMsg.ToolCallID = tc.ID
+				}
+			}
+
 			if err := session.AddMessages(ctx, toolMsg); err != nil {
 				return fmt.Errorf("adding tool response: %w", err)
 			}
 			events.MessageAppended(ctx, toolMsg)
+
+			if errors.Is(callErr, ErrSessionFinished) {
+				return callErr
+			}
 		}
 
 		// Here we continue the LLM loop, with the tool responses at the tail of the chat thread.

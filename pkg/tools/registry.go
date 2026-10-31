@@ -115,6 +115,13 @@ func (r *Registry) Call(ctx context.Context, sandbox Sandbox, tc llm.ToolCall) (
 	}
 
 	res, err := toolInvocation.Run(runCtx, sandbox)
+
+	// Populate some default values so the tools don't all have to do it.
+	if res.Role == "" {
+		res.Role = "tool"
+	}
+	res.ToolCallID = tc.ID
+
 	if err != nil {
 		// Classify via context.Cause(runCtx), not runCtx.Err(): Err() reports
 		// context.DeadlineExceeded both when our own timeout fires and when an
@@ -123,17 +130,12 @@ func (r *Registry) Call(ctx context.Context, sandbox Sandbox, tc llm.ToolCall) (
 		// reports errToolTimeout only when runCtx's own timer won the race; it
 		// does not depend on whatever error Tool.Run happens to return.
 		if r.ToolTimeout > 0 && context.Cause(runCtx) == errToolTimeout {
-			return llm.Message{}, fmt.Errorf("tool %q timed out after %s: %w", tc.Function.Name, r.ToolTimeout, err)
+			return res, fmt.Errorf("tool %q timed out after %s: %w", tc.Function.Name, r.ToolTimeout, err)
 		}
-		return llm.Message{}, fmt.Errorf("failed to run tool: %w", err)
+		return res, fmt.Errorf("failed to run tool: %w", err)
 	}
 
 	log.Info("tool result", "tool.name", tc.Function.Name)
 
-	// Populate some default values so the tools don't all have to do it.
-	if res.Role == "" {
-		res.Role = "tool"
-	}
-	res.ToolCallID = tc.ID
 	return res, nil
 }

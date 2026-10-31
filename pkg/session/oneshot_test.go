@@ -16,6 +16,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -151,5 +152,206 @@ func TestOneShot_FakeEliza(t *testing.T) {
 	msgs := sess.Messages()
 	if len(msgs) < 3 {
 		t.Fatalf("expected at least 3 messages in history (user, tool call, tool result, assistant), got %d", len(msgs))
+	}
+}
+
+type fakeFinishTool struct {
+	Summary string `json:"summary"`
+}
+
+func (f *fakeFinishTool) Schema() llm.Tool {
+	return llm.Tool{
+		Type: "function",
+		Function: llm.ToolFunction{
+			Name: "finish",
+		},
+	}
+}
+
+func (f *fakeFinishTool) Run(_ context.Context, _ tools.Sandbox) (llm.Message, error) {
+	content := f.Summary
+	return llm.Message{Content: &content}, ErrSessionFinished
+}
+
+type fakeFailingTool struct{}
+
+func (f *fakeFailingTool) Schema() llm.Tool {
+	return llm.Tool{
+		Type: "function",
+		Function: llm.ToolFunction{
+			Name: "failing_tool",
+		},
+	}
+}
+
+func (f *fakeFailingTool) Run(_ context.Context, _ tools.Sandbox) (llm.Message, error) {
+	return llm.Message{}, errors.New("something went wrong")
+}
+
+type scriptedLLM struct {
+	responses []*llm.ChatCompletionResponse
+	idx       int
+}
+
+func (s *scriptedLLM) CreateChatCompletion(_ context.Context, _ llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	if s.idx >= len(s.responses) {
+		return nil, errors.New("unexpected call to LLM")
+	}
+	resp := s.responses[s.idx]
+	s.idx++
+	return resp, nil
+}
+
+func TestHarness_WithTools_RunScopedTool_FinishesSession(t *testing.T) {
+	ctx := t.Context()
+
+	scripted := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			{
+				ID: "resp-1",
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{
+								{
+									ID:   "call-finish",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "finish",
+										Arguments: `{"summary":"session completed"}`,
+									},
+								},
+							},
+						},
+						FinishReason: "tool_calls",
+					},
+				},
+			},
+		},
+	}
+
+	baseRegistry := tools.NewRegistry()
+	baseHarness := NewHarness(scripted, nil, baseRegistry, RunOptions{})
+
+	finishTool := &fakeFinishTool{}
+	runHarness := baseHarness.WithTools(finishTool)
+
+	// Verify original harness was not mutated
+	if len(baseHarness.extraTools) != 0 {
+		t.Errorf("baseHarness.extraTools length = %d, want 0", len(baseHarness.extraTools))
+	}
+	if len(baseRegistry.All()) != 0 {
+		t.Errorf("baseRegistry has tools, want empty")
+	}
+
+	storeDir := t.TempDir()
+	sessionStore := NewFileStore(storeDir)
+	sess, err := runHarness.NewSession(ctx, sessionStore, "finishsess", Metadata{})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	events := &recordingEvents{}
+	err = runHarness.RunTurn(ctx, sess, "start work", events)
+	if !errors.Is(err, ErrSessionFinished) {
+		t.Fatalf("RunTurn err = %v, want ErrSessionFinished", err)
+	}
+
+	// Verify finishTool captured arguments
+	if finishTool.Summary != "session completed" {
+		t.Errorf("finishTool.Summary = %q, want 'session completed'", finishTool.Summary)
+	}
+
+	// Verify transcript in session history contains the tool result
+	msgs := sess.Messages()
+	var foundToolMsg bool
+	for _, m := range msgs {
+		if m.Role == "tool" && m.Content != nil && *m.Content == "session completed" {
+			foundToolMsg = true
+			if m.ToolCallID != "call-finish" {
+				t.Errorf("ToolCallID = %q, want call-finish", m.ToolCallID)
+			}
+		}
+	}
+	if !foundToolMsg {
+		t.Errorf("expected tool message with content 'session completed' in transcript, got: %+v", msgs)
+	}
+}
+
+func TestHarness_WithTools_OrdinaryError_ContinuesSession(t *testing.T) {
+	ctx := t.Context()
+
+	finalReply := "I recovered from the failing tool."
+	scripted := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			{
+				ID: "resp-1",
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{
+								{
+									ID:   "call-fail",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "failing_tool",
+										Arguments: `{}`,
+									},
+								},
+							},
+						},
+						FinishReason: "tool_calls",
+					},
+				},
+			},
+			{
+				ID: "resp-2",
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role:    "assistant",
+							Content: &finalReply,
+						},
+						FinishReason: "stop",
+					},
+				},
+			},
+		},
+	}
+
+	baseRegistry := tools.NewRegistry()
+	failingTool := &fakeFailingTool{}
+	runHarness := NewHarness(scripted, nil, baseRegistry, RunOptions{}).WithTools(failingTool)
+
+	storeDir := t.TempDir()
+	sessionStore := NewFileStore(storeDir)
+	sess, err := runHarness.NewSession(ctx, sessionStore, "errorsess", Metadata{})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	events := &recordingEvents{}
+	err = runHarness.RunTurn(ctx, sess, "do work", events)
+	if err != nil {
+		t.Fatalf("RunTurn failed unexpectedly: %v", err)
+	}
+
+	// Verify transcript has recorded the error tool message
+	msgs := sess.Messages()
+	var foundErrorMsg bool
+	for _, m := range msgs {
+		if m.Role == "tool" && m.Content != nil && strings.Contains(*m.Content, "something went wrong") {
+			foundErrorMsg = true
+		}
+	}
+	if !foundErrorMsg {
+		t.Errorf("expected error tool message in transcript, got: %+v", msgs)
+	}
+
+	// Verify assistant received next turn and stopped with finalReply
+	if len(events.assistantMessages) == 0 || events.assistantMessages[len(events.assistantMessages)-1] != finalReply {
+		t.Errorf("expected final assistant message %q, got %v", finalReply, events.assistantMessages)
 	}
 }
