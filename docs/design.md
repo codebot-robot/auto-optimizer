@@ -376,7 +376,7 @@ Pending -> Preparing -> Working -> Selecting -> OpeningPR -> Succeeded
 
 Runs are reconciled in response to events:
 - **Scheduler creation:** When the scheduler creates a `Pending` run in the state store, it calls `Orchestrator.Notify(repo, runID)` to enqueue the run immediately.
-- **Phase transitions:** When `prepareRun` completes sandbox setup and moves the run to `Working`, it calls `Orchestrator.Notify(repo, runID)` to trigger session execution.
+- **Sandbox watch and readiness:** The controller watches Sandbox resources in the sandbox namespace via a generated shared informer, mapped to runs through the `auto-optimizer.labs.gke.io/run` label. When a Sandbox status changes or the Sandbox is deleted, the run is enqueued. Once the Sandbox becomes `Ready`, the second step of `Preparing` clones the repository at the base commit, moves the run to `Working`, and calls `Orchestrator.Notify(repo, runID)` to trigger session execution.
 - **Worker concurrency:** The reconciler runs with configurable concurrency via `--max-concurrent-runs` (default 4), so runs in different repositories proceed in parallel without blocking each other. The controller-runtime workqueue de-duplicates notifications for the same run.
 
 ### Restart and shutdown semantics
@@ -389,12 +389,18 @@ Runs are reconciled in response to events:
 1. **Pending.** A goal needs a run because its schedule is due, its content
    changed, or someone asked. The scheduler allows one active run per goal
    and enforces the repository's budget cap.
-2. **Preparing.** The orchestrator creates the workspace PVC, the portal
-   rules Secret, and the Sandbox. It mints the installation token now. The
-   token is valid for one hour, and the portal re-reads its rules on `SIGHUP`
-   when the control plane rotates it. The orchestrator waits for `Ready`,
-   clones the repository at the base commit, freezes the goal file, and
-   measures the baseline for a metric goal.
+2. **Preparing.** Split into two reconcile steps without blocking a worker:
+   - *Step 1 (creation):* The orchestrator creates the workspace PVC, portal
+     rules Secret, and the Sandbox with a label naming the run, records
+     `SandboxName` and a `ReadyDeadline` on the run, appends an event, and
+     returns with `RequeueAfter`.
+   - *Step 2 (readiness):* A watch on Sandbox resources enqueues the run when
+     its status changes. When the Sandbox becomes `Ready`, the orchestrator
+     clones the repository at the base commit into `/workspace/repo`, freezes
+     the goal file, measures the baseline for a metric goal, moves the run
+     to `Working`, and enqueues it. If the Sandbox disappears or reports a
+     failure before becoming ready, or if the ready deadline passes without
+     the Sandbox becoming ready, the run transitions to `Failed`.
 3. **Working.** The session manager runs the session turn by turn. The
    session ends when it calls `open_pull_request` or `finish`, when the model
    stops, or when a limit is hit. The limits are `maxDuration`, `maxCostUSD`,
