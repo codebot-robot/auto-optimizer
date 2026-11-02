@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	clientgotesting "k8s.io/client-go/testing"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
@@ -76,11 +77,11 @@ func (m *mockProcessServer) Execute(ctx context.Context, req *processv1.ExecuteR
 	}, nil
 }
 
-func setupTestHarness(t *testing.T, procSrv *mockProcessServer) (*session.Harness, *fakeagents.Clientset, *fakek8s.Clientset) {
+func setupTestHarness(t *testing.T, procSrv processv1.ProcessServiceServer) (*session.Harness, *fakeagents.Clientset, *fakek8s.Clientset) {
 	return setupTestHarnessWithLLM(t, procSrv, nil)
 }
 
-func setupTestHarnessWithLLM(t *testing.T, procSrv *mockProcessServer, llmClient llm.ChatClient) (*session.Harness, *fakeagents.Clientset, *fakek8s.Clientset) {
+func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServer, llmClient llm.ChatClient) (*session.Harness, *fakeagents.Clientset, *fakek8s.Clientset) {
 	t.Helper()
 
 	agentsCS := fakeagents.NewSimpleClientset()
@@ -194,8 +195,8 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if err := orch.Tick(ctx); err != nil {
-		t.Fatalf("orch.Tick: %v", err)
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify run is in Working phase
@@ -299,8 +300,8 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if err := orch.Tick(ctx); err == nil {
-		t.Logf("orch.Tick completed (errors logged or returned)")
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+		t.Logf("orch.Reconcile completed (errors logged or returned)")
 	}
 
 	// 1. Verify run is in Failed phase
@@ -501,8 +502,8 @@ func TestOrchestrator_Working_StartsSession_ModelStops_NoImprovement(t *testing.
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if err := orch.Tick(ctx); err != nil {
-		t.Fatalf("orch.Tick: %v", err)
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify run is marked NoImprovement
@@ -670,8 +671,8 @@ func TestOrchestrator_Working_MaxTurns(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if err := orch.Tick(ctx); err != nil {
-		t.Fatalf("orch.Tick: %v", err)
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify LLM stopped after exactly MaxTurns
@@ -746,8 +747,8 @@ func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if err := orch.Tick(ctx); err == nil {
-		t.Logf("orch.Tick completed (errors handled)")
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+		t.Logf("orch.Reconcile completed (errors handled)")
 	}
 
 	// Verify run transitioned to Failed
@@ -877,8 +878,8 @@ func TestOrchestrator_Working_ExpiredSandbox_DuringSession(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if err := orch.Tick(ctx); err == nil {
-		t.Logf("orch.Tick completed (errors handled)")
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+		t.Logf("orch.Reconcile completed (errors handled)")
 	}
 
 	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
@@ -945,8 +946,11 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if err := orch.Tick(ctx); err != nil {
-		t.Fatalf("orch.Tick: %v", err)
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile 1: %v", err)
+	}
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile 2: %v", err)
 	}
 
 	// 1. Verify run reached NoImprovement
@@ -1083,8 +1087,8 @@ func TestOrchestrator_Working_FinishTool_EndsSession_RecordsSummary(t *testing.T
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if err := orch.Tick(ctx); err != nil {
-		t.Fatalf("orch.Tick: %v", err)
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify run is in NoImprovement and has the summary recorded
@@ -1281,8 +1285,8 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if err := orch.Tick(ctx); err != nil {
-		t.Fatalf("orch.Tick: %v", err)
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify session completed and run has the finish summary
@@ -1319,5 +1323,472 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 		t.Errorf("expected sandbox %s to be deleted, but still exists", sandboxName)
 	} else if !k8serrors.IsNotFound(err) {
 		t.Errorf("expected NotFound error, got: %v", err)
+	}
+
+	// 4. Verify session transcript in sessionStore contains 6 messages:
+	// turn 1: system, user, call-err-1, tool error result
+	// turn 2: call-finish-2, tool success result
+	msgs, _, err := sessionStore.LoadSession(ctx, gotRun.SessionID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if len(msgs) != 6 {
+		t.Fatalf("expected 6 messages in 2 turns, got %d: %+v", len(msgs), msgs)
+	}
+	if len(msgs[2].ToolCalls) == 0 || msgs[2].ToolCalls[0].Function.Name != "run_command" {
+		t.Errorf("first tool call = %+v, want run_command", msgs[2].ToolCalls)
+	}
+	if msgs[3].Role != "tool" || msgs[3].Content == nil || !strings.Contains(*msgs[3].Content, "command execution failed") {
+		t.Errorf("first tool result = %+v, want command execution failed", msgs[3])
+	}
+	if len(msgs[4].ToolCalls) == 0 || msgs[4].ToolCalls[0].Function.Name != "finish" {
+		t.Errorf("second tool call = %+v, want finish", msgs[4].ToolCalls)
+	}
+	if msgs[5].Role != "tool" || msgs[5].Content == nil || *msgs[5].Content != finishSummary {
+		t.Errorf("second tool result = %+v, want finishSummary", msgs[5])
+	}
+}
+
+func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	goalRec := &state.GoalRecord{
+		BaseCommit: "commit-base123",
+		Goal: &goals.Goal{
+			Name: "optimize-latency",
+			Body: "reduce latency by 10%",
+		},
+		Hash: "hash-v1",
+	}
+	if err := store.PutGoal(ctx, repo.Key(), goalRec); err != nil {
+		t.Fatalf("PutGoal: %v", err)
+	}
+
+	procSrv := &mockProcessServer{
+		exitCode: 0,
+		stdout:   "Cloned successfully\n",
+	}
+	harness, _, _ := setupTestHarness(t, procSrv)
+
+	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:   store,
+		Harness: harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	if err := orch.SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager: %v", err)
+	}
+
+	scheduler, err := NewScheduler(SchedulerOptions{
+		Store:        store,
+		Orchestrator: orch,
+	})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	go func() {
+		_ = mgr.Start(ctx)
+	}()
+
+	// The scheduler creates the pending run and calls Orchestrator.Notify.
+	// There is no orchestrator timer.
+	if err := scheduler.Tick(ctx); err != nil {
+		t.Fatalf("scheduler.Tick: %v", err)
+	}
+
+	// Verify the run is reconciled to Working without any timer
+	var reachedWorking bool
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		runs, err := store.ListRuns(ctx, repo.Key())
+		if err == nil && len(runs) > 0 {
+			if runs[0].Phase == state.PhaseWorking {
+				reachedWorking = true
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !reachedWorking {
+		t.Fatal("expected run created by scheduler to reach Working after Notify without timer")
+	}
+}
+
+type blockingConcurrentProcessServer struct {
+	processv1.UnimplementedProcessServiceServer
+	onCommand func([]string)
+}
+
+func (b *blockingConcurrentProcessServer) Execute(ctx context.Context, req *processv1.ExecuteRequest) (*processv1.ExecuteResponse, error) {
+	if req.Config != nil && b.onCommand != nil {
+		b.onCommand(req.Config.Command)
+	}
+	return &processv1.ExecuteResponse{
+		ExitCode: 0,
+		Stdout:   []byte("ok"),
+	}, nil
+}
+
+func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	store := state.NewFileStore(t.TempDir())
+
+	repo1 := &state.Repo{
+		URL:           "https://github.com/gke-labs/repo1",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "repo1",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo1); err != nil {
+		t.Fatalf("PutRepo 1: %v", err)
+	}
+
+	repo2 := &state.Repo{
+		URL:           "https://github.com/gke-labs/repo2",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "repo2",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo2); err != nil {
+		t.Fatalf("PutRepo 2: %v", err)
+	}
+
+	run1 := &state.Run{
+		ID:         "20261030T120000Z-run1",
+		Repo:       repo1.Key(),
+		GoalName:   "goal1",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit1",
+	}
+	if err := store.PutRun(ctx, run1); err != nil {
+		t.Fatalf("PutRun 1: %v", err)
+	}
+
+	run2 := &state.Run{
+		ID:         "20261030T120000Z-run2",
+		Repo:       repo2.Key(),
+		GoalName:   "goal2",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit2",
+	}
+	if err := store.PutRun(ctx, run2); err != nil {
+		t.Fatalf("PutRun 2: %v", err)
+	}
+
+	// Use channels to verify both runs execute their clone command concurrently.
+	run1Started := make(chan struct{})
+	run2Started := make(chan struct{})
+	var closeOnce1, closeOnce2 sync.Once
+
+	procSrv := &blockingConcurrentProcessServer{
+		onCommand: func(cmd []string) {
+			cmdStr := strings.Join(cmd, " ")
+			if strings.Contains(cmdStr, "repo1") {
+				closeOnce1.Do(func() { close(run1Started) })
+				select {
+				case <-run2Started:
+				case <-time.After(5 * time.Second):
+				}
+			} else if strings.Contains(cmdStr, "repo2") {
+				closeOnce2.Do(func() { close(run2Started) })
+				select {
+				case <-run1Started:
+				case <-time.After(5 * time.Second):
+				}
+			}
+		},
+	}
+
+	harness, _, _ := setupTestHarness(t, procSrv)
+
+	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:             store,
+		Harness:           harness,
+		MaxConcurrentRuns: 4,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	if err := orch.SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager: %v", err)
+	}
+
+	go func() {
+		_ = mgr.Start(ctx)
+	}()
+
+	orch.Notify(repo1.Key(), run1.ID)
+	orch.Notify(repo2.Key(), run2.ID)
+
+	// Wait for both to reach Working
+	deadline := time.Now().Add(5 * time.Second)
+	var run1OK, run2OK bool
+	for time.Now().Before(deadline) {
+		r1, err1 := store.GetRun(ctx, repo1.Key(), run1.ID)
+		r2, err2 := store.GetRun(ctx, repo2.Key(), run2.ID)
+		if err1 == nil && r1.Phase == state.PhaseWorking {
+			run1OK = true
+		}
+		if err2 == nil && r2.Phase == state.PhaseWorking {
+			run2OK = true
+		}
+		if run1OK && run2OK {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !run1OK || !run2OK {
+		t.Fatalf("expected both runs to reach Working concurrently: run1OK=%v, run2OK=%v", run1OK, run2OK)
+	}
+}
+
+type cancellingChatClient struct {
+	cancelFn context.CancelFunc
+}
+
+func (c *cancellingChatClient) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	c.cancelFn()
+	return nil, context.Canceled
+}
+
+func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
+	storeDir := t.TempDir()
+	store := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(t.Context(), repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-cancel"
+	sandboxName := "run-20261030t120000z-cancel"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "optimize",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "commit-base123",
+		SandboxName: sandboxName,
+	}
+	if err := store.PutRun(t.Context(), run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	testCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	cancellingLLM := &cancellingChatClient{
+		cancelFn: cancel,
+	}
+
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, cancellingLLM)
+
+	// Create sandbox in fake k8s
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(t.Context(), &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionTrue,
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox in fake k8s: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Reconcile with the cancellable context. The LLM will cancel the context during the session.
+	_, _ = orch.Reconcile(testCtx, Request{Repo: repo.Key(), RunID: runID})
+
+	// Check with test context: run MUST stay in Working phase
+	gotRun, err := store.GetRun(t.Context(), repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseWorking {
+		t.Errorf("expected phase %s after context cancellation, got %s", state.PhaseWorking, gotRun.Phase)
+	}
+	if gotRun.Error != "" {
+		t.Errorf("expected empty error on context cancellation, got %q", gotRun.Error)
+	}
+
+	// Verify no failure event was written
+	events, err := store.ReadEvents(t.Context(), repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed {
+			t.Errorf("unexpected failed event recorded on context cancellation: %+v", e)
+		}
+	}
+}
+
+func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	storeDir := t.TempDir()
+	store := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	workingRunID := "20261030T120000Z-working"
+	workingRun := &state.Run{
+		ID:          workingRunID,
+		Repo:        repo.Key(),
+		GoalName:    "task",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "commit-base",
+		SandboxName: "run-working",
+	}
+	if err := store.PutRun(ctx, workingRun); err != nil {
+		t.Fatalf("PutRun working: %v", err)
+	}
+
+	prepRunID := "20261030T120000Z-prep"
+	prepRun := &state.Run{
+		ID:          prepRunID,
+		Repo:        repo.Key(),
+		GoalName:    "task",
+		Phase:       state.PhasePreparing,
+		BaseCommit:  "commit-base",
+		SandboxName: "run-prep",
+	}
+	if err := store.PutRun(ctx, prepRun); err != nil {
+		t.Fatalf("PutRun prep: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+
+	// Create sandboxes in fake k8s
+	for _, sbName := range []string{"run-working", "run-prep"} {
+		_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sbName,
+				Namespace: "ao-sandboxes",
+			},
+			Status: sandboxv1beta1.SandboxStatus{
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(sandboxv1beta1.SandboxConditionReady),
+						Status: metav1.ConditionTrue,
+					},
+				},
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("creating sandbox %s: %v", sbName, err)
+		}
+	}
+
+	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	if err := orch.SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager: %v", err)
+	}
+
+	go func() {
+		_ = mgr.Start(ctx)
+	}()
+
+	// Wait for the Working run to be reconciled on start and reach NoImprovement
+	deadline := time.Now().Add(5 * time.Second)
+	var workingReconciled bool
+	for time.Now().Before(deadline) {
+		r, err := store.GetRun(ctx, repo.Key(), workingRunID)
+		if err == nil && r.Phase == state.PhaseNoImprovement {
+			workingReconciled = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !workingReconciled {
+		t.Fatal("expected working run to be enqueued on start and reach NoImprovement")
+	}
+
+	// Verify Preparing run was transitioned to Failed per Resume rule
+	rPrep, err := store.GetRun(ctx, repo.Key(), prepRunID)
+	if err != nil {
+		t.Fatalf("GetRun prep: %v", err)
+	}
+	if rPrep.Phase != state.PhaseFailed {
+		t.Errorf("expected preparing run to become Failed on start, got %s", rPrep.Phase)
 	}
 }
