@@ -669,3 +669,79 @@ func TestCreateSandbox_MissingSigningKey_Fails(t *testing.T) {
 		t.Fatalf("expected error mentioning SigningKey must be configured, got: %v", err)
 	}
 }
+
+func TestCheckAliveAndExtendLifecycle(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-ns"
+	sbName := "test-sb"
+
+	now := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	inactivityTimeout := 15 * time.Minute
+
+	initialShutdownTime := now.Add(5 * time.Minute)
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      sbName,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			ShutdownTime: &metav1.Time{Time: initialShutdownTime},
+		},
+	}
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(ns).Create(ctx, sb, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create fake sandbox: %v", err)
+	}
+
+	client := &SandboxClient{
+		agentsClient: agentsCS,
+	}
+	sandbox := &Sandbox{
+		client: client,
+		id: types.NamespacedName{
+			Namespace: ns,
+			Name:      sbName,
+		},
+	}
+
+	// 1. Success: verifies alive and extends lifecycle using the provided now
+	if err := sandbox.CheckAliveAndExtendLifecycle(ctx, now, inactivityTimeout); err != nil {
+		t.Fatalf("CheckAliveAndExtendLifecycle failed: %v", err)
+	}
+
+	updated, err := agentsCS.AgentsV1beta1().Sandboxes(ns).Get(ctx, sbName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get updated sandbox: %v", err)
+	}
+	wantShutdownTime := now.Add(inactivityTimeout)
+	if !updated.Spec.ShutdownTime.Time.Equal(wantShutdownTime) {
+		t.Errorf("ShutdownTime = %v, want %v", updated.Spec.ShutdownTime.Time, wantShutdownTime)
+	}
+
+	// 2. Expired: now is after ShutdownTime
+	laterNow := now.Add(20 * time.Minute)
+	err = sandbox.CheckAliveAndExtendLifecycle(ctx, laterNow, inactivityTimeout)
+	if err == nil {
+		t.Fatal("expected error for expired sandbox, got nil")
+	}
+	if !errors.Is(err, ErrSandboxExpired) {
+		t.Errorf("expected ErrSandboxExpired, got: %v", err)
+	}
+
+	// 3. Not found: sandbox does not exist
+	missingSandbox := &Sandbox{
+		client: client,
+		id: types.NamespacedName{
+			Namespace: ns,
+			Name:      "nonexistent",
+		},
+	}
+	err = missingSandbox.CheckAliveAndExtendLifecycle(ctx, now, inactivityTimeout)
+	if err == nil {
+		t.Fatal("expected error for missing sandbox, got nil")
+	}
+	if !errors.Is(err, ErrSandboxExpired) {
+		t.Errorf("expected ErrSandboxExpired, got: %v", err)
+	}
+}

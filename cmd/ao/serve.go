@@ -96,6 +96,24 @@ func newServeCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the session API server",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			if envMaxTurns := os.Getenv("AO_MAX_TURNS"); envMaxTurns != "" {
+				v, err := strconv.Atoi(envMaxTurns)
+				if err != nil {
+					return fmt.Errorf("parsing AO_MAX_TURNS: %w", err)
+				}
+				if v <= 0 {
+					return fmt.Errorf("AO_MAX_TURNS must be positive, got %d", v)
+				}
+				if !cmd.Flags().Changed("max-turns") {
+					flags.maxTurns = v
+				}
+			}
+			if flags.maxTurns <= 0 {
+				return fmt.Errorf("max-turns must be positive, got %d", flags.maxTurns)
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runServe(cmd.Context(), flags)
 		},
@@ -110,14 +128,7 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().DurationVar(&flags.toolTimeout, "tool-timeout", session.DefaultToolTimeout, "Maximum duration for a single tool execution")
 	cmd.Flags().StringVar(&flags.stateDir, "state-dir", defaultStateDir, "Directory where session state and snapshots are saved")
 	cmd.Flags().StringArrayVar(&flags.repos, "repo", nil, "Repository URL to register with the forge (repeatable, or AO_REPOS env var)")
-
-	defaultMaxTurns := 30
-	if envMaxTurns := os.Getenv("AO_MAX_TURNS"); envMaxTurns != "" {
-		if v, err := strconv.Atoi(envMaxTurns); err == nil && v > 0 {
-			defaultMaxTurns = v
-		}
-	}
-	cmd.Flags().IntVar(&flags.maxTurns, "max-turns", defaultMaxTurns, "Maximum number of session turns before ending a run")
+	cmd.Flags().IntVar(&flags.maxTurns, "max-turns", 30, "Maximum number of session turns before ending a run")
 
 	return cmd
 }

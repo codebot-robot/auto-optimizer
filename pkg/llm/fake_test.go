@@ -99,11 +99,11 @@ func TestElizaReadReadme(t *testing.T) {
 	systemMsg := Message{Role: "system", Content: ptr("read the README and summarise it")}
 	userMsg := Message{Role: "user", Content: ptr("Please work on the goal.")}
 
-	// 1. With read_file in tools
+	// 1. With read in tools
 	resp, err := client.CreateChatCompletion(t.Context(), ChatCompletionRequest{
 		Messages: []Message{systemMsg, userMsg},
 		Tools: []Tool{
-			{Function: ToolFunction{Name: "read_file"}},
+			{Function: ToolFunction{Name: "read"}},
 		},
 	})
 	if err != nil {
@@ -113,14 +113,35 @@ func TestElizaReadReadme(t *testing.T) {
 		t.Fatalf("expected 1 tool call, got %d", len(resp.Choices[0].Message.ToolCalls))
 	}
 	tc := resp.Choices[0].Message.ToolCalls[0]
-	if tc.Function.Name != "read_file" {
-		t.Errorf("tool name = %q, want read_file", tc.Function.Name)
+	if tc.Function.Name != "read" {
+		t.Errorf("tool name = %q, want read", tc.Function.Name)
 	}
-	if tc.Function.Arguments != `{"file_path":"/workspace/repo/README.md"}` {
-		t.Errorf("arguments = %q, want file_path", tc.Function.Arguments)
+	if tc.Function.Arguments != `{"path":"/workspace/repo/README.md"}` {
+		t.Errorf("arguments = %q, want path", tc.Function.Arguments)
 	}
 
-	// 2. Tool result produces final summary
+	// 2. Fallback to run_command when read is not in tools
+	resp, err = client.CreateChatCompletion(t.Context(), ChatCompletionRequest{
+		Messages: []Message{systemMsg, userMsg},
+		Tools: []Tool{
+			{Function: ToolFunction{Name: "run_command"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateChatCompletion: %v", err)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(resp.Choices[0].Message.ToolCalls))
+	}
+	fallbackTC := resp.Choices[0].Message.ToolCalls[0]
+	if fallbackTC.Function.Name != "run_command" {
+		t.Errorf("tool name = %q, want run_command", fallbackTC.Function.Name)
+	}
+	if fallbackTC.Function.Arguments != `{"command":"cat /workspace/repo/README.md"}` {
+		t.Errorf("arguments = %q, want cat command", fallbackTC.Function.Arguments)
+	}
+
+	// 3. Tool result produces final summary
 	toolOutput := "# My Project\nThis is a cool project."
 	resp, err = client.CreateChatCompletion(t.Context(), ChatCompletionRequest{
 		Messages: []Message{

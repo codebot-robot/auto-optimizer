@@ -144,15 +144,9 @@ func readReadmeResponse(tools []Tool) (*ChatCompletionResponse, error) {
 
 	toolName := "run_command"
 	var args map[string]string
-	if hasTool("read_file") {
-		toolName = "read_file"
-		args = map[string]string{"file_path": "/workspace/repo/README.md"}
-	} else if hasTool("read") {
+	if hasTool("read") {
 		toolName = "read"
 		args = map[string]string{"path": "/workspace/repo/README.md"}
-	} else if hasTool("run_shell_command") {
-		toolName = "run_shell_command"
-		args = map[string]string{"command": "cat /workspace/repo/README.md"}
 	} else {
 		toolName = "run_command"
 		args = map[string]string{"command": "cat /workspace/repo/README.md"}

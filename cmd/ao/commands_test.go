@@ -108,6 +108,129 @@ func TestServeFlags(t *testing.T) {
 	if cmd.Flag("repo") == nil {
 		t.Error("expected --repo flag on ao serve")
 	}
+	if cmd.Flag("max-turns") == nil {
+		t.Error("expected --max-turns flag on ao serve")
+	}
+}
+
+func TestServeMaxTurnsValidation(t *testing.T) {
+	t.Run("default is 30", func(t *testing.T) {
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+	})
+
+	t.Run("valid AO_MAX_TURNS", func(t *testing.T) {
+		t.Setenv("AO_MAX_TURNS", "42")
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+	})
+
+	t.Run("invalid unparseable AO_MAX_TURNS", func(t *testing.T) {
+		t.Setenv("AO_MAX_TURNS", "not-a-number")
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		err := cmd.PreRunE(cmd, nil)
+		if err == nil {
+			t.Fatal("expected error for unparseable AO_MAX_TURNS, got nil")
+		}
+		if !strings.Contains(err.Error(), "parsing AO_MAX_TURNS") {
+			t.Errorf("error = %q, want containing 'parsing AO_MAX_TURNS'", err.Error())
+		}
+	})
+
+	t.Run("zero AO_MAX_TURNS", func(t *testing.T) {
+		t.Setenv("AO_MAX_TURNS", "0")
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		err := cmd.PreRunE(cmd, nil)
+		if err == nil {
+			t.Fatal("expected error for zero AO_MAX_TURNS, got nil")
+		}
+		if !strings.Contains(err.Error(), "AO_MAX_TURNS must be positive") {
+			t.Errorf("error = %q, want containing 'AO_MAX_TURNS must be positive'", err.Error())
+		}
+	})
+
+	t.Run("negative AO_MAX_TURNS", func(t *testing.T) {
+		t.Setenv("AO_MAX_TURNS", "-5")
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		err := cmd.PreRunE(cmd, nil)
+		if err == nil {
+			t.Fatal("expected error for negative AO_MAX_TURNS, got nil")
+		}
+		if !strings.Contains(err.Error(), "AO_MAX_TURNS must be positive") {
+			t.Errorf("error = %q, want containing 'AO_MAX_TURNS must be positive'", err.Error())
+		}
+	})
+
+	t.Run("zero max-turns flag", func(t *testing.T) {
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{"--max-turns", "0"}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		err := cmd.PreRunE(cmd, nil)
+		if err == nil {
+			t.Fatal("expected error for zero --max-turns, got nil")
+		}
+		if !strings.Contains(err.Error(), "max-turns must be positive") {
+			t.Errorf("error = %q, want containing 'max-turns must be positive'", err.Error())
+		}
+	})
+
+	t.Run("negative max-turns flag", func(t *testing.T) {
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{"--max-turns", "-10"}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		err := cmd.PreRunE(cmd, nil)
+		if err == nil {
+			t.Fatal("expected error for negative --max-turns, got nil")
+		}
+		if !strings.Contains(err.Error(), "max-turns must be positive") {
+			t.Errorf("error = %q, want containing 'max-turns must be positive'", err.Error())
+		}
+	})
+
+	t.Run("flag overrides AO_MAX_TURNS", func(t *testing.T) {
+		t.Setenv("AO_MAX_TURNS", "10")
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{"--max-turns", "25"}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+	})
+
+	t.Run("execute context aborts before run on invalid AO_MAX_TURNS", func(t *testing.T) {
+		t.Setenv("AO_MAX_TURNS", "bad-val")
+		cmd := newServeCommand()
+		cmd.SetArgs([]string{})
+		err := cmd.ExecuteContext(t.Context())
+		if err == nil {
+			t.Fatal("expected error from ExecuteContext, got nil")
+		}
+		if !strings.Contains(err.Error(), "parsing AO_MAX_TURNS") {
+			t.Errorf("error = %q, want containing 'parsing AO_MAX_TURNS'", err.Error())
+		}
+	})
 }
 
 func TestSelectForge(t *testing.T) {

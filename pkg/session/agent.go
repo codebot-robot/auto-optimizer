@@ -122,16 +122,6 @@ func NewSandboxClientWithClients(agentsClient agentsclientset.Interface, coreCli
 	}
 }
 
-// AgentsClient returns the underlying Kubernetes agents clientset.
-func (c *SandboxClient) AgentsClient() agentsclientset.Interface {
-	return c.agentsClient
-}
-
-// CoreClient returns the underlying Kubernetes core v1 client.
-func (c *SandboxClient) CoreClient() corev1client.CoreV1Interface {
-	return c.coreClient
-}
-
 // GetRESTConfig loads the kubernetes client configuration, preferring
 // local kubeconfig (or KUBECONFIG) if present, and falling back to
 // in-cluster configuration.
@@ -226,11 +216,6 @@ func (s *Session) SetActiveSandbox(sb *Sandbox) {
 		sb.session = s
 		s.sandboxID = sb.NamespacedName()
 	}
-}
-
-// ActiveSandbox returns the active sandbox bound to the session, if any.
-func (s *Session) ActiveSandbox() *Sandbox {
-	return s.activeSandbox
 }
 
 // Messages returns a copy of the messages in the session so far.
@@ -341,7 +326,7 @@ func (s *Sandbox) ExtendLifecycle(ctx context.Context, inactivityTimeout time.Du
 }
 
 // CheckAliveAndExtendLifecycle verifies that the sandbox exists and has not expired past now,
-// and updates the shutdownTime to time.Now() + inactivityTimeout.
+// and updates the shutdownTime to now + inactivityTimeout.
 func (s *Sandbox) CheckAliveAndExtendLifecycle(ctx context.Context, now time.Time, inactivityTimeout time.Duration) error {
 	agentsClient := s.agentsClient()
 	if agentsClient == nil {
@@ -361,7 +346,7 @@ func (s *Sandbox) CheckAliveAndExtendLifecycle(ctx context.Context, now time.Tim
 			return fmt.Errorf("%w: sandbox %s expired at %s", ErrSandboxExpired, s.id.Name, latest.Spec.ShutdownTime.Time)
 		}
 
-		latest.Spec.ShutdownTime = &metav1.Time{Time: time.Now().Add(inactivityTimeout)}
+		latest.Spec.ShutdownTime = &metav1.Time{Time: now.Add(inactivityTimeout)}
 		_, err = agentsClient.AgentsV1beta1().Sandboxes(s.id.Namespace).Update(ctx, latest, metav1.UpdateOptions{})
 		return err
 	})
