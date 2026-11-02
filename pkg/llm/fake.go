@@ -76,6 +76,12 @@ func (c *ElizaClient) CreateChatCompletion(_ context.Context, req ChatCompletion
 		return runCommandResponse(strings.TrimSpace(command))
 	}
 
+	for _, msg := range req.Messages {
+		if msg.Content != nil && strings.Contains(strings.ToLower(*msg.Content), "read the readme") {
+			return readReadmeResponse(req.Tools)
+		}
+	}
+
 	if lastUser != "" {
 		reply = fmt.Sprintf("What do you think it means when you say '%s'?", lastUser)
 	}
@@ -114,6 +120,62 @@ func runCommandResponse(command string) (*ChatCompletionResponse, error) {
 							Function: FunctionCall{
 								Name:      "run_command",
 								Arguments: string(args),
+							},
+						},
+					},
+				},
+				FinishReason: "tool_calls",
+			},
+		},
+	}, nil
+}
+
+// readReadmeResponse asks the harness to read the repository README using the
+// best available tool in tools.
+func readReadmeResponse(tools []Tool) (*ChatCompletionResponse, error) {
+	hasTool := func(name string) bool {
+		for _, t := range tools {
+			if t.Function.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	toolName := "run_command"
+	var args map[string]string
+	if hasTool("read_file") {
+		toolName = "read_file"
+		args = map[string]string{"file_path": "/workspace/repo/README.md"}
+	} else if hasTool("read") {
+		toolName = "read"
+		args = map[string]string{"path": "/workspace/repo/README.md"}
+	} else if hasTool("run_shell_command") {
+		toolName = "run_shell_command"
+		args = map[string]string{"command": "cat /workspace/repo/README.md"}
+	} else {
+		toolName = "run_command"
+		args = map[string]string{"command": "cat /workspace/repo/README.md"}
+	}
+
+	argBytes, err := json.Marshal(args)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling %s arguments: %w", toolName, err)
+	}
+
+	return &ChatCompletionResponse{
+		ID: "fake-eliza",
+		Choices: []Choice{
+			{
+				Message: Message{
+					Role: "assistant",
+					ToolCalls: []ToolCall{
+						{
+							ID:   "eliza-read-1",
+							Type: "function",
+							Function: FunctionCall{
+								Name:      toolName,
+								Arguments: string(argBytes),
 							},
 						},
 					},
