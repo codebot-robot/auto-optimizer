@@ -22,6 +22,17 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -30,28 +41,56 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets/ao"
 )
 
-// OrchestratorOptions configures the run Orchestrator.
-type OrchestratorOptions struct {
-	Store        state.Store
-	SessionStore session.Store
-	Harness      *session.Harness
-	Interval     time.Duration
-	Clock        func() time.Time
-	MaxTurns     int
+// Request identifies a run to be reconciled.
+type Request struct {
+	Repo  state.RepoKey
+	RunID string
 }
 
-// Orchestrator picks runs in phase Pending and drives them through Preparing
-// and Working.
+// String returns a human-readable identifier for the request.
+func (r Request) String() string {
+	return fmt.Sprintf("%s/%s", r.Repo, r.RunID)
+}
+
+// OrchestratorOptions configures the run Orchestrator.
+type OrchestratorOptions struct {
+	Store             state.Store
+	SessionStore      session.Store
+	Harness           *session.Harness
+	Clock             func() time.Time
+	MaxTurns          int
+	MaxConcurrentRuns int
+}
+
+// Orchestrator reconciles runs in phase Pending and Working using a controller-runtime controller.
 type Orchestrator struct {
-	store        state.Store
-	sessionStore session.Store
-	harness      *session.Harness
-	interval     time.Duration
-	clock        func() time.Time
-	maxTurns     int
+	store             state.Store
+	sessionStore      session.Store
+	harness           *session.Harness
+	clock             func() time.Time
+	maxTurns          int
+	maxConcurrentRuns int
+
+	notifyCh chan event.TypedGenericEvent[Request]
 
 	activeRunsMu sync.Mutex
 	activeRuns   map[string]bool
+}
+
+var _ reconcile.TypedReconciler[Request] = (*Orchestrator)(nil)
+var _ manager.Runnable = (*Orchestrator)(nil)
+
+// NewManager builds a controller-runtime manager from rest.Config with metrics and health
+// endpoints disabled and leader election disabled.
+func NewManager(restConfig *rest.Config) (manager.Manager, error) {
+	return ctrl.NewManager(restConfig, ctrl.Options{
+		Logger: klog.NewKlogr(),
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
+		HealthProbeBindAddress: "0",
+		LeaderElection:         false,
+	})
 }
 
 // NewOrchestrator creates a new run Orchestrator.
@@ -61,11 +100,6 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 	}
 	if opts.Harness == nil {
 		return nil, errors.New("harness is required")
-	}
-
-	interval := opts.Interval
-	if interval <= 0 {
-		interval = 10 * time.Second
 	}
 
 	clock := opts.Clock
@@ -78,20 +112,80 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		maxTurns = 30
 	}
 
+	maxConcurrentRuns := opts.MaxConcurrentRuns
+	if maxConcurrentRuns <= 0 {
+		maxConcurrentRuns = 4
+	}
+
 	return &Orchestrator{
-		store:        opts.Store,
-		sessionStore: opts.SessionStore,
-		harness:      opts.Harness,
-		interval:     interval,
-		clock:        clock,
-		maxTurns:     maxTurns,
-		activeRuns:   make(map[string]bool),
+		store:             opts.Store,
+		sessionStore:      opts.SessionStore,
+		harness:           opts.Harness,
+		clock:             clock,
+		maxTurns:          maxTurns,
+		maxConcurrentRuns: maxConcurrentRuns,
+		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
+		activeRuns:        make(map[string]bool),
 	}, nil
+}
+
+// Notify enqueues a run for reconciliation.
+// If o is nil, Notify is a no-op.
+func (o *Orchestrator) Notify(repo state.RepoKey, runID string) {
+	if o == nil {
+		return
+	}
+	req := Request{Repo: repo, RunID: runID}
+	select {
+	case o.notifyCh <- event.TypedGenericEvent[Request]{Object: req}:
+	default:
+		go func() {
+			o.notifyCh <- event.TypedGenericEvent[Request]{Object: req}
+		}()
+	}
+}
+
+// SetupWithManager registers the orchestrator with the controller-runtime manager.
+func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
+	// Skip name validation so unit tests can build multiple controllers named "run" in one process.
+	skipNameValidation := true
+	c, err := controller.NewTyped[Request]("run", mgr, controller.TypedOptions[Request]{
+		Reconciler:              o,
+		MaxConcurrentReconciles: o.maxConcurrentRuns,
+		SkipNameValidation:      &skipNameValidation,
+	})
+	if err != nil {
+		return fmt.Errorf("creating run controller: %w", err)
+	}
+
+	src := source.TypedChannel[Request, Request](
+		o.notifyCh,
+		handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req Request) []Request {
+			return []Request{req}
+		}),
+	)
+	if err := c.Watch(src); err != nil {
+		return fmt.Errorf("watching notification channel: %w", err)
+	}
+
+	return mgr.Add(o)
+}
+
+// Start implements manager.Runnable. On manager startup it calls Resume,
+// which marks interrupted Preparing runs as Failed and enqueues all non-terminal runs.
+// It then blocks until ctx is cancelled.
+func (o *Orchestrator) Start(ctx context.Context) error {
+	if err := o.Resume(ctx); err != nil {
+		scoped.Log(ctx).Error(err, "failed to resume interrupted runs on startup")
+	}
+	<-ctx.Done()
+	return nil
 }
 
 // Resume inspects existing runs across all repositories on startup.
 // Any run found in Preparing is marked Failed with an explanatory event,
 // because sandboxes and clones are not yet durable across restarts.
+// Every non-terminal run is enqueued for reconciliation.
 func (o *Orchestrator) Resume(ctx context.Context) error {
 	log := scoped.Log(ctx)
 	repos, err := o.store.ListRepos(ctx)
@@ -108,105 +202,80 @@ func (o *Orchestrator) Resume(ctx context.Context) error {
 		}
 
 		for _, r := range runs {
-			if r.Phase != state.PhasePreparing {
+			if r.Phase == state.PhasePreparing {
+				log.Info("marking interrupted Preparing run as Failed", "repo", repo.URL, "run", r.ID)
+				r.SetPhase(state.PhaseFailed, now)
+				r.Error = "server restarted while run was in Preparing phase"
+				if err := o.store.PutRun(ctx, r); err != nil {
+					log.Error(err, "failed to update interrupted run", "run", r.ID)
+				}
+
+				event := state.Event{
+					Time:    now,
+					Phase:   state.PhaseFailed,
+					Kind:    "restart",
+					Message: "Run failed: server restarted while preparing sandbox",
+					Error:   r.Error,
+				}
+				if err := o.store.AppendEvent(ctx, repo.Key(), r.ID, event); err != nil {
+					log.Error(err, "failed to append restart failure event", "run", r.ID)
+				}
+
+				if r.SandboxName != "" && o.harness != nil && o.harness.SandboxClient() != nil {
+					if delErr := o.harness.SandboxClient().DeleteSandboxByName(ctx, o.harness.Namespace(), r.SandboxName); delErr != nil {
+						log.V(2).Info("error deleting orphaned sandbox on restart", "sandbox", r.SandboxName, "error", delErr)
+					}
+				}
 				continue
 			}
 
-			log.Info("marking interrupted Preparing run as Failed", "repo", repo.URL, "run", r.ID)
-			r.SetPhase(state.PhaseFailed, now)
-			r.Error = "server restarted while run was in Preparing phase"
-			if err := o.store.PutRun(ctx, r); err != nil {
-				log.Error(err, "failed to update interrupted run", "run", r.ID)
-			}
-
-			event := state.Event{
-				Time:    now,
-				Phase:   state.PhaseFailed,
-				Kind:    "restart",
-				Message: "Run failed: server restarted while preparing sandbox",
-				Error:   r.Error,
-			}
-			if err := o.store.AppendEvent(ctx, repo.Key(), r.ID, event); err != nil {
-				log.Error(err, "failed to append restart failure event", "run", r.ID)
-			}
-
-			if r.SandboxName != "" && o.harness != nil && o.harness.SandboxClient() != nil {
-				if delErr := o.harness.SandboxClient().DeleteSandboxByName(ctx, o.harness.Namespace(), r.SandboxName); delErr != nil {
-					log.V(2).Info("error deleting orphaned sandbox on restart", "sandbox", r.SandboxName, "error", delErr)
-				}
+			if !r.Phase.IsTerminal() {
+				o.Notify(repo.Key(), r.ID)
 			}
 		}
 	}
 	return nil
 }
 
-// Run runs the orchestrator loop until the context is cancelled.
-func (o *Orchestrator) Run(ctx context.Context) error {
+// Reconcile loads the run and the repository, dispatches on the phase to
+// prepareRun or workRun unchanged, and returns.
+func (o *Orchestrator) Reconcile(ctx context.Context, req Request) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
-	log.Info("starting run orchestrator", "interval", o.interval)
 
-	if err := o.Resume(ctx); err != nil {
-		log.Error(err, "failed to resume interrupted runs on startup")
-	}
-
-	if err := o.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		log.Error(err, "initial orchestrator tick failed")
-	}
-
-	ticker := time.NewTicker(o.interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := o.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Error(err, "orchestrator tick failed")
-			}
-		}
-	}
-}
-
-// Tick performs one orchestration pass over all registered repositories.
-func (o *Orchestrator) Tick(ctx context.Context) error {
-	repos, err := o.store.ListRepos(ctx)
+	run, err := o.store.GetRun(ctx, req.Repo, req.RunID)
 	if err != nil {
-		return fmt.Errorf("listing repositories: %w", err)
-	}
-
-	var errs []error
-	for _, repo := range repos {
-		if err := o.tickRepo(ctx, repo); err != nil {
-			errs = append(errs, fmt.Errorf("repo %s: %w", repo.URL, err))
+		if errors.Is(err, state.ErrNotFound) {
+			return reconcile.Result{}, nil
 		}
+		return reconcile.Result{}, fmt.Errorf("getting run %s: %w", req.RunID, err)
 	}
 
-	return errors.Join(errs...)
-}
-
-func (o *Orchestrator) tickRepo(ctx context.Context, repo *state.Repo) error {
-	runs, err := o.store.ListRuns(ctx, repo.Key())
+	repo, err := o.store.GetRepo(ctx, req.Repo)
 	if err != nil {
-		return fmt.Errorf("listing runs: %w", err)
+		if errors.Is(err, state.ErrNotFound) {
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, fmt.Errorf("getting repo %s: %w", req.Repo, err)
 	}
 
-	for _, run := range runs {
-		switch run.Phase {
-		case state.PhasePending:
-			if err := o.prepareRun(ctx, repo, run); err != nil {
-				scoped.Log(ctx).Error(err, "preparing run failed", "repo", repo.URL, "run", run.ID)
-			}
-		case state.PhaseWorking:
-			if o.sessionStore != nil && o.harness != nil && o.harness.LLMClient() != nil {
-				if err := o.workRun(ctx, repo, run); err != nil {
-					scoped.Log(ctx).Error(err, "working run failed", "repo", repo.URL, "run", run.ID)
-				}
+	switch run.Phase {
+	case state.PhasePending:
+		if err := o.prepareRun(ctx, repo, run); err != nil {
+			log.Error(err, "preparing run failed", "repo", repo.URL, "run", run.ID)
+			// prepareRun transitions to PhaseFailed on error; do not requeue terminal runs.
+			return reconcile.Result{}, nil
+		}
+	case state.PhaseWorking:
+		if o.sessionStore != nil && o.harness != nil && o.harness.LLMClient() != nil {
+			if err := o.workRun(ctx, repo, run); err != nil {
+				log.Error(err, "working run failed", "repo", repo.URL, "run", run.ID)
+				// workRun transitions to PhaseFailed on error; do not requeue terminal runs.
+				return reconcile.Result{}, nil
 			}
 		}
 	}
 
-	return nil
+	return reconcile.Result{}, nil
 }
 
 func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
@@ -407,9 +476,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 
 	log.Info("run successfully prepared and entered Working phase", "run", run.ID, "sandbox", sandboxName)
 
-	if o.sessionStore != nil && o.harness != nil && o.harness.LLMClient() != nil {
-		return o.workRun(ctx, repo, run)
-	}
+	o.Notify(repo.Key(), run.ID)
 	return nil
 }
 
@@ -428,6 +495,10 @@ func (o *Orchestrator) setRunActive(runID string, active bool) bool {
 }
 
 func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	failTime := o.clock().UTC()
 	run.SetPhase(state.PhaseFailed, failTime)
 	run.Error = errMsg
@@ -475,6 +546,10 @@ func (o *Orchestrator) finishRunNoImprovement(ctx context.Context, repo *state.R
 func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
 	log := scoped.Log(ctx)
 
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	if !o.setRunActive(run.ID, true) {
 		log.V(2).Info("run is already actively executing a session", "run", run.ID)
 		return nil
@@ -494,6 +569,9 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	// Verify sandbox exists in Kubernetes and has not expired.
 	// If expired or deleted, fail the run with a clear event.
 	if err := sb.CheckAliveAndExtendLifecycle(ctx, o.clock().UTC(), session.SandboxInactivityTimeout); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s expired or deleted: %v", sandboxName, err))
 	}
 
@@ -597,6 +675,10 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 
 	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
 		return o.finishRunNoImprovement(ctx, repo, run, sb, "no_improvement", "session ended without a pull request")
+	}
+
+	if ctx.Err() != nil {
+		return nil
 	}
 
 	heartbeatMu.Lock()

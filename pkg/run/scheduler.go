@@ -33,16 +33,18 @@ const DefaultSchedulerInterval = 60 * time.Second
 
 // SchedulerOptions configures a Scheduler.
 type SchedulerOptions struct {
-	Store    state.Store
-	Clock    func() time.Time
-	Interval time.Duration
+	Store        state.Store
+	Orchestrator *Orchestrator
+	Clock        func() time.Time
+	Interval     time.Duration
 }
 
 // Scheduler inspects goals and creates pending runs for goals that have changed.
 type Scheduler struct {
-	Store    state.Store
-	Clock    func() time.Time
-	Interval time.Duration
+	Store        state.Store
+	Orchestrator *Orchestrator
+	Clock        func() time.Time
+	Interval     time.Duration
 }
 
 // NewScheduler creates a new Scheduler with the given options.
@@ -62,9 +64,10 @@ func NewScheduler(opts SchedulerOptions) (*Scheduler, error) {
 	}
 
 	return &Scheduler{
-		Store:    opts.Store,
-		Clock:    clock,
-		Interval: interval,
+		Store:        opts.Store,
+		Orchestrator: opts.Orchestrator,
+		Clock:        clock,
+		Interval:     interval,
 	}, nil
 }
 
@@ -242,6 +245,7 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 		}
 
 		log.Info("created pending run", "repo", repo.URL, "goal", g.Name, "run", runID, "reason", reason)
+		s.Orchestrator.Notify(key, runID)
 		runs = append(runs, run)
 	}
 

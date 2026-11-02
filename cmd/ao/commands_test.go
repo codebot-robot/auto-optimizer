@@ -111,6 +111,12 @@ func TestServeFlags(t *testing.T) {
 	if cmd.Flag("max-turns") == nil {
 		t.Error("expected --max-turns flag on ao serve")
 	}
+	flag := cmd.Flag("max-concurrent-runs")
+	if flag == nil {
+		t.Error("expected --max-concurrent-runs flag on ao serve")
+	} else if flag.DefValue != "4" {
+		t.Errorf("expected default max-concurrent-runs to be 4, got %s", flag.DefValue)
+	}
 }
 
 func TestServeMaxTurnsValidation(t *testing.T) {
