@@ -212,6 +212,23 @@ ensure_cached_repo() {
   echo "${target_dir}"
 }
 
+# nested_ap runs ap with REPO_ROOT and AP_ROOT unset so nested invocations inside
+# another repository's clone do not inherit the outer repository root
+# (https://github.com/gke-labs/gke-labs-infra/issues/620).
+nested_ap() {
+  env -u REPO_ROOT -u AP_ROOT \
+    GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest "$@"
+}
+
+require_images() {
+  for img in "$@"; do
+    if ! docker image inspect "${img}" >/dev/null 2>&1; then
+      echo "ERROR: Expected image \"${img}\" not found in local docker daemon after ap build" >&2
+      exit 1
+    fi
+  done
+}
+
 # ------------------------------------------------------------------------------
 # 1. Namespaces
 # ------------------------------------------------------------------------------
@@ -250,19 +267,24 @@ if has_component "service-portals"; then
   # using 'ap build'.
   SERVICE_PORTALS_DIR="$(ensure_cached_repo "service-portals" "https://github.com/gke-labs/service-portals.git" "${SERVICE_PORTALS_COMMIT}")"
 
+  SERVICE_PORTALS_IMAGES=(
+    "${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}"
+    "${IMAGE_PREFIX}/all-in-one-portal:${IMAGE_TAG}"
+    "${IMAGE_PREFIX}/gitproxy-server:${IMAGE_TAG}"
+    "${IMAGE_PREFIX}/service-portal:${IMAGE_TAG}"
+  )
+
   if [[ "${IS_KIND}" == "true" ]]; then
     echo "Building service-portals images locally..."
-    (cd "${SERVICE_PORTALS_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+    (cd "${SERVICE_PORTALS_DIR}" && nested_ap build)
+    require_images "${SERVICE_PORTALS_IMAGES[@]}"
     echo "Loading service-portals images into kind cluster ${KIND_CLUSTER_NAME}..."
     kind load docker-image \
-      "${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}" \
-      "${IMAGE_PREFIX}/all-in-one-portal:${IMAGE_TAG}" \
-      "${IMAGE_PREFIX}/gitproxy-server:${IMAGE_TAG}" \
-      "${IMAGE_PREFIX}/service-portal:${IMAGE_TAG}" \
+      "${SERVICE_PORTALS_IMAGES[@]}" \
       --name "${KIND_CLUSTER_NAME}"
   else
     echo "Building and pushing service-portals images to ${IMAGE_PREFIX}..."
-    (cd "${SERVICE_PORTALS_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build --push)
+    (cd "${SERVICE_PORTALS_DIR}" && nested_ap build --push)
   fi
 fi
 
@@ -288,7 +310,8 @@ if has_component "objectfs"; then
     if [[ "${IS_KIND}" == "true" ]]; then
       if [[ "${USE_FAKES3}" == "true" ]]; then
         echo "Building and loading fakes3 for kind..."
-        (cd "${IN_CLUSTER_STORAGE_DIR}/fakes3" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+        (cd "${IN_CLUSTER_STORAGE_DIR}/fakes3" && nested_ap build)
+        require_images "${IMAGE_PREFIX}/fakes3:${IMAGE_TAG}"
         kind load docker-image "${IMAGE_PREFIX}/fakes3:${IMAGE_TAG}" --name "${KIND_CLUSTER_NAME}"
 
         echo "Deploying in-cluster fakes3 service and deployment..."
@@ -333,19 +356,23 @@ EOF
       fi
 
       echo "Building in-cluster-storage images..."
-      (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+      (cd "${IN_CLUSTER_STORAGE_DIR}" && nested_ap build)
+      IN_CLUSTER_STORAGE_IMAGES=(
+        "${IMAGE_PREFIX}/wal-buffer:${IMAGE_TAG}"
+        "${IMAGE_PREFIX}/objectfs-controller:${IMAGE_TAG}"
+        "${IMAGE_PREFIX}/objectfs-node-daemon:${IMAGE_TAG}"
+      )
+      require_images "${IN_CLUSTER_STORAGE_IMAGES[@]}"
       echo "Loading in-cluster-storage images into kind cluster ${KIND_CLUSTER_NAME}..."
       kind load docker-image \
-        "${IMAGE_PREFIX}/wal-buffer:${IMAGE_TAG}" \
-        "${IMAGE_PREFIX}/objectfs-controller:${IMAGE_TAG}" \
-        "${IMAGE_PREFIX}/objectfs-node-daemon:${IMAGE_TAG}" \
+        "${IN_CLUSTER_STORAGE_IMAGES[@]}" \
         --name "${KIND_CLUSTER_NAME}"
 
       echo "Deploying in-cluster-storage manifests with ap deploy..."
-      (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy --skip-push)
+      (cd "${IN_CLUSTER_STORAGE_DIR}" && nested_ap deploy --skip-push)
     else
       echo "Deploying in-cluster-storage with ap deploy (pushing to ${IMAGE_PREFIX})..."
-      (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy)
+      (cd "${IN_CLUSTER_STORAGE_DIR}" && nested_ap deploy)
     fi
 
     # Configure backend via objectfs-config ConfigMap (replaces backend without patching manifests)
