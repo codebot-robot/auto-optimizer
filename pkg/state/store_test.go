@@ -231,6 +231,7 @@ func TestRun_PutGetList(t *testing.T) {
 		Branch:     "ao/bench/20261023T100000Z-0001",
 		PRURL:      "https://github.com/gke-labs/auto-optimizer/pull/1",
 		SessionID:  "sess-1",
+		Summary:    "optimized benchmark runtime",
 		Baseline:   &baseline,
 		Candidate:  &candidate,
 		CostUSD:    0.45,
