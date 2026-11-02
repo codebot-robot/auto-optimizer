@@ -109,6 +109,7 @@ token-only first cut, so a token and an App both work from day one.
 | `pkg/sandbox` | new | Builds the `Sandbox` object for a run, or a `SandboxClaim` once we use warm pools. Waits for readiness, holds the sandboxd client with its bearer token and address, extends `shutdownTime`, and deletes the sandbox. It wraps `sigs.k8s.io/agent-sandbox/clients/go/sandbox` where that fits. |
 | `pkg/portal` | new | Renders the per-run `PortalRule`s, which say which hosts the sandbox may reach and which token each host gets, into the Secret that the sidecar reads. Parses the portal's usage logs for metering. |
 | `pkg/measure` | new, idea from the spike | Implements the metric protocol, the median of N runs, the verify gate, and the improvement arithmetic. It runs commands through sandboxd `Execute`. |
+| `pkg/run` | new | Reconciles runs with a typed controller-runtime reconciler instead of a timer loop. controller-runtime was chosen for its work queue with de-duplication and backoff, channel source for internal notifications, typed watch sources for Kubernetes resources, and bounded worker concurrency. |
 | `pkg/state` | new | Defines the file layout under the state directory, atomic JSON writes, and append-only JSONL. |
 | `pkg/web` | new | Serves the repository list, the repository page with goals and run history, and the run page with the session transcript, tool calls, measurements, and PR link. Draws an inline SVG chart of the metric over time. Web pages follow the one-function-per-page convention (`RenderXPage`) with their template and data type in the same file. |
 
@@ -358,12 +359,32 @@ large repositories across runs.
 
 ## Run lifecycle
 
+Runs are driven by a typed controller-runtime reconciler (`pkg/run`) rather than
+a polling loop or timer. The unit of reconciliation is one run, identified by its
+repository key and run ID. Reconcile loads `run.json`, inspects the current phase,
+takes one step (such as preparing the sandbox or executing an agent session turn),
+persists state and events, and returns.
+
 ```
 Pending -> Preparing -> Working -> Selecting -> OpeningPR -> Succeeded
                                      |              |
                                      |              +-> NoImprovement
                                      +-> Failed / Cancelled / Expired
 ```
+
+### Events and concurrency
+
+Runs are reconciled in response to events:
+- **Scheduler creation:** When the scheduler creates a `Pending` run in the state store, it calls `Orchestrator.Notify(repo, runID)` to enqueue the run immediately.
+- **Phase transitions:** When `prepareRun` completes sandbox setup and moves the run to `Working`, it calls `Orchestrator.Notify(repo, runID)` to trigger session execution.
+- **Worker concurrency:** The reconciler runs with configurable concurrency via `--max-concurrent-runs` (default 4), so runs in different repositories proceed in parallel without blocking each other. The controller-runtime workqueue de-duplicates notifications for the same run.
+
+### Restart and shutdown semantics
+
+- **Startup:** When the manager starts, the orchestrator enqueues all existing runs that are not in a terminal phase. An interrupted `Preparing` run is marked `Failed` (with any orphaned sandbox cleaned up), because sandboxes and clones are not yet durable across restarts. Runs in `Working` or other active phases are re-enqueued for reconciliation.
+- **Shutdown:** When the control plane shuts down (context cancelled), `workRun` returns cleanly without changing the run phase. The run remains `Working` in the state store rather than failing with a context-cancelled error, allowing the next server start to pick it back up.
+
+### Phases
 
 1. **Pending.** A goal needs a run because its schedule is due, its content
    changed, or someone asked. The scheduler allows one active run per goal

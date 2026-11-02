@@ -28,6 +28,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
@@ -45,16 +47,17 @@ import (
 )
 
 type serveFlags struct {
-	listen      string
-	http        string
-	namespace   string
-	toolset     string
-	image       string
-	homeDir     string
-	toolTimeout time.Duration
-	stateDir    string
-	repos       []string
-	maxTurns    int
+	listen            string
+	http              string
+	namespace         string
+	toolset           string
+	image             string
+	homeDir           string
+	toolTimeout       time.Duration
+	stateDir          string
+	repos             []string
+	maxTurns          int
+	maxConcurrentRuns int
 }
 
 func newServeCommand() *cobra.Command {
@@ -129,11 +132,14 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&flags.stateDir, "state-dir", defaultStateDir, "Directory where session state and snapshots are saved")
 	cmd.Flags().StringArrayVar(&flags.repos, "repo", nil, "Repository URL to register with the forge (repeatable, or AO_REPOS env var)")
 	cmd.Flags().IntVar(&flags.maxTurns, "max-turns", 30, "Maximum number of session turns before ending a run")
+	cmd.Flags().IntVar(&flags.maxConcurrentRuns, "max-concurrent-runs", 4, "Maximum number of concurrent runs reconciled")
 
 	return cmd
 }
 
 func runServe(ctx context.Context, flags serveFlags) error {
+	ctrl.SetLogger(klog.NewKlogr())
+
 	log := scoped.Log(ctx)
 
 	if flags.homeDir == "" {
@@ -170,6 +176,11 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	restConfig, err := session.GetRESTConfig()
 	if err != nil {
 		return fmt.Errorf("getting Kubernetes configuration: %w", err)
+	}
+
+	mgr, err := run.NewManager(restConfig)
+	if err != nil {
+		return fmt.Errorf("initializing controller manager: %w", err)
 	}
 
 	sandboxClient, err := session.NewSandboxClient(restConfig)
@@ -240,18 +251,6 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		}
 	}()
 
-	scheduler, err := run.NewScheduler(run.SchedulerOptions{
-		Store: stateStore,
-	})
-	if err != nil {
-		return fmt.Errorf("initializing scheduler: %w", err)
-	}
-	go func() {
-		if err := scheduler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Error(err, "scheduler loop error")
-		}
-	}()
-
 	harnessFactory := func(toolsetName string) (*session.Harness, error) {
 		toolset, err := toolsets.Get(toolsetName)
 		if err != nil {
@@ -283,17 +282,35 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	}
 
 	orchestrator, err := run.NewOrchestrator(run.OrchestratorOptions{
-		Store:        stateStore,
-		SessionStore: sessionStore,
-		Harness:      orchestratorHarness,
-		MaxTurns:     flags.maxTurns,
+		Store:             stateStore,
+		SessionStore:      sessionStore,
+		Harness:           orchestratorHarness,
+		MaxTurns:          flags.maxTurns,
+		MaxConcurrentRuns: flags.maxConcurrentRuns,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing orchestrator: %w", err)
 	}
+	if err := orchestrator.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setting up orchestrator controller: %w", err)
+	}
+
+	scheduler, err := run.NewScheduler(run.SchedulerOptions{
+		Store:        stateStore,
+		Orchestrator: orchestrator,
+	})
+	if err != nil {
+		return fmt.Errorf("initializing scheduler: %w", err)
+	}
 	go func() {
-		if err := orchestrator.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Error(err, "orchestrator loop error")
+		if err := scheduler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error(err, "scheduler loop error")
+		}
+	}()
+
+	go func() {
+		if err := mgr.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error(err, "controller manager error")
 		}
 	}()
 
