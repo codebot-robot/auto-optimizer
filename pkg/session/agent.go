@@ -434,6 +434,24 @@ readyLoop:
 	return nil
 }
 
+// SetPodInfo sets the podName and podIP on the Sandbox.
+func (s *Sandbox) SetPodInfo(podName, podIP string) {
+	s.grpcMu.Lock()
+	defer s.grpcMu.Unlock()
+	if podName != "" {
+		s.podName = podName
+	}
+	if podIP != "" {
+		s.podIP = podIP
+	}
+}
+
+// CheckPodImagePullStatus inspects the backing Pod's container statuses to fail fast
+// if any container is stuck in ImagePullBackOff or ErrImagePull.
+func (s *Sandbox) CheckPodImagePullStatus(ctx context.Context) error {
+	return s.checkPodImagePullStatus(ctx)
+}
+
 // checkPodImagePullStatus inspects the backing Pod's container statuses to fail fast
 // if any container is stuck in ImagePullBackOff or ErrImagePull.
 func (s *Sandbox) checkPodImagePullStatus(ctx context.Context) error {
@@ -611,17 +629,19 @@ func (s *Sandbox) startPortForward(ctx context.Context, targetPort int) (int, fu
 // Can also be explicitly forced via AO_SANDBOX_CONNECTIVITY ("pod-ip" or "port-forward").
 func (s *Sandbox) resolveTarget(ctx context.Context) (string, func(), error) {
 	connMode := ""
-	if s.session != nil && s.session.client != nil {
+	if s.client != nil {
+		connMode = s.client.connectivity
+	} else if s.session != nil && s.session.client != nil {
 		connMode = s.session.client.connectivity
 	}
 
 	podIP := s.podIP
-	if podIP == "" && s.session != nil && s.session.client != nil && s.session.client.coreClient != nil {
+	if podIP == "" && s.coreClient() != nil {
 		podName := s.PodNamespacedName().Name
 		if podName == "" {
 			podName = s.id.Name
 		}
-		pod, err := s.session.client.coreClient.Pods(s.id.Namespace).Get(ctx, podName, metav1.GetOptions{})
+		pod, err := s.coreClient().Pods(s.id.Namespace).Get(ctx, podName, metav1.GetOptions{})
 		if err == nil && pod != nil {
 			podIP = pod.Status.PodIP
 			s.podIP = podIP
@@ -1126,13 +1146,18 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 	return h.createSandboxResource(ctx, session.sandboxID, session)
 }
 
-// CreateSandboxNamed creates a Sandbox resource with the specified name using topology B.
-func (h *Harness) CreateSandboxNamed(ctx context.Context, sandboxName string) (*Sandbox, error) {
+// CreateSandboxNamedWithLabels creates a Sandbox resource with the specified name and metadata using topology B.
+func (h *Harness) CreateSandboxNamedWithLabels(ctx context.Context, sandboxName string, labels, annotations map[string]string) (*Sandbox, error) {
 	id := types.NamespacedName{
 		Namespace: h.opts.Namespace,
 		Name:      sandboxName,
 	}
-	return h.createSandboxResource(ctx, id, nil)
+	return h.createSandboxResourceWithMetadata(ctx, id, nil, labels, annotations)
+}
+
+// CreateSandboxNamed creates a Sandbox resource with the specified name using topology B.
+func (h *Harness) CreateSandboxNamed(ctx context.Context, sandboxName string) (*Sandbox, error) {
+	return h.CreateSandboxNamedWithLabels(ctx, sandboxName, nil, nil)
 }
 
 // StartSandbox creates a Sandbox resource with the specified name and waits for it to become ready.
@@ -1172,6 +1197,10 @@ func (h *Harness) Namespace() string {
 }
 
 func (h *Harness) createSandboxResource(ctx context.Context, id types.NamespacedName, session *Session) (*Sandbox, error) {
+	return h.createSandboxResourceWithMetadata(ctx, id, session, nil, nil)
+}
+
+func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id types.NamespacedName, session *Session, labels, annotations map[string]string) (*Sandbox, error) {
 	agentsClient := h.sandboxClient.agentsClient
 	image := h.opts.Image
 	if image == "" {
@@ -1211,8 +1240,10 @@ func (h *Harness) createSandboxResource(ctx context.Context, id types.Namespaced
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	sb := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      id.Name,
-			Namespace: id.Namespace,
+			Name:        id.Name,
+			Namespace:   id.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
 		},
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
@@ -1412,6 +1443,22 @@ func (c *SandboxClient) DeleteSandboxByName(ctx context.Context, namespace, name
 		return fmt.Errorf("failed to delete Sandbox: %w", err)
 	}
 	return nil
+}
+
+// AgentsClient returns the underlying agentsclientset.Interface.
+func (c *SandboxClient) AgentsClient() agentsclientset.Interface {
+	if c == nil {
+		return nil
+	}
+	return c.agentsClient
+}
+
+// GetSandboxResource fetches the Sandbox custom resource from Kubernetes.
+func (c *SandboxClient) GetSandboxResource(ctx context.Context, namespace, name string) (*sandboxv1beta1.Sandbox, error) {
+	if c == nil || c.agentsClient == nil {
+		return nil, errors.New("no agentsClient available")
+	}
+	return c.agentsClient.AgentsV1beta1().Sandboxes(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
 // DeleteAllSandboxes deletes all active Sandboxes tracked by this client.

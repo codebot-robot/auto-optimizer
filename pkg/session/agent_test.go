@@ -745,3 +745,63 @@ func TestCheckAliveAndExtendLifecycle(t *testing.T) {
 		t.Errorf("expected ErrSandboxExpired, got: %v", err)
 	}
 }
+
+func TestCreateSandboxNamedWithLabels(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+	sbName := "test-sb-metadata"
+	cpNamespace := "ao-system"
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	client := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	harness := NewHarness(nil, client, nil, RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: cpNamespace,
+		SigningKey:            privKey,
+	})
+
+	labels := map[string]string{
+		"auto-optimizer.labs.gke.io/run": "run-123",
+	}
+	annotations := map[string]string{
+		"auto-optimizer.labs.gke.io/repo": "github.com/gke-labs/test",
+	}
+
+	sb, err := harness.CreateSandboxNamedWithLabels(ctx, sbName, labels, annotations)
+	if err != nil {
+		t.Fatalf("CreateSandboxNamedWithLabels failed: %v", err)
+	}
+	defer func() { _ = client.DeleteSandbox(ctx, sb) }()
+
+	created, err := client.GetSandboxResource(ctx, ns, sbName)
+	if err != nil {
+		t.Fatalf("GetSandboxResource failed: %v", err)
+	}
+	if created.Labels["auto-optimizer.labs.gke.io/run"] != "run-123" {
+		t.Errorf("expected label run-123, got %q", created.Labels["auto-optimizer.labs.gke.io/run"])
+	}
+	if created.Annotations["auto-optimizer.labs.gke.io/repo"] != "github.com/gke-labs/test" {
+		t.Errorf("expected annotation github.com/gke-labs/test, got %q", created.Annotations["auto-optimizer.labs.gke.io/repo"])
+	}
+	if client.AgentsClient() != agentsCS {
+		t.Errorf("expected AgentsClient to return agentsCS")
+	}
+}
+
+func TestSandbox_SetPodInfo(t *testing.T) {
+	sb := &Sandbox{}
+	sb.SetPodInfo("pod-abc", "10.0.0.1")
+	if sb.podName != "pod-abc" {
+		t.Errorf("expected podName 'pod-abc', got %q", sb.podName)
+	}
+	if sb.podIP != "10.0.0.1" {
+		t.Errorf("expected podIP '10.0.0.1', got %q", sb.podIP)
+	}
+}
