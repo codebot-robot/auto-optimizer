@@ -381,7 +381,7 @@ Runs are reconciled in response to events:
 
 ### Restart and shutdown semantics
 
-- **Startup:** When the manager starts, the orchestrator enqueues all existing runs that are not in a terminal phase. An interrupted `Preparing` run is marked `Failed` (with any orphaned sandbox cleaned up), because sandboxes and clones are not yet durable across restarts. Runs in `Working` or other active phases are re-enqueued for reconciliation.
+- **Startup:** When the manager starts, the orchestrator enqueues all existing runs that are not in a terminal phase. Runs in `Preparing`, `Working`, or other active phases are re-enqueued for reconciliation.
 - **Shutdown:** When the control plane shuts down (context cancelled), `workRun` returns cleanly without changing the run phase. The run remains `Working` in the state store rather than failing with a context-cancelled error, allowing the next server start to pick it back up.
 
 ### Phases
@@ -389,12 +389,19 @@ Runs are reconciled in response to events:
 1. **Pending.** A goal needs a run because its schedule is due, its content
    changed, or someone asked. The scheduler allows one active run per goal
    and enforces the repository's budget cap.
-2. **Preparing.** The orchestrator creates the workspace PVC, the portal
-   rules Secret, and the Sandbox. It mints the installation token now. The
-   token is valid for one hour, and the portal re-reads its rules on `SIGHUP`
-   when the control plane rotates it. The orchestrator waits for `Ready`,
-   clones the repository at the base commit, freezes the goal file, and
-   measures the baseline for a metric goal.
+2. **Preparing.** Split into two reconcile steps without blocking a worker:
+   - *Step 1 (creation):* The orchestrator creates the workspace PVC, portal
+     rules Secret, and the Sandbox with a label naming the run, records
+     `SandboxName` and a `ReadyDeadline` on the run, appends an event, and
+     returns with `RequeueAfter`.
+   - *Step 2 (readiness):* The orchestrator polls the Sandbox resource until
+     it becomes `Ready` via `RequeueAfter`. When the Sandbox becomes `Ready`,
+     the orchestrator clones the repository at the base commit into
+     `/workspace/repo`, freezes the goal file, measures the baseline for a
+     metric goal, moves the run to `Working`, and enqueues it. If the Sandbox
+     disappears or reports a failure before becoming ready, or if the ready
+     deadline passes without the Sandbox becoming ready, the run transitions
+     to `Failed`.
 3. **Working.** The session manager runs the session turn by turn. The
    session ends when it calls `open_pull_request` or `finish`, when the model
    stops, or when a limit is hit. The limits are `maxDuration`, `maxCostUSD`,
