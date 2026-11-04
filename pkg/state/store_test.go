@@ -296,6 +296,33 @@ func TestRun_PutGetList(t *testing.T) {
 	}
 }
 
+func TestRun_ReadyDeadline(t *testing.T) {
+	ctx := t.Context()
+	store := NewFileStore(t.TempDir())
+	key := RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+
+	deadline := time.Date(2026, 10, 30, 12, 5, 0, 0, time.UTC)
+	run := &Run{
+		ID:            "20261030T120000Z-0001",
+		Repo:          key,
+		Phase:         PhasePreparing,
+		SandboxName:   "run-sandbox-1",
+		ReadyDeadline: &deadline,
+	}
+
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	got, err := store.GetRun(ctx, key, run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.ReadyDeadline == nil || !got.ReadyDeadline.Equal(deadline) {
+		t.Errorf("expected ReadyDeadline %v, got %v", deadline, got.ReadyDeadline)
+	}
+}
+
 func TestRun_FindRun(t *testing.T) {
 	ctx := t.Context()
 	storeDir := t.TempDir()
