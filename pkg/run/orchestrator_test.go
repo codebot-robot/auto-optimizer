@@ -1792,3 +1792,34 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 		t.Errorf("expected preparing run to become Failed on start, got %s", rPrep.Phase)
 	}
 }
+
+func TestBuildSystemPrompt(t *testing.T) {
+	repo := &state.Repo{
+		URL:           "https://github.com/example/repo",
+		DefaultBranch: "main",
+	}
+	run := &state.Run{
+		ID:         "20261104T120000Z-0001",
+		GoalName:   "throughput",
+		BaseCommit: "abcdef123456",
+	}
+	prompt := buildSystemPrompt("Base prompt", repo, run, "Improve throughput by 10%")
+
+	expectedSubstrings := []string{
+		"Base prompt",
+		"# Goal",
+		"Improve throughput by 10%",
+		"# Repository Facts",
+		"- URL: https://github.com/example/repo",
+		"- Default Branch: main",
+		"- Branch: ao/throughput/20261104T120000Z-0001",
+		"- Base Commit: abcdef123456",
+		"- Working Directory: /workspace/repo",
+		"# Rules",
+	}
+	for _, expected := range expectedSubstrings {
+		if !strings.Contains(prompt, expected) {
+			t.Errorf("buildSystemPrompt missing %q, got:\n%s", expected, prompt)
+		}
+	}
+}

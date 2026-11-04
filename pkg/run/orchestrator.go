@@ -709,8 +709,13 @@ func buildSystemPrompt(basePrompt string, repo *state.Repo, run *state.Run, goal
 			sb.WriteString(fmt.Sprintf("- Default Branch: %s\n", repo.DefaultBranch))
 		}
 	}
-	if run != nil && run.BaseCommit != "" {
-		sb.WriteString(fmt.Sprintf("- Base Commit: %s\n", run.BaseCommit))
+	if run != nil {
+		if branch := run.BranchName(); branch != "" {
+			sb.WriteString(fmt.Sprintf("- Branch: %s\n", branch))
+		}
+		if run.BaseCommit != "" {
+			sb.WriteString(fmt.Sprintf("- Base Commit: %s\n", run.BaseCommit))
+		}
 	}
 	sb.WriteString("- Working Directory: /workspace/repo\n\n")
 

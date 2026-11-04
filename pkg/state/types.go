@@ -143,6 +143,20 @@ func (r *Run) SetPhase(phase RunPhase, t time.Time) {
 	r.PhaseTimestamps[phase] = t
 }
 
+// BranchName returns the branch name for this run, defaulting to ao/<goalName>/<id>.
+func (r *Run) BranchName() string {
+	if r == nil {
+		return ""
+	}
+	if r.Branch != "" {
+		return r.Branch
+	}
+	if r.GoalName != "" && r.ID != "" {
+		return fmt.Sprintf("ao/%s/%s", r.GoalName, r.ID)
+	}
+	return ""
+}
+
 // Event represents an event entry appended to events.jsonl.
 type Event struct {
 	Time    time.Time `json:"time"`

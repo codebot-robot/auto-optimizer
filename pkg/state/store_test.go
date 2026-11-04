@@ -692,3 +692,32 @@ func TestValidation(t *testing.T) {
 		t.Error("expected active phases to return false from IsTerminal()")
 	}
 }
+
+func TestRun_BranchName(t *testing.T) {
+	var nilRun *Run
+	if got := nilRun.BranchName(); got != "" {
+		t.Errorf("nil Run.BranchName() = %q, want empty", got)
+	}
+
+	explicitRun := &Run{
+		Branch:   "custom-branch",
+		GoalName: "my-goal",
+		ID:       "run-1",
+	}
+	if got := explicitRun.BranchName(); got != "custom-branch" {
+		t.Errorf("explicit Run.BranchName() = %q, want custom-branch", got)
+	}
+
+	defaultRun := &Run{
+		GoalName: "my-goal",
+		ID:       "run-1",
+	}
+	if got := defaultRun.BranchName(); got != "ao/my-goal/run-1" {
+		t.Errorf("default Run.BranchName() = %q, want ao/my-goal/run-1", got)
+	}
+
+	emptyRun := &Run{}
+	if got := emptyRun.BranchName(); got != "" {
+		t.Errorf("empty Run.BranchName() = %q, want empty", got)
+	}
+}
