@@ -154,21 +154,12 @@ func TestExportCommits(t *testing.T) {
 			checkStdin:  "obj1\nobj2\n",
 		},
 		{
-			name: "pending changes committed with author and subject",
-			opts: ExportOptions{RepoDir: "/custom", Base: base, Author: "Alice <alice@example.org>", Subject: "Feature X"},
+			name: "pending changes return ErrUncommittedChanges",
+			opts: ExportOptions{RepoDir: "/custom", Base: base},
 			commands: map[string]cmdResult{
 				"git -C /custom status --porcelain": {stdout: " M file.go\n"},
-				"git -C /custom add -A":             {},
-				"git -C /custom -c user.name=Alice -c user.email=alice@example.org commit -m Feature X": {},
-				"git -C /custom diff --quiet " + base + " HEAD":                                         {exitCode: 1},
-				"git -C /custom diff --name-only " + base + " HEAD":                                     {stdout: "file.go\n"},
-				"git -C /custom rev-parse HEAD":                                                         {stdout: tip + "\n"},
-				"git -C /custom rev-list --objects " + base + "..HEAD":                                  {stdout: "obj\n"},
-				"git -C /custom pack-objects --stdout --no-thin -q":                                     {},
 			},
-			startStdout: []byte("PACK-COMMITTED"),
-			wantTip:     tip,
-			wantPack:    []byte("PACK-COMMITTED"),
+			wantErr: ErrUncommittedChanges,
 		},
 		{
 			name: "empty diff returns ErrNoChanges",
@@ -193,12 +184,6 @@ func TestExportCommits(t *testing.T) {
 			name:   "invalid base SHA rejected up front",
 			opts:   ExportOptions{Base: "invalid;injection"},
 			errSub: "invalid base commit SHA",
-		},
-		{
-			name:     "unparsable author returns error when pending changes present",
-			opts:     ExportOptions{Base: base, Author: "bad-author<"},
-			commands: map[string]cmdResult{"git -C /workspace/repo status --porcelain": {stdout: " M file.go\n"}},
-			errSub:   "invalid author",
 		},
 		{
 			name: "pack-objects failure cleans up temp file",

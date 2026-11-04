@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/mail"
 	"os"
 	"path"
 	"path/filepath"
@@ -35,8 +34,6 @@ var validBaseSHA = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
 type ExportOptions struct {
 	RepoDir string // default /workspace/repo
 	Base    string // base commit SHA
-	Author  string // "Name <email>", used for the commit of pending changes
-	Subject string // commit subject for pending changes
 	DestDir string // local directory for the packfile
 }
 
@@ -52,11 +49,14 @@ var (
 
 	// ErrGoalsChanged is returned when the sandbox modified files under .goals/.
 	ErrGoalsChanged = errors.New("changes under .goals/ are not allowed")
+
+	// ErrUncommittedChanges is returned when the sandbox repository has uncommitted changes.
+	ErrUncommittedChanges = errors.New("uncommitted changes in repository")
 )
 
-// ExportCommits commits any uncommitted changes in the sandbox repository, verifies
-// that there are valid changes (and none under .goals/), and streams a git packfile
-// containing all objects between Base and HEAD to a local file in DestDir.
+// ExportCommits verifies that there are no uncommitted changes and valid changes against
+// base commit (and none under .goals/), and streams a git packfile containing all objects
+// between Base and HEAD to a local file in DestDir.
 func (s *Sandbox) ExportCommits(ctx context.Context, opts ExportOptions) (*ExportResult, error) {
 	log := scoped.Log(ctx)
 	repoDir := opts.RepoDir
@@ -70,7 +70,7 @@ func (s *Sandbox) ExportCommits(ctx context.Context, opts ExportOptions) (*Expor
 		return nil, errors.New("destination directory is required")
 	}
 
-	// 1. Commit pending changes if any.
+	// 1. Verify there are no uncommitted changes.
 	statusRes, err := s.ExecCommand(ctx, tools.ExecCommandOptions{
 		Command: []string{"git", "-C", repoDir, "status", "--porcelain"},
 	})
@@ -80,42 +80,8 @@ func (s *Sandbox) ExportCommits(ctx context.Context, opts ExportOptions) (*Expor
 	if statusRes.ExitCode != 0 {
 		return nil, fmt.Errorf("git status failed with exit code %d: %s", statusRes.ExitCode, statusRes.Stderr)
 	}
-
 	if strings.TrimSpace(statusRes.Stdout) != "" {
-		name, email, err := parseAuthor(opts.Author)
-		if err != nil {
-			return nil, err
-		}
-
-		addRes, err := s.ExecCommand(ctx, tools.ExecCommandOptions{
-			Command: []string{"git", "-C", repoDir, "add", "-A"},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("git add: %w", err)
-		}
-		if addRes.ExitCode != 0 {
-			return nil, fmt.Errorf("git add failed with exit code %d: %s", addRes.ExitCode, addRes.Stderr)
-		}
-
-		subject := opts.Subject
-		if subject == "" {
-			subject = "Pending changes"
-		}
-
-		commitRes, err := s.ExecCommand(ctx, tools.ExecCommandOptions{
-			Command: []string{
-				"git", "-C", repoDir,
-				"-c", "user.name=" + name,
-				"-c", "user.email=" + email,
-				"commit", "-m", subject,
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("git commit: %w", err)
-		}
-		if commitRes.ExitCode != 0 {
-			return nil, fmt.Errorf("git commit failed with exit code %d: %s", commitRes.ExitCode, commitRes.Stderr)
-		}
+		return nil, ErrUncommittedChanges
 	}
 
 	// 2. Check diff against base commit.
@@ -229,17 +195,4 @@ func (s *Sandbox) ExportCommits(ctx context.Context, opts ExportOptions) (*Expor
 		Tip:          tip,
 		PackfilePath: packFilename,
 	}, nil
-}
-
-// parseAuthor parses "Name <email>" into name and email strings.
-func parseAuthor(author string) (name, email string, err error) {
-	addr, err := mail.ParseAddress(author)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid author %q: %w", author, err)
-	}
-	name = addr.Name
-	if name == "" {
-		name = addr.Address
-	}
-	return name, addr.Address, nil
 }
