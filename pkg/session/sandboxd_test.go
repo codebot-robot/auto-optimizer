@@ -53,6 +53,7 @@ type fakeProcessServer struct {
 	startStdout     [][]byte
 	startStderr     [][]byte
 	startExit       int32
+	startErr        error
 	startBlockCh    chan struct{}
 	stdinReceivedCh chan struct{}
 
@@ -86,6 +87,11 @@ func (f *fakeProcessServer) Start(req *processv1.StartRequest, stream processv1.
 	f.startCalls = append(f.startCalls, req)
 	if md, ok := metadata.FromIncomingContext(stream.Context()); ok {
 		f.capturedMD = md
+	}
+	if f.startErr != nil {
+		err := f.startErr
+		f.mu.Unlock()
+		return err
 	}
 	pid := f.startPID
 	if pid == 0 {
