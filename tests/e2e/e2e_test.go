@@ -86,6 +86,84 @@ func assertSandboxdAuthAndNoSecretsRBAC(t *testing.T, subH *Harness, sessionName
 	}
 }
 
+// startFixtureGitServer starts an HTTP git server for the bare repository at bareRepoDir
+// accessible to kind cluster nodes, with http.receivepack enabled to allow git pushes.
+func startFixtureGitServer(t *testing.T, bareRepoDir string) string {
+	t.Helper()
+
+	bareRepoDir = filepath.Clean(bareRepoDir)
+	if out, err := exec.Command("git", "-C", bareRepoDir, "config", "http.receivepack", "true").CombinedOutput(); err != nil {
+		t.Fatalf("failed to set http.receivepack on bare repo: %v\nOutput: %s", err, string(out))
+	}
+
+	execPathOut, err := exec.Command("git", "--exec-path").CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to locate git exec-path: %v\nOutput: %s", err, string(execPathOut))
+	}
+	execPath := strings.TrimSpace(string(execPathOut))
+	gitHTTPBackend := filepath.Join(execPath, "git-http-backend")
+	if _, err := os.Stat(gitHTTPBackend); err != nil {
+		t.Fatalf("git-http-backend binary not found at %s (checked git --exec-path): %v", gitHTTPBackend, err)
+	}
+
+	dockerCmd := exec.Command("docker", "network", "inspect", "kind")
+	var netInspectErr bytes.Buffer
+	dockerCmd.Stderr = &netInspectErr
+	netInspectOut, err := dockerCmd.Output()
+	if err != nil {
+		t.Fatalf("failed to inspect docker network kind: %v\nStderr: %s", err, netInspectErr.String())
+	}
+	if idx := bytes.IndexByte(netInspectOut, '['); idx >= 0 {
+		netInspectOut = netInspectOut[idx:]
+	}
+
+	type dockerNetConfig struct {
+		IPAM struct {
+			Config []struct {
+				Subnet  string `json:"Subnet"`
+				Gateway string `json:"Gateway"`
+			} `json:"Config"`
+		} `json:"IPAM"`
+	}
+	var dockerNets []dockerNetConfig
+	if err := json.Unmarshal(netInspectOut, &dockerNets); err != nil || len(dockerNets) == 0 {
+		t.Fatalf("failed to parse docker network inspect kind output: %v\nOutput: %s", err, string(netInspectOut))
+	}
+
+	var kindGatewayIPv4 string
+	for _, cfg := range dockerNets[0].IPAM.Config {
+		ip := net.ParseIP(cfg.Gateway)
+		if ip != nil && ip.To4() != nil && cfg.Gateway != "" {
+			kindGatewayIPv4 = cfg.Gateway
+			break
+		}
+	}
+	if kindGatewayIPv4 == "" {
+		t.Fatalf("could not find IPv4 gateway in docker network inspect kind: %s", string(netInspectOut))
+	}
+
+	gitListener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("failed to listen for git HTTP server: %v", err)
+	}
+
+	gitPort := gitListener.Addr().(*net.TCPAddr).Port
+	gitHandler := &cgi.Handler{
+		Path: gitHTTPBackend,
+		Env: []string{
+			"GIT_PROJECT_ROOT=" + filepath.Dir(bareRepoDir),
+			"GIT_HTTP_EXPORT_ALL=1",
+		},
+	}
+	gitServer := &http.Server{Handler: gitHandler}
+	go func() { _ = gitServer.Serve(gitListener) }()
+	t.Cleanup(func() { _ = gitServer.Close() })
+
+	repoURL := fmt.Sprintf("http://%s:%d/%s", kindGatewayIPv4, gitPort, filepath.Base(bareRepoDir))
+	t.Logf("Git repository available at %s (backend %s)", repoURL, gitHTTPBackend)
+	return repoURL
+}
+
 func TestSmoke(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e smoke tests")
@@ -895,75 +973,18 @@ func TestRunLifecycle(t *testing.T) {
 	baseCommit := runGit(workDir, "rev-parse", "HEAD")
 	runGit(workDir, "push", "origin", "HEAD:main")
 	runGit(bareRepoDir, "symbolic-ref", "HEAD", "refs/heads/main")
+	runGit(bareRepoDir, "config", "http.receivepack", "true")
 
-	// 2. Locate git-http-backend via git --exec-path and kind IPv4 gateway via docker network inspect kind
-	execPathOut, err := exec.Command("git", "--exec-path").CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to locate git exec-path: %v\nOutput: %s", err, string(execPathOut))
-	}
-	execPath := strings.TrimSpace(string(execPathOut))
-	gitHTTPBackend := filepath.Join(execPath, "git-http-backend")
-	if _, err := os.Stat(gitHTTPBackend); err != nil {
-		t.Fatalf("git-http-backend binary not found at %s (checked git --exec-path): %v", gitHTTPBackend, err)
-	}
+	// 2. Start fixture git server accessible to kind nodes
+	repoURL := startFixtureGitServer(t, bareRepoDir)
+	t.Logf("Git repository available at %s (base commit %s)", repoURL, baseCommit)
 
-	dockerCmd := exec.Command("docker", "network", "inspect", "kind")
-	var netInspectErr bytes.Buffer
-	dockerCmd.Stderr = &netInspectErr
-	netInspectOut, err := dockerCmd.Output()
-	if err != nil {
-		t.Fatalf("failed to inspect docker network kind: %v\nStderr: %s", err, netInspectErr.String())
+	// Assert the fixture git server accepts pushes
+	runGit(workDir, "push", repoURL, "HEAD:probe")
+	if got := runGit(bareRepoDir, "rev-parse", "refs/heads/probe"); got != baseCommit {
+		t.Fatalf("expected bare repo to have branch probe at %s, got %s", baseCommit, got)
 	}
-	if idx := bytes.IndexByte(netInspectOut, '['); idx >= 0 {
-		netInspectOut = netInspectOut[idx:]
-	}
-
-	type dockerNetConfig struct {
-		IPAM struct {
-			Config []struct {
-				Subnet  string `json:"Subnet"`
-				Gateway string `json:"Gateway"`
-			} `json:"Config"`
-		} `json:"IPAM"`
-	}
-	var dockerNets []dockerNetConfig
-	if err := json.Unmarshal(netInspectOut, &dockerNets); err != nil || len(dockerNets) == 0 {
-		t.Fatalf("failed to parse docker network inspect kind output: %v\nOutput: %s", err, string(netInspectOut))
-	}
-
-	var kindGatewayIPv4 string
-	for _, cfg := range dockerNets[0].IPAM.Config {
-		ip := net.ParseIP(cfg.Gateway)
-		if ip != nil && ip.To4() != nil && cfg.Gateway != "" {
-			kindGatewayIPv4 = cfg.Gateway
-			break
-		}
-	}
-	if kindGatewayIPv4 == "" {
-		t.Fatalf("could not find IPv4 gateway in docker network inspect kind: %s", string(netInspectOut))
-	}
-
-	// Start HTTP git server accessible to kind nodes at kindGatewayIPv4
-	gitListener, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("failed to listen for git HTTP server: %v", err)
-	}
-	defer gitListener.Close()
-
-	gitPort := gitListener.Addr().(*net.TCPAddr).Port
-	gitHandler := &cgi.Handler{
-		Path: gitHTTPBackend,
-		Env: []string{
-			"GIT_PROJECT_ROOT=" + gitBaseDir,
-			"GIT_HTTP_EXPORT_ALL=1",
-		},
-	}
-	gitServer := &http.Server{Handler: gitHandler}
-	go func() { _ = gitServer.Serve(gitListener) }()
-	t.Cleanup(func() { _ = gitServer.Close() })
-
-	repoURL := fmt.Sprintf("http://%s:%d/hello-repo.git", kindGatewayIPv4, gitPort)
-	t.Logf("Git repository available at %s (base commit %s, backend %s)", repoURL, baseCommit, gitHTTPBackend)
+	runGit(bareRepoDir, "branch", "-D", "probe")
 
 	// 3. Start ao serve with the repository registered
 	aoListener, err := net.Listen("tcp", "127.0.0.1:0")
