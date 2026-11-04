@@ -24,11 +24,13 @@ import (
 
 // FakeForge is an in-memory implementation of Forge for testing.
 type FakeForge struct {
-	mu              sync.RWMutex
-	refs            map[string]map[string]string            // repoURL -> ref -> commit
-	trees           map[string]map[string]map[string][]byte // repoURL -> commit -> path -> content
-	defaultBranches map[string]string                       // repoURL -> default branch
-	requestedBlobs  []string
+	mu                   sync.RWMutex
+	refs                 map[string]map[string]string            // repoURL -> ref -> commit
+	trees                map[string]map[string]map[string][]byte // repoURL -> commit -> path -> content
+	defaultBranches      map[string]string                       // repoURL -> default branch
+	requestedBlobs       []string
+	pullRequests         map[string][]PullRequest
+	openPullRequestError error
 }
 
 // NewFake creates a new FakeForge.
@@ -37,6 +39,7 @@ func NewFake() *FakeForge {
 		refs:            make(map[string]map[string]string),
 		trees:           make(map[string]map[string]map[string][]byte),
 		defaultBranches: make(map[string]string),
+		pullRequests:    make(map[string][]PullRequest),
 	}
 }
 
