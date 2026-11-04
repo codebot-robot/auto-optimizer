@@ -79,14 +79,20 @@ same PR as the code; GitHub issues hold the backlog, the design lives in the
 repository.
 
 - Solve only the specific issue. One idea per PR.
-- Keep the PR small enough to review in one sitting. If an issue needs more,
-  say so in the issue and split it.
+- Keep the PR small. See [Scope](#scope) below.
 - Do not check in binary files or large data files. Confirm this before you
   send a PR.
 - Code that is forked from an upstream example (for example the session loop
   from agent-sandbox's `examples/sandboxed-tools`) keeps the upstream license
   header and names its origin in the package comment.
 - Before pushing, read each commit message against its diff and remove any sentence that describes work not in that diff.
+
+### Scope
+
+- **One idea, one issue, one PR.** If a PR can be split into two ideas, split it. Problems found during review that lie outside the PR's idea become new issues.
+- **A good PR changes at most 200 lines, including tests.** Review effort grows roughly with the square of the diff, so two 100-line PRs cost about a quarter of one 200-line PR. If one idea needs more than 200 lines, say so on the issue before pushing and propose where to cut or how to order the parts.
+- **Issues carry a line budget.** An issue without one should be given one before it is assigned.
+- **Stack dependent PRs in order.** Open the first against `main`, and open each later one after the previous merges, so every diff shows only its own idea.
 
 ### Commit messages and PR descriptions
 
