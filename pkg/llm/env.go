@@ -29,8 +29,8 @@ var defaultTokenSource = func(ctx context.Context, scope ...string) (oauth2.Toke
 	return google.DefaultTokenSource(ctx, scope...)
 }
 
-// NewFromEnv returns the ChatClient for modelName: the built-in fake for
-// FakeModelEliza (which needs no API key), otherwise the OpenAI-compatible
+// NewFromEnv returns the ChatClient for modelName: the built-in fakes for
+// FakeModelEliza or FakeModelScript (which need no API key), otherwise the OpenAI-compatible
 // client configured from the environment.
 //
 // An explicit GEMINI_API_KEY takes precedence. When OPENAI_BASE_URL is unset
@@ -39,6 +39,9 @@ var defaultTokenSource = func(ctx context.Context, scope ...string) (oauth2.Toke
 func NewFromEnv(modelName string) (ChatClient, error) {
 	if modelName == FakeModelEliza {
 		return &ElizaClient{}, nil
+	}
+	if modelName == FakeModelScript {
+		return NewScriptClientFromEnv()
 	}
 
 	baseURL := os.Getenv("OPENAI_BASE_URL")
