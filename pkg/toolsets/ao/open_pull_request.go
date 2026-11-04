@@ -58,8 +58,10 @@ func (t *OpenPullRequestTool) Schema() llm.Tool {
 		Type: "function",
 		Function: llm.ToolFunction{
 			Name: "open_pull_request",
-			Description: "Call this tool to request opening a pull request. The control plane " +
-				"reviews, commits and pushes your changes and opens the pull request. " +
+			Description: "Call this tool to request opening a pull request. " +
+				"You must commit your changes with git before calling this tool: " +
+				"the control plane pushes the commits that exist on the branch and " +
+				"opens the pull request from them; nothing uncommitted is included. " +
 				"The session ends after this call.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -88,9 +90,10 @@ func (t *OpenPullRequestTool) Schema() llm.Tool {
 }
 
 // Run implements tools.Tool. It verifies the repository URL and branch match
-// the expected values, rejects an empty title with a tool error, and returns
+// the expected values, rejects an empty title with a tool error, verifies the
+// working tree is clean via git status in the sandbox, and returns
 // session.ErrPullRequestRequested to signal the control plane to take over.
-func (t *OpenPullRequestTool) Run(_ context.Context, _ tools.Sandbox) (llm.Message, error) {
+func (t *OpenPullRequestTool) Run(ctx context.Context, sandbox tools.Sandbox) (llm.Message, error) {
 	if !repoMatches(t.Repository, t.expected.Repository) {
 		return llm.Message{}, fmt.Errorf("unexpected repository %q, expected %q", t.Repository, t.expected.Repository)
 	}
@@ -99,6 +102,50 @@ func (t *OpenPullRequestTool) Run(_ context.Context, _ tools.Sandbox) (llm.Messa
 	}
 	if strings.TrimSpace(t.Title) == "" {
 		return llm.Message{}, errors.New("title is required")
+	}
+
+	if sandbox == nil {
+		return llm.Message{}, errors.New("sandbox is required")
+	}
+
+	res, err := sandbox.ExecCommand(ctx, tools.ExecCommandOptions{
+		Command: []string{"git", "-C", "/workspace/repo", "status", "--porcelain"},
+	})
+	if err != nil {
+		return llm.Message{}, fmt.Errorf("git status: %w", err)
+	}
+	if res == nil {
+		return llm.Message{}, errors.New("git status returned nil result")
+	}
+	if res.ExitCode != 0 {
+		stderr := strings.TrimSpace(res.Stderr)
+		if stderr != "" {
+			return llm.Message{}, fmt.Errorf("git status failed with exit code %d: %s", res.ExitCode, stderr)
+		}
+		return llm.Message{}, fmt.Errorf("git status failed with exit code %d", res.ExitCode)
+	}
+
+	if strings.TrimSpace(res.Stdout) != "" {
+		var paths []string
+		for _, line := range strings.Split(res.Stdout, "\n") {
+			line = strings.TrimRight(line, "\r")
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			path := strings.TrimSpace(line)
+			if len(line) > 3 {
+				path = strings.TrimSpace(line[3:])
+			}
+			paths = append(paths, path)
+			if len(paths) == 5 {
+				break
+			}
+		}
+		msg := "the working tree has uncommitted changes; commit them with git, then call open_pull_request again"
+		if len(paths) > 0 {
+			msg += ": " + strings.Join(paths, ", ")
+		}
+		return llm.Message{}, errors.New(msg)
 	}
 
 	content := "Pull request recorded. The control plane will review and push your changes."
