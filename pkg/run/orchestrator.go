@@ -60,6 +60,10 @@ type OrchestratorOptions struct {
 	Clock             func() time.Time
 	MaxTurns          int
 	MaxConcurrentRuns int
+
+	// GitAuthor is the identity configured as git user.name and user.email in
+	// each run's sandbox, as `Name <email>`.
+	GitAuthor string
 }
 
 // Orchestrator reconciles runs in phase Pending and Working using a controller-runtime controller.
@@ -70,6 +74,7 @@ type Orchestrator struct {
 	clock             func() time.Time
 	maxTurns          int
 	maxConcurrentRuns int
+	gitAuthor         string
 
 	notifyCh chan event.TypedGenericEvent[Request]
 
@@ -124,6 +129,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		clock:             clock,
 		maxTurns:          maxTurns,
 		maxConcurrentRuns: maxConcurrentRuns,
+		gitAuthor:         opts.GitAuthor,
 		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
 		activeRuns:        make(map[string]bool),
 	}, nil
