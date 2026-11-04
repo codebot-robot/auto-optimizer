@@ -25,7 +25,11 @@ import (
 )
 
 func TestOpenPullRequestTool_Schema(t *testing.T) {
-	tool := NewOpenPullRequestTool()
+	expected := OpenPullRequestExpectation{
+		Repository: "https://github.com/example/repo",
+		Branch:     "ao/goal/run-1",
+	}
+	tool := NewOpenPullRequestTool(expected)
 	schema := tool.Schema()
 
 	if schema.Function.Name != "open_pull_request" {
@@ -40,29 +44,37 @@ func TestOpenPullRequestTool_Schema(t *testing.T) {
 		t.Fatalf("parameters is %T, want map[string]any", schema.Function.Parameters)
 	}
 	req, ok := params["required"].([]string)
-	if !ok || !slices.Equal(req, []string{"title", "body"}) {
-		t.Errorf("required parameters = %v, want ['title', 'body']", req)
+	wantReq := []string{"repository", "branch", "title", "body"}
+	if !ok || !slices.Equal(req, wantReq) {
+		t.Errorf("required parameters = %v, want %v", req, wantReq)
 	}
 
 	props, ok := params["properties"].(map[string]any)
 	if !ok {
 		t.Fatalf("properties is %T, want map[string]any", params["properties"])
 	}
-	titleProp, ok := props["title"].(map[string]any)
-	if !ok || titleProp["type"] != "string" {
-		t.Errorf("title property = %v, want type: string", titleProp)
-	}
-	bodyProp, ok := props["body"].(map[string]any)
-	if !ok || bodyProp["type"] != "string" {
-		t.Errorf("body property = %v, want type: string", bodyProp)
+	for _, prop := range wantReq {
+		p, ok := props[prop].(map[string]any)
+		if !ok || p["type"] != "string" {
+			t.Errorf("property %q = %v, want type: string", prop, p)
+		}
+		if desc, ok := p["description"].(string); !ok || desc == "" {
+			t.Errorf("property %q description is empty", prop)
+		}
 	}
 }
 
 func TestOpenPullRequestTool_Run(t *testing.T) {
 	ctx := t.Context()
+	expected := OpenPullRequestExpectation{
+		Repository: "https://github.com/example/repo",
+		Branch:     "ao/goal/run-1",
+	}
 
-	// 1. Run with Title and Body populated
-	tool := NewOpenPullRequestTool()
+	// 1. Run with matching repository, branch, title, body succeeds with sentinel
+	tool := NewOpenPullRequestTool(expected)
+	tool.Repository = "https://github.com/example/repo"
+	tool.Branch = "ao/goal/run-1"
 	tool.Title = "Optimize database index queries"
 	tool.Body = "Adds compound index on (repo, goal, run_id)."
 
@@ -83,9 +95,62 @@ func TestOpenPullRequestTool_Run(t *testing.T) {
 		t.Errorf("tool.Body = %q, want 'Adds compound index on (repo, goal, run_id).'", tool.Body)
 	}
 
-	// 2. Run with empty or whitespace title returns tool error without sentinel
+	// 2. Trailing .git and slash variants match successfully
+	repoVariants := []string{
+		"https://github.com/example/repo.git",
+		"https://github.com/example/repo/",
+		"https://github.com/example/repo.git/",
+	}
+	for _, variant := range repoVariants {
+		vTool := NewOpenPullRequestTool(expected)
+		vTool.Repository = variant
+		vTool.Branch = expected.Branch
+		vTool.Title = "Valid title"
+		vTool.Body = "Valid body"
+		if _, err := vTool.Run(ctx, nil); !errors.Is(err, session.ErrPullRequestRequested) {
+			t.Errorf("Run with repo variant %q err = %v, want ErrPullRequestRequested", variant, err)
+		}
+	}
+
+	// 3. Wrong repository returns error naming expected value without sentinel
+	wrongRepoTool := NewOpenPullRequestTool(expected)
+	wrongRepoTool.Repository = "https://github.com/other/repo"
+	wrongRepoTool.Branch = expected.Branch
+	wrongRepoTool.Title = "Valid title"
+	wrongRepoTool.Body = "Valid body"
+	if _, err := wrongRepoTool.Run(ctx, nil); err == nil {
+		t.Error("Run with wrong repo returned nil error, want error")
+	} else {
+		if errors.Is(err, session.ErrPullRequestRequested) {
+			t.Error("Run with wrong repo returned ErrPullRequestRequested, want ordinary error")
+		}
+		if !strings.Contains(err.Error(), expected.Repository) {
+			t.Errorf("Run with wrong repo error %q does not name expected repo %q", err.Error(), expected.Repository)
+		}
+	}
+
+	// 4. Wrong branch returns error naming expected value without sentinel
+	wrongBranchTool := NewOpenPullRequestTool(expected)
+	wrongBranchTool.Repository = expected.Repository
+	wrongBranchTool.Branch = "main"
+	wrongBranchTool.Title = "Valid title"
+	wrongBranchTool.Body = "Valid body"
+	if _, err := wrongBranchTool.Run(ctx, nil); err == nil {
+		t.Error("Run with wrong branch returned nil error, want error")
+	} else {
+		if errors.Is(err, session.ErrPullRequestRequested) {
+			t.Error("Run with wrong branch returned ErrPullRequestRequested, want ordinary error")
+		}
+		if !strings.Contains(err.Error(), expected.Branch) {
+			t.Errorf("Run with wrong branch error %q does not name expected branch %q", err.Error(), expected.Branch)
+		}
+	}
+
+	// 5. Run with empty or whitespace title returns tool error without sentinel
 	for _, badTitle := range []string{"", "   "} {
-		badTool := NewOpenPullRequestTool()
+		badTool := NewOpenPullRequestTool(expected)
+		badTool.Repository = expected.Repository
+		badTool.Branch = expected.Branch
 		badTool.Title = badTitle
 		badTool.Body = "Some body"
 		if _, err := badTool.Run(ctx, nil); err == nil {
@@ -95,11 +160,17 @@ func TestOpenPullRequestTool_Run(t *testing.T) {
 		}
 	}
 
-	// 3. Unmarshal JSON into tool, keeps Title and Body and returns sentinel
-	unmarshalTool := NewOpenPullRequestTool()
-	jsonInput := `{"title":"Refactor cache layer","body":"Replaces map with sync.Map."}`
+	// 6. Unmarshal JSON into tool, keeps Title, Body, Repository, Branch and returns sentinel
+	unmarshalTool := NewOpenPullRequestTool(expected)
+	jsonInput := `{"repository":"https://github.com/example/repo","branch":"ao/goal/run-1","title":"Refactor cache layer","body":"Replaces map with sync.Map."}`
 	if err := json.Unmarshal([]byte(jsonInput), unmarshalTool); err != nil {
 		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	if unmarshalTool.Repository != "https://github.com/example/repo" {
+		t.Errorf("Repository = %q, want 'https://github.com/example/repo'", unmarshalTool.Repository)
+	}
+	if unmarshalTool.Branch != "ao/goal/run-1" {
+		t.Errorf("Branch = %q, want 'ao/goal/run-1'", unmarshalTool.Branch)
 	}
 	if unmarshalTool.Title != "Refactor cache layer" {
 		t.Errorf("Title = %q, want 'Refactor cache layer'", unmarshalTool.Title)
@@ -114,11 +185,5 @@ func TestOpenPullRequestTool_Run(t *testing.T) {
 	}
 	if jsonMsg.Content == nil || !strings.Contains(*jsonMsg.Content, "recorded") {
 		t.Errorf("jsonMsg.Content = %v, want non-nil containing 'recorded'", jsonMsg.Content)
-	}
-	if unmarshalTool.Title != "Refactor cache layer" {
-		t.Errorf("unmarshalTool.Title = %q, want 'Refactor cache layer'", unmarshalTool.Title)
-	}
-	if unmarshalTool.Body != "Replaces map with sync.Map." {
-		t.Errorf("unmarshalTool.Body = %q, want 'Replaces map with sync.Map.'", unmarshalTool.Body)
 	}
 }

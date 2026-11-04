@@ -18,6 +18,7 @@ package ao
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
@@ -27,16 +28,28 @@ import (
 
 var _ tools.Tool = &OpenPullRequestTool{}
 
+// OpenPullRequestExpectation holds the expected repository URL and branch for a run.
+type OpenPullRequestExpectation struct {
+	Repository string
+	Branch     string
+}
+
 // OpenPullRequestTool is a run-scoped tool that records the model's request
 // to open a pull request and ends the session so the control plane can take over.
 type OpenPullRequestTool struct {
-	Title string `json:"title"`
-	Body  string `json:"body"`
+	expected OpenPullRequestExpectation
+
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
+	Title      string `json:"title"`
+	Body       string `json:"body"`
 }
 
 // NewOpenPullRequestTool returns a new OpenPullRequestTool instance.
-func NewOpenPullRequestTool() *OpenPullRequestTool {
-	return &OpenPullRequestTool{}
+func NewOpenPullRequestTool(expected OpenPullRequestExpectation) *OpenPullRequestTool {
+	return &OpenPullRequestTool{
+		expected: expected,
+	}
 }
 
 // Schema implements tools.Tool.
@@ -51,6 +64,14 @@ func (t *OpenPullRequestTool) Schema() llm.Tool {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
+					"repository": map[string]any{
+						"type":        "string",
+						"description": "Repository URL for this run as given in the repository facts.",
+					},
+					"branch": map[string]any{
+						"type":        "string",
+						"description": "Branch name for this run as given in the repository facts.",
+					},
 					"title": map[string]any{
 						"type":        "string",
 						"description": "Title of the pull request.",
@@ -60,16 +81,22 @@ func (t *OpenPullRequestTool) Schema() llm.Tool {
 						"description": "Description of the pull request.",
 					},
 				},
-				"required": []string{"title", "body"},
+				"required": []string{"repository", "branch", "title", "body"},
 			},
 		},
 	}
 }
 
-// Run implements tools.Tool. It records the arguments, rejects an empty title
-// with a tool error, and returns session.ErrPullRequestRequested to signal
-// the control plane to take over.
+// Run implements tools.Tool. It verifies the repository URL and branch match
+// the expected values, rejects an empty title with a tool error, and returns
+// session.ErrPullRequestRequested to signal the control plane to take over.
 func (t *OpenPullRequestTool) Run(_ context.Context, _ tools.Sandbox) (llm.Message, error) {
+	if !repoMatches(t.Repository, t.expected.Repository) {
+		return llm.Message{}, fmt.Errorf("unexpected repository %q, expected %q", t.Repository, t.expected.Repository)
+	}
+	if t.Branch != t.expected.Branch {
+		return llm.Message{}, fmt.Errorf("unexpected branch %q, expected %q", t.Branch, t.expected.Branch)
+	}
 	if strings.TrimSpace(t.Title) == "" {
 		return llm.Message{}, errors.New("title is required")
 	}
@@ -79,4 +106,21 @@ func (t *OpenPullRequestTool) Run(_ context.Context, _ tools.Sandbox) (llm.Messa
 		Role:    "tool",
 		Content: &content,
 	}, session.ErrPullRequestRequested
+}
+
+func repoMatches(got, expected string) bool {
+	return normalizeRepo(got) == normalizeRepo(expected)
+}
+
+func normalizeRepo(repo string) string {
+	repo = strings.TrimSpace(repo)
+	for {
+		trimmed := strings.TrimSuffix(repo, "/")
+		trimmed = strings.TrimSuffix(trimmed, ".git")
+		if trimmed == repo {
+			break
+		}
+		repo = trimmed
+	}
+	return repo
 }
