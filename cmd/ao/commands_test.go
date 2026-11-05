@@ -117,6 +117,34 @@ func TestServeFlags(t *testing.T) {
 	} else if flag.DefValue != "4" {
 		t.Errorf("expected default max-concurrent-runs to be 4, got %s", flag.DefValue)
 	}
+	gitAuthor := cmd.Flag("git-author")
+	if gitAuthor == nil {
+		t.Error("expected --git-author flag on ao serve")
+	} else if gitAuthor.DefValue != "auto-optimizer <auto-optimizer@users.noreply.github.com>" {
+		t.Errorf("expected default git-author to be %q, got %s", "auto-optimizer <auto-optimizer@users.noreply.github.com>", gitAuthor.DefValue)
+	}
+}
+
+func TestServeGitAuthorValidation(t *testing.T) {
+	t.Run("valid custom author", func(t *testing.T) {
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{"--git-author", "Custom Bot <bot@example.com>"}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+	})
+
+	t.Run("unparsable value rejected", func(t *testing.T) {
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{"--git-author", "not-a-valid-address"}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err == nil {
+			t.Error("expected error for unparsable --git-author, got nil")
+		}
+	})
 }
 
 func TestServeMaxTurnsValidation(t *testing.T) {

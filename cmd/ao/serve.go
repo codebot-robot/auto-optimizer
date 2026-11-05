@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -58,6 +59,7 @@ type serveFlags struct {
 	repos             []string
 	maxTurns          int
 	maxConcurrentRuns int
+	gitAuthor         string
 }
 
 func newServeCommand() *cobra.Command {
@@ -115,6 +117,9 @@ func newServeCommand() *cobra.Command {
 			if flags.maxTurns <= 0 {
 				return fmt.Errorf("max-turns must be positive, got %d", flags.maxTurns)
 			}
+			if _, err := mail.ParseAddress(flags.gitAuthor); err != nil {
+				return fmt.Errorf("invalid --git-author: %w", err)
+			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -133,6 +138,7 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().StringArrayVar(&flags.repos, "repo", nil, "Repository URL to register with the forge (repeatable, or AO_REPOS env var)")
 	cmd.Flags().IntVar(&flags.maxTurns, "max-turns", 30, "Maximum number of session turns before ending a run")
 	cmd.Flags().IntVar(&flags.maxConcurrentRuns, "max-concurrent-runs", 4, "Maximum number of concurrent runs reconciled")
+	cmd.Flags().StringVar(&flags.gitAuthor, "git-author", "auto-optimizer <auto-optimizer@users.noreply.github.com>", "Identity configured as git user.name and user.email in each run's sandbox, as `Name <email>`")
 
 	return cmd
 }
@@ -287,6 +293,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		Harness:           orchestratorHarness,
 		MaxTurns:          flags.maxTurns,
 		MaxConcurrentRuns: flags.maxConcurrentRuns,
+		GitAuthor:         flags.gitAuthor,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing orchestrator: %w", err)

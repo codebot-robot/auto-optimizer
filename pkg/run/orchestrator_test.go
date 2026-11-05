@@ -1823,3 +1823,21 @@ func TestBuildSystemPrompt(t *testing.T) {
 		}
 	}
 }
+
+func TestOrchestrator_GitAuthor(t *testing.T) {
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+
+	const author = "auto-optimizer <auto-optimizer@users.noreply.github.com>"
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:     store,
+		Harness:   harness,
+		GitAuthor: author,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	if orch.gitAuthor != author {
+		t.Errorf("orch.gitAuthor = %q, want %q", orch.gitAuthor, author)
+	}
+}
