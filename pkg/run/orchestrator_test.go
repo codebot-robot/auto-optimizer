@@ -1769,9 +1769,14 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 
 func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
 		URL:           "https://github.com/gke-labs/test-repo",
@@ -1827,10 +1832,9 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
-
-	// Watch goroutine to mark created sandbox Ready, simulating agent-sandbox controller
 	go func() {
 		for {
 			select {
@@ -1898,9 +1902,14 @@ func (b *blockingConcurrentProcessServer) Execute(ctx context.Context, req *proc
 
 func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo1 := &state.Repo{
 		URL:           "https://github.com/gke-labs/repo1",
@@ -2013,6 +2022,7 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
 
@@ -2147,9 +2157,13 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 
 func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
 	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 	store := state.NewFileStore(storeDir)
 	sessionStore := session.NewFileStore(storeDir)
 
@@ -2235,10 +2249,9 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
-
-	// Wait for the Working run to be reconciled on start and reach NoImprovement
 	deadline := time.Now().Add(5 * time.Second)
 	var workingReconciled bool
 	for time.Now().Before(deadline) {
@@ -2393,9 +2406,14 @@ func TestOrchestrator_RunPageURL(t *testing.T) {
 
 func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
 		URL:           "https://github.com/gke-labs/test-repo",
@@ -2443,10 +2461,9 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
-
-	// Enqueue the pending run
 	orch.Notify(repo.Key(), runID)
 
 	// 1. Wait until the run enters Preparing and has a Sandbox created
@@ -2509,9 +2526,14 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 
 func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
 		URL:           "https://github.com/gke-labs/test-repo",
@@ -2555,6 +2577,7 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
 
@@ -2602,9 +2625,14 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 
 func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
 		URL:           "https://github.com/gke-labs/test-repo",
@@ -2648,6 +2676,7 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
 
