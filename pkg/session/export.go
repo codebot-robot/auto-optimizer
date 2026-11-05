@@ -70,68 +70,37 @@ func (s *Sandbox) ExportCommits(ctx context.Context, opts ExportOptions) (*Expor
 		return nil, errors.New("destination directory is required")
 	}
 
+	git := s.Git(repoDir)
+
 	// 1. Verify there are no uncommitted changes.
-	statusRes, err := s.ExecCommand(ctx, tools.ExecCommandOptions{
-		Command: []string{"git", "-C", repoDir, "status", "--porcelain"},
-	})
+	status, err := git.Status(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("git status: %w", err)
 	}
-	if statusRes.ExitCode != 0 {
-		return nil, fmt.Errorf("git status failed with exit code %d: %s", statusRes.ExitCode, statusRes.Stderr)
-	}
-	if strings.TrimSpace(statusRes.Stdout) != "" {
+	if len(status) > 0 {
 		return nil, ErrUncommittedChanges
 	}
 
 	// 2. Check diff against base commit.
-	diffQuietRes, err := s.ExecCommand(ctx, tools.ExecCommandOptions{
-		Command: []string{"git", "-C", repoDir, "diff", "--quiet", opts.Base, "HEAD"},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("git diff --quiet: %w", err)
-	}
-	if diffQuietRes.ExitCode == 0 {
-		return nil, ErrNoChanges
-	}
-	if diffQuietRes.ExitCode != 1 {
-		return nil, fmt.Errorf("git diff --quiet failed with exit code %d: %s", diffQuietRes.ExitCode, diffQuietRes.Stderr)
-	}
-
-	diffNamesRes, err := s.ExecCommand(ctx, tools.ExecCommandOptions{
-		Command: []string{"git", "-C", repoDir, "diff", "--name-only", opts.Base, "HEAD"},
-	})
+	changedPaths, err := git.ChangedPaths(ctx, opts.Base, "HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("git diff --name-only: %w", err)
 	}
-	if diffNamesRes.ExitCode != 0 {
-		return nil, fmt.Errorf("git diff --name-only failed with exit code %d: %s", diffNamesRes.ExitCode, diffNamesRes.Stderr)
+	if len(changedPaths) == 0 {
+		return nil, ErrNoChanges
 	}
 
-	for _, line := range strings.Split(diffNamesRes.Stdout, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		clean := path.Clean(strings.TrimPrefix(trimmed, "./"))
+	for _, p := range changedPaths {
+		clean := path.Clean(strings.TrimPrefix(p, "./"))
 		if clean == ".goals" || strings.HasPrefix(clean, ".goals/") {
 			return nil, ErrGoalsChanged
 		}
 	}
 
 	// 3. Read Tip with git rev-parse HEAD.
-	revParseRes, err := s.ExecCommand(ctx, tools.ExecCommandOptions{
-		Command: []string{"git", "-C", repoDir, "rev-parse", "HEAD"},
-	})
+	tip, err := git.RevParse(ctx, "HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("git rev-parse HEAD: %w", err)
-	}
-	if revParseRes.ExitCode != 0 {
-		return nil, fmt.Errorf("git rev-parse HEAD failed with exit code %d: %s", revParseRes.ExitCode, revParseRes.Stderr)
-	}
-	tip := strings.TrimSpace(revParseRes.Stdout)
-	if tip == "" {
-		return nil, errors.New("git rev-parse HEAD returned empty tip")
 	}
 
 	// 4. Produce the packfile streaming stdout to a temporary file in DestDir.
@@ -161,26 +130,18 @@ func (s *Sandbox) ExportCommits(ctx context.Context, opts ExportOptions) (*Expor
 		}
 	}()
 
-	revListRes, err := s.ExecCommand(ctx, tools.ExecCommandOptions{
-		Command: []string{"git", "-C", repoDir, "rev-list", "--objects", opts.Base + "..HEAD"},
-	})
+	revListRes, err := git.Run(ctx, "rev-list", "--objects", opts.Base+"..HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("git rev-list: %w", err)
 	}
-	if revListRes.ExitCode != 0 {
-		return nil, fmt.Errorf("git rev-list failed with exit code %d: %s", revListRes.ExitCode, revListRes.Stderr)
-	}
 
-	packRes, err := s.ExecCommand(ctx, tools.ExecCommandOptions{
-		Command: []string{"git", "-C", repoDir, "pack-objects", "--stdout", "--no-thin", "-q"},
+	_, err = git.RunWithOptions(ctx, tools.ExecCommandOptions{
+		Command: []string{"pack-objects", "--stdout", "--no-thin", "-q"},
 		Stdin:   strings.NewReader(revListRes.Stdout),
 		Stdout:  tmpFile,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to produce packfile: %w", err)
-	}
-	if packRes.ExitCode != 0 {
-		return nil, fmt.Errorf("packfile generation failed with exit code %d: %s", packRes.ExitCode, packRes.Stderr)
+		return nil, fmt.Errorf("packfile generation failed: %w", err)
 	}
 
 	if err := tmpFile.Close(); err != nil {

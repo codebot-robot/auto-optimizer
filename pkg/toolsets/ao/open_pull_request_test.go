@@ -121,7 +121,7 @@ func TestOpenPullRequestTool_Run(t *testing.T) {
 	if len(sandbox.calls) != 1 {
 		t.Fatalf("calls = %d, want 1", len(sandbox.calls))
 	}
-	wantCmd := []string{"git", "-C", "/workspace/repo", "status", "--porcelain"}
+	wantCmd := strings.Fields("git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all")
 	if diff := cmp.Diff(wantCmd, sandbox.calls[0].Command); diff != "" {
 		t.Errorf("command diff (-want +got):\n%s", diff)
 	}
@@ -193,7 +193,7 @@ func TestOpenPullRequestTool_Run(t *testing.T) {
 
 	// 6. Cheap argument checks fail before git status is called on a dirty sandbox
 	dirtySandbox := &fakeSandbox{
-		res: &tools.ExecCommandResult{Stdout: " M file.go\n"},
+		res: &tools.ExecCommandResult{Stdout: "? file.go\x00"},
 	}
 	cheapCheckTool := NewOpenPullRequestTool(expected)
 	cheapCheckTool.Repository = "https://github.com/wrong/repo"
@@ -243,7 +243,7 @@ func TestOpenPullRequestTool_Run_DirtyTree(t *testing.T) {
 	}
 	dirtySandbox := &fakeSandbox{
 		res: &tools.ExecCommandResult{
-			Stdout: " M pkg/tool.go\n?? new_file.txt\n",
+			Stdout: "1 .M N... 100644 100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 pkg/tool.go\x00? new_file.txt\x00",
 		},
 	}
 	tool := NewOpenPullRequestTool(expected)
@@ -276,7 +276,7 @@ func TestOpenPullRequestTool_Run_DirtyTree_MaxFivePaths(t *testing.T) {
 	}
 	dirtySandbox := &fakeSandbox{
 		res: &tools.ExecCommandResult{
-			Stdout: " M f1.go\n M f2.go\n M f3.go\n M f4.go\n M f5.go\n M f6.go\n M f7.go\n",
+			Stdout: "? f1.go\x00? f2.go\x00? f3.go\x00? f4.go\x00? f5.go\x00? f6.go\x00? f7.go\x00",
 		},
 	}
 	tool := NewOpenPullRequestTool(expected)
