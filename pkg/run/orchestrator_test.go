@@ -2302,3 +2302,75 @@ func TestOrchestrator_GitAuthor(t *testing.T) {
 		t.Errorf("orch.gitAuthor = %q, want %q", orch.gitAuthor, author)
 	}
 }
+
+func TestOrchestrator_PublicURL(t *testing.T) {
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:     store,
+		Harness:   harness,
+		PublicURL: "https://ao.example.com/",
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	if want := "https://ao.example.com"; orch.publicURL != want {
+		t.Errorf("orch.publicURL = %q, want %q", orch.publicURL, want)
+	}
+}
+
+func TestOrchestrator_RunPageURL(t *testing.T) {
+	repo := &state.Repo{Host: "github.com", Owner: "testowner", Name: "testrepo"}
+	run := &state.Run{ID: "20261105T120000Z-abcd", Repo: repo.Key()}
+
+	tests := []struct {
+		name      string
+		publicURL string
+		orchNil   bool
+		run       *state.Run
+		want      string
+	}{
+		{
+			name:      "configured",
+			publicURL: "https://ao.example.com",
+			run:       run,
+			want:      "https://ao.example.com/runs/20261105T120000Z-abcd",
+		},
+		{
+			name:      "trailing slash stripped",
+			publicURL: "https://ao.example.com/",
+			run:       run,
+			want:      "https://ao.example.com/runs/20261105T120000Z-abcd",
+		},
+		{
+			name: "unset",
+			run:  run,
+			want: "",
+		},
+		{
+			name:    "nil orchestrator",
+			orchNil: true,
+			run:     run,
+			want:    "",
+		},
+		{
+			name:      "nil run",
+			publicURL: "https://ao.example.com",
+			run:       nil,
+			want:      "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var orch *Orchestrator
+			if !tc.orchNil {
+				orch = &Orchestrator{publicURL: strings.TrimRight(tc.publicURL, "/")}
+			}
+			if got := orch.RunPageURL(repo, tc.run); got != tc.want {
+				t.Errorf("RunPageURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
