@@ -166,11 +166,13 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 	}
 	harness, agentsCS, _ := setupTestHarness(t, procSrv)
 
+	const author = "auto-optimizer <auto-optimizer@users.noreply.github.com>"
 	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
 	orch, err := NewOrchestrator(OrchestratorOptions{
-		Store:   store,
-		Harness: harness,
-		Clock:   func() time.Time { return fixedTime },
+		Store:     store,
+		Harness:   harness,
+		Clock:     func() time.Time { return fixedTime },
+		GitAuthor: author,
 	})
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -256,13 +258,13 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 		t.Errorf("expected sandbox name %s, got %s", gotRun.SandboxName, sb.Name)
 	}
 
-	// 6. Verify clone and checkout commands were issued directly without shell
+	// 6. Verify clone, checkout, and git config commands were issued directly without shell
 	procSrv.mu.Lock()
 	cmds = procSrv.commands
 	procSrv.mu.Unlock()
 
-	if len(cmds) != 2 {
-		t.Fatalf("expected exactly 2 commands executed in sandbox (clone then checkout), got %d: %+v", len(cmds), cmds)
+	if len(cmds) != 4 {
+		t.Fatalf("expected exactly 4 commands executed in sandbox (clone, checkout, 2 git config), got %d: %+v", len(cmds), cmds)
 	}
 
 	cloneCmdStr := strings.Join(cmds[0], " ")
@@ -275,20 +277,148 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 		t.Errorf("expected checkout command 'git -C /workspace/repo checkout commit-base123', got: %s", checkoutCmdStr)
 	}
 
-	// 4. Verify events.jsonl contains expected events
+	configNameCmdStr := strings.Join(cmds[2], " ")
+	if configNameCmdStr != "git -C /workspace/repo config user.name auto-optimizer" {
+		t.Errorf("expected config user.name command 'git -C /workspace/repo config user.name auto-optimizer', got: %s", configNameCmdStr)
+	}
+
+	configEmailCmdStr := strings.Join(cmds[3], " ")
+	if configEmailCmdStr != "git -C /workspace/repo config user.email auto-optimizer@users.noreply.github.com" {
+		t.Errorf("expected config user.email command 'git -C /workspace/repo config user.email auto-optimizer@users.noreply.github.com', got: %s", configEmailCmdStr)
+	}
+
+	// 7. Verify events.jsonl contains expected events
 	events, err := store.ReadEvents(ctx, repo.Key(), runID)
 	if err != nil {
 		t.Fatalf("ReadEvents: %v", err)
 	}
 	var phases []state.RunPhase
+	var foundIdentityEvent bool
 	for _, e := range events {
 		phases = append(phases, e.Phase)
+		if e.Kind == "git_identity_configured" && strings.Contains(e.Message, author) {
+			foundIdentityEvent = true
+		}
 	}
-	if len(events) < 5 {
-		t.Fatalf("expected at least 5 events (preparing phase, sandbox ready, clone command, checkout command, working phase), got %d: %+v", len(events), events)
+	if len(events) < 6 {
+		t.Fatalf("expected at least 6 events (preparing phase, sandbox ready, clone command, checkout command, git identity configured, working phase), got %d: %+v", len(events), events)
+	}
+	if !foundIdentityEvent {
+		t.Errorf("expected git identity configured event in events: %+v", events)
 	}
 	if phases[0] != state.PhasePreparing || phases[len(phases)-1] != state.PhaseWorking {
 		t.Errorf("unexpected event phases: %v", phases)
+	}
+}
+
+func TestOrchestrator_ConfigureGitIdentityFailure(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-gitfail"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "optimize-search",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit-base123",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &mockProcessServer{
+		exitCode: 0,
+		stdout:   "ok\n",
+	}
+	harness, agentsCS, _ := setupTestHarness(t, procSrv)
+
+	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:     store,
+		Harness:   harness,
+		Clock:     func() time.Time { return fixedTime },
+		GitAuthor: "invalid-author<",
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Step 1: Reconcile Pending run to Preparing.
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile step 1: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+
+	// Mark fake sandbox as Ready
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating sandbox to Ready: %v", err)
+	}
+
+	// Step 2: Reconcile Preparing run; clone/checkout succeed, but git identity fails.
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+		t.Logf("orch.Reconcile completed (errors handled)")
+	}
+
+	// 1. Verify run is in Failed phase
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
+	}
+	if !strings.Contains(gotRun.Error, "invalid author") {
+		t.Errorf("expected error to mention 'invalid author', got: %s", gotRun.Error)
+	}
+
+	// 2. Verify sandbox was deleted
+	_, err = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err == nil {
+		t.Errorf("expected sandbox %s to be deleted, but it still exists", gotRun.SandboxName)
+	} else if !k8serrors.IsNotFound(err) {
+		t.Errorf("expected NotFound error, got: %v", err)
+	}
+
+	// 3. Verify events recorded failure event
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundFailureEvent bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && strings.Contains(e.Message, "invalid author") {
+			foundFailureEvent = true
+			break
+		}
+	}
+	if !foundFailureEvent {
+		t.Errorf("expected a PhaseFailed event mentioning invalid author in events.jsonl, got: %+v", events)
 	}
 }
 
@@ -2145,6 +2275,7 @@ func TestBuildSystemPrompt(t *testing.T) {
 		"- Branch: ao/throughput/20261104T120000Z-0001",
 		"- Base Commit: abcdef123456",
 		"- Working Directory: /workspace/repo",
+		"Commit your changes with git before calling open_pull_request; only commits on the branch are pushed, nothing uncommitted is included.",
 		"# Rules",
 	}
 	for _, expected := range expectedSubstrings {
