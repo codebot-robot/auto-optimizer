@@ -108,35 +108,16 @@ func (t *OpenPullRequestTool) Run(ctx context.Context, sandbox tools.Sandbox) (l
 		return llm.Message{}, errors.New("sandbox is required")
 	}
 
-	res, err := sandbox.ExecCommand(ctx, tools.ExecCommandOptions{
-		Command: []string{"git", "-C", "/workspace/repo", "status", "--porcelain"},
-	})
+	git := session.NewGit(sandbox, "/workspace/repo")
+	entries, err := git.Status(ctx)
 	if err != nil {
 		return llm.Message{}, fmt.Errorf("git status: %w", err)
 	}
-	if res == nil {
-		return llm.Message{}, errors.New("git status returned nil result")
-	}
-	if res.ExitCode != 0 {
-		stderr := strings.TrimSpace(res.Stderr)
-		if stderr != "" {
-			return llm.Message{}, fmt.Errorf("git status failed with exit code %d: %s", res.ExitCode, stderr)
-		}
-		return llm.Message{}, fmt.Errorf("git status failed with exit code %d", res.ExitCode)
-	}
 
-	if strings.TrimSpace(res.Stdout) != "" {
+	if len(entries) > 0 {
 		var paths []string
-		for _, line := range strings.Split(res.Stdout, "\n") {
-			line = strings.TrimRight(line, "\r")
-			if strings.TrimSpace(line) == "" {
-				continue
-			}
-			path := strings.TrimSpace(line)
-			if len(line) > 3 {
-				path = strings.TrimSpace(line[3:])
-			}
-			paths = append(paths, path)
+		for _, e := range entries {
+			paths = append(paths, e.Path)
 			if len(paths) == 5 {
 				break
 			}
