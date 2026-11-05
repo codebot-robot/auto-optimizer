@@ -123,6 +123,12 @@ func TestServeFlags(t *testing.T) {
 	} else if gitAuthor.DefValue != "auto-optimizer <auto-optimizer@users.noreply.github.com>" {
 		t.Errorf("expected default git-author to be %q, got %s", "auto-optimizer <auto-optimizer@users.noreply.github.com>", gitAuthor.DefValue)
 	}
+	readyTimeoutFlag := cmd.Flag("ready-timeout")
+	if readyTimeoutFlag == nil {
+		t.Error("expected --ready-timeout flag on ao serve")
+	} else if readyTimeoutFlag.DefValue != "3m0s" {
+		t.Errorf("expected default ready-timeout to be 3m0s, got %s", readyTimeoutFlag.DefValue)
+	}
 }
 
 func TestServeGitAuthorValidation(t *testing.T) {

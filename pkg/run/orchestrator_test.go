@@ -32,10 +32,8 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
-	clientgotesting "k8s.io/client-go/testing"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	fakeagents "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
@@ -85,23 +83,6 @@ func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServe
 	t.Helper()
 
 	agentsCS := fakeagents.NewSimpleClientset()
-	// React to sandbox get by marking it Ready if it exists in the tracker
-	agentsCS.PrependReactor("get", "sandboxes", func(action clientgotesting.Action) (bool, runtime.Object, error) {
-		getAction := action.(clientgotesting.GetAction)
-		obj, err := agentsCS.Tracker().Get(action.GetResource(), getAction.GetNamespace(), getAction.GetName())
-		if err != nil {
-			return true, nil, err
-		}
-		sb := obj.(*sandboxv1beta1.Sandbox).DeepCopy()
-		sb.Status.Conditions = []metav1.Condition{
-			{
-				Type:   string(sandboxv1beta1.SandboxConditionReady),
-				Status: metav1.ConditionTrue,
-			},
-		}
-		return true, sb, nil
-	})
-
 	coreCS := fakek8s.NewSimpleClientset()
 	sandboxClient := session.NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
 
@@ -195,24 +176,79 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
-		t.Fatalf("orch.Reconcile: %v", err)
+	// Step 1: Reconcile Pending run.
+	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	if err != nil {
+		t.Fatalf("orch.Reconcile step 1: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("expected RequeueAfter > 0, got %v", res.RequeueAfter)
 	}
 
-	// 1. Verify run is in Working phase
+	// 1. After the first step the run has a SandboxName, is in Preparing phase, and has ReadyDeadline set.
 	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhasePreparing {
+		t.Errorf("expected phase %s, got %s", state.PhasePreparing, gotRun.Phase)
+	}
+	if gotRun.SandboxName != "run-20261030t120000z-abcd" {
+		t.Errorf("expected sandbox name 'run-20261030t120000z-abcd', got %q", gotRun.SandboxName)
+	}
+	if gotRun.ReadyDeadline == nil {
+		t.Fatal("expected ReadyDeadline to be set after step 1")
+	}
+
+	// 2. Verify fake Sandbox was created with the run label and repo annotation
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected sandbox to exist in Kubernetes, got err: %v", err)
+	}
+	if sb.Labels[LabelRun] != runID {
+		t.Errorf("expected sandbox label %s=%q, got %q", LabelRun, runID, sb.Labels[LabelRun])
+	}
+	if sb.Annotations[AnnotationRepo] != repo.Key().String() {
+		t.Errorf("expected sandbox annotation %s=%q, got %q", AnnotationRepo, repo.Key().String(), sb.Annotations[AnnotationRepo])
+	}
+
+	// 3. Worker is free: no clone or checkout commands have executed yet
+	procSrv.mu.Lock()
+	cmds := procSrv.commands
+	procSrv.mu.Unlock()
+	if len(cmds) != 0 {
+		t.Fatalf("expected 0 commands executed in step 1, got %d: %+v", len(cmds), cmds)
+	}
+
+	// 4. Update the fake Sandbox's status to Ready
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating fake sandbox to Ready: %v", err)
+	}
+
+	// Step 2: Second reconcile step executes clone and moves run to Working.
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile step 2: %v", err)
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
 	if gotRun.Phase != state.PhaseWorking {
 		t.Errorf("expected phase %s, got %s", state.PhaseWorking, gotRun.Phase)
 	}
-	if gotRun.SandboxName != "run-20261030t120000z-abcd" {
-		t.Errorf("expected sandbox name 'run-20261030t120000z-abcd', got %q", gotRun.SandboxName)
+	if gotRun.ReadyDeadline != nil {
+		t.Errorf("expected ReadyDeadline to be cleared in Working, got %v", gotRun.ReadyDeadline)
 	}
 
-	// 2. Verify sandbox still exists in Kubernetes (not deleted)
-	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	// 5. Verify sandbox still exists in Kubernetes (not deleted)
+	sb, err = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected sandbox to exist in Kubernetes, got err: %v", err)
 	}
@@ -220,9 +256,9 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 		t.Errorf("expected sandbox name %s, got %s", gotRun.SandboxName, sb.Name)
 	}
 
-	// 3. Verify clone and checkout commands were issued directly without shell
+	// 6. Verify clone and checkout commands were issued directly without shell
 	procSrv.mu.Lock()
-	cmds := procSrv.commands
+	cmds = procSrv.commands
 	procSrv.mu.Unlock()
 
 	if len(cmds) != 2 {
@@ -300,12 +336,41 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
+	// Step 1: reconcile Pending run to Preparing.
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile step 1: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhasePreparing {
+		t.Fatalf("expected phase %s after step 1, got %s", state.PhasePreparing, gotRun.Phase)
+	}
+
+	// Mark fake sandbox as Ready
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating sandbox to Ready: %v", err)
+	}
+
+	// Step 2: reconcile Preparing run with Ready sandbox; clone fails.
 	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err == nil {
 		t.Logf("orch.Reconcile completed (errors logged or returned)")
 	}
 
 	// 1. Verify run is in Failed phase
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -341,7 +406,7 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 	}
 }
 
-func TestOrchestrator_Resume_PreparingToFailed(t *testing.T) {
+func TestOrchestrator_Preparing_DeleteSandboxFailsRun(t *testing.T) {
 	ctx := t.Context()
 	store := state.NewFileStore(t.TempDir())
 
@@ -356,14 +421,13 @@ func TestOrchestrator_Resume_PreparingToFailed(t *testing.T) {
 		t.Fatalf("PutRepo: %v", err)
 	}
 
-	runID := "20261030T120000Z-interrupted"
+	runID := "20261030T120000Z-deleted"
 	run := &state.Run{
-		ID:          runID,
-		Repo:        repo.Key(),
-		GoalName:    "benchmark",
-		Phase:       state.PhasePreparing,
-		BaseCommit:  "commit-abc",
-		SandboxName: "run-20261030t120000z-interrupted",
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "optimize-search",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit-base123",
 	}
 	if err := store.PutRun(ctx, run); err != nil {
 		t.Fatalf("PutRun: %v", err)
@@ -371,7 +435,200 @@ func TestOrchestrator_Resume_PreparingToFailed(t *testing.T) {
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
-	// Pre-create the sandbox in Kubernetes to verify cleanup on resume
+	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:   store,
+		Harness: harness,
+		Clock:   func() time.Time { return fixedTime },
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Step 1: Reconcile creates sandbox and moves to Preparing
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile step 1: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhasePreparing {
+		t.Fatalf("expected Preparing phase, got %s", gotRun.Phase)
+	}
+
+	// Delete sandbox before readiness
+	if err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, gotRun.SandboxName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("Delete sandbox: %v", err)
+	}
+
+	// Step 2: Reconcile detects sandbox is gone and transitions run to Failed
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile step 2: %v", err)
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Errorf("expected Failed phase, got %s", gotRun.Phase)
+	}
+	if !strings.Contains(gotRun.Error, "deleted before becoming ready") {
+		t.Errorf("expected error to mention deleted before becoming ready, got: %q", gotRun.Error)
+	}
+
+	// Verify events contain failure event
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var failureEventFound bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && strings.Contains(e.Message, "deleted before becoming ready") {
+			failureEventFound = true
+			break
+		}
+	}
+	if !failureEventFound {
+		t.Errorf("expected failure event mentioning deleted before becoming ready in events: %+v", events)
+	}
+}
+
+func TestOrchestrator_Preparing_NeverReadyDeadlinePasses(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-timeout"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "optimize-search",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit-base123",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+
+	currentTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		Harness:      harness,
+		Clock:        func() time.Time { return currentTime },
+		ReadyTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Step 1: Reconcile creates sandbox and sets ReadyDeadline = currentTime + 10s
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile step 1: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhasePreparing {
+		t.Fatalf("expected Preparing phase, got %s", gotRun.Phase)
+	}
+	if gotRun.ReadyDeadline == nil {
+		t.Fatal("expected ReadyDeadline to be recorded on run")
+	}
+
+	// Advance clock past the deadline
+	currentTime = currentTime.Add(15 * time.Second)
+
+	// Step 2: Reconcile when deadline has passed fails the run
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile step 2: %v", err)
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Errorf("expected Failed phase, got %s", gotRun.Phase)
+	}
+	if !strings.Contains(gotRun.Error, "sandbox not ready before deadline") {
+		t.Errorf("expected error to mention sandbox not ready before deadline, got: %q", gotRun.Error)
+	}
+
+	// Verify sandbox was cleaned up
+	_, err = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err == nil {
+		t.Errorf("expected sandbox %s to be deleted after timeout, but it still exists", gotRun.SandboxName)
+	} else if !k8serrors.IsNotFound(err) {
+		t.Errorf("expected NotFound error, got: %v", err)
+	}
+
+	// Verify events contain failure event
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var timeoutEventFound bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && strings.Contains(e.Message, "sandbox not ready before deadline") {
+			timeoutEventFound = true
+			break
+		}
+	}
+	if !timeoutEventFound {
+		t.Errorf("expected failure event mentioning sandbox not ready before deadline in events: %+v", events)
+	}
+}
+
+func TestOrchestrator_Resume_PreparingEnqueued(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-preparing"
+	deadline := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	run := &state.Run{
+		ID:            runID,
+		Repo:          repo.Key(),
+		GoalName:      "benchmark",
+		Phase:         state.PhasePreparing,
+		BaseCommit:    "commit-abc",
+		SandboxName:   "run-20261030t120000z-preparing",
+		ReadyDeadline: &deadline,
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+
+	// Pre-create the sandbox in Kubernetes
 	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      run.SandboxName,
@@ -396,37 +653,29 @@ func TestOrchestrator_Resume_PreparingToFailed(t *testing.T) {
 		t.Fatalf("orch.Resume: %v", err)
 	}
 
-	// 1. Verify run is marked Failed
+	// 1. Verify run remains in Preparing phase (not failed)
 	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
-	if gotRun.Phase != state.PhaseFailed {
-		t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
-	}
-	if !strings.Contains(gotRun.Error, "server restarted") {
-		t.Errorf("expected error to explain restart, got: %s", gotRun.Error)
+	if gotRun.Phase != state.PhasePreparing {
+		t.Errorf("expected phase %s, got %s", state.PhasePreparing, gotRun.Phase)
 	}
 
-	// 2. Verify sandbox was deleted
+	// 2. Verify sandbox still exists
 	_, err = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{})
-	if err == nil {
-		t.Errorf("expected sandbox %s to be deleted on resume, but it still exists", run.SandboxName)
-	} else if !k8serrors.IsNotFound(err) {
-		t.Errorf("expected NotFound error, got: %v", err)
+	if err != nil {
+		t.Errorf("expected sandbox %s to exist, got: %v", run.SandboxName, err)
 	}
 
-	// 3. Verify restart event
-	events, err := store.ReadEvents(ctx, repo.Key(), runID)
-	if err != nil {
-		t.Fatalf("ReadEvents: %v", err)
-	}
-	if len(events) == 0 {
-		t.Fatal("expected at least 1 event appended")
-	}
-	lastEvent := events[len(events)-1]
-	if lastEvent.Phase != state.PhaseFailed || lastEvent.Kind != "restart" {
-		t.Errorf("unexpected last event: %+v", lastEvent)
+	// 3. Verify notification was sent
+	select {
+	case evt := <-orch.notifyCh:
+		if evt.Object.RunID != runID {
+			t.Errorf("expected enqueued run %s, got %s", runID, evt.Object.RunID)
+		}
+	default:
+		t.Error("expected Preparing run to be enqueued on Resume")
 	}
 }
 
@@ -946,11 +1195,34 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
+	// Step 1: Pending -> Preparing
 	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
-		t.Fatalf("orch.Reconcile 1: %v", err)
+		t.Fatalf("orch.Reconcile 1 (step 1): %v", err)
 	}
+
+	// Mark sandbox Ready
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, "run-20261030t120000z-fullflow", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating sandbox to Ready: %v", err)
+	}
+
+	// Step 2: Preparing -> Working
 	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
-		t.Fatalf("orch.Reconcile 2: %v", err)
+		t.Fatalf("orch.Reconcile 2 (step 2): %v", err)
+	}
+
+	// Step 3: Working -> NoImprovement
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile 3: %v", err)
 	}
 
 	// 1. Verify run reached NoImprovement
@@ -1382,7 +1654,7 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 		exitCode: 0,
 		stdout:   "Cloned successfully\n",
 	}
-	harness, _, _ := setupTestHarness(t, procSrv)
+	harness, agentsCS, _ := setupTestHarness(t, procSrv)
 
 	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
 	if err != nil {
@@ -1410,6 +1682,32 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 
 	go func() {
 		_ = mgr.Start(ctx)
+	}()
+
+	// Watch goroutine to mark created sandbox Ready, simulating agent-sandbox controller
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			runs, err := store.ListRuns(ctx, repo.Key())
+			if err == nil && len(runs) > 0 && runs[0].SandboxName != "" {
+				sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, runs[0].SandboxName, metav1.GetOptions{})
+				if err == nil && len(sb.Status.Conditions) == 0 {
+					sb.Status.Conditions = []metav1.Condition{
+						{
+							Type:   string(sandboxv1beta1.SandboxConditionReady),
+							Status: metav1.ConditionTrue,
+						},
+					}
+					_, _ = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{})
+					return
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}()
 
 	// The scheduler creates the pending run and calls Orchestrator.Notify.
@@ -1526,7 +1824,30 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 		},
 	}
 
-	harness, _, _ := setupTestHarness(t, procSrv)
+	harness, agentsCS, _ := setupTestHarness(t, procSrv)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			for _, sbName := range []string{"run-20261030t120000z-run1", "run-20261030t120000z-run2"} {
+				sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sbName, metav1.GetOptions{})
+				if err == nil && len(sb.Status.Conditions) == 0 {
+					sb.Status.Conditions = []metav1.Condition{
+						{
+							Type:   string(sandboxv1beta1.SandboxConditionReady),
+							Status: metav1.ConditionTrue,
+						},
+					}
+					_, _ = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{})
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
 
 	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
 	if err != nil {
@@ -1723,7 +2044,11 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 		t.Fatalf("PutRun prep: %v", err)
 	}
 
-	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+	procSrv := &mockProcessServer{
+		exitCode: 0,
+		stdout:   "ok",
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, &llm.ElizaClient{})
 
 	// Create sandboxes in fake k8s
 	for _, sbName := range []string{"run-working", "run-prep"} {
@@ -1783,13 +2108,18 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 		t.Fatal("expected working run to be enqueued on start and reach NoImprovement")
 	}
 
-	// Verify Preparing run was transitioned to Failed per Resume rule
-	rPrep, err := store.GetRun(ctx, repo.Key(), prepRunID)
-	if err != nil {
-		t.Fatalf("GetRun prep: %v", err)
+	// Verify Preparing run was enqueued on start and reached Working or NoImprovement
+	var prepReconciled bool
+	for time.Now().Before(deadline) {
+		rPrep, err := store.GetRun(ctx, repo.Key(), prepRunID)
+		if err == nil && (rPrep.Phase == state.PhaseWorking || rPrep.Phase == state.PhaseNoImprovement) {
+			prepReconciled = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if rPrep.Phase != state.PhaseFailed {
-		t.Errorf("expected preparing run to become Failed on start, got %s", rPrep.Phase)
+	if !prepReconciled {
+		t.Fatal("expected preparing run to be enqueued on start and reach Working or NoImprovement")
 	}
 }
 

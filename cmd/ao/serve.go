@@ -60,6 +60,7 @@ type serveFlags struct {
 	maxTurns          int
 	maxConcurrentRuns int
 	gitAuthor         string
+	readyTimeout      time.Duration
 }
 
 func newServeCommand() *cobra.Command {
@@ -139,6 +140,7 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().IntVar(&flags.maxTurns, "max-turns", 30, "Maximum number of session turns before ending a run")
 	cmd.Flags().IntVar(&flags.maxConcurrentRuns, "max-concurrent-runs", 4, "Maximum number of concurrent runs reconciled")
 	cmd.Flags().StringVar(&flags.gitAuthor, "git-author", "auto-optimizer <auto-optimizer@users.noreply.github.com>", "Identity configured as git user.name and user.email in each run's sandbox, as `Name <email>`")
+	cmd.Flags().DurationVar(&flags.readyTimeout, "ready-timeout", run.DefaultReadyTimeout, "Maximum duration to wait for a sandbox to become ready")
 
 	return cmd
 }
@@ -294,6 +296,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		MaxTurns:          flags.maxTurns,
 		MaxConcurrentRuns: flags.maxConcurrentRuns,
 		GitAuthor:         flags.gitAuthor,
+		ReadyTimeout:      flags.readyTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing orchestrator: %w", err)
