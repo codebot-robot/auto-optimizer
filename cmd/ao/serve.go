@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/mail"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -60,6 +61,7 @@ type serveFlags struct {
 	maxTurns          int
 	maxConcurrentRuns int
 	gitAuthor         string
+	publicURL         string
 	readyTimeout      time.Duration
 }
 
@@ -121,6 +123,24 @@ func newServeCommand() *cobra.Command {
 			if _, err := mail.ParseAddress(flags.gitAuthor); err != nil {
 				return fmt.Errorf("invalid --git-author: %w", err)
 			}
+			if !cmd.Flags().Changed("public-url") {
+				if envPublicURL := os.Getenv("AO_PUBLIC_URL"); envPublicURL != "" {
+					flags.publicURL = envPublicURL
+				}
+			}
+			if flags.publicURL != "" {
+				u, err := url.Parse(flags.publicURL)
+				if err != nil {
+					return fmt.Errorf("invalid --public-url: %w", err)
+				}
+				if u.Scheme != "http" && u.Scheme != "https" {
+					return fmt.Errorf("invalid --public-url: scheme must be http or https, got %q", u.Scheme)
+				}
+				if u.Host == "" {
+					return fmt.Errorf("invalid --public-url: host must not be empty")
+				}
+				flags.publicURL = strings.TrimRight(flags.publicURL, "/")
+			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -140,6 +160,7 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().IntVar(&flags.maxTurns, "max-turns", 30, "Maximum number of session turns before ending a run")
 	cmd.Flags().IntVar(&flags.maxConcurrentRuns, "max-concurrent-runs", 4, "Maximum number of concurrent runs reconciled")
 	cmd.Flags().StringVar(&flags.gitAuthor, "git-author", "auto-optimizer <auto-optimizer@users.noreply.github.com>", "Identity configured as git user.name and user.email in each run's sandbox, as `Name <email>`")
+	cmd.Flags().StringVar(&flags.publicURL, "public-url", "", "Public base URL of this server, used for links in pull request bodies, for example https://ao.example.com")
 	cmd.Flags().DurationVar(&flags.readyTimeout, "ready-timeout", run.DefaultReadyTimeout, "Maximum duration to wait for a sandbox to become ready")
 
 	return cmd
@@ -296,6 +317,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		MaxTurns:          flags.maxTurns,
 		MaxConcurrentRuns: flags.maxConcurrentRuns,
 		GitAuthor:         flags.gitAuthor,
+		PublicURL:         flags.publicURL,
 		ReadyTimeout:      flags.readyTimeout,
 	})
 	if err != nil {

@@ -129,6 +129,12 @@ func TestServeFlags(t *testing.T) {
 	} else if readyTimeoutFlag.DefValue != "3m0s" {
 		t.Errorf("expected default ready-timeout to be 3m0s, got %s", readyTimeoutFlag.DefValue)
 	}
+	publicURLFlag := cmd.Flag("public-url")
+	if publicURLFlag == nil {
+		t.Error("expected --public-url flag on ao serve")
+	} else if publicURLFlag.DefValue != "" {
+		t.Errorf("expected default public-url to be empty, got %s", publicURLFlag.DefValue)
+	}
 }
 
 func TestServeGitAuthorValidation(t *testing.T) {
@@ -149,6 +155,82 @@ func TestServeGitAuthorValidation(t *testing.T) {
 		}
 		if err := cmd.PreRunE(cmd, nil); err == nil {
 			t.Error("expected error for unparsable --git-author, got nil")
+		}
+	})
+}
+
+func TestServePublicURLValidation(t *testing.T) {
+	t.Run("default empty", func(t *testing.T) {
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+		if got := cmd.Flag("public-url").Value.String(); got != "" {
+			t.Errorf("expected empty public-url, got %q", got)
+		}
+	})
+
+	t.Run("valid URL accepted with slash stripped", func(t *testing.T) {
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{"--public-url", "https://ao.example.com/"}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+		if got := cmd.Flag("public-url").Value.String(); got != "https://ao.example.com" {
+			t.Errorf("got public-url %q, want %q", got, "https://ao.example.com")
+		}
+	})
+
+	t.Run("invalid value rejected", func(t *testing.T) {
+		for _, invalid := range []string{
+			"not-a-valid-url",
+			"ftp://ao.example.com",
+			"http://",
+			"https://",
+			"://bad-url",
+		} {
+			t.Run(invalid, func(t *testing.T) {
+				cmd := newServeCommand()
+				if err := cmd.ParseFlags([]string{"--public-url", invalid}); err != nil {
+					t.Fatalf("ParseFlags: %v", err)
+				}
+				if err := cmd.PreRunE(cmd, nil); err == nil {
+					t.Errorf("expected error for invalid --public-url %q, got nil", invalid)
+				}
+			})
+		}
+	})
+
+	t.Run("environment variable accepted when flag unset", func(t *testing.T) {
+		t.Setenv("AO_PUBLIC_URL", "https://ao-env.example.com/")
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+		if got := cmd.Flag("public-url").Value.String(); got != "https://ao-env.example.com" {
+			t.Errorf("got public-url %q, want %q", got, "https://ao-env.example.com")
+		}
+	})
+
+	t.Run("flag overrides environment variable", func(t *testing.T) {
+		t.Setenv("AO_PUBLIC_URL", "https://ao-env.example.com/")
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{"--public-url", "https://ao-flag.example.com/"}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+		if got := cmd.Flag("public-url").Value.String(); got != "https://ao-flag.example.com" {
+			t.Errorf("got public-url %q, want %q", got, "https://ao-flag.example.com")
 		}
 	})
 }
