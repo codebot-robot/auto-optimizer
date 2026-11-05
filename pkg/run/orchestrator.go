@@ -592,6 +592,30 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 		}
 	}
 
+	if o.gitAuthor != "" {
+		if err := sb.ConfigureGitIdentity(ctx, "/workspace/repo", o.gitAuthor); err != nil {
+			log.Error(err, "failed to configure git identity; deleting sandbox", "run", run.ID, "sandbox", run.SandboxName)
+
+			// Delete sandbox
+			if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+				log.Error(delErr, "failed to delete sandbox after command failure", "sandbox", run.SandboxName)
+			}
+
+			run.ReadyDeadline = nil
+			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, err.Error())
+		}
+
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    o.clock().UTC(),
+			Phase:   state.PhasePreparing,
+			Kind:    "git_identity_configured",
+			Message: fmt.Sprintf("git identity configured: %s", o.gitAuthor),
+			Data:    map[string]any{"author": o.gitAuthor},
+		}); err != nil {
+			log.Error(err, "failed to append git_identity_configured event", "run", run.ID)
+		}
+	}
+
 	// Move to Working phase
 	workTime := o.clock().UTC()
 	run.SetPhase(state.PhaseWorking, workTime)
@@ -853,6 +877,7 @@ func buildSystemPrompt(basePrompt string, repo *state.Repo, run *state.Run, goal
 		}
 	}
 	sb.WriteString("- Working Directory: /workspace/repo\n\n")
+	sb.WriteString("Commit your changes with git before calling open_pull_request; only commits on the branch are pushed, nothing uncommitted is included.\n\n")
 
 	sb.WriteString("# Rules\n\n")
 	sb.WriteString("- Never edit .goals/ or the metric script.\n")
