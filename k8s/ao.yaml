@@ -51,6 +51,25 @@ rules:
     verbs:
       - get
       - list
+  - apiGroups:
+      - auto-optimizer.labs.gke.io
+    resources:
+      - heroruns
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - auto-optimizer.labs.gke.io
+    resources:
+      - heroruns/status
+    verbs:
+      - update
+      - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
