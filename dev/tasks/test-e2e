@@ -97,3 +97,12 @@ echo "=== Running dev/tasks/deploy-to-kube ==="
 "${REPO_ROOT}/dev/tasks/deploy-to-kube"
 
 echo "=== Kind cluster ${CLUSTER_NAME} prepared and ready for E2E tests ==="
+
+# ------------------------------------------------------------------------------
+# 4. Run Go E2E Tests
+# ------------------------------------------------------------------------------
+# Contract: ap e2e does not run Go e2e tests when this script exists.
+echo "=== Running Go E2E tests ==="
+cd "${REPO_ROOT}"
+RUN_E2E=1 GOTOOLCHAIN=auto go test -v -count=1 -timeout 30m ./tests/e2e/...
+
