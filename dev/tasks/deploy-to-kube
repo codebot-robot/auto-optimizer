@@ -26,7 +26,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 # - IN_CLUSTER_STORAGE_COMMIT: Check latest commit at https://github.com/gke-labs/in-cluster-storage/commits/main
 AGENT_SANDBOX_VERSION="v1.0.8"
 SERVICE_PORTALS_COMMIT="686b34d8aa74546af1039119bbfa6e05ead15f53"
-IN_CLUSTER_STORAGE_COMMIT="923578df519c02cd0da1b7455d8a1e0278a103c4"
+IN_CLUSTER_STORAGE_COMMIT="1b4fbb5bc4f8ffa9ace7304fe6cf36c86e247994"
 
 GOBIN="${REPO_ROOT}/.build/bin" GOTOOLCHAIN=auto go install github.com/gke-labs/gke-labs-infra/ap@latest
 "${REPO_ROOT}/.build/bin/ap" tool install "${REPO_ROOT}/.build/bin"
