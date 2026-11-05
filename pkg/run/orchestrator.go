@@ -81,6 +81,9 @@ type OrchestratorOptions struct {
 	// each run's sandbox, as `Name <email>`.
 	GitAuthor string
 
+	// PublicURL is the public base URL of this server, used for links in pull request bodies.
+	PublicURL string
+
 	ReadyTimeout time.Duration
 }
 
@@ -93,6 +96,7 @@ type Orchestrator struct {
 	maxTurns          int
 	maxConcurrentRuns int
 	gitAuthor         string
+	publicURL         string
 	readyTimeout      time.Duration
 
 	notifyCh chan event.TypedGenericEvent[Request]
@@ -154,10 +158,19 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		maxTurns:          maxTurns,
 		maxConcurrentRuns: maxConcurrentRuns,
 		gitAuthor:         opts.GitAuthor,
+		publicURL:         strings.TrimRight(opts.PublicURL, "/"),
 		readyTimeout:      readyTimeout,
 		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
 		activeRuns:        make(map[string]bool),
 	}, nil
+}
+
+// RunPageURL returns the public URL for a run's detail page, or empty when unset.
+func (o *Orchestrator) RunPageURL(repo *state.Repo, run *state.Run) string {
+	if o == nil || o.publicURL == "" || run == nil || run.ID == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/runs/%s", o.publicURL, run.ID)
 }
 
 // Notify enqueues a run for reconciliation.
