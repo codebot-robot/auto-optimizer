@@ -231,6 +231,22 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 	return mgr.Add(o)
 }
 
+// sandboxSource is a hand-written source.TypedSource[Request] that watches
+// Sandboxes in the control-plane namespace, maps the run label and repo
+// annotation to a Request, and enqueues it for reconciliation.
+//
+// A conventional controller-runtime setup uses source.Kind with an
+// EnqueueRequestForOwner or EnqueueRequestsFromMapFunc handler, but that
+// does not fit here for two reasons:
+//
+//  1. The reconciler's request type is run.Request{Repo, RunID}, not
+//     reconcile.Request. A run is a JSON record in the state directory, not a
+//     Kubernetes object, so a Sandbox cannot carry an owner reference to it
+//     and EnqueueRequestForOwner has nothing to enqueue.
+//  2. The sandbox watch uses the agent-sandbox typed clientset and a
+//     namespace-scoped shared informer rather than the manager's cache,
+//     because the manager's scheme does not include the Sandbox CRD types
+//     and unit tests supply an in-memory fake clientset.
 type sandboxSource struct {
 	agentsClient agentsclientset.Interface
 	namespace    string
