@@ -55,6 +55,24 @@ func ValidateRepoKey(key RepoKey) error {
 	return nil
 }
 
+// ParseRepoKey parses a string in the host/owner/name format (the exact inverse of RepoKey.String)
+// into a RepoKey, validating all components.
+func ParseRepoKey(s string) (RepoKey, error) {
+	parts := strings.Split(s, "/")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return RepoKey{}, fmt.Errorf("invalid repository key %q: expected host/owner/name", s)
+	}
+	key := RepoKey{
+		Host:  parts[0],
+		Owner: parts[1],
+		Name:  parts[2],
+	}
+	if err := ValidateRepoKey(key); err != nil {
+		return RepoKey{}, err
+	}
+	return key, nil
+}
+
 // ValidateGoalName checks that the goal name is non-empty and safe in branch names and paths.
 func ValidateGoalName(name string) error {
 	if name == "" {
