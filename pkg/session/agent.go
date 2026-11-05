@@ -943,16 +943,24 @@ func (s *Sandbox) execStart(ctx context.Context, opts tools.ExecCommandOptions) 
 // ExecCommand executes a command inside the sandbox container with specified options.
 // If Stdout or Stderr are nil in tools.ExecCommandOptions, they are captured internally and returned in the tools.ExecCommandResult.
 // If the command returns a non-zero exit code, that is _not_ treated as an error; the exit code is returned in the result.
+// When the caller's context is cancelled, ExecCommand returns ctx.Err() even if the exit event arrives first,
+// because the caller asked to stop and the exit code is a consequence of the signal, not a result.
 func (s *Sandbox) ExecCommand(ctx context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
 	if err := s.ensureClient(ctx); err != nil {
 		return nil, err
 	}
 
+	var res *tools.ExecCommandResult
+	var err error
 	if opts.Stdin != nil || opts.Stdout != nil || opts.Stderr != nil || opts.Stream {
-		return s.execStart(ctx, opts)
+		res, err = s.execStart(ctx, opts)
+	} else {
+		res, err = s.execExecute(ctx, opts)
 	}
-
-	return s.execExecute(ctx, opts)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return res, err
 }
 
 // SetStateDir configures the state directory for this session.
