@@ -314,6 +314,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		Store:             stateStore,
 		SessionStore:      sessionStore,
 		Harness:           orchestratorHarness,
+		KubeClient:        mgr.GetClient(),
 		MaxTurns:          flags.maxTurns,
 		MaxConcurrentRuns: flags.maxConcurrentRuns,
 		GitAuthor:         flags.gitAuthor,

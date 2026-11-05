@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 )
 
@@ -932,6 +933,12 @@ func TestRunLifecycle(t *testing.T) {
 		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
 	}
 
+	subH := h.WithT(t)
+	_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	t.Cleanup(func() {
+		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	})
+
 	// 1. Create a bare git repository with a goal in .goals/hello.md
 	gitBaseDir := t.TempDir()
 	bareRepoDir := filepath.Join(gitBaseDir, "hello-repo.git")
@@ -1100,7 +1107,6 @@ func TestRunLifecycle(t *testing.T) {
 	}
 
 	sandboxName := finalRun.SandboxName
-	subH := h.WithT(t)
 
 	// 5. Verify sandbox was deleted in Kubernetes after session ended
 	deleteDeadline := time.Now().Add(30 * time.Second)
@@ -1150,6 +1156,22 @@ func TestRunLifecycle(t *testing.T) {
 	fmtStr := string(getFmtOut)
 	if !strings.Contains(fmtStr, "NoImprovement") || !strings.Contains(fmtStr, "session ended without a pull request") || !strings.Contains(fmtStr, "Events:") {
 		t.Errorf("expected formatted run output to contain NoImprovement, event message, and Events, got:\n%s", fmtStr)
+	}
+
+	// 8. Verify exactly one HeroRun exists in the sandbox namespace whose spec.runID matches the run
+	hrOut, err := subH.Kubectl("get", "heroruns", "-n", "ao-sandboxes", "-o", "json")
+	if err != nil {
+		t.Fatalf("failed to get heroruns in ao-sandboxes: %v\nOutput: %s", err, hrOut)
+	}
+	var hrList herorunv1alpha1.HeroRunList
+	if err := json.Unmarshal([]byte(hrOut), &hrList); err != nil {
+		t.Fatalf("failed to unmarshal heroruns: %v\nOutput: %s", err, hrOut)
+	}
+	if len(hrList.Items) != 1 {
+		t.Fatalf("expected exactly 1 HeroRun in ao-sandboxes, got %d", len(hrList.Items))
+	}
+	if gotRunID := hrList.Items[0].Spec.RunID; gotRunID != finalRun.ID {
+		t.Errorf("expected HeroRun spec.runID %q, got %q", finalRun.ID, gotRunID)
 	}
 
 	t.Logf("PASS: session transcript for run %s shows agent reading cloned repository README", runID)

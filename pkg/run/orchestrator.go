@@ -25,6 +25,8 @@ import (
 	"github.com/go-logr/logr"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -33,6 +35,7 @@ import (
 	agentsclientset "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned"
 	informers "sigs.k8s.io/agent-sandbox/clients/k8s/informers/externalversions"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -41,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -90,6 +94,10 @@ type OrchestratorOptions struct {
 	PublicURL string
 
 	ReadyTimeout time.Duration
+
+	// KubeClient is the controller-runtime client used to publish HeroRun custom resources.
+	// When nil, as in most unit tests, publishing is skipped and logged once at startup.
+	KubeClient client.Client
 }
 
 // Orchestrator reconciles runs in phase Pending and Working using a controller-runtime controller.
@@ -103,6 +111,8 @@ type Orchestrator struct {
 	gitAuthor         string
 	publicURL         string
 	readyTimeout      time.Duration
+	kubeClient        client.Client
+	logNoKubeClient   sync.Once
 
 	notifyCh chan event.TypedGenericEvent[Request]
 
@@ -113,10 +123,27 @@ type Orchestrator struct {
 var _ reconcile.TypedReconciler[Request] = (*Orchestrator)(nil)
 var _ manager.Runnable = (*Orchestrator)(nil)
 
+// NewScheme builds a runtime.Scheme containing client-go types and the HeroRun types.
+func NewScheme() (*runtime.Scheme, error) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("adding client-go to scheme: %w", err)
+	}
+	if err := herorunv1alpha1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("adding herorun v1alpha1 to scheme: %w", err)
+	}
+	return scheme, nil
+}
+
 // NewManager builds a controller-runtime manager from rest.Config with metrics and health
 // endpoints disabled and leader election disabled.
 func NewManager(restConfig *rest.Config) (manager.Manager, error) {
+	scheme, err := NewScheme()
+	if err != nil {
+		return nil, err
+	}
 	return ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme: scheme,
 		Logger: klog.NewKlogr(),
 		Metrics: metricsserver.Options{
 			BindAddress: "0",
@@ -165,6 +192,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		gitAuthor:         opts.GitAuthor,
 		publicURL:         strings.TrimRight(opts.PublicURL, "/"),
 		readyTimeout:      readyTimeout,
+		kubeClient:        opts.KubeClient,
 		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
 		activeRuns:        make(map[string]bool),
 	}, nil
@@ -326,6 +354,11 @@ func (s *sandboxSource) mapSandboxToRequest(ctx context.Context, sb *sandboxv1be
 // Start implements manager.Runnable. On manager startup it calls Resume,
 // which enqueues all non-terminal runs. It then blocks until ctx is cancelled.
 func (o *Orchestrator) Start(ctx context.Context) error {
+	if o.kubeClient == nil {
+		o.logNoKubeClient.Do(func() {
+			scoped.Log(ctx).Info("HeroRun publishing skipped: no Kubernetes client configured")
+		})
+	}
 	if err := o.Resume(ctx); err != nil {
 		scoped.Log(ctx).Error(err, "failed to resume interrupted runs on startup")
 	}
@@ -351,6 +384,9 @@ func (o *Orchestrator) Resume(ctx context.Context) error {
 
 		for _, r := range runs {
 			if !r.Phase.IsTerminal() {
+				if r.Phase != state.PhasePending {
+					o.publishHeroRun(ctx, repo, r)
+				}
 				o.Notify(repo.Key(), r.ID)
 			}
 		}
@@ -429,7 +465,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 	// 1. Assign sandbox name if not already assigned
 	sandboxName := run.SandboxName
 	if sandboxName == "" {
-		sandboxName = fmt.Sprintf("run-%s", strings.ToLower(run.ID))
+		sandboxName = sandboxNameForRun(run.ID)
 		run.SandboxName = sandboxName
 	}
 
@@ -483,7 +519,79 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		log.Error(err, "failed to append Preparing phase event", "run", run.ID)
 	}
 
+	o.publishHeroRun(ctx, repo, run)
+
 	return nil
+}
+
+// sandboxNameForRun returns the canonical name for a run's Sandbox and HeroRun objects.
+func sandboxNameForRun(runID string) string {
+	return fmt.Sprintf("run-%s", strings.ToLower(runID))
+}
+
+// publishHeroRun publishes a thin HeroRun custom resource for run in the sandbox namespace.
+// It creates the object if it does not already exist; if it exists, it leaves it alone.
+// A publish failure never fails the run; it is logged and the next reconcile or restart retries.
+func (o *Orchestrator) publishHeroRun(ctx context.Context, repo *state.Repo, run *state.Run) {
+	if o.kubeClient == nil {
+		o.logNoKubeClient.Do(func() {
+			scoped.Log(ctx).Info("HeroRun publishing skipped: no Kubernetes client configured")
+		})
+		return
+	}
+	if repo == nil || run == nil {
+		return
+	}
+
+	name := sandboxNameForRun(run.ID)
+	namespace := ""
+	if o.harness != nil {
+		namespace = o.harness.Namespace()
+	}
+
+	log := scoped.Log(ctx)
+
+	var existing herorunv1alpha1.HeroRun
+	err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &existing)
+	if err == nil {
+		// Already exists; leave it alone (status handling is part 4).
+		return
+	}
+	if !k8serrors.IsNotFound(err) {
+		log.Error(err, "failed to get HeroRun", "run", run.ID, "heroRun", name)
+		return
+	}
+
+	goal := run.GoalName
+	if goal == "" && run.Goal != nil {
+		goal = run.Goal.Name
+	}
+
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelRun: run.ID,
+			},
+			Annotations: map[string]string{
+				AnnotationRepo: repo.Key().String(),
+			},
+		},
+		Spec: herorunv1alpha1.HeroRunSpec{
+			Repository: repo.URL,
+			Goal:       goal,
+			RunID:      run.ID,
+			BaseCommit: run.BaseCommit,
+		},
+	}
+
+	if err := o.kubeClient.Create(ctx, hr); err != nil {
+		if !k8serrors.IsAlreadyExists(err) {
+			log.Error(err, "failed to create HeroRun", "run", run.ID, "heroRun", name)
+		}
+		return
+	}
 }
 
 // isSandboxFailed inspects sandbox status conditions to detect failure before readiness.
