@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-logr/logr"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,6 +47,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
+	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -106,6 +108,10 @@ type OrchestratorOptions struct {
 	// KubeClient is the controller-runtime client used to publish HeroRun custom resources.
 	// When nil, as in most unit tests, publishing is skipped and logged once at startup.
 	KubeClient client.Client
+
+	// ForgeFor returns the Forge for a repository URL.
+	// If nil or returns an error, push operations in Selecting fail.
+	ForgeFor func(repoURL string) (forge.Forge, error)
 }
 
 // Orchestrator reconciles runs in phase Pending and Working using a controller-runtime controller.
@@ -122,6 +128,7 @@ type Orchestrator struct {
 	kubeClient        client.Client
 	logNoKubeClient   sync.Once
 	statusPublisher   *heroRunStatusPublisher
+	forgeFor          func(repoURL string) (forge.Forge, error)
 
 	notifyCh chan event.TypedGenericEvent[Request]
 
@@ -211,6 +218,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		publicURL:         strings.TrimRight(opts.PublicURL, "/"),
 		readyTimeout:      readyTimeout,
 		kubeClient:        opts.KubeClient,
+		forgeFor:          opts.ForgeFor,
 		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
 		activeRuns:        make(map[string]bool),
 	}
@@ -963,66 +971,47 @@ func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.
 	return nil
 }
 
-func (o *Orchestrator) failRun(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, kind, errMsg string) {
+func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, phase state.RunPhase, kind, message string) {
 	if ctx.Err() != nil {
 		return
 	}
 
-	failTime := o.clock().UTC()
-	run.SetPhase(state.PhaseFailed, failTime)
-	run.Error = errMsg
-	if err := o.putRun(ctx, repo, run); err != nil {
-		scoped.Log(ctx).Error(err, "failed to update run to Failed", "run", run.ID)
-	}
-
-	msg := errMsg
-	if kind == "failed" {
-		msg = fmt.Sprintf("Run failed: %s", errMsg)
-	}
-	event := state.Event{
-		Time:    failTime,
-		Phase:   state.PhaseFailed,
-		Kind:    kind,
-		Message: msg,
-		Error:   errMsg,
-	}
-	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, event); err != nil {
-		scoped.Log(ctx).Error(err, "failed to append failure event", "run", run.ID)
-	}
-
-	if sb != nil {
-		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-			scoped.Log(ctx).V(2).Info("error deleting sandbox after run failed", "sandbox", run.SandboxName, "error", delErr)
-		}
-	}
-}
-
-func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
-	o.failRun(ctx, repo, run, nil, "failed", errMsg)
-	return errors.New(errMsg)
-}
-
-func (o *Orchestrator) finishRunNoImprovement(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, kind, message string) error {
 	endTime := o.clock().UTC()
-	run.SetPhase(state.PhaseNoImprovement, endTime)
+	run.SetPhase(phase, endTime)
+	if phase == state.PhaseFailed {
+		run.Error = message
+	}
 	if err := o.putRun(ctx, repo, run); err != nil {
-		scoped.Log(ctx).Error(err, "failed to update run to NoImprovement", "run", run.ID)
+		scoped.Log(ctx).Error(err, "failed to update run phase", "phase", phase, "run", run.ID)
 	}
 
+	msg := message
+	if phase == state.PhaseFailed && kind == "failed" {
+		msg = fmt.Sprintf("Run failed: %s", message)
+	}
 	event := state.Event{
 		Time:    endTime,
-		Phase:   state.PhaseNoImprovement,
+		Phase:   phase,
 		Kind:    kind,
-		Message: message,
+		Message: msg,
+	}
+	if phase == state.PhaseFailed {
+		event.Error = message
 	}
 	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, event); err != nil {
 		scoped.Log(ctx).Error(err, "failed to append event", "kind", kind, "run", run.ID)
 	}
 
-	if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-		scoped.Log(ctx).V(2).Info("error deleting sandbox after session", "sandbox", run.SandboxName, "error", delErr)
+	if sb != nil {
+		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+			scoped.Log(ctx).V(2).Info("error deleting sandbox after run ended", "sandbox", run.SandboxName, "error", delErr)
+		}
 	}
-	return nil
+}
+
+func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
+	o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", errMsg)
+	return errors.New(errMsg)
 }
 
 func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
@@ -1176,11 +1165,13 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 
 	if errors.Is(turnErr, session.ErrSessionFinished) {
 		run.Summary = finishTool.Summary
-		return o.finishRunNoImprovement(ctx, repo, run, sb, "finished", finishTool.Summary)
+		o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "finished", finishTool.Summary)
+		return nil
 	}
 
 	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
-		return o.finishRunNoImprovement(ctx, repo, run, sb, "no_improvement", "session ended without a pull request")
+		o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "no_improvement", "session ended without a pull request")
+		return nil
 	}
 
 	if ctx.Err() != nil {
@@ -1206,19 +1197,19 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 
 	sandboxName := run.SandboxName
 	if sandboxName == "" {
-		o.failRun(ctx, repo, run, nil, "failed", "sandbox name is empty for selecting run")
+		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", "sandbox name is empty for selecting run")
 		return reconcile.Result{}, nil
 	}
 
 	sb := o.harness.GetOrAttachSandbox(sandboxName)
 	if sb == nil {
-		o.failRun(ctx, repo, run, nil, "failed", "failed to get sandbox handle")
+		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", "failed to get sandbox handle")
 		return reconcile.Result{}, nil
 	}
 
 	destDir, err := os.MkdirTemp("", "ao-export-*")
 	if err != nil {
-		o.failRun(ctx, repo, run, sb, "failed", fmt.Sprintf("creating temp dir for export: %v", err))
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "failed", fmt.Sprintf("creating temp dir for export: %v", err))
 		return reconcile.Result{}, nil
 	}
 	defer func() {
@@ -1234,16 +1225,18 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 	})
 	if err != nil {
 		if errors.Is(err, session.ErrNoChanges) {
-			return reconcile.Result{}, o.finishRunNoImprovement(ctx, repo, run, sb, "no_changes", "no changes against base commit")
-		}
-		if errors.Is(err, session.ErrGoalsChanged) {
-			return reconcile.Result{}, o.finishRunNoImprovement(ctx, repo, run, sb, "refused", "changes under .goals/")
-		}
-		if errors.Is(err, session.ErrUncommittedChanges) {
-			o.failRun(ctx, repo, run, sb, "failed", err.Error())
+			o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "no_changes", "no changes against base commit")
 			return reconcile.Result{}, nil
 		}
-		o.failRun(ctx, repo, run, sb, "failed", fmt.Sprintf("export commits: %v", err))
+		if errors.Is(err, session.ErrGoalsChanged) {
+			o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "refused", "changes under .goals/")
+			return reconcile.Result{}, nil
+		}
+		if errors.Is(err, session.ErrUncommittedChanges) {
+			o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "failed", err.Error())
+			return reconcile.Result{}, nil
+		}
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "failed", fmt.Sprintf("export commits: %v", err))
 		return reconcile.Result{}, nil
 	}
 
@@ -1252,6 +1245,14 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 }
 
 func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, res *session.ExportResult) error {
+	if res.PackfilePath != "" {
+		defer func() {
+			if err := os.Remove(res.PackfilePath); err != nil && !os.IsNotExist(err) {
+				scoped.Log(ctx).V(2).Info("failed to remove packfile", "path", res.PackfilePath, "error", err)
+			}
+		}()
+	}
+
 	now := o.clock().UTC()
 	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 		Time:    now,
@@ -1263,13 +1264,73 @@ func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run 
 		scoped.Log(ctx).Error(err, "failed to append commits_exported event", "run", run.ID)
 	}
 
-	if res.PackfilePath != "" {
-		if err := os.Remove(res.PackfilePath); err != nil && !os.IsNotExist(err) {
-			scoped.Log(ctx).V(2).Info("failed to remove packfile", "path", res.PackfilePath, "error", err)
-		}
+	if o.forgeFor == nil {
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("no forge configured for repository %s", repo.URL))
+		return nil
 	}
 
-	o.failRun(ctx, repo, run, sb, "push_not_implemented", "push not implemented")
+	f, err := o.forgeFor(repo.URL)
+	if err != nil {
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("selecting forge for %s: %v", repo.URL, err))
+		return nil
+	}
+	if f == nil {
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("no forge configured for repository %s", repo.URL))
+		return nil
+	}
+
+	packFile, err := os.Open(res.PackfilePath)
+	if err != nil {
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("opening packfile: %v", err))
+		return nil
+	}
+	defer func() {
+		if closeErr := packFile.Close(); closeErr != nil {
+			scoped.Log(ctx).V(2).Info("failed to close packfile", "error", closeErr)
+		}
+	}()
+
+	var creds forge.PushCredentialer
+	if c, ok := f.(forge.PushCredentialer); ok {
+		creds = c
+	}
+
+	branchName := run.BranchName()
+	pushErr := forge.PushPackfile(ctx, forge.PushPackfileOptions{
+		RemoteURL:   repo.URL,
+		Branch:      branchName,
+		Tip:         plumbing.NewHash(res.Tip),
+		Base:        plumbing.NewHash(run.BaseCommit),
+		Packfile:    packFile,
+		Credentials: creds,
+	})
+	if pushErr != nil {
+		if errors.Is(pushErr, forge.ErrBranchMoved) {
+			o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "branch_moved", "remote branch is not at base commit")
+			return nil
+		}
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("push packfile: %v", pushErr))
+		return nil
+	}
+
+	run.Branch = branchName
+
+	pushTime := o.clock().UTC()
+	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+		Time:    pushTime,
+		Phase:   state.PhaseSelecting,
+		Kind:    "branch_pushed",
+		Message: fmt.Sprintf("Pushed branch %s with tip %s", branchName, res.Tip),
+		Data: map[string]any{
+			"branch": branchName,
+			"tip":    res.Tip,
+		},
+	}); err != nil {
+		scoped.Log(ctx).Error(err, "failed to append branch_pushed event", "run", run.ID)
+	}
+
+	run.SetPhase(state.PhaseOpeningPR, pushTime)
+	o.finishRun(ctx, repo, run, sb, state.PhaseSucceeded, "pull_request_not_opened", "opening the pull request through the forge is the next step")
 	return nil
 }
 

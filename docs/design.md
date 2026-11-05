@@ -413,12 +413,10 @@ Runs are reconciled in response to events:
    base commit to HEAD out of the sandbox. It enforces refusals: runs with no
    changes against the base commit end in `NoImprovement` (event `no_changes`),
    changes under `.goals/` are refused as `NoImprovement` (event `refused`),
-   and uncommitted changes fail the run. Whatever the outcome, the sandbox is
-   deleted when the run leaves `Selecting`. For a metric goal, the orchestrator
-   starts a clean sandbox, clones the pushed branch, and runs `verify` and
-   `metric` with the median of N runs. It compares the result with the baseline
-   that it measured the same way. For a judged goal, it runs `verify` if the goal
-   has one.
+   and uncommitted changes fail the run. The control plane pushes the branch
+   with a lease on the base commit through the forge, and hands over to
+   `OpeningPR`. Whatever the outcome, the sandbox is deleted when the run leaves
+   `Selecting`.
 5. **OpeningPR.** The orchestrator opens or updates the PR through the forge.
    The harness writes the body. The body names the goal and the base commit,
    gives the baseline and candidate numbers and the improvement, states the

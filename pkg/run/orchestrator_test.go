@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -54,6 +55,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
+	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -3459,11 +3461,18 @@ func (s *scriptedExportServer) WriteStdin(context.Context, *processv1.WriteStdin
 	return &processv1.WriteStdinResponse{}, nil
 }
 
-func createTestPackfile(t *testing.T) (string, string, []byte) {
+func createTestRemoteAndPackfile(t *testing.T) (string, *git.Repository, *git.Repository, string, string, []byte) {
 	t.Helper()
-	work, err := git.PlainInit(t.TempDir(), false)
+	bareDir := filepath.Join(t.TempDir(), "remote.git")
+	bare, err := git.PlainInit(bareDir, true)
 	if err != nil {
-		t.Fatalf("PlainInit: %v", err)
+		t.Fatalf("PlainInit bare: %v", err)
+	}
+	remoteURL := "file://" + bareDir
+
+	work, err := git.PlainInit(filepath.Join(t.TempDir(), "work"), false)
+	if err != nil {
+		t.Fatalf("PlainInit work: %v", err)
 	}
 	wt, err := work.Worktree()
 	if err != nil {
@@ -3475,6 +3484,12 @@ func createTestPackfile(t *testing.T) (string, string, []byte) {
 	if err != nil {
 		t.Fatalf("Commit base: %v", err)
 	}
+
+	_, _ = work.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{remoteURL}})
+	if err := work.Push(&git.PushOptions{RemoteName: "origin"}); err != nil {
+		t.Fatalf("Push base: %v", err)
+	}
+
 	_ = os.WriteFile(filepath.Join(wt.Filesystem.Root(), "feat.txt"), []byte("feat"), 0644)
 	_, _ = wt.Add("feat.txt")
 	tipCommit, err := wt.Commit("feat", &git.CommitOptions{Author: &object.Signature{Name: "A", Email: "a@example.com", When: time.Now()}})
@@ -3489,7 +3504,7 @@ func createTestPackfile(t *testing.T) (string, string, []byte) {
 	if _, err := packfile.NewEncoder(buf, work.Storer, false).Encode(hashes, 10); err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
-	return baseCommit.String(), tipCommit.String(), buf.Bytes()
+	return remoteURL, bare, work, baseCommit.String(), tipCommit.String(), buf.Bytes()
 }
 
 func setupSelectingRun(t *testing.T, phase state.RunPhase, baseSHA string, procSrv processv1.ProcessServiceServer, llmClient llm.ChatClient) (*Orchestrator, state.Store, *fakeagents.Clientset, *state.Repo, *state.Run) {
@@ -3565,9 +3580,45 @@ func TestOrchestrator_Working_OpenPullRequest_TransitionsToSelecting(t *testing.
 	}
 }
 
-func TestOrchestrator_Selecting_ExportsCommits_PushNotImplemented(t *testing.T) {
+func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 	ctx := t.Context()
-	baseSHA, tipSHA, packBytes := createTestPackfile(t)
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	remoteURL, bare, _, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+
+	repoKey, err := state.ParseRepoURL(remoteURL)
+	if err != nil {
+		t.Fatalf("ParseRepoURL: %v", err)
+	}
+
+	repo := &state.Repo{
+		URL:           remoteURL,
+		Host:          repoKey.Host,
+		Owner:         repoKey.Owner,
+		Name:          repoKey.Name,
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-pushrun"
+	sandboxName := "run-20261030t120000z-pushrun"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "export-goal",
+		Phase:       state.PhaseSelecting,
+		BaseCommit:  baseSHA,
+		SandboxName: sandboxName,
+		PRTitle:     "Add feature",
+		PRBody:      "Implements feature",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
 	procSrv := &scriptedExportServer{
 		commands: map[string]string{
 			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
@@ -3577,38 +3628,441 @@ func TestOrchestrator_Selecting_ExportsCommits_PushNotImplemented(t *testing.T) 
 		},
 		pack: packBytes,
 	}
-	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, baseSHA, procSrv, nil)
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, nil)
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: "ao-sandboxes"},
+		Spec:       sandboxv1beta1.SandboxSpec{Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: time.Now().Add(5 * time.Minute)}, ShutdownPolicy: &policy}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox in fake k8s: %v", err)
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     30,
+		ForgeFor: func(repoURL string) (forge.Forge, error) {
+			return forge.NewGitRemote(), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	// 1. Verify run ended in Succeeded with Branch set
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
-	if gotRun.Phase != state.PhaseFailed || gotRun.Error != "push not implemented" {
-		t.Errorf("got phase %s error %q, want Failed/push not implemented", gotRun.Phase, gotRun.Error)
+	if gotRun.Phase != state.PhaseSucceeded {
+		t.Errorf("expected phase %s, got %s", state.PhaseSucceeded, gotRun.Phase)
+	}
+	wantBranch := "ao/export-goal/" + runID
+	if gotRun.Branch != wantBranch {
+		t.Errorf("expected branch %q, got %q", wantBranch, gotRun.Branch)
 	}
 
-	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
-	var foundExported, foundPushNotImpl bool
+	// 2. Verify bare remote has branch at tipSHA
+	refName := plumbing.ReferenceName("refs/heads/" + wantBranch)
+	ref, err := bare.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("bare.Reference(%s): %v", refName, err)
+	}
+	if ref.Hash().String() != tipSHA {
+		t.Errorf("expected remote ref %s to be %s, got %s", refName, tipSHA, ref.Hash().String())
+	}
+
+	// 3. Verify events: commits_exported, branch_pushed, pull_request_not_opened
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundExported, foundPushed, foundPRNotOpened bool
 	for _, e := range events {
 		if e.Phase == state.PhaseSelecting && e.Kind == "commits_exported" {
 			if m, ok := e.Data.(map[string]any); ok && m["tip"] == tipSHA {
 				foundExported = true
 			}
 		}
-		if e.Phase == state.PhaseFailed && e.Kind == "push_not_implemented" {
-			foundPushNotImpl = true
+		if e.Phase == state.PhaseSelecting && e.Kind == "branch_pushed" {
+			if m, ok := e.Data.(map[string]any); ok && m["tip"] == tipSHA && m["branch"] == wantBranch {
+				foundPushed = true
+			}
+		}
+		if e.Phase == state.PhaseSucceeded && e.Kind == "pull_request_not_opened" && e.Message == "opening the pull request through the forge is the next step" {
+			foundPRNotOpened = true
 		}
 	}
-	if !foundExported || !foundPushNotImpl {
-		t.Errorf("expected commits_exported then push_not_implemented events, got: %+v", events)
+	if !foundExported {
+		t.Errorf("expected commits_exported event carrying tip %s, got: %+v", tipSHA, events)
+	}
+	if !foundPushed {
+		t.Errorf("expected branch_pushed event carrying tip %s and branch %s, got: %+v", tipSHA, wantBranch, events)
+	}
+	if !foundPRNotOpened {
+		t.Errorf("expected pull_request_not_opened event, got: %+v", events)
 	}
 
-	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
-		t.Errorf("expected sandbox deleted, got err: %v", err)
+	// 4. Verify sandbox was deleted
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got: %v", err)
+	}
+}
+
+func TestOrchestrator_Selecting_BranchMoved_Fails(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	remoteURL, bare, work, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+
+	repoKey, err := state.ParseRepoURL(remoteURL)
+	if err != nil {
+		t.Fatalf("ParseRepoURL: %v", err)
+	}
+
+	repo := &state.Repo{
+		URL:           remoteURL,
+		Host:          repoKey.Host,
+		Owner:         repoKey.Owner,
+		Name:          repoKey.Name,
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-movedrun"
+	sandboxName := "run-20261030t120000z-movedrun"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "export-goal",
+		Phase:       state.PhaseSelecting,
+		BaseCommit:  baseSHA,
+		SandboxName: sandboxName,
+		PRTitle:     "Add feature",
+		PRBody:      "Implements feature",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	// Advance ao/<goal>/<run-id> in the bare repository to another commit before Selecting
+	wantBranch := "ao/export-goal/" + runID
+	wt, err := work.Worktree()
+	if err != nil {
+		t.Fatalf("Worktree: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(wt.Filesystem.Root(), "other.txt"), []byte("other"), 0644)
+	_, _ = wt.Add("other.txt")
+	otherCommit, err := wt.Commit("other", &git.CommitOptions{Author: &object.Signature{Name: "A", Email: "a@example.com", When: time.Now()}})
+	if err != nil {
+		t.Fatalf("Commit other: %v", err)
+	}
+	refName := plumbing.ReferenceName("refs/heads/" + wantBranch)
+	if err := work.Push(&git.PushOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{config.RefSpec(otherCommit.String() + ":" + refName.String())},
+	}); err != nil {
+		t.Fatalf("Push other to bare: %v", err)
+	}
+
+	procSrv := &scriptedExportServer{
+		commands: map[string]string{
+			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+			"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+			"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+			"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+		},
+		pack: packBytes,
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, nil)
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: "ao-sandboxes"},
+		Spec:       sandboxv1beta1.SandboxSpec{Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: time.Now().Add(5 * time.Minute)}, ShutdownPolicy: &policy}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     30,
+		ForgeFor: func(repoURL string) (forge.Forge, error) {
+			return forge.NewGitRemote(), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	// 1. Verify run ended in Failed
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
+	}
+	if gotRun.Error != "remote branch is not at base commit" {
+		t.Errorf("expected error %q, got %q", "remote branch is not at base commit", gotRun.Error)
+	}
+
+	// 2. Verify events: branch_moved
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundBranchMoved bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && e.Kind == "branch_moved" && e.Message == "remote branch is not at base commit" {
+			foundBranchMoved = true
+			break
+		}
+	}
+	if !foundBranchMoved {
+		t.Errorf("expected branch_moved event, got: %+v", events)
+	}
+
+	// 3. Verify remote branch was left unchanged
+	if ref, err := bare.Reference(refName, true); err != nil || ref.Hash() != otherCommit {
+		t.Errorf("expected bare branch to remain at %s, got: %v (err: %v)", otherCommit, ref, err)
+	}
+
+	// 4. Verify sandbox was deleted
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got: %v", err)
+	}
+}
+
+func TestOrchestrator_Selecting_PushFailed(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	_, _, _, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+
+	// Point repository URL at a nonexistent path to trigger real push failure
+	nonexistentURL := "file://" + filepath.Join(t.TempDir(), "nonexistent.git")
+
+	repoKey, err := state.ParseRepoURL(nonexistentURL)
+	if err != nil {
+		t.Fatalf("ParseRepoURL: %v", err)
+	}
+
+	repo := &state.Repo{
+		URL:           nonexistentURL,
+		Host:          repoKey.Host,
+		Owner:         repoKey.Owner,
+		Name:          repoKey.Name,
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-pushfailrun"
+	sandboxName := "run-20261030t120000z-pushfailrun"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "export-goal",
+		Phase:       state.PhaseSelecting,
+		BaseCommit:  baseSHA,
+		SandboxName: sandboxName,
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &scriptedExportServer{
+		commands: map[string]string{
+			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+			"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+			"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+			"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+		},
+		pack: packBytes,
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, nil)
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: "ao-sandboxes"},
+		Spec:       sandboxv1beta1.SandboxSpec{Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: time.Now().Add(5 * time.Minute)}, ShutdownPolicy: &policy}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     30,
+		ForgeFor: func(repoURL string) (forge.Forge, error) {
+			return forge.NewGitRemote(), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	// 1. Verify run ended in Failed
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
+	}
+
+	// 2. Verify events: push_failed
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundPushFailed bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && e.Kind == "push_failed" {
+			foundPushFailed = true
+			break
+		}
+	}
+	if !foundPushFailed {
+		t.Errorf("expected push_failed event, got events: %+v", events)
+	}
+
+	// 3. Verify sandbox was deleted
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got: %v", err)
+	}
+}
+
+func TestOrchestrator_Selecting_NilForge_Fails(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	remoteURL, _, _, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+
+	repoKey, err := state.ParseRepoURL(remoteURL)
+	if err != nil {
+		t.Fatalf("ParseRepoURL: %v", err)
+	}
+
+	repo := &state.Repo{
+		URL:           remoteURL,
+		Host:          repoKey.Host,
+		Owner:         repoKey.Owner,
+		Name:          repoKey.Name,
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-nilforgerun"
+	sandboxName := "run-20261030t120000z-nilforgerun"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "export-goal",
+		Phase:       state.PhaseSelecting,
+		BaseCommit:  baseSHA,
+		SandboxName: sandboxName,
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &scriptedExportServer{
+		commands: map[string]string{
+			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+			"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+			"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+			"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+		},
+		pack: packBytes,
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, nil)
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: "ao-sandboxes"},
+		Spec:       sandboxv1beta1.SandboxSpec{Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: time.Now().Add(5 * time.Minute)}, ShutdownPolicy: &policy}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox in fake k8s: %v", err)
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     30,
+		ForgeFor:     nil, // explicitly nil
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	// 1. Verify run ended in Failed
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
+	}
+
+	// 2. Verify events: push_failed
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundPushFailed bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && e.Kind == "push_failed" {
+			foundPushFailed = true
+			break
+		}
+	}
+	if !foundPushFailed {
+		t.Errorf("expected push_failed event, got events: %+v", events)
+	}
+
+	// 3. Verify sandbox was deleted
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got: %v", err)
 	}
 }
 

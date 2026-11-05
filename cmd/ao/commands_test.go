@@ -384,7 +384,10 @@ func TestSelectForge(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		_, name := selectForge(tt.repoURL, tt.githubToken)
+		_, name, err := selectForge(tt.repoURL, tt.githubToken)
+		if err != nil {
+			t.Errorf("selectForge(%q, token=%q) returned unexpected error: %v", tt.repoURL, tt.githubToken, err)
+		}
 		if name != tt.wantForge {
 			t.Errorf("selectForge(%q, token=%q) = %q; want %q", tt.repoURL, tt.githubToken, name, tt.wantForge)
 		}
