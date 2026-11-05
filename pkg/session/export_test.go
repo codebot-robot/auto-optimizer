@@ -51,6 +51,7 @@ type scriptedProcessServer struct {
 	stdinCh       chan struct{}
 	capturedStdin []byte
 	lastCall      string
+	calls         []string
 }
 
 func (s *scriptedProcessServer) Execute(_ context.Context, req *processv1.ExecuteRequest) (*processv1.ExecuteResponse, error) {
@@ -58,6 +59,7 @@ func (s *scriptedProcessServer) Execute(_ context.Context, req *processv1.Execut
 	defer s.mu.Unlock()
 	key := strings.Join(req.GetConfig().GetCommand(), " ")
 	s.lastCall = key
+	s.calls = append(s.calls, key)
 	res, ok := s.commands[key]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "unhandled command: %s", key)
