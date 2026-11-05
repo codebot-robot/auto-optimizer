@@ -426,6 +426,77 @@ updates the existing PR instead of opening another. The scheduler skips a goal
 that already has an open auto-optimizer PR, unless the goal's `schedule` says
 otherwise.
 
+### Runs as custom resources: the HeroRun decision
+
+The orchestrator currently stores runs as JSON and JSONL records in the state
+directory. The reconciler keys work by `run.Request{Repo, RunID}` instead of
+`reconcile.Request`. A custom informer source watches Sandboxes and maps them to
+runs through labels and annotations. Representing runs as a Kubernetes custom
+resource offers clear benefits, but it also carries significant costs.
+
+A `HeroRun` custom resource buys standard Kubernetes integration:
+- **Owner references.** Sandboxes can declare an owner reference to their
+  `HeroRun`. The orchestrator can then replace `sandboxSource` with standard
+  controller-runtime primitives such as `source.Kind` and
+  `handler.EnqueueRequestForOwner`.
+- **Garbage collection.** Kubernetes deletes child Sandboxes automatically when
+  someone deletes a `HeroRun`.
+- **Cluster visibility.** Operators can inspect runs directly through
+  `kubectl get heroruns`, and controllers can observe progress through status
+  conditions.
+- **Standard reconcile requests.** The reconciler operates on standard
+  `reconcile.Request` values containing a namespace and a name.
+
+A `HeroRun` custom resource would cost simplicity and storage efficiency:
+- **Violates "State is files".** The project design relies on a single state
+  directory with one writer per file, append-only JSONL events, and no database.
+  A custom resource moves run state into etcd.
+- **Exceeds etcd limits.** A run accumulates tool outputs, model messages, and
+  streamed turn events. These records quickly exceed etcd's 1.5 MB object size
+  limit, so transcripts cannot live in the custom resource.
+- **Requires an API server.** Reading past runs requires an active Kubernetes API
+  server. With file records, developers can inspect runs offline with standard
+  tools.
+- **Breaks the web UI.** The web server reads repository pages and transcripts
+  directly from the state directory. Storing runs in custom resources requires
+  rewriting the web server or adding a synchronization loop.
+
+Two shapes for `HeroRun` exist:
+- **Thin `HeroRun` custom resource as a rebuildable cache.** The state directory
+  on object storage stays the source of truth. The orchestrator publishes a
+  minimal `HeroRun` object into the cluster to establish ownership and visibility.
+  The orchestrator can reconstruct deleted `HeroRun` objects from disk at any
+  time.
+- **`HeroRun` as the primary source of truth.** The custom resource stores the
+  authoritative run state, while transcripts and events remain on disk. Moving the
+  source of truth into `HeroRun` remains an open question: it would require
+  updating the web UI to read from both the API server and the state directory,
+  and reconciling status updates across two stores.
+
+We decide to adopt `HeroRun` as a thin, rebuildable custom resource. The state
+directory on object storage (GCS in production, via the workspace storage in this
+design) remains the source of truth for runs, sessions, and events. We do not use
+the Kubernetes API server as a database. `HeroRun` places the run into the
+Kubernetes object hierarchy, owns the run's Sandboxes, and enables standard
+controller-runtime reconciliation. To prevent frequent session events from
+generating excessive API server traffic, the orchestrator writes `HeroRun` status
+at a bounded rate (at most once every few seconds per object). The orchestrator
+deletes the sandbox when a run reaches a terminal phase, and
+`spec.shutdownPolicy: Delete` (set in `pkg/session/agent.go`) serves as the
+backstop. A missing or deleted `HeroRun` is not data loss, because the
+orchestrator can rebuild every `HeroRun` from the state directory.
+
+To implement `HeroRun`, we will:
+1. Define a `HeroRun` custom resource definition with spec fields for the forge
+   repository, goal, and base commit, and status fields for phase, conditions,
+   and summary metrics.
+2. Update the orchestrator to publish and update thin `HeroRun` objects from
+   `run.json`, rate-limiting status updates to at most once every few seconds.
+3. Add owner references from each created `Sandbox` to its `HeroRun` object.
+4. Replace `sandboxSource` with standard `source.Kind` and
+   `handler.EnqueueRequestForOwner`.
+5. Keep session transcripts, tool outputs, and events in the state directory.
+
 ## State
 
 Every record is a file under the state directory. The `--state-dir` flag
