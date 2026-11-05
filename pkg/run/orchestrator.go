@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -479,6 +480,14 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req Request) (reconcile.Re
 				return reconcile.Result{}, nil
 			}
 		}
+
+	case state.PhaseSelecting:
+		res, err := o.reconcileSelecting(ctx, repo, run)
+		if err != nil {
+			log.Error(err, "reconciling selecting run failed", "repo", repo.URL, "run", run.ID)
+			return reconcile.Result{}, nil
+		}
+		return res, nil
 	}
 
 	return reconcile.Result{}, nil
@@ -954,9 +963,9 @@ func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.
 	return nil
 }
 
-func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
+func (o *Orchestrator) failRun(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, kind, errMsg string) {
 	if ctx.Err() != nil {
-		return nil
+		return
 	}
 
 	failTime := o.clock().UTC()
@@ -966,17 +975,30 @@ func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, r
 		scoped.Log(ctx).Error(err, "failed to update run to Failed", "run", run.ID)
 	}
 
+	msg := errMsg
+	if kind == "failed" {
+		msg = fmt.Sprintf("Run failed: %s", errMsg)
+	}
 	event := state.Event{
 		Time:    failTime,
 		Phase:   state.PhaseFailed,
-		Kind:    "failed",
-		Message: fmt.Sprintf("Run failed: %s", errMsg),
+		Kind:    kind,
+		Message: msg,
 		Error:   errMsg,
 	}
 	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, event); err != nil {
 		scoped.Log(ctx).Error(err, "failed to append failure event", "run", run.ID)
 	}
 
+	if sb != nil {
+		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+			scoped.Log(ctx).V(2).Info("error deleting sandbox after run failed", "sandbox", run.SandboxName, "error", delErr)
+		}
+	}
+}
+
+func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
+	o.failRun(ctx, repo, run, nil, "failed", errMsg)
 	return errors.New(errMsg)
 }
 
@@ -1125,8 +1147,32 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 
 	events := &orchestratorTurnEvents{}
 	finishTool := ao.NewFinishTool()
-	harness := o.harness.WithMaxTurns(o.maxTurns).WithExtraTools(finishTool)
+	prTool := ao.NewOpenPullRequestTool(ao.OpenPullRequestExpectation{
+		Repository: repo.URL,
+		Branch:     run.BranchName(),
+	})
+	harness := o.harness.WithMaxTurns(o.maxTurns).WithExtraTools(finishTool, prTool)
 	turnErr := harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
+
+	if errors.Is(turnErr, session.ErrPullRequestRequested) {
+		run.PRTitle = prTool.Title
+		run.PRBody = prTool.Body
+		now := o.clock().UTC()
+		run.SetPhase(state.PhaseSelecting, now)
+		if err := o.putRun(ctx, repo, run); err != nil {
+			return fmt.Errorf("updating run to Selecting: %w", err)
+		}
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    now,
+			Phase:   state.PhaseSelecting,
+			Kind:    "pull_request_requested",
+			Message: "Pull request requested by agent",
+		}); err != nil {
+			log.Error(err, "failed to append pull_request_requested event", "run", run.ID)
+		}
+		o.Notify(repo.Key(), run.ID)
+		return nil
+	}
 
 	if errors.Is(turnErr, session.ErrSessionFinished) {
 		run.Summary = finishTool.Summary
@@ -1149,6 +1195,82 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	}
 
 	return o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("session error: %v", turnErr))
+}
+
+func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
+	log := scoped.Log(ctx)
+
+	if o.harness == nil {
+		return reconcile.Result{}, errors.New("harness is nil")
+	}
+
+	sandboxName := run.SandboxName
+	if sandboxName == "" {
+		o.failRun(ctx, repo, run, nil, "failed", "sandbox name is empty for selecting run")
+		return reconcile.Result{}, nil
+	}
+
+	sb := o.harness.GetOrAttachSandbox(sandboxName)
+	if sb == nil {
+		o.failRun(ctx, repo, run, nil, "failed", "failed to get sandbox handle")
+		return reconcile.Result{}, nil
+	}
+
+	destDir, err := os.MkdirTemp("", "ao-export-*")
+	if err != nil {
+		o.failRun(ctx, repo, run, sb, "failed", fmt.Sprintf("creating temp dir for export: %v", err))
+		return reconcile.Result{}, nil
+	}
+	defer func() {
+		if rmErr := os.RemoveAll(destDir); rmErr != nil {
+			log.V(2).Info("failed to remove temp export dir", "dir", destDir, "error", rmErr)
+		}
+	}()
+
+	res, err := sb.ExportCommits(ctx, session.ExportOptions{
+		RepoDir: "/workspace/repo",
+		Base:    run.BaseCommit,
+		DestDir: destDir,
+	})
+	if err != nil {
+		if errors.Is(err, session.ErrNoChanges) {
+			return reconcile.Result{}, o.finishRunNoImprovement(ctx, repo, run, sb, "no_changes", "no changes against base commit")
+		}
+		if errors.Is(err, session.ErrGoalsChanged) {
+			return reconcile.Result{}, o.finishRunNoImprovement(ctx, repo, run, sb, "refused", "changes under .goals/")
+		}
+		if errors.Is(err, session.ErrUncommittedChanges) {
+			o.failRun(ctx, repo, run, sb, "failed", err.Error())
+			return reconcile.Result{}, nil
+		}
+		o.failRun(ctx, repo, run, sb, "failed", fmt.Sprintf("export commits: %v", err))
+		return reconcile.Result{}, nil
+	}
+
+	log.V(2).Info("commits exported successfully", "run", run.ID, "tip", res.Tip)
+	return reconcile.Result{}, o.exportSuccess(ctx, repo, run, sb, res)
+}
+
+func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, res *session.ExportResult) error {
+	now := o.clock().UTC()
+	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+		Time:    now,
+		Phase:   state.PhaseSelecting,
+		Kind:    "commits_exported",
+		Message: fmt.Sprintf("Exported commits with tip %s", res.Tip),
+		Data:    map[string]any{"tip": res.Tip},
+	}); err != nil {
+		scoped.Log(ctx).Error(err, "failed to append commits_exported event", "run", run.ID)
+	}
+
+	if res.PackfilePath != "" {
+		if err := os.Remove(res.PackfilePath); err != nil && !os.IsNotExist(err) {
+			scoped.Log(ctx).V(2).Info("failed to remove packfile", "path", res.PackfilePath, "error", err)
+		}
+	}
+
+	o.failRun(ctx, repo, run, sb, "push_not_implemented", "push not implemented")
+	return nil
 }
 
 func buildSystemPrompt(basePrompt string, repo *state.Repo, run *state.Run, goalBody string) string {

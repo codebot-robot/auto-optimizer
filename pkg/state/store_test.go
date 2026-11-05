@@ -229,6 +229,8 @@ func TestRun_PutGetList(t *testing.T) {
 		Phase:      PhaseSucceeded,
 		BaseCommit: "c0ffee",
 		Branch:     "ao/bench/20261023T100000Z-0001",
+		PRTitle:    "optimize benchmark",
+		PRBody:     "improves runtime by 15%",
 		PRURL:      "https://github.com/gke-labs/auto-optimizer/pull/1",
 		SessionID:  "sess-1",
 		Summary:    "optimized benchmark runtime",

@@ -407,10 +407,18 @@ Runs are reconciled in response to events:
    a maximum number of turns, and the tool timeout. Every tool call, its
    truncated result, and its full output go to the state directory as they
    happen, so the UI shows progress live.
-4. **Selecting.** For a metric goal, the orchestrator starts a clean sandbox,
-   clones the pushed branch, and runs `verify` and `metric` with the median
-   of N runs. It compares the result with the baseline that it measured the
-   same way. For a judged goal, it runs `verify` if the goal has one.
+4. **Selecting.** When the agent requests a pull request, it commits its own
+   work before calling `open_pull_request`, moving the run to `Selecting`.
+   The control plane exports a git packfile containing the commits from the
+   base commit to HEAD out of the sandbox. It enforces refusals: runs with no
+   changes against the base commit end in `NoImprovement` (event `no_changes`),
+   changes under `.goals/` are refused as `NoImprovement` (event `refused`),
+   and uncommitted changes fail the run. Whatever the outcome, the sandbox is
+   deleted when the run leaves `Selecting`. For a metric goal, the orchestrator
+   starts a clean sandbox, clones the pushed branch, and runs `verify` and
+   `metric` with the median of N runs. It compares the result with the baseline
+   that it measured the same way. For a judged goal, it runs `verify` if the goal
+   has one.
 5. **OpeningPR.** The orchestrator opens or updates the PR through the forge.
    The harness writes the body. The body names the goal and the base commit,
    gives the baseline and candidate numbers and the improvement, states the

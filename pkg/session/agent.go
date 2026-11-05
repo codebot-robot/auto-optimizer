@@ -1906,13 +1906,16 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 			}
 
 			if approved {
-				if errors.Is(callErr, ErrSessionFinished) {
+				if errors.Is(callErr, ErrSessionFinished) || errors.Is(callErr, ErrPullRequestRequested) {
 					if toolMsg.Role == "" {
 						toolMsg.Role = "tool"
 					}
 					toolMsg.ToolCallID = tc.ID
 					if toolMsg.Content == nil {
 						content := "Session finished."
+						if errors.Is(callErr, ErrPullRequestRequested) {
+							content = "Pull request requested."
+						}
 						toolMsg.Content = &content
 					}
 				} else if callErr != nil {
@@ -1932,7 +1935,7 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 			}
 			events.MessageAppended(ctx, toolMsg)
 
-			if errors.Is(callErr, ErrSessionFinished) {
+			if errors.Is(callErr, ErrSessionFinished) || errors.Is(callErr, ErrPullRequestRequested) {
 				return callErr
 			}
 		}
