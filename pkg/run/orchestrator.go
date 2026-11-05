@@ -22,11 +22,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	agentsclientset "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned"
+	informers "sigs.k8s.io/agent-sandbox/clients/k8s/informers/externalversions"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -53,8 +58,8 @@ const (
 	// DefaultReadyTimeout is the default duration to wait for a Sandbox to become ready.
 	DefaultReadyTimeout = 3 * time.Minute
 
-	// readyPollInterval is the requeue interval when waiting for a Sandbox to become ready.
-	readyPollInterval = 2 * time.Second
+	// readySafetyRequeueInterval is the slow safety requeue interval when waiting for a Sandbox to become ready.
+	readySafetyRequeueInterval = 1 * time.Minute
 )
 
 // Request identifies a run to be reconciled.
@@ -212,7 +217,94 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 		return fmt.Errorf("watching notification channel: %w", err)
 	}
 
+	if o.harness != nil && o.harness.SandboxClient() != nil && o.harness.SandboxClient().AgentsClient() != nil {
+		sbSrc := &sandboxSource{
+			agentsClient: o.harness.SandboxClient().AgentsClient(),
+			namespace:    o.harness.Namespace(),
+			log:          scoped.Log(context.Background()),
+		}
+		if err := c.Watch(sbSrc); err != nil {
+			return fmt.Errorf("watching sandbox resources: %w", err)
+		}
+	}
+
 	return mgr.Add(o)
+}
+
+type sandboxSource struct {
+	agentsClient agentsclientset.Interface
+	namespace    string
+	log          logr.Logger
+}
+
+var _ source.TypedSource[Request] = (*sandboxSource)(nil)
+
+func (s *sandboxSource) Start(ctx context.Context, queue workqueue.TypedRateLimitingInterface[Request]) error {
+	factory := informers.NewSharedInformerFactoryWithOptions(s.agentsClient, 0, informers.WithNamespace(s.namespace))
+	informer := factory.Agents().V1beta1().Sandboxes().Informer()
+
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			s.enqueueSandbox(ctx, obj, queue)
+		},
+		UpdateFunc: func(oldObj, newObj any) {
+			s.enqueueSandbox(ctx, newObj, queue)
+		},
+		DeleteFunc: func(obj any) {
+			s.enqueueSandbox(ctx, obj, queue)
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("adding event handler to sandbox informer: %w", err)
+	}
+
+	factory.StartWithContext(ctx)
+
+	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return errors.New("timed out waiting for sandbox informer caches to sync")
+	}
+
+	return nil
+}
+
+func (s *sandboxSource) enqueueSandbox(ctx context.Context, obj any, queue workqueue.TypedRateLimitingInterface[Request]) {
+	sb, ok := obj.(*sandboxv1beta1.Sandbox)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		sb, ok = tombstone.Obj.(*sandboxv1beta1.Sandbox)
+		if !ok || sb == nil {
+			return
+		}
+	}
+
+	runID := sb.Labels[LabelRun]
+	if runID == "" {
+		return
+	}
+
+	if req := s.mapSandboxToRequest(ctx, sb, runID); req != nil {
+		queue.Add(*req)
+	}
+}
+
+func (s *sandboxSource) mapSandboxToRequest(ctx context.Context, sb *sandboxv1beta1.Sandbox, runID string) *Request {
+	if sb.Annotations != nil {
+		if repoStr := sb.Annotations[AnnotationRepo]; repoStr != "" {
+			key, err := state.ParseRepoKey(repoStr)
+			if err != nil {
+				s.log.V(2).Info("failed to parse repo key from sandbox annotation", "repo", repoStr, "error", err)
+				return nil
+			}
+			return &Request{Repo: key, RunID: runID}
+		}
+	}
+	return nil
 }
 
 // Start implements manager.Runnable. On manager startup it calls Resume,
@@ -278,7 +370,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req Request) (reconcile.Re
 			// prepareRun transitions to PhaseFailed on error; do not requeue terminal runs.
 			return reconcile.Result{}, nil
 		}
-		requeueAfter := readyPollInterval
+		requeueAfter := readySafetyRequeueInterval
 		if run.ReadyDeadline != nil {
 			rem := run.ReadyDeadline.Sub(o.clock().UTC())
 			if rem < requeueAfter {
@@ -469,8 +561,8 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "sandbox not ready before deadline")
 		}
 
-		// Otherwise return RequeueAfter until the deadline.
-		requeueAfter := readyPollInterval
+		// Otherwise return RequeueAfter with a slow safety interval capped at the deadline.
+		requeueAfter := readySafetyRequeueInterval
 		if run.ReadyDeadline != nil {
 			rem := run.ReadyDeadline.Sub(now)
 			if rem < requeueAfter {

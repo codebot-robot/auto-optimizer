@@ -44,6 +44,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
+	"github.com/go-logr/logr"
 )
 
 type mockProcessServer struct {
@@ -2370,6 +2371,389 @@ func TestOrchestrator_RunPageURL(t *testing.T) {
 			}
 			if got := orch.RunPageURL(repo, tc.run); got != tc.want {
 				t.Errorf("RunPageURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-watchready"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "goal-watch",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit-base123",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &mockProcessServer{
+		exitCode: 0,
+		stdout:   "Cloned successfully\n",
+	}
+	harness, agentsCS, _ := setupTestHarness(t, procSrv)
+
+	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:   store,
+		Harness: harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	if err := orch.SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager: %v", err)
+	}
+
+	go func() {
+		_ = mgr.Start(ctx)
+	}()
+
+	// Enqueue the pending run
+	orch.Notify(repo.Key(), runID)
+
+	// 1. Wait until the run enters Preparing and has a Sandbox created
+	deadline := time.Now().Add(5 * time.Second)
+	var sb *sandboxv1beta1.Sandbox
+	for time.Now().Before(deadline) {
+		r, err := store.GetRun(ctx, repo.Key(), runID)
+		if err == nil && r.Phase == state.PhasePreparing && r.SandboxName != "" {
+			if s, getErr := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, r.SandboxName, metav1.GetOptions{}); getErr == nil {
+				sb = s
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sb == nil {
+		t.Fatal("timed out waiting for run to enter Preparing with Sandbox created")
+	}
+
+	// 2. Verify worker is free (no clone executed yet)
+	procSrv.mu.Lock()
+	cmdsCount := len(procSrv.commands)
+	procSrv.mu.Unlock()
+	if cmdsCount != 0 {
+		t.Fatalf("expected 0 commands executed while unready, got %d", cmdsCount)
+	}
+
+	// 3. Update the fake Sandbox's status to Ready
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating fake sandbox to Ready: %v", err)
+	}
+
+	// 4. Verify watch detects status change, enqueues run, clones, and moves to Working
+	var reachedWorking bool
+	for time.Now().Before(deadline) {
+		r, err := store.GetRun(ctx, repo.Key(), runID)
+		if err == nil && r.Phase == state.PhaseWorking {
+			reachedWorking = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !reachedWorking {
+		t.Fatal("expected run to reach Working after Sandbox status changed to Ready via watch")
+	}
+
+	procSrv.mu.Lock()
+	finalCmds := len(procSrv.commands)
+	procSrv.mu.Unlock()
+	if finalCmds != 2 {
+		t.Fatalf("expected 2 commands executed after Ready, got %d", finalCmds)
+	}
+}
+
+func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-watchdel"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "goal-del",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit-base123",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+
+	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:   store,
+		Harness: harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	if err := orch.SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager: %v", err)
+	}
+
+	go func() {
+		_ = mgr.Start(ctx)
+	}()
+
+	orch.Notify(repo.Key(), runID)
+
+	// Wait until run enters Preparing and sandbox exists in Kubernetes
+	deadline := time.Now().Add(5 * time.Second)
+	var sbName string
+	for time.Now().Before(deadline) {
+		r, err := store.GetRun(ctx, repo.Key(), runID)
+		if err == nil && r.Phase == state.PhasePreparing && r.SandboxName != "" {
+			if _, getErr := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, r.SandboxName, metav1.GetOptions{}); getErr == nil {
+				sbName = r.SandboxName
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sbName == "" {
+		t.Fatal("timed out waiting for run to enter Preparing with SandboxName")
+	}
+
+	// Delete fake sandbox before readiness
+	if err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, sbName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("deleting fake sandbox: %v", err)
+	}
+
+	// Verify watch detects deletion, enqueues run, and marks it Failed
+	var reachedFailed bool
+	for time.Now().Before(deadline) {
+		r, err := store.GetRun(ctx, repo.Key(), runID)
+		if err == nil && r.Phase == state.PhaseFailed {
+			reachedFailed = true
+			if !strings.Contains(r.Error, "deleted before becoming ready") {
+				t.Errorf("expected error to mention deleted before becoming ready, got: %q", r.Error)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !reachedFailed {
+		t.Fatal("expected run to reach Failed after Sandbox was deleted via watch")
+	}
+}
+
+func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-watchfailcond"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "goal-failcond",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit-base123",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+
+	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:   store,
+		Harness: harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	if err := orch.SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager: %v", err)
+	}
+
+	go func() {
+		_ = mgr.Start(ctx)
+	}()
+
+	orch.Notify(repo.Key(), runID)
+
+	// Wait until run enters Preparing and sandbox exists in Kubernetes
+	deadline := time.Now().Add(5 * time.Second)
+	var sb *sandboxv1beta1.Sandbox
+	for time.Now().Before(deadline) {
+		r, err := store.GetRun(ctx, repo.Key(), runID)
+		if err == nil && r.Phase == state.PhasePreparing && r.SandboxName != "" {
+			if s, getErr := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, r.SandboxName, metav1.GetOptions{}); getErr == nil {
+				sb = s
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sb == nil {
+		t.Fatal("timed out waiting for run to enter Preparing with Sandbox created")
+	}
+
+	// Update fake sandbox with failure condition (InvalidConfiguration)
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:    string(sandboxv1beta1.SandboxConditionReady),
+			Status:  metav1.ConditionFalse,
+			Reason:  sandboxv1beta1.SandboxReasonInvalidConfiguration,
+			Message: "Sandbox name exceeds maximum length",
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating fake sandbox with failure condition: %v", err)
+	}
+
+	// Verify watch detects status change, enqueues run, and marks it Failed
+	var reachedFailed bool
+	for time.Now().Before(deadline) {
+		r, err := store.GetRun(ctx, repo.Key(), runID)
+		if err == nil && r.Phase == state.PhaseFailed {
+			reachedFailed = true
+			if !strings.Contains(r.Error, "Sandbox name exceeds maximum length") {
+				t.Errorf("expected error to mention failure message, got: %q", r.Error)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !reachedFailed {
+		t.Fatal("expected run to reach Failed after Sandbox reported failure condition")
+	}
+}
+
+func TestSandboxSource_MapSandboxToRequest(t *testing.T) {
+	ctx := t.Context()
+	s := &sandboxSource{
+		log: logr.Discard(),
+	}
+
+	tests := []struct {
+		name     string
+		repoStr  string
+		runID    string
+		wantRepo state.RepoKey
+		wantNil  bool
+	}{
+		{
+			name:     "remote repo key",
+			repoStr:  "github.com/gke-labs/auto-optimizer",
+			runID:    "run-1",
+			wantRepo: state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"},
+		},
+		{
+			name:     "local repo key with underscore owner",
+			repoStr:  "local/_/hello-repo",
+			runID:    "run-2",
+			wantRepo: state.RepoKey{Host: "local", Owner: "_", Name: "hello-repo"},
+		},
+		{
+			name:    "invalid repo key format",
+			repoStr: "invalid-format",
+			runID:   "run-3",
+			wantNil: true,
+		},
+		{
+			name:    "missing annotation",
+			repoStr: "",
+			runID:   "run-4",
+			wantNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var sb *sandboxv1beta1.Sandbox
+			if tt.repoStr != "" {
+				sb = &sandboxv1beta1.Sandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							AnnotationRepo: tt.repoStr,
+						},
+					},
+				}
+			} else {
+				sb = &sandboxv1beta1.Sandbox{}
+			}
+			got := s.mapSandboxToRequest(ctx, sb, tt.runID)
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil request, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected non-nil request")
+			}
+			if got.RunID != tt.runID {
+				t.Errorf("got RunID = %q, want %q", got.RunID, tt.runID)
+			}
+			if got.Repo != tt.wantRepo {
+				t.Errorf("got Repo = %+v, want %+v", got.Repo, tt.wantRepo)
 			}
 		})
 	}
