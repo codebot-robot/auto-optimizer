@@ -36,6 +36,32 @@ type dirtyKey struct {
 	runID string
 }
 
+type tier int
+
+const (
+	tierProgress tier = iota
+	tierCritical
+)
+
+// statusTier classifies a run phase transition into either progress
+// (coalesced at a bounded rate) or critical (written synchronously).
+//
+// A transition is critical when:
+//   - the run becomes unhappy: Ready drops from True to False for a reason other
+//     than normal completion (today: prev == PhaseWorking && next == PhaseFailed,
+//     kept explicit to cover future non-terminal unhappy phases); or
+//   - the run reaches any terminal phase, because sandboxes are deleted on
+//     terminal transition and external watchers must see it promptly.
+func statusTier(prev, next state.RunPhase) tier {
+	if prev == state.PhaseWorking && next == state.PhaseFailed {
+		return tierCritical
+	}
+	if next.IsTerminal() {
+		return tierCritical
+	}
+	return tierProgress
+}
+
 // heroRunStatusPublisher maintains HeroRun status records at a bounded rate,
 // coalescing rapid state transitions to reduce Kubernetes API server writes.
 type heroRunStatusPublisher struct {
@@ -133,6 +159,40 @@ func (p *heroRunStatusPublisher) flush(ctx context.Context) {
 	}
 }
 
+// PublishNow writes status for one run synchronously with one retry.
+// On failure, it logs the error, marks the run dirty so the next tick retries,
+// and returns the error without blocking the caller.
+func (p *heroRunStatusPublisher) PublishNow(ctx context.Context, repo *state.Repo, run *state.Run) error {
+	if p == nil || p.kubeClient == nil || run == nil {
+		return nil
+	}
+	var repoKey state.RepoKey
+	if repo != nil {
+		repoKey = repo.Key()
+	} else {
+		repoKey = run.Repo
+	}
+
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			break
+		}
+		err = p.publishRunStatus(ctx, repoKey, repo, run)
+		if err == nil {
+			p.mu.Lock()
+			delete(p.dirty, dirtyKey{repo: repoKey, runID: run.ID})
+			p.mu.Unlock()
+			return nil
+		}
+	}
+
+	scoped.Log(ctx).Error(err, "failed to update HeroRun status synchronously; marked dirty for retry", "repo", repoKey, "run", run.ID)
+	p.MarkDirty(repoKey, run.ID)
+	return err
+}
+
 func (p *heroRunStatusPublisher) publishStatusForRun(ctx context.Context, repoKey state.RepoKey, runID string) error {
 	run, err := p.store.GetRun(ctx, repoKey, runID)
 	if err != nil {
@@ -141,17 +201,23 @@ func (p *heroRunStatusPublisher) publishStatusForRun(ctx context.Context, repoKe
 		}
 		return fmt.Errorf("getting run %s: %w", runID, err)
 	}
+	return p.publishRunStatus(ctx, repoKey, nil, run)
+}
 
+func (p *heroRunStatusPublisher) publishRunStatus(ctx context.Context, repoKey state.RepoKey, repo *state.Repo, run *state.Run) error {
 	name := sandboxNameForRun(run.ID)
 	var hr herorunv1alpha1.HeroRun
-	err = p.kubeClient.Get(ctx, client.ObjectKey{Namespace: p.namespace, Name: name}, &hr)
+	err := p.kubeClient.Get(ctx, client.ObjectKey{Namespace: p.namespace, Name: name}, &hr)
 	if k8serrors.IsNotFound(err) {
 		if p.publishHeroRun == nil {
 			return fmt.Errorf("heroRun %s not found and publishHeroRun is nil", name)
 		}
-		repo, getRepoErr := p.store.GetRepo(ctx, repoKey)
-		if getRepoErr != nil {
-			return fmt.Errorf("getting repo %s for HeroRun publish: %w", repoKey, getRepoErr)
+		if repo == nil {
+			var getRepoErr error
+			repo, getRepoErr = p.store.GetRepo(ctx, repoKey)
+			if getRepoErr != nil {
+				return fmt.Errorf("getting repo %s for HeroRun publish: %w", repoKey, getRepoErr)
+			}
 		}
 		published := p.publishHeroRun(ctx, repo, run)
 		if published == nil {
