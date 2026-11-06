@@ -25,6 +25,8 @@ import (
 	"github.com/go-logr/logr"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -33,6 +35,7 @@ import (
 	agentsclientset "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned"
 	informers "sigs.k8s.io/agent-sandbox/clients/k8s/informers/externalversions"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -41,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -57,6 +61,9 @@ const (
 
 	// DefaultReadyTimeout is the default duration to wait for a Sandbox to become ready.
 	DefaultReadyTimeout = 3 * time.Minute
+
+	// DefaultHeroRunStatusInterval is the default period between HeroRun status flushes.
+	DefaultHeroRunStatusInterval = 3 * time.Second
 
 	// readySafetyRequeueInterval is the slow safety requeue interval when waiting for a Sandbox to become ready.
 	readySafetyRequeueInterval = 1 * time.Minute
@@ -90,6 +97,14 @@ type OrchestratorOptions struct {
 	PublicURL string
 
 	ReadyTimeout time.Duration
+
+	// HeroRunStatusInterval is the interval at which dirty HeroRun status records are flushed.
+	// When unset or <= 0, defaults to DefaultHeroRunStatusInterval (3 seconds).
+	HeroRunStatusInterval time.Duration
+
+	// KubeClient is the controller-runtime client used to publish HeroRun custom resources.
+	// When nil, as in most unit tests, publishing is skipped and logged once at startup.
+	KubeClient client.Client
 }
 
 // Orchestrator reconciles runs in phase Pending and Working using a controller-runtime controller.
@@ -103,6 +118,9 @@ type Orchestrator struct {
 	gitAuthor         string
 	publicURL         string
 	readyTimeout      time.Duration
+	kubeClient        client.Client
+	logNoKubeClient   sync.Once
+	statusPublisher   *heroRunStatusPublisher
 
 	notifyCh chan event.TypedGenericEvent[Request]
 
@@ -113,10 +131,27 @@ type Orchestrator struct {
 var _ reconcile.TypedReconciler[Request] = (*Orchestrator)(nil)
 var _ manager.Runnable = (*Orchestrator)(nil)
 
+// NewScheme builds a runtime.Scheme containing client-go types and the HeroRun types.
+func NewScheme() (*runtime.Scheme, error) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("adding client-go to scheme: %w", err)
+	}
+	if err := herorunv1alpha1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("adding herorun v1alpha1 to scheme: %w", err)
+	}
+	return scheme, nil
+}
+
 // NewManager builds a controller-runtime manager from rest.Config with metrics and health
 // endpoints disabled and leader election disabled.
 func NewManager(restConfig *rest.Config) (manager.Manager, error) {
+	scheme, err := NewScheme()
+	if err != nil {
+		return nil, err
+	}
 	return ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme: scheme,
 		Logger: klog.NewKlogr(),
 		Metrics: metricsserver.Options{
 			BindAddress: "0",
@@ -155,7 +190,16 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		readyTimeout = DefaultReadyTimeout
 	}
 
-	return &Orchestrator{
+	interval := opts.HeroRunStatusInterval
+	if interval <= 0 {
+		interval = DefaultHeroRunStatusInterval
+	}
+	namespace := ""
+	if opts.Harness != nil {
+		namespace = opts.Harness.Namespace()
+	}
+
+	orch := &Orchestrator{
 		store:             opts.Store,
 		sessionStore:      opts.SessionStore,
 		harness:           opts.Harness,
@@ -165,9 +209,12 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		gitAuthor:         opts.GitAuthor,
 		publicURL:         strings.TrimRight(opts.PublicURL, "/"),
 		readyTimeout:      readyTimeout,
+		kubeClient:        opts.KubeClient,
 		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
 		activeRuns:        make(map[string]bool),
-	}, nil
+	}
+	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, clock, interval, namespace, orch.publishHeroRun)
+	return orch, nil
 }
 
 // RunPageURL returns the public URL for a run's detail page, or empty when unset.
@@ -326,8 +373,20 @@ func (s *sandboxSource) mapSandboxToRequest(ctx context.Context, sb *sandboxv1be
 // Start implements manager.Runnable. On manager startup it calls Resume,
 // which enqueues all non-terminal runs. It then blocks until ctx is cancelled.
 func (o *Orchestrator) Start(ctx context.Context) error {
+	if o.kubeClient == nil {
+		o.logNoKubeClient.Do(func() {
+			scoped.Log(ctx).Info("HeroRun publishing skipped: no Kubernetes client configured")
+		})
+	}
 	if err := o.Resume(ctx); err != nil {
 		scoped.Log(ctx).Error(err, "failed to resume interrupted runs on startup")
+	}
+	if o.statusPublisher != nil {
+		go func() {
+			if err := o.statusPublisher.Run(ctx); err != nil {
+				scoped.Log(ctx).Error(err, "heroRunStatusPublisher stopped with error")
+			}
+		}()
 	}
 	<-ctx.Done()
 	return nil
@@ -350,7 +409,13 @@ func (o *Orchestrator) Resume(ctx context.Context) error {
 		}
 
 		for _, r := range runs {
+			if o.statusPublisher != nil {
+				o.statusPublisher.MarkDirty(repo.Key(), r.ID)
+			}
 			if !r.Phase.IsTerminal() {
+				if r.Phase != state.PhasePending {
+					o.publishHeroRun(ctx, repo, r)
+				}
 				o.Notify(repo.Key(), r.ID)
 			}
 		}
@@ -419,9 +484,10 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req Request) (reconcile.Re
 	return reconcile.Result{}, nil
 }
 
-// prepareRun executes the first step of Preparing: creates the Sandbox with a label
-// naming the run and annotation naming the repository, records SandboxName and ReadyDeadline,
-// moves the run to Preparing, appends a phase event, and returns.
+// prepareRun executes the first step of Preparing: publishes the HeroRun,
+// creates the Sandbox with an owner reference to the HeroRun (or unowned if
+// HeroRun is unavailable), records SandboxName and ReadyDeadline, moves the
+// run to Preparing, appends a phase event, and returns.
 func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
 	log := scoped.Log(ctx)
 	now := o.clock().UTC()
@@ -429,7 +495,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 	// 1. Assign sandbox name if not already assigned
 	sandboxName := run.SandboxName
 	if sandboxName == "" {
-		sandboxName = fmt.Sprintf("run-%s", strings.ToLower(run.ID))
+		sandboxName = sandboxNameForRun(run.ID)
 		run.SandboxName = sandboxName
 	}
 
@@ -439,19 +505,38 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 
 	log.Info("preparing run: creating sandbox", "repo", repo.URL, "run", run.ID, "sandbox", sandboxName)
 
-	// 3. Create sandbox with a label naming the run and annotation naming the repository
+	// 3. Publish HeroRun before creating the sandbox so the sandbox can reference it as owner
+	heroRun := o.publishHeroRun(ctx, repo, run)
+
+	var ownerRefs []metav1.OwnerReference
+	if heroRun != nil {
+		isController := true
+		ownerRefs = []metav1.OwnerReference{
+			{
+				APIVersion: herorunv1alpha1.GroupVersion.String(),
+				Kind:       "HeroRun",
+				Name:       heroRun.Name,
+				UID:        heroRun.UID,
+				Controller: &isController,
+			},
+		}
+	} else {
+		log.Info("creating unowned sandbox: no HeroRun available", "run", run.ID, "sandbox", sandboxName)
+	}
+
+	// 4. Create sandbox with a label naming the run, annotation naming the repository, and owner reference
 	labels := map[string]string{
 		LabelRun: run.ID,
 	}
 	annotations := map[string]string{
 		AnnotationRepo: repo.Key().String(),
 	}
-	if _, err := o.harness.CreateSandboxNamedWithLabels(ctx, sandboxName, labels, annotations); err != nil {
+	if _, err := o.harness.CreateSandboxNamedWithOwnerReferences(ctx, sandboxName, labels, annotations, ownerRefs); err != nil {
 		failTime := o.clock().UTC()
 		run.SetPhase(state.PhaseFailed, failTime)
 		run.Error = fmt.Sprintf("creating sandbox: %v", err)
 		run.ReadyDeadline = nil
-		if putErr := o.store.PutRun(ctx, run); putErr != nil {
+		if putErr := o.putRun(ctx, repo, run); putErr != nil {
 			log.Error(putErr, "failed to update run to Failed", "run", run.ID)
 		}
 
@@ -468,9 +553,9 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		return fmt.Errorf("creating sandbox: %w", err)
 	}
 
-	// 4. Transition to Preparing
+	// 5. Transition to Preparing
 	run.SetPhase(state.PhasePreparing, now)
-	if err := o.store.PutRun(ctx, run); err != nil {
+	if err := o.putRun(ctx, repo, run); err != nil {
 		return fmt.Errorf("updating run to Preparing: %w", err)
 	}
 
@@ -484,6 +569,83 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 	}
 
 	return nil
+}
+
+// sandboxNameForRun returns the canonical name for a run's Sandbox and HeroRun objects.
+func sandboxNameForRun(runID string) string {
+	return fmt.Sprintf("run-%s", strings.ToLower(runID))
+}
+
+// publishHeroRun publishes a thin HeroRun custom resource for run in the sandbox namespace.
+// It creates the object if it does not already exist; if it exists, it leaves it alone.
+// It returns the published or existing object, or nil if there is no KubeClient or publishing failed.
+// A publish failure never fails the run; it is logged and the next reconcile or restart retries.
+func (o *Orchestrator) publishHeroRun(ctx context.Context, repo *state.Repo, run *state.Run) *herorunv1alpha1.HeroRun {
+	if o.kubeClient == nil {
+		o.logNoKubeClient.Do(func() {
+			scoped.Log(ctx).Info("HeroRun publishing skipped: no Kubernetes client configured")
+		})
+		return nil
+	}
+	if repo == nil || run == nil {
+		return nil
+	}
+
+	name := sandboxNameForRun(run.ID)
+	namespace := ""
+	if o.harness != nil {
+		namespace = o.harness.Namespace()
+	}
+
+	log := scoped.Log(ctx)
+
+	var existing herorunv1alpha1.HeroRun
+	err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &existing)
+	if err == nil {
+		// Already exists; leave it alone (status handling is part 4).
+		return &existing
+	}
+	if !k8serrors.IsNotFound(err) {
+		log.Error(err, "failed to get HeroRun", "run", run.ID, "heroRun", name)
+		return nil
+	}
+
+	goal := run.GoalName
+	if goal == "" && run.Goal != nil {
+		goal = run.Goal.Name
+	}
+
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelRun: run.ID,
+			},
+			Annotations: map[string]string{
+				AnnotationRepo: repo.Key().String(),
+			},
+		},
+		Spec: herorunv1alpha1.HeroRunSpec{
+			Repository: repo.URL,
+			Goal:       goal,
+			RunID:      run.ID,
+			BaseCommit: run.BaseCommit,
+		},
+	}
+
+	if err := o.kubeClient.Create(ctx, hr); err != nil {
+		if !k8serrors.IsAlreadyExists(err) {
+			log.Error(err, "failed to create HeroRun", "run", run.ID, "heroRun", name)
+			return nil
+		}
+		if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &existing); err != nil {
+			log.Error(err, "failed to get existing HeroRun after already-exists", "run", run.ID, "heroRun", name)
+			return nil
+		}
+		return &existing
+	}
+	return hr
 }
 
 // isSandboxFailed inspects sandbox status conditions to detect failure before readiness.
@@ -741,7 +903,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 	workTime := o.clock().UTC()
 	run.SetPhase(state.PhaseWorking, workTime)
 	run.ReadyDeadline = nil
-	if err := o.store.PutRun(ctx, run); err != nil {
+	if err := o.putRun(ctx, repo, run); err != nil {
 		return reconcile.Result{}, fmt.Errorf("updating run to Working: %w", err)
 	}
 
@@ -774,6 +936,24 @@ func (o *Orchestrator) setRunActive(runID string, active bool) bool {
 	return true
 }
 
+// putRun writes a run record to the state store and marks the run dirty
+// for rate-limited HeroRun status publishing.
+func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
+	if err := o.store.PutRun(ctx, run); err != nil {
+		return err
+	}
+	if o.statusPublisher != nil {
+		var key state.RepoKey
+		if repo != nil {
+			key = repo.Key()
+		} else if run != nil {
+			key = run.Repo
+		}
+		o.statusPublisher.MarkDirty(key, run.ID)
+	}
+	return nil
+}
+
 func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
 	if ctx.Err() != nil {
 		return nil
@@ -782,7 +962,7 @@ func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, r
 	failTime := o.clock().UTC()
 	run.SetPhase(state.PhaseFailed, failTime)
 	run.Error = errMsg
-	if err := o.store.PutRun(ctx, run); err != nil {
+	if err := o.putRun(ctx, repo, run); err != nil {
 		scoped.Log(ctx).Error(err, "failed to update run to Failed", "run", run.ID)
 	}
 
@@ -803,7 +983,7 @@ func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, r
 func (o *Orchestrator) finishRunNoImprovement(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, kind, message string) error {
 	endTime := o.clock().UTC()
 	run.SetPhase(state.PhaseNoImprovement, endTime)
-	if err := o.store.PutRun(ctx, run); err != nil {
+	if err := o.putRun(ctx, repo, run); err != nil {
 		scoped.Log(ctx).Error(err, "failed to update run to NoImprovement", "run", run.ID)
 	}
 
@@ -860,7 +1040,7 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	if sessionID == "" {
 		sessionID = generateSessionID(run.ID)
 		run.SessionID = sessionID
-		if err := o.store.PutRun(ctx, run); err != nil {
+		if err := o.putRun(ctx, repo, run); err != nil {
 			return fmt.Errorf("updating run with session ID: %w", err)
 		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{

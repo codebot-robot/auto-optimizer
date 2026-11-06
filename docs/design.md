@@ -480,7 +480,7 @@ the Kubernetes API server as a database. `HeroRun` places the run into the
 Kubernetes object hierarchy, owns the run's Sandboxes, and enables standard
 controller-runtime reconciliation. To prevent frequent session events from
 generating excessive API server traffic, the orchestrator writes `HeroRun` status
-at a bounded rate (at most once every few seconds per object). The orchestrator
+at a bounded rate (at most once every 3 seconds per object). The orchestrator
 deletes the sandbox when a run reaches a terminal phase, and
 `spec.shutdownPolicy: Delete` (set in `pkg/session/agent.go`) serves as the
 backstop. A missing or deleted `HeroRun` is not data loss, because the
@@ -489,9 +489,12 @@ orchestrator can rebuild every `HeroRun` from the state directory.
 To implement `HeroRun`, we will:
 1. Define the `HeroRun` custom resource: the type lives in
    `api/herorun/v1alpha1` and the CRD under `k8s/crds/`.
-2. Update the orchestrator to publish and update thin `HeroRun` objects from
-   `run.json`, rate-limiting status updates to at most once every few seconds.
-3. Add owner references from each created `Sandbox` to its `HeroRun` object.
+2. Publish thin `HeroRun` objects and report status: the orchestrator creates
+   each object when a run leaves `Pending`, rebuilds missing ones in `Resume`,
+   and keeps status updated at a bounded rate (every 3 seconds per dirty object).
+3. Add owner references from each created `Sandbox` to its `HeroRun` object:
+   every Sandbox created for a run carries an owner reference naming its
+   `HeroRun` with `controller: true`.
 4. Replace `sandboxSource` with standard `source.Kind` and
    `handler.EnqueueRequestForOwner`.
 5. Keep session transcripts, tool outputs, and events in the state directory.

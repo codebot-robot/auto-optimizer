@@ -1154,13 +1154,18 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 	return h.createSandboxResource(ctx, session.sandboxID, session)
 }
 
-// CreateSandboxNamedWithLabels creates a Sandbox resource with the specified name and metadata using topology B.
-func (h *Harness) CreateSandboxNamedWithLabels(ctx context.Context, sandboxName string, labels, annotations map[string]string) (*Sandbox, error) {
+// CreateSandboxNamedWithOwnerReferences creates a Sandbox resource with the specified name, metadata, and owner references using topology B.
+func (h *Harness) CreateSandboxNamedWithOwnerReferences(ctx context.Context, sandboxName string, labels, annotations map[string]string, ownerRefs []metav1.OwnerReference) (*Sandbox, error) {
 	id := types.NamespacedName{
 		Namespace: h.opts.Namespace,
 		Name:      sandboxName,
 	}
-	return h.createSandboxResourceWithMetadata(ctx, id, nil, labels, annotations)
+	return h.createSandboxResourceWithMetadata(ctx, id, nil, labels, annotations, ownerRefs)
+}
+
+// CreateSandboxNamedWithLabels creates a Sandbox resource with the specified name and metadata using topology B.
+func (h *Harness) CreateSandboxNamedWithLabels(ctx context.Context, sandboxName string, labels, annotations map[string]string) (*Sandbox, error) {
+	return h.CreateSandboxNamedWithOwnerReferences(ctx, sandboxName, labels, annotations, nil)
 }
 
 // CreateSandboxNamed creates a Sandbox resource with the specified name using topology B.
@@ -1205,10 +1210,10 @@ func (h *Harness) Namespace() string {
 }
 
 func (h *Harness) createSandboxResource(ctx context.Context, id types.NamespacedName, session *Session) (*Sandbox, error) {
-	return h.createSandboxResourceWithMetadata(ctx, id, session, nil, nil)
+	return h.createSandboxResourceWithMetadata(ctx, id, session, nil, nil, nil)
 }
 
-func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id types.NamespacedName, session *Session, labels, annotations map[string]string) (*Sandbox, error) {
+func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id types.NamespacedName, session *Session, labels, annotations map[string]string, ownerRefs []metav1.OwnerReference) (*Sandbox, error) {
 	agentsClient := h.sandboxClient.agentsClient
 	image := h.opts.Image
 	if image == "" {
@@ -1248,10 +1253,11 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	sb := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        id.Name,
-			Namespace:   id.Namespace,
-			Labels:      labels,
-			Annotations: annotations,
+			Name:            id.Name,
+			Namespace:       id.Namespace,
+			Labels:          labels,
+			Annotations:     annotations,
+			OwnerReferences: ownerRefs,
 		},
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
