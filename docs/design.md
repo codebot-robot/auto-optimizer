@@ -417,10 +417,16 @@ Runs are reconciled in response to events:
    with a lease on the base commit through the forge, and hands over to
    `OpeningPR`. Whatever the outcome, the sandbox is deleted when the run leaves
    `Selecting`.
-5. **OpeningPR.** The orchestrator opens or updates the PR through the forge.
-   The harness writes the body. The body names the goal and the base commit,
-   gives the baseline and candidate numbers and the improvement, states the
-   cost, links to the run page, and then quotes the session's own summary.
+5. **OpeningPR.** When the forge implements change requests, the orchestrator
+   checks for an existing open pull request for the branch and reuses it;
+   otherwise it opens a new pull request through the forge. The harness writes
+   the body: a first section naming the goal, the base commit (short), the branch
+   and the run ID, with a link to the run page when configured; followed by the
+   agent's requested PR body under the heading "What the agent says". The pull
+   request URL is recorded on the run. When the forge does not support opening
+   pull requests (such as gitremote), the run succeeds with the event
+   `pull_request_not_opened`. The verify gate that checks candidate measurements
+   before opening or merging is deferred and still to come.
 6. **Terminal.** The orchestrator deletes the Sandbox. The portal Secret goes
    with it through owner references. The workspace volume stays for the
    retention window, so the session can resume with review feedback. The
@@ -428,7 +434,7 @@ Runs are reconciled in response to events:
    window passes.
 
 A run has one deterministic branch name, so re-running the OpeningPR step
-updates the existing PR instead of opening another. The scheduler skips a goal
+reuses the existing open PR instead of opening another. The scheduler skips a goal
 that already has an open auto-optimizer PR, unless the goal's `schedule` says
 otherwise.
 

@@ -3665,6 +3665,9 @@ func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 	if gotRun.Phase != state.PhaseSucceeded {
 		t.Errorf("expected phase %s, got %s", state.PhaseSucceeded, gotRun.Phase)
 	}
+	if gotRun.PRURL != "" {
+		t.Errorf("expected empty PRURL, got %q", gotRun.PRURL)
+	}
 	wantBranch := "ao/export-goal/" + runID
 	if gotRun.Branch != wantBranch {
 		t.Errorf("expected branch %q, got %q", wantBranch, gotRun.Branch)
@@ -3697,7 +3700,7 @@ func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 				foundPushed = true
 			}
 		}
-		if e.Phase == state.PhaseSucceeded && e.Kind == "pull_request_not_opened" && e.Message == "opening the pull request through the forge is the next step" {
+		if e.Phase == state.PhaseSucceeded && e.Kind == "pull_request_not_opened" && e.Message == "forge cannot open pull requests" {
 			foundPRNotOpened = true
 		}
 	}
@@ -4113,5 +4116,375 @@ func TestOrchestrator_Selecting_Refusals_NoImprovement(t *testing.T) {
 				t.Errorf("expected sandbox deleted, got err: %v", err)
 			}
 		})
+	}
+}
+
+func setupOpeningPRTest(t *testing.T, forgeFor func(string) (forge.Forge, error)) (*Orchestrator, state.Store, *state.Repo, *state.Run) {
+	t.Helper()
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	remoteURL := "https://github.com/example/repo"
+	repoKey, err := state.ParseRepoURL(remoteURL)
+	if err != nil {
+		t.Fatalf("ParseRepoURL: %v", err)
+	}
+
+	repo := &state.Repo{
+		URL:           remoteURL,
+		Host:          repoKey.Host,
+		Owner:         repoKey.Owner,
+		Name:          repoKey.Name,
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261106T120000Z-testpr"
+	baseSHA := "1189a319f389802669884696409ba28db20216b0"
+	branchName := "ao/optimize-speed/" + runID
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "optimize-speed",
+		Phase:      state.PhaseOpeningPR,
+		BaseCommit: baseSHA,
+		Branch:     branchName,
+		PRTitle:    "Speed up queries",
+		PRBody:     "Replaced linear scan with hash map lookup.",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	harness, _, _ := setupTestHarness(t, nil)
+	fixedTime := time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		PublicURL:    "https://ao.example.com",
+		Clock:        func() time.Time { return fixedTime },
+		ForgeFor:     forgeFor,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	return orch, store, repo, run
+}
+
+func TestOrchestrator_OpeningPR_OpensPullRequest_Succeeds(t *testing.T) {
+	ctx := t.Context()
+	fakeForge := forge.NewFake()
+	orch, store, repo, run := setupOpeningPRTest(t, func(string) (forge.Forge, error) {
+		return fakeForge, nil
+	})
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	// 1. Verify run ended in Succeeded with PRURL set
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseSucceeded {
+		t.Errorf("got phase %s, want Succeeded", gotRun.Phase)
+	}
+
+	// 2. Verify FakeForge recorded exactly one PR with expected head, base, title and body
+	prs := fakeForge.PullRequests(repo.URL)
+	if len(prs) != 1 {
+		t.Fatalf("expected exactly 1 pull request, got %d", len(prs))
+	}
+	pr := prs[0]
+	if pr.Head != run.Branch || pr.Base != "main" || pr.Title != run.PRTitle {
+		t.Errorf("unexpected PR details: %+v", pr)
+	}
+	if gotRun.PRURL != pr.URL {
+		t.Errorf("run.PRURL = %q, want %q", gotRun.PRURL, pr.URL)
+	}
+
+	// Body must contain goal, base commit (short), branch, run ID, link to run page, and agent's text under heading
+	shortSHA := run.BaseCommit[:7]
+	for _, substr := range []string{run.GoalName, shortSHA, run.Branch, run.ID, "https://ao.example.com/runs/" + run.ID, "What the agent says", run.PRBody} {
+		if !strings.Contains(pr.Body, substr) {
+			t.Errorf("expected body to contain %q, got:\n%s", substr, pr.Body)
+		}
+	}
+
+	// 3. Verify event pull_request_opened
+	events, err := store.ReadEvents(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundOpened bool
+	for _, e := range events {
+		if e.Phase == state.PhaseSucceeded && e.Kind == "pull_request_opened" && e.Message == pr.URL {
+			foundOpened = true
+		}
+	}
+	if !foundOpened {
+		t.Errorf("expected pull_request_opened event carrying %s, got: %+v", pr.URL, events)
+	}
+}
+
+func TestOrchestrator_OpeningPR_ReusesOpenPullRequest(t *testing.T) {
+	ctx := t.Context()
+	fakeForge := forge.NewFake()
+	// Pre-create an open pull request for the branch
+	existingPR, err := fakeForge.OpenPullRequest(ctx, "https://github.com/example/repo", "ao/optimize-speed/20261106T120000Z-testpr", "main", "Existing PR", "Existing body")
+	if err != nil {
+		t.Fatalf("OpenPullRequest: %v", err)
+	}
+
+	orch, store, repo, run := setupOpeningPRTest(t, func(string) (forge.Forge, error) {
+		return fakeForge, nil
+	})
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	// 1. Verify run ended in Succeeded with existing PR URL recorded
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseSucceeded {
+		t.Errorf("got phase %s, want Succeeded", gotRun.Phase)
+	}
+	if gotRun.PRURL != existingPR.URL {
+		t.Errorf("got PRURL %q, want %q", gotRun.PRURL, existingPR.URL)
+	}
+
+	// 2. Verify no second PR was opened
+	if len(fakeForge.PullRequests(repo.URL)) != 1 {
+		t.Errorf("expected no second PR opened, got %d", len(fakeForge.PullRequests(repo.URL)))
+	}
+
+	// 3. Verify event pull_request_reused
+	events, err := store.ReadEvents(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundReused bool
+	for _, e := range events {
+		if e.Phase == state.PhaseSucceeded && e.Kind == "pull_request_reused" && e.Message == existingPR.URL {
+			foundReused = true
+		}
+	}
+	if !foundReused {
+		t.Errorf("expected pull_request_reused event carrying %s, got: %+v", existingPR.URL, events)
+	}
+}
+
+func TestOrchestrator_OpeningPR_GitRemote_CannotOpenPR(t *testing.T) {
+	ctx := t.Context()
+	orch, store, repo, run := setupOpeningPRTest(t, func(string) (forge.Forge, error) {
+		return forge.NewGitRemote(), nil
+	})
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	// 1. Verify run ended in Succeeded without PRURL
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseSucceeded {
+		t.Errorf("got phase %s, want Succeeded", gotRun.Phase)
+	}
+	if gotRun.PRURL != "" {
+		t.Errorf("got PRURL %q, want empty", gotRun.PRURL)
+	}
+
+	// 2. Verify event pull_request_not_opened says forge cannot open pull requests
+	events, err := store.ReadEvents(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundNotOpened bool
+	for _, e := range events {
+		if e.Phase == state.PhaseSucceeded && e.Kind == "pull_request_not_opened" && e.Message == "forge cannot open pull requests" {
+			foundNotOpened = true
+		}
+	}
+	if !foundNotOpened {
+		t.Errorf("expected pull_request_not_opened event with 'forge cannot open pull requests', got: %+v", events)
+	}
+}
+
+func TestOrchestrator_OpeningPR_OpenPullRequestError_Fails(t *testing.T) {
+	ctx := t.Context()
+	fakeForge := forge.NewFake()
+	fakeForge.SetOpenPullRequestError(errors.New("API rate limit exceeded"))
+
+	orch, store, repo, run := setupOpeningPRTest(t, func(string) (forge.Forge, error) {
+		return fakeForge, nil
+	})
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed || gotRun.Error != "API rate limit exceeded" {
+		t.Errorf("got phase %s error %q, want Failed/'API rate limit exceeded'", gotRun.Phase, gotRun.Error)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundFailed bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && e.Kind == "pull_request_failed" && e.Message == "API rate limit exceeded" {
+			foundFailed = true
+		}
+	}
+	if !foundFailed {
+		t.Errorf("expected pull_request_failed event with 'API rate limit exceeded', got: %+v", events)
+	}
+}
+
+func TestOrchestrator_Selecting_PushesAndOpensPullRequest_WithFakeForge(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	remoteURL, bare, _, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+
+	repoKey, err := state.ParseRepoURL(remoteURL)
+	if err != nil {
+		t.Fatalf("ParseRepoURL: %v", err)
+	}
+
+	repo := &state.Repo{
+		URL:           remoteURL,
+		Host:          repoKey.Host,
+		Owner:         repoKey.Owner,
+		Name:          repoKey.Name,
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-pushandpr"
+	sandboxName := "run-20261030t120000z-pushandpr"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "export-goal",
+		Phase:       state.PhaseSelecting,
+		BaseCommit:  baseSHA,
+		SandboxName: sandboxName,
+		PRTitle:     "Add feature",
+		PRBody:      "Implements feature",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &scriptedExportServer{
+		commands: map[string]string{
+			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+			"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+			"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+			"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+		},
+		pack: packBytes,
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, nil)
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: "ao-sandboxes"},
+		Spec:       sandboxv1beta1.SandboxSpec{Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: time.Now().Add(5 * time.Minute)}, ShutdownPolicy: &policy}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox in fake k8s: %v", err)
+	}
+
+	// FakeForge implements Forge and ChangeRequestCreator. For file:// remotes,
+	// PushPackfile pushes directly to the bare git repository without requiring PushCredentialer.
+	fakeForge := forge.NewFake()
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     30,
+		ForgeFor: func(repoURL string) (forge.Forge, error) {
+			return fakeForge, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	// 1. Verify run ended in Succeeded with Branch and PRURL set
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseSucceeded {
+		t.Errorf("expected phase %s, got %s", state.PhaseSucceeded, gotRun.Phase)
+	}
+	wantBranch := "ao/export-goal/" + runID
+	if gotRun.Branch != wantBranch {
+		t.Errorf("expected branch %q, got %q", wantBranch, gotRun.Branch)
+	}
+	prs := fakeForge.PullRequests(repo.URL)
+	if len(prs) != 1 {
+		t.Fatalf("expected 1 pull request, got %d", len(prs))
+	}
+	if gotRun.PRURL != prs[0].URL {
+		t.Errorf("expected PRURL %q, got %q", prs[0].URL, gotRun.PRURL)
+	}
+
+	// 2. Verify bare remote has branch at tipSHA
+	refName := plumbing.ReferenceName("refs/heads/" + wantBranch)
+	ref, err := bare.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("bare.Reference(%s): %v", refName, err)
+	}
+	if ref.Hash().String() != tipSHA {
+		t.Errorf("expected remote ref %s to be %s, got %s", refName, tipSHA, ref.Hash().String())
+	}
+
+	// 3. Verify events: commits_exported, branch_pushed, pull_request_opened
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundExported, foundPushed, foundPROpened bool
+	for _, e := range events {
+		if e.Phase == state.PhaseSelecting && e.Kind == "commits_exported" {
+			foundExported = true
+		}
+		if e.Phase == state.PhaseSelecting && e.Kind == "branch_pushed" {
+			foundPushed = true
+		}
+		if e.Phase == state.PhaseSucceeded && e.Kind == "pull_request_opened" && e.Message == prs[0].URL {
+			foundPROpened = true
+		}
+	}
+	if !foundExported || !foundPushed || !foundPROpened {
+		t.Errorf("expected commits_exported, branch_pushed, pull_request_opened events, got: %+v", events)
 	}
 }
