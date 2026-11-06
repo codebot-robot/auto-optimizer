@@ -62,6 +62,9 @@ const (
 	// DefaultReadyTimeout is the default duration to wait for a Sandbox to become ready.
 	DefaultReadyTimeout = 3 * time.Minute
 
+	// DefaultHeroRunStatusInterval is the default period between HeroRun status flushes.
+	DefaultHeroRunStatusInterval = 3 * time.Second
+
 	// readySafetyRequeueInterval is the slow safety requeue interval when waiting for a Sandbox to become ready.
 	readySafetyRequeueInterval = 1 * time.Minute
 )
@@ -95,6 +98,10 @@ type OrchestratorOptions struct {
 
 	ReadyTimeout time.Duration
 
+	// HeroRunStatusInterval is the interval at which dirty HeroRun status records are flushed.
+	// When unset or <= 0, defaults to DefaultHeroRunStatusInterval (3 seconds).
+	HeroRunStatusInterval time.Duration
+
 	// KubeClient is the controller-runtime client used to publish HeroRun custom resources.
 	// When nil, as in most unit tests, publishing is skipped and logged once at startup.
 	KubeClient client.Client
@@ -113,6 +120,7 @@ type Orchestrator struct {
 	readyTimeout      time.Duration
 	kubeClient        client.Client
 	logNoKubeClient   sync.Once
+	statusPublisher   *heroRunStatusPublisher
 
 	notifyCh chan event.TypedGenericEvent[Request]
 
@@ -182,7 +190,16 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		readyTimeout = DefaultReadyTimeout
 	}
 
-	return &Orchestrator{
+	interval := opts.HeroRunStatusInterval
+	if interval <= 0 {
+		interval = DefaultHeroRunStatusInterval
+	}
+	namespace := ""
+	if opts.Harness != nil {
+		namespace = opts.Harness.Namespace()
+	}
+
+	orch := &Orchestrator{
 		store:             opts.Store,
 		sessionStore:      opts.SessionStore,
 		harness:           opts.Harness,
@@ -195,7 +212,9 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		kubeClient:        opts.KubeClient,
 		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
 		activeRuns:        make(map[string]bool),
-	}, nil
+	}
+	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, clock, interval, namespace, orch.publishHeroRun)
+	return orch, nil
 }
 
 // RunPageURL returns the public URL for a run's detail page, or empty when unset.
@@ -362,6 +381,13 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 	if err := o.Resume(ctx); err != nil {
 		scoped.Log(ctx).Error(err, "failed to resume interrupted runs on startup")
 	}
+	if o.statusPublisher != nil {
+		go func() {
+			if err := o.statusPublisher.Run(ctx); err != nil {
+				scoped.Log(ctx).Error(err, "heroRunStatusPublisher stopped with error")
+			}
+		}()
+	}
 	<-ctx.Done()
 	return nil
 }
@@ -383,6 +409,9 @@ func (o *Orchestrator) Resume(ctx context.Context) error {
 		}
 
 		for _, r := range runs {
+			if o.statusPublisher != nil {
+				o.statusPublisher.MarkDirty(repo.Key(), r.ID)
+			}
 			if !r.Phase.IsTerminal() {
 				if r.Phase != state.PhasePending {
 					o.publishHeroRun(ctx, repo, r)
@@ -507,7 +536,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		run.SetPhase(state.PhaseFailed, failTime)
 		run.Error = fmt.Sprintf("creating sandbox: %v", err)
 		run.ReadyDeadline = nil
-		if putErr := o.store.PutRun(ctx, run); putErr != nil {
+		if putErr := o.putRun(ctx, repo, run); putErr != nil {
 			log.Error(putErr, "failed to update run to Failed", "run", run.ID)
 		}
 
@@ -526,7 +555,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 
 	// 5. Transition to Preparing
 	run.SetPhase(state.PhasePreparing, now)
-	if err := o.store.PutRun(ctx, run); err != nil {
+	if err := o.putRun(ctx, repo, run); err != nil {
 		return fmt.Errorf("updating run to Preparing: %w", err)
 	}
 
@@ -874,7 +903,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 	workTime := o.clock().UTC()
 	run.SetPhase(state.PhaseWorking, workTime)
 	run.ReadyDeadline = nil
-	if err := o.store.PutRun(ctx, run); err != nil {
+	if err := o.putRun(ctx, repo, run); err != nil {
 		return reconcile.Result{}, fmt.Errorf("updating run to Working: %w", err)
 	}
 
@@ -907,6 +936,24 @@ func (o *Orchestrator) setRunActive(runID string, active bool) bool {
 	return true
 }
 
+// putRun writes a run record to the state store and marks the run dirty
+// for rate-limited HeroRun status publishing.
+func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
+	if err := o.store.PutRun(ctx, run); err != nil {
+		return err
+	}
+	if o.statusPublisher != nil {
+		var key state.RepoKey
+		if repo != nil {
+			key = repo.Key()
+		} else if run != nil {
+			key = run.Repo
+		}
+		o.statusPublisher.MarkDirty(key, run.ID)
+	}
+	return nil
+}
+
 func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
 	if ctx.Err() != nil {
 		return nil
@@ -915,7 +962,7 @@ func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, r
 	failTime := o.clock().UTC()
 	run.SetPhase(state.PhaseFailed, failTime)
 	run.Error = errMsg
-	if err := o.store.PutRun(ctx, run); err != nil {
+	if err := o.putRun(ctx, repo, run); err != nil {
 		scoped.Log(ctx).Error(err, "failed to update run to Failed", "run", run.ID)
 	}
 
@@ -936,7 +983,7 @@ func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, r
 func (o *Orchestrator) finishRunNoImprovement(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, kind, message string) error {
 	endTime := o.clock().UTC()
 	run.SetPhase(state.PhaseNoImprovement, endTime)
-	if err := o.store.PutRun(ctx, run); err != nil {
+	if err := o.putRun(ctx, repo, run); err != nil {
 		scoped.Log(ctx).Error(err, "failed to update run to NoImprovement", "run", run.ID)
 	}
 
@@ -993,7 +1040,7 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	if sessionID == "" {
 		sessionID = generateSessionID(run.ID)
 		run.SessionID = sessionID
-		if err := o.store.PutRun(ctx, run); err != nil {
+		if err := o.putRun(ctx, repo, run); err != nil {
 			return fmt.Errorf("updating run with session ID: %w", err)
 		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{

@@ -1158,20 +1158,31 @@ func TestRunLifecycle(t *testing.T) {
 		t.Errorf("expected formatted run output to contain NoImprovement, event message, and Events, got:\n%s", fmtStr)
 	}
 
-	// 8. Verify exactly one HeroRun exists in the sandbox namespace whose spec.runID matches the run
-	hrOut, err := subH.Kubectl("get", "heroruns", "-n", "ao-sandboxes", "-o", "json")
-	if err != nil {
-		t.Fatalf("failed to get heroruns in ao-sandboxes: %v\nOutput: %s", err, hrOut)
-	}
+	// 8. Verify exactly one HeroRun exists in the sandbox namespace whose spec.runID matches the run,
+	// and wait for status.phase to reflect the terminal phase after the flush interval.
+	var finalHRPhase string
 	var hrList herorunv1alpha1.HeroRunList
-	if err := json.Unmarshal([]byte(hrOut), &hrList); err != nil {
-		t.Fatalf("failed to unmarshal heroruns: %v\nOutput: %s", err, hrOut)
+	flushDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(flushDeadline) {
+		hrOut, err := subH.Kubectl("get", "heroruns", "-n", "ao-sandboxes", "-o", "json")
+		if err == nil {
+			if unmarshalErr := json.Unmarshal([]byte(hrOut), &hrList); unmarshalErr == nil && len(hrList.Items) == 1 {
+				finalHRPhase = hrList.Items[0].Status.Phase
+				if finalHRPhase == string(finalRun.Phase) {
+					break
+				}
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 	if len(hrList.Items) != 1 {
 		t.Fatalf("expected exactly 1 HeroRun in ao-sandboxes, got %d", len(hrList.Items))
 	}
 	if gotRunID := hrList.Items[0].Spec.RunID; gotRunID != finalRun.ID {
 		t.Errorf("expected HeroRun spec.runID %q, got %q", finalRun.ID, gotRunID)
+	}
+	if finalHRPhase != string(finalRun.Phase) {
+		t.Errorf("expected HeroRun status.phase %q, got %q", string(finalRun.Phase), finalHRPhase)
 	}
 
 	t.Logf("PASS: session transcript for run %s shows agent reading cloned repository README", runID)
