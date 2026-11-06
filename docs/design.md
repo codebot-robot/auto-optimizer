@@ -401,41 +401,51 @@ Runs are reconciled in response to events:
      to `Working`, and enqueues it. If the Sandbox disappears or reports a
      failure before becoming ready, or if the ready deadline passes without
      the Sandbox becoming ready, the run transitions to `Failed`.
-3. **Working.** The session manager runs the session turn by turn. The
-   session ends when it calls `open_pull_request` or `finish`, when the model
-   stops, or when a limit is hit. The limits are `maxDuration`, `maxCostUSD`,
-   a maximum number of turns, and the tool timeout. Every tool call, its
-   truncated result, and its full output go to the state directory as they
-   happen, so the UI shows progress live.
-4. **Selecting.** When the agent requests a pull request, it commits its own
-   work before calling `open_pull_request`, moving the run to `Selecting`.
-   If the goal specifies a `verify` command, the orchestrator runs it in the
-   sandbox bounded by `--verify-timeout` (default 10 minutes); a failing
-   command ends the run as `NoImprovement` (event `verify_failed`), while
-   execution errors fail the run (`verify_error`). When verify passes, or if
-   the goal has no verify command, the control plane exports a git packfile
-   containing the commits from the base commit to HEAD out of the sandbox. It
-   enforces refusals: runs with no changes against the base commit end in
-   `NoImprovement` (event `no_changes`), changes under `.goals/` are refused
-   as `NoImprovement` (event `refused`), and uncommitted changes fail the run.
-   The control plane pushes the branch with a lease on the base commit through
-   the forge, and hands over to `OpeningPR`. Whatever the outcome, the sandbox is
-   deleted when the run leaves `Selecting`.
-5. **OpeningPR.** When the forge implements change requests, the orchestrator
-   checks for an existing open pull request for the branch and reuses it;
-   otherwise it opens a new pull request through the forge. The harness writes
-   the body: a first section naming the goal, the base commit (short), the branch
-   and the run ID, with a link to the run page when configured; followed by the
-   agent's requested PR body under the heading "What the agent says". The pull
-   request URL is recorded on the run. When the forge does not support opening
-   pull requests (such as gitremote), the run succeeds with the event
-   `pull_request_not_opened`. The verify gate that checks candidate measurements
-   before opening or merging is deferred and still to come.
-6. **Terminal.** The orchestrator deletes the Sandbox. The portal Secret goes
-   with it through owner references. The workspace volume stays for the
-   retention window, so the session can resume with review feedback. The
-   orchestrator deletes the volume when the PR is closed or merged, or when the
-   window passes.
+3. **Working.** The session runs turn by turn in the sandbox. The session ends
+   when the agent calls the `finish` or `open_pull_request` tool, when the model
+   stops, or when a run limit is reached. The limits are `maxDuration`,
+   `maxCostUSD`, a maximum number of turns, and the tool timeout. The agent
+   commits its own work before asking for a pull request. The control plane sets
+   the agent's git identity during preparation. Every tool call, its truncated
+   result, and its full output go to the state directory as they happen, so the
+   UI shows progress live.
+4. **Selecting.** When the goal specifies a `verify` command, the orchestrator
+   runs it in the sandbox bounded by `--verify-timeout`. A failing command ends
+   the run as `NoImprovement` with the event `verify_failed`. Execution errors
+   fail the run with `verify_error`. When verification succeeds or when the goal
+   lacks a verify command, the control plane exports a git packfile containing
+   the commits from the base commit to HEAD out of the sandbox. The control
+   plane enforces refusals on the candidate commits. A run with no changes
+   against the base commit ends in `NoImprovement` with the event `no_changes`.
+   The control plane refuses changes under `.goals/` as `NoImprovement` with
+   the event `refused`. Uncommitted changes in the sandbox fail the run. Next,
+   the control plane pushes the branch through the forge with a lease on the
+   base commit. If the branch moved on the remote forge, the run fails with the
+   event `branch_moved`. Other push errors fail the run with the event
+   `push_failed`. The orchestrator deletes the sandbox when the run leaves
+   `Selecting`. Measuring metric goals in a clean sandbox is planned, not built
+   (epic #32).
+5. **OpeningPR.** When the forge supports change requests, the orchestrator
+   checks for an existing open pull request for the branch. If an open pull
+   request already exists, the orchestrator reuses it. Otherwise, the
+   orchestrator opens a new pull request through the forge. The harness writes
+   the body with an introductory section naming the goal, short base commit,
+   branch, and run ID, alongside a link to the run page when configured. It
+   appends the agent's requested body under the heading "What the agent says".
+   The orchestrator records the pull request URL on the run. When the forge does
+   not support change requests, the run succeeds with the event
+   `pull_request_not_opened`.
+6. **Terminal.** The orchestrator deletes the sandbox. The sandbox's
+   `shutdownPolicy: Delete` serves as a backstop if the control plane terminates
+   unexpectedly. The orchestrator updates the `HeroRun` status to the terminal
+   phase synchronously (#194).
+
+   Retaining workspaces and cleaning up portal secrets is planned (epic #33 for
+   the portal and workspace). Kubernetes deletes the portal Secret with the
+   sandbox through owner references. The workspace volume stays for the
+   retention window so the session can resume with review feedback. The
+   orchestrator deletes the volume when the pull request closes or merges, or
+   when the window passes.
 
 A run has one deterministic branch name, so re-running the OpeningPR step
 reuses the existing open PR instead of opening another. The scheduler skips a goal
