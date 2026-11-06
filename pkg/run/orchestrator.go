@@ -25,6 +25,8 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-logr/logr"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -68,6 +70,9 @@ const (
 	// DefaultHeroRunStatusInterval is the default period between HeroRun status flushes.
 	DefaultHeroRunStatusInterval = 3 * time.Second
 
+	// DefaultVerifyTimeout is the default duration to wait for a goal's verify command to complete.
+	DefaultVerifyTimeout = 10 * time.Minute
+
 	// readySafetyRequeueInterval is the slow safety requeue interval when waiting for a Sandbox to become ready.
 	readySafetyRequeueInterval = 1 * time.Minute
 )
@@ -109,6 +114,9 @@ type OrchestratorOptions struct {
 	// When nil, as in most unit tests, publishing is skipped and logged once at startup.
 	KubeClient client.Client
 
+	// VerifyTimeout is the maximum duration for running a goal's verify command.
+	VerifyTimeout time.Duration
+
 	// ForgeFor returns the Forge for a repository URL.
 	// If nil or returns an error, push operations in Selecting fail.
 	ForgeFor func(repoURL string) (forge.Forge, error)
@@ -128,6 +136,7 @@ type Orchestrator struct {
 	kubeClient        client.Client
 	logNoKubeClient   sync.Once
 	statusPublisher   *heroRunStatusPublisher
+	verifyTimeout     time.Duration
 	forgeFor          func(repoURL string) (forge.Forge, error)
 
 	notifyCh chan event.TypedGenericEvent[Request]
@@ -207,6 +216,11 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		namespace = opts.Harness.Namespace()
 	}
 
+	verifyTimeout := opts.VerifyTimeout
+	if verifyTimeout <= 0 {
+		verifyTimeout = DefaultVerifyTimeout
+	}
+
 	orch := &Orchestrator{
 		store:             opts.Store,
 		sessionStore:      opts.SessionStore,
@@ -218,6 +232,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		publicURL:         strings.TrimRight(opts.PublicURL, "/"),
 		readyTimeout:      readyTimeout,
 		kubeClient:        opts.KubeClient,
+		verifyTimeout:     verifyTimeout,
 		forgeFor:          opts.ForgeFor,
 		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
 		activeRuns:        make(map[string]bool),
@@ -1213,6 +1228,55 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 	if sb == nil {
 		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", "failed to get sandbox handle", nil)
 		return reconcile.Result{}, nil
+	}
+
+	if run.Goal != nil && run.Goal.Verify != "" {
+		now := o.clock().UTC()
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    now,
+			Phase:   state.PhaseSelecting,
+			Kind:    "verify_started",
+			Message: fmt.Sprintf("Running verify command: %s", run.Goal.Verify),
+			Data:    map[string]any{"command": run.Goal.Verify},
+		}); err != nil {
+			log.Error(err, "failed to append verify_started event", "run", run.ID)
+		}
+
+		verifyCtx, verifyCancel := context.WithTimeout(ctx, o.verifyTimeout)
+		res, err := sb.RunVerify(verifyCtx, "/workspace/repo", run.Goal.Verify, 50)
+		timedOut := errors.Is(err, context.DeadlineExceeded) || verifyCtx.Err() == context.DeadlineExceeded || status.Code(err) == codes.DeadlineExceeded
+		verifyCancel()
+
+		if ctx.Err() != nil {
+			return reconcile.Result{}, nil
+		}
+
+		if err != nil {
+			if timedOut {
+				o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "verify_failed", fmt.Sprintf("verify command timed out after %s", o.verifyTimeout), nil)
+				return reconcile.Result{}, nil
+			}
+			o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "verify_error", fmt.Sprintf("running verify command: %v", err), nil)
+			return reconcile.Result{}, nil
+		}
+
+		if res.ExitCode != 0 {
+			msg := fmt.Sprintf("verify command failed with exit code %d", res.ExitCode)
+			o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "verify_failed", msg, map[string]any{
+				"exitCode": res.ExitCode,
+				"tail":     res.Tail,
+			})
+			return reconcile.Result{}, nil
+		}
+
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    o.clock().UTC(),
+			Phase:   state.PhaseSelecting,
+			Kind:    "verify_passed",
+			Message: "Verify command passed",
+		}); err != nil {
+			log.Error(err, "failed to append verify_passed event", "run", run.ID)
+		}
 	}
 
 	destDir, err := os.MkdirTemp("", "ao-export-*")

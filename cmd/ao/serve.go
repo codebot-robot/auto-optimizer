@@ -63,6 +63,7 @@ type serveFlags struct {
 	gitAuthor         string
 	publicURL         string
 	readyTimeout      time.Duration
+	verifyTimeout     time.Duration
 }
 
 func newServeCommand() *cobra.Command {
@@ -162,6 +163,7 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&flags.gitAuthor, "git-author", "auto-optimizer <auto-optimizer@users.noreply.github.com>", "Identity configured as git user.name and user.email in each run's sandbox, as `Name <email>`")
 	cmd.Flags().StringVar(&flags.publicURL, "public-url", "", "Public base URL of this server, used for links in pull request bodies, for example https://ao.example.com")
 	cmd.Flags().DurationVar(&flags.readyTimeout, "ready-timeout", run.DefaultReadyTimeout, "Maximum duration to wait for a sandbox to become ready")
+	cmd.Flags().DurationVar(&flags.verifyTimeout, "verify-timeout", run.DefaultVerifyTimeout, "Maximum duration for running a goal's verify command")
 
 	return cmd
 }
@@ -323,6 +325,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		GitAuthor:         flags.gitAuthor,
 		PublicURL:         flags.publicURL,
 		ReadyTimeout:      flags.readyTimeout,
+		VerifyTimeout:     flags.verifyTimeout,
 		ForgeFor: func(repoURL string) (forge.Forge, error) {
 			f, _, err := selectForge(repoURL, githubToken)
 			return f, err

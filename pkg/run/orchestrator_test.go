@@ -25,6 +25,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -3434,25 +3435,44 @@ func (s *scriptedOpenPullRequestLLM) CreateChatCompletion(_ context.Context, _ l
 
 type scriptedExportServer struct {
 	processv1.UnimplementedProcessServiceServer
-	commands map[string]string
-	pack     []byte
+	mu            sync.Mutex
+	commands      map[string]string
+	pack          []byte
+	startHandlers map[string]func(stream processv1.ProcessService_StartServer) error
+	startCalls    []string
 }
 
 func (s *scriptedExportServer) Execute(_ context.Context, req *processv1.ExecuteRequest) (*processv1.ExecuteResponse, error) {
 	cmd := strings.Join(req.GetConfig().GetCommand(), " ")
+	s.mu.Lock()
 	out, ok := s.commands[cmd]
+	s.mu.Unlock()
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "unhandled command: %s", cmd)
 	}
 	return &processv1.ExecuteResponse{Stdout: []byte(out)}, nil
 }
 
-func (s *scriptedExportServer) Start(_ *processv1.StartRequest, stream processv1.ProcessService_StartServer) error {
+func (s *scriptedExportServer) Start(req *processv1.StartRequest, stream processv1.ProcessService_StartServer) error {
+	cmd := strings.Join(req.GetConfig().GetCommand(), " ")
+	s.mu.Lock()
+	s.startCalls = append(s.startCalls, cmd)
+	var handler func(stream processv1.ProcessService_StartServer) error
+	if s.startHandlers != nil {
+		handler = s.startHandlers[cmd]
+	}
+	pack := s.pack
+	s.mu.Unlock()
+
+	if handler != nil {
+		return handler(stream)
+	}
+
 	if err := stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Init{Init: &processv1.InitEvent{ProcessId: 1}}}); err != nil {
 		return err
 	}
-	if len(s.pack) > 0 {
-		_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Stdout{Stdout: s.pack}})
+	if len(pack) > 0 {
+		_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Stdout{Stdout: pack}})
 	}
 	return stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Exit{Exit: &processv1.ExitEvent{}}})
 }
@@ -4116,6 +4136,323 @@ func TestOrchestrator_Selecting_Refusals_NoImprovement(t *testing.T) {
 				t.Errorf("expected sandbox deleted, got err: %v", err)
 			}
 		})
+	}
+}
+
+func TestOrchestrator_Selecting_Verify_PassingProceedsToExport(t *testing.T) {
+	ctx := t.Context()
+	_, _, _, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+	const verifyCmd = "go test ./..."
+	expectedVerifyShell := "sh -c cd '/workspace/repo' && " + verifyCmd
+	procSrv := &scriptedExportServer{
+		commands: map[string]string{
+			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+			"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+			"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+			"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+		},
+		pack: packBytes,
+		startHandlers: map[string]func(stream processv1.ProcessService_StartServer) error{
+			expectedVerifyShell: func(stream processv1.ProcessService_StartServer) error {
+				_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Init{Init: &processv1.InitEvent{ProcessId: 42}}})
+				_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Stdout{Stdout: []byte("PASS\nok\n")}})
+				return stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Exit{Exit: &processv1.ExitEvent{ExitCode: 0}}})
+			},
+		},
+	}
+	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, baseSHA, procSrv, nil)
+	run.Goal.Verify = verifyCmd
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed || gotRun.Error != "no forge configured for repository "+repo.URL {
+		t.Errorf("got phase %s error %q, want Failed/no forge configured", gotRun.Phase, gotRun.Error)
+	}
+
+	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
+	var foundStarted, foundPassed, foundExported bool
+	var order []string
+	for _, e := range events {
+		if e.Kind == "verify_started" {
+			foundStarted = true
+			order = append(order, e.Kind)
+			if m, ok := e.Data.(map[string]any); !ok || m["command"] != verifyCmd {
+				t.Errorf("verify_started data command = %v, want %q", e.Data, verifyCmd)
+			}
+		}
+		if e.Kind == "verify_passed" {
+			foundPassed = true
+			order = append(order, e.Kind)
+		}
+		if e.Kind == "commits_exported" {
+			foundExported = true
+			order = append(order, e.Kind)
+		}
+	}
+	if !foundStarted || !foundPassed || !foundExported {
+		t.Errorf("expected verify_started, verify_passed, and commits_exported events, got: %+v", events)
+	}
+	wantOrder := []string{"verify_started", "verify_passed", "commits_exported"}
+	if !slices.Equal(order, wantOrder) {
+		t.Errorf("events order = %v, want %v", order, wantOrder)
+	}
+
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got err: %v", err)
+	}
+}
+
+func TestOrchestrator_Selecting_Verify_FailingEndsInNoImprovement(t *testing.T) {
+	ctx := t.Context()
+	const verifyCmd = "make test"
+	expectedVerifyShell := "sh -c cd '/workspace/repo' && " + verifyCmd
+	const tailOutput = "--- FAIL: TestA (0.00s)\nFAIL\nexit status 2\n"
+	procSrv := &scriptedExportServer{
+		startHandlers: map[string]func(stream processv1.ProcessService_StartServer) error{
+			expectedVerifyShell: func(stream processv1.ProcessService_StartServer) error {
+				_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Init{Init: &processv1.InitEvent{ProcessId: 42}}})
+				_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Stderr{Stderr: []byte(tailOutput)}})
+				return stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Exit{Exit: &processv1.ExitEvent{ExitCode: 2}}})
+			},
+		},
+	}
+	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, "base-sha", procSrv, nil)
+	run.Goal.Verify = verifyCmd
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("got phase %s, want NoImprovement", gotRun.Phase)
+	}
+
+	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
+	var foundStarted, foundFailed, foundExported bool
+	for _, e := range events {
+		if e.Kind == "verify_started" {
+			foundStarted = true
+		}
+		if e.Phase == state.PhaseNoImprovement && e.Kind == "verify_failed" {
+			foundFailed = true
+			if !strings.Contains(e.Message, "2") {
+				t.Errorf("expected exit code in message, got: %q", e.Message)
+			}
+			m, ok := e.Data.(map[string]any)
+			if !ok {
+				t.Fatalf("expected map[string]any in e.Data, got %T", e.Data)
+			}
+			var exitCode int
+			switch v := m["exitCode"].(type) {
+			case int:
+				exitCode = v
+			case float64:
+				exitCode = int(v)
+			default:
+				t.Fatalf("unexpected type for exitCode: %T", m["exitCode"])
+			}
+			if exitCode != 2 {
+				t.Errorf("exitCode = %d, want 2", exitCode)
+			}
+			if m["tail"] != tailOutput {
+				t.Errorf("tail = %q, want %q", m["tail"], tailOutput)
+			}
+		}
+		if e.Kind == "commits_exported" {
+			foundExported = true
+		}
+	}
+	if !foundStarted || !foundFailed {
+		t.Errorf("expected verify_started and verify_failed events, got: %+v", events)
+	}
+	if foundExported {
+		t.Errorf("unexpected commits_exported event when verify failed")
+	}
+
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got err: %v", err)
+	}
+}
+
+func TestOrchestrator_Selecting_Verify_TimeoutEndsInNoImprovement(t *testing.T) {
+	ctx := t.Context()
+	const verifyCmd = "sleep 10"
+	expectedVerifyShell := "sh -c cd '/workspace/repo' && " + verifyCmd
+	var handlerCalled bool
+	var handlerMu sync.Mutex
+	procSrv := &scriptedExportServer{
+		startHandlers: map[string]func(stream processv1.ProcessService_StartServer) error{
+			expectedVerifyShell: func(stream processv1.ProcessService_StartServer) error {
+				handlerMu.Lock()
+				handlerCalled = true
+				handlerMu.Unlock()
+				_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Init{Init: &processv1.InitEvent{ProcessId: 42}}})
+				<-stream.Context().Done()
+				return stream.Context().Err()
+			},
+		},
+	}
+	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, "base-sha", procSrv, nil)
+	orch.verifyTimeout = 50 * time.Millisecond
+	run.Goal.Verify = verifyCmd
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	handlerMu.Lock()
+	invoked := handlerCalled
+	handlerMu.Unlock()
+	if !invoked {
+		t.Fatalf("expected timeout handler for %q to be invoked, but it was not", expectedVerifyShell)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("got phase %s, want NoImprovement", gotRun.Phase)
+	}
+
+	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
+	var foundTimeout bool
+	for _, e := range events {
+		if e.Phase == state.PhaseNoImprovement && e.Kind == "verify_failed" && strings.Contains(e.Message, "timed out") {
+			foundTimeout = true
+		}
+	}
+	if !foundTimeout {
+		t.Errorf("expected verify_failed event mentioning timeout, got: %+v", events)
+	}
+
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got err: %v", err)
+	}
+}
+
+func TestOrchestrator_Selecting_Verify_ExecutionErrorFailsRun(t *testing.T) {
+	ctx := t.Context()
+	const verifyCmd = "make test"
+	expectedVerifyShell := "sh -c cd '/workspace/repo' && " + verifyCmd
+	procSrv := &scriptedExportServer{
+		startHandlers: map[string]func(stream processv1.ProcessService_StartServer) error{
+			expectedVerifyShell: func(stream processv1.ProcessService_StartServer) error {
+				return status.Errorf(codes.Unavailable, "sandbox connection lost")
+			},
+		},
+	}
+	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, "base-sha", procSrv, nil)
+	run.Goal.Verify = verifyCmd
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Errorf("got phase %s, want Failed", gotRun.Phase)
+	}
+
+	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
+	var foundError bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && e.Kind == "verify_error" {
+			foundError = true
+		}
+	}
+	if !foundError {
+		t.Errorf("expected verify_error event, got: %+v", events)
+	}
+
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got err: %v", err)
+	}
+}
+
+func TestOrchestrator_Selecting_GoalWithoutVerify_RunsNoCommandBeforeExport(t *testing.T) {
+	ctx := t.Context()
+	_, _, _, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+	procSrv := &scriptedExportServer{
+		commands: map[string]string{
+			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+			"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+			"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+			"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+		},
+		pack: packBytes,
+	}
+	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, baseSHA, procSrv, nil)
+	run.Goal.Verify = ""
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	// Explicit assertion: goal without verify runs no verify command before export.
+	procSrv.mu.Lock()
+	for _, call := range procSrv.startCalls {
+		if strings.Contains(call, "sh -c") {
+			t.Errorf("unexpected command run in sandbox for goal without verify: %s", call)
+		}
+	}
+	const wantExportCall = "git -C /workspace/repo pack-objects --stdout --no-thin -q"
+	if len(procSrv.startCalls) != 1 || procSrv.startCalls[0] != wantExportCall {
+		t.Errorf("expected only pack-objects Start call for export (%q), got: %v", wantExportCall, procSrv.startCalls)
+	}
+	procSrv.mu.Unlock()
+
+	// Verify no verify events were appended.
+	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
+	for _, e := range events {
+		if strings.HasPrefix(e.Kind, "verify_") {
+			t.Errorf("unexpected verify event for goal without verify: %+v", e)
+		}
+	}
+
+	// Verify commits_exported was recorded.
+	var foundExported bool
+	for _, e := range events {
+		if e.Phase == state.PhaseSelecting && e.Kind == "commits_exported" {
+			foundExported = true
+			break
+		}
+	}
+	if !foundExported {
+		t.Errorf("expected commits_exported event, got: %+v", events)
+	}
+
+	// Verify sandbox is deleted.
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got err: %v", err)
 	}
 }
 

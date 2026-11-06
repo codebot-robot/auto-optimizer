@@ -129,6 +129,12 @@ func TestServeFlags(t *testing.T) {
 	} else if readyTimeoutFlag.DefValue != "3m0s" {
 		t.Errorf("expected default ready-timeout to be 3m0s, got %s", readyTimeoutFlag.DefValue)
 	}
+	verifyTimeoutFlag := cmd.Flag("verify-timeout")
+	if verifyTimeoutFlag == nil {
+		t.Error("expected --verify-timeout flag on ao serve")
+	} else if verifyTimeoutFlag.DefValue != "10m0s" {
+		t.Errorf("expected default verify-timeout to be 10m0s, got %s", verifyTimeoutFlag.DefValue)
+	}
 	publicURLFlag := cmd.Flag("public-url")
 	if publicURLFlag == nil {
 		t.Error("expected --public-url flag on ao serve")
