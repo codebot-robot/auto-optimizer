@@ -93,13 +93,13 @@ func TestHeroRunStatusPublisher_CoalescesPhasesWithinInterval(t *testing.T) {
 
 	// Move run through Preparing and then Working before any status flush tick occurs.
 	run.SetPhase(state.PhasePreparing, prepTime)
-	if err := orch.putRun(ctx, repo, run); err != nil {
+	if err := orch.putRun(ctx, repo, run, state.PhasePending); err != nil {
 		t.Fatalf("putRun Preparing: %v", err)
 	}
 
 	workTime := prepTime.Add(time.Second)
 	run.SetPhase(state.PhaseWorking, workTime)
-	if err := orch.putRun(ctx, repo, run); err != nil {
+	if err := orch.putRun(ctx, repo, run, state.PhasePreparing); err != nil {
 		t.Fatalf("putRun Working: %v", err)
 	}
 
@@ -213,7 +213,7 @@ func TestHeroRunStatusPublisher_BranchMatchesRunBranch(t *testing.T) {
 	// After push, Selecting sets run.Branch
 	pushedBranch := "ao/optimize-search/run-1"
 	run.Branch = pushedBranch
-	if err := orch.putRun(ctx, repo, run); err != nil {
+	if err := orch.putRun(ctx, repo, run, run.Phase); err != nil {
 		t.Fatalf("putRun with branch: %v", err)
 	}
 
@@ -282,8 +282,9 @@ func TestHeroRunStatusPublisher_TerminalRunEndsWithFinishedAtAndReadyFalse(t *te
 	}
 
 	// Move run to terminal phase NoImprovement
+	prev := run.Phase
 	run.SetPhase(state.PhaseNoImprovement, endTime)
-	if err := orch.putRun(ctx, repo, run); err != nil {
+	if err := orch.putRun(ctx, repo, run, prev); err != nil {
 		t.Fatalf("putRun terminal: %v", err)
 	}
 
@@ -319,9 +320,10 @@ func TestHeroRunStatusPublisher_TerminalRunEndsWithFinishedAtAndReadyFalse(t *te
 	// Test Failed phase with error text
 	failTime := endTime.Add(time.Minute)
 	failErrMsg := "command execution timed out in sandbox"
+	prev = run.Phase
 	run.SetPhase(state.PhaseFailed, failTime)
 	run.Error = failErrMsg
-	if err := orch.putRun(ctx, repo, run); err != nil {
+	if err := orch.putRun(ctx, repo, run, prev); err != nil {
 		t.Fatalf("putRun Failed: %v", err)
 	}
 
@@ -646,5 +648,213 @@ func TestHeroRunStatusPublisher_FinalFlushOnContextCancel(t *testing.T) {
 	}
 	if hr.Status.Phase != string(state.PhaseWorking) {
 		t.Errorf("expected status.phase %q, got %q", state.PhaseWorking, hr.Status.Phase)
+	}
+}
+
+func setupStatusTierTest(t *testing.T, interceptorFuncs *interceptor.Funcs) (*state.Repo, *state.Run, *Orchestrator, client.Client) {
+	t.Helper()
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo", DefaultBranch: "main"}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261106T120000Z-tier"
+	run := &state.Run{
+		ID: runID, Repo: repo.Key(), GoalName: "optimize-search", Phase: state.PhaseWorking,
+		BaseCommit: "commit-base123", SandboxName: sandboxNameForRun(runID),
+		PhaseTimestamps: map[state.RunPhase]time.Time{state.PhaseWorking: time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{})
+	if interceptorFuncs != nil {
+		builder = builder.WithInterceptorFuncs(*interceptorFuncs)
+	}
+	fakeClient := builder.Build()
+
+	harness, _, _ := setupTestHarness(t, nil)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store: store, Harness: harness, KubeClient: fakeClient, HeroRunStatusInterval: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	_ = orch.publishHeroRun(ctx, repo, run)
+	if interceptorFuncs == nil {
+		orch.statusPublisher.MarkDirty(repo.Key(), run.ID)
+		orch.statusPublisher.flush(ctx)
+	}
+	return repo, run, orch, fakeClient
+}
+
+func TestHeroRunStatusPublisher_WorkingToFailed_WrittenImmediately(t *testing.T) {
+	ctx := t.Context()
+	repo, run, orch, fakeClient := setupStatusTierTest(t, nil)
+
+	failTime := time.Date(2026, 11, 6, 12, 1, 0, 0, time.UTC)
+	run.SetPhase(state.PhaseFailed, failTime)
+	run.Error = "process crashed"
+	if err := orch.putRun(ctx, repo, run, state.PhaseWorking); err != nil {
+		t.Fatalf("putRun Failed: %v", err)
+	}
+
+	var hr herorunv1alpha1.HeroRun
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
+		t.Fatalf("getting HeroRun: %v", err)
+	}
+	if hr.Status.Phase != string(state.PhaseFailed) {
+		t.Errorf("expected phase %q, got %q", state.PhaseFailed, hr.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(hr.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != string(state.PhaseFailed) || cond.Message != "process crashed" {
+		t.Errorf("unexpected Ready condition: %+v", cond)
+	}
+}
+
+func TestHeroRunStatusPublisher_PreparingToWorking_NotVisibleUntilTick(t *testing.T) {
+	ctx := t.Context()
+	repo, run, orch, fakeClient := setupStatusTierTest(t, nil)
+
+	prepTime := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	run.SetPhase(state.PhasePreparing, prepTime)
+	_ = orch.putRun(ctx, repo, run, state.PhaseWorking)
+	orch.statusPublisher.flush(ctx)
+
+	workTime := time.Date(2026, 11, 6, 12, 0, 5, 0, time.UTC)
+	run.SetPhase(state.PhaseWorking, workTime)
+	if err := orch.putRun(ctx, repo, run, state.PhasePreparing); err != nil {
+		t.Fatalf("putRun: %v", err)
+	}
+
+	var hr herorunv1alpha1.HeroRun
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
+		t.Fatalf("getting HeroRun: %v", err)
+	}
+	if hr.Status.Phase != string(state.PhasePreparing) {
+		t.Errorf("expected phase %q before tick, got %q", state.PhasePreparing, hr.Status.Phase)
+	}
+
+	orch.statusPublisher.flush(ctx)
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
+		t.Fatalf("getting HeroRun after flush: %v", err)
+	}
+	if hr.Status.Phase != string(state.PhaseWorking) {
+		t.Errorf("expected phase %q after tick, got %q", state.PhaseWorking, hr.Status.Phase)
+	}
+}
+
+func TestHeroRunStatusPublisher_FailedSyncWrite_LeavesRunDirtyAndNextTickWrites(t *testing.T) {
+	ctx := t.Context()
+	var attempts atomic.Int32
+	funcs := interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if subResourceName == "status" {
+				if attempts.Add(1) <= 2 {
+					return errors.New("simulated API server status update error")
+				}
+			}
+			return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+		},
+	}
+	repo, run, orch, fakeClient := setupStatusTierTest(t, &funcs)
+
+	failTime := time.Date(2026, 11, 6, 12, 1, 0, 0, time.UTC)
+	run.SetPhase(state.PhaseFailed, failTime)
+	run.Error = "transient failure"
+	if err := orch.putRun(ctx, repo, run, state.PhaseWorking); err != nil {
+		t.Fatalf("putRun should not fail on API server error: %v", err)
+	}
+
+	var hr herorunv1alpha1.HeroRun
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
+		t.Fatalf("getting HeroRun: %v", err)
+	}
+	if hr.Status.Phase == string(state.PhaseFailed) {
+		t.Fatalf("status should not have been updated while API server failed")
+	}
+
+	orch.statusPublisher.mu.Lock()
+	dirty := orch.statusPublisher.dirty[dirtyKey{repo: repo.Key(), runID: run.ID}]
+	orch.statusPublisher.mu.Unlock()
+	if !dirty {
+		t.Fatalf("expected run to be left dirty after failed sync write")
+	}
+
+	orch.statusPublisher.flush(ctx)
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
+		t.Fatalf("getting HeroRun after flush: %v", err)
+	}
+	if hr.Status.Phase != string(state.PhaseFailed) {
+		t.Errorf("expected phase %q after flush, got %q", state.PhaseFailed, hr.Status.Phase)
+	}
+}
+
+func TestHeroRunStatusPublisher_TerminalNoImprovement_WrittenImmediately(t *testing.T) {
+	ctx := t.Context()
+	repo, run, orch, fakeClient := setupStatusTierTest(t, nil)
+
+	endTime := time.Date(2026, 11, 6, 12, 1, 0, 0, time.UTC)
+	run.SetPhase(state.PhaseNoImprovement, endTime)
+	if err := orch.putRun(ctx, repo, run, state.PhaseWorking); err != nil {
+		t.Fatalf("putRun NoImprovement: %v", err)
+	}
+
+	var hr herorunv1alpha1.HeroRun
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
+		t.Fatalf("getting HeroRun: %v", err)
+	}
+	if hr.Status.Phase != string(state.PhaseNoImprovement) {
+		t.Errorf("expected phase %q, got %q", state.PhaseNoImprovement, hr.Status.Phase)
+	}
+	if hr.Status.FinishedAt == nil || !hr.Status.FinishedAt.Equal(&metav1.Time{Time: endTime}) {
+		t.Errorf("expected finishedAt %v, got %v", endTime, hr.Status.FinishedAt)
+	}
+	cond := meta.FindStatusCondition(hr.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != string(state.PhaseNoImprovement) {
+		t.Errorf("unexpected Ready condition: %+v", cond)
+	}
+}
+
+func TestStatusTier(t *testing.T) {
+	tests := []struct {
+		prev state.RunPhase
+		next state.RunPhase
+		want tier
+	}{
+		// Happy path progress transitions
+		{prev: state.PhasePending, next: state.PhasePreparing, want: tierProgress},
+		{prev: state.PhasePreparing, next: state.PhaseWorking, want: tierProgress},
+		{prev: state.PhaseWorking, next: state.PhaseSelecting, want: tierProgress},
+		{prev: state.PhaseSelecting, next: state.PhaseOpeningPR, want: tierProgress},
+		{prev: state.PhaseWorking, next: state.PhaseWorking, want: tierProgress},
+
+		// Unhappy transition (Ready drops from True to False)
+		{prev: state.PhaseWorking, next: state.PhaseFailed, want: tierCritical},
+
+		// Terminal transitions
+		{prev: state.PhaseWorking, next: state.PhaseSucceeded, want: tierCritical},
+		{prev: state.PhaseWorking, next: state.PhaseNoImprovement, want: tierCritical},
+		{prev: state.PhaseWorking, next: state.PhaseCancelled, want: tierCritical},
+		{prev: state.PhaseWorking, next: state.PhaseExpired, want: tierCritical},
+		{prev: state.PhasePending, next: state.PhaseFailed, want: tierCritical},
+		{prev: state.PhasePreparing, next: state.PhaseFailed, want: tierCritical},
+	}
+
+	for _, tc := range tests {
+		t.Run(string(tc.prev)+"->"+string(tc.next), func(t *testing.T) {
+			if got := statusTier(tc.prev, tc.next); got != tc.want {
+				t.Errorf("statusTier(%s, %s) = %v, want %v", tc.prev, tc.next, got, tc.want)
+			}
+		})
 	}
 }

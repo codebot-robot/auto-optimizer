@@ -498,6 +498,21 @@ deletes the sandbox when a run reaches a terminal phase, and
 backstop. A missing or deleted `HeroRun` is not data loss, because the
 orchestrator can rebuild every `HeroRun` from the state directory.
 
+Status writes distinguish between two tiers based on who consumes them:
+progress ("watched by a person") versus critical ("acted on by another actor").
+Happy-path phase transitions (`Pending` to `Preparing` to `Working` to `Selecting`
+to `OpeningPR`), `sandboxName`, `branch`, and `pullRequestURL` updates belong to
+the progress tier. They are coalesced and written at a bounded interval because
+human observers tolerate modest delays. Transitions into terminal phases or
+unhappy states (where `Ready` becomes `False` because the phase became `Failed`)
+belong to the critical tier. Another actor must act promptly on these
+transitions for sandbox deletion, alerting, or garbage collection. Critical
+transitions are therefore written synchronously before the orchestrator
+continues. If synchronous writing fails after one retry, the run falls back to
+the dirty set so the orchestrator never blocks. Orchestrator shutdown flushes
+are also critical. If this policy proves out here, a reusable version could
+move to a shared library later.
+
 To implement `HeroRun`, we will:
 1. Define the `HeroRun` custom resource: the type lives in
    `api/herorun/v1alpha1` and the CRD under `k8s/crds/`.

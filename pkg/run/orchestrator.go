@@ -556,11 +556,12 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		AnnotationRepo: repo.Key().String(),
 	}
 	if _, err := o.harness.CreateSandboxNamedWithOwnerReferences(ctx, sandboxName, labels, annotations, ownerRefs); err != nil {
+		prev := run.Phase
 		failTime := o.clock().UTC()
 		run.SetPhase(state.PhaseFailed, failTime)
 		run.Error = fmt.Sprintf("creating sandbox: %v", err)
 		run.ReadyDeadline = nil
-		if putErr := o.putRun(ctx, repo, run); putErr != nil {
+		if putErr := o.putRun(ctx, repo, run, prev); putErr != nil {
 			log.Error(putErr, "failed to update run to Failed", "run", run.ID)
 		}
 
@@ -578,8 +579,9 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 	}
 
 	// 5. Transition to Preparing
+	prev := run.Phase
 	run.SetPhase(state.PhasePreparing, now)
-	if err := o.putRun(ctx, repo, run); err != nil {
+	if err := o.putRun(ctx, repo, run, prev); err != nil {
 		return fmt.Errorf("updating run to Preparing: %w", err)
 	}
 
@@ -924,10 +926,11 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 	}
 
 	// Move to Working phase
+	prev := run.Phase
 	workTime := o.clock().UTC()
 	run.SetPhase(state.PhaseWorking, workTime)
 	run.ReadyDeadline = nil
-	if err := o.putRun(ctx, repo, run); err != nil {
+	if err := o.putRun(ctx, repo, run, prev); err != nil {
 		return reconcile.Result{}, fmt.Errorf("updating run to Working: %w", err)
 	}
 
@@ -960,9 +963,10 @@ func (o *Orchestrator) setRunActive(runID string, active bool) bool {
 	return true
 }
 
-// putRun writes a run record to the state store and marks the run dirty
-// for rate-limited HeroRun status publishing.
-func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
+// putRun writes a run record to the state store and updates HeroRun status:
+// critical transitions are published synchronously via PublishNow, while
+// progress updates are marked dirty and coalesced by the publisher loop.
+func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.Run, prev state.RunPhase) error {
 	if err := o.store.PutRun(ctx, run); err != nil {
 		return err
 	}
@@ -973,7 +977,13 @@ func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.
 		} else if run != nil {
 			key = run.Repo
 		}
-		o.statusPublisher.MarkDirty(key, run.ID)
+		if statusTier(prev, run.Phase) == tierCritical {
+			if err := o.statusPublisher.PublishNow(ctx, repo, run); err != nil {
+				scoped.Log(ctx).V(2).Info("synchronous HeroRun status publish failed, deferred to next tick", "run", run.ID, "error", err)
+			}
+		} else {
+			o.statusPublisher.MarkDirty(key, run.ID)
+		}
 	}
 	return nil
 }
@@ -983,12 +993,13 @@ func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *sta
 		return
 	}
 
+	prev := run.Phase
 	endTime := o.clock().UTC()
 	run.SetPhase(phase, endTime)
 	if phase == state.PhaseFailed {
 		run.Error = message
 	}
-	if err := o.putRun(ctx, repo, run); err != nil {
+	if err := o.putRun(ctx, repo, run, prev); err != nil {
 		scoped.Log(ctx).Error(err, "failed to update run phase", "phase", phase, "run", run.ID)
 	}
 
@@ -1059,7 +1070,7 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	if sessionID == "" {
 		sessionID = generateSessionID(run.ID)
 		run.SessionID = sessionID
-		if err := o.putRun(ctx, repo, run); err != nil {
+		if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
 			return fmt.Errorf("updating run with session ID: %w", err)
 		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
@@ -1154,9 +1165,10 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	if errors.Is(turnErr, session.ErrPullRequestRequested) {
 		run.PRTitle = prTool.Title
 		run.PRBody = prTool.Body
+		prev := run.Phase
 		now := o.clock().UTC()
 		run.SetPhase(state.PhaseSelecting, now)
-		if err := o.putRun(ctx, repo, run); err != nil {
+		if err := o.putRun(ctx, repo, run, prev); err != nil {
 			return fmt.Errorf("updating run to Selecting: %w", err)
 		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
@@ -1343,8 +1355,9 @@ func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run 
 		}
 	}
 
+	prev := run.Phase
 	run.SetPhase(state.PhaseOpeningPR, pushTime)
-	if err := o.putRun(ctx, repo, run); err != nil {
+	if err := o.putRun(ctx, repo, run, prev); err != nil {
 		scoped.Log(ctx).Error(err, "failed to update run to OpeningPR", "run", run.ID)
 	}
 
