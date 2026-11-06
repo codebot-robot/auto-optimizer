@@ -114,6 +114,8 @@ type Run struct {
 	PhaseTimestamps map[RunPhase]time.Time `json:"phaseTimestamps,omitempty"`
 	BaseCommit      string                 `json:"baseCommit,omitempty"`
 	Branch          string                 `json:"branch,omitempty"`
+	PRTitle         string                 `json:"prTitle,omitempty"`
+	PRBody          string                 `json:"prBody,omitempty"`
 	PRURL           string                 `json:"prURL,omitempty"`
 	SessionID       string                 `json:"sessionId,omitempty"`
 	SandboxName     string                 `json:"sandboxName,omitempty"`

@@ -15,6 +15,7 @@
 package run
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -22,13 +23,22 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/revlist"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1759,9 +1769,14 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 
 func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
 		URL:           "https://github.com/gke-labs/test-repo",
@@ -1817,10 +1832,9 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
-
-	// Watch goroutine to mark created sandbox Ready, simulating agent-sandbox controller
 	go func() {
 		for {
 			select {
@@ -1888,9 +1902,14 @@ func (b *blockingConcurrentProcessServer) Execute(ctx context.Context, req *proc
 
 func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo1 := &state.Repo{
 		URL:           "https://github.com/gke-labs/repo1",
@@ -2003,6 +2022,7 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
 
@@ -2137,9 +2157,13 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 
 func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
 	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 	store := state.NewFileStore(storeDir)
 	sessionStore := session.NewFileStore(storeDir)
 
@@ -2225,10 +2249,9 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
-
-	// Wait for the Working run to be reconciled on start and reach NoImprovement
 	deadline := time.Now().Add(5 * time.Second)
 	var workingReconciled bool
 	for time.Now().Before(deadline) {
@@ -2383,9 +2406,14 @@ func TestOrchestrator_RunPageURL(t *testing.T) {
 
 func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
 		URL:           "https://github.com/gke-labs/test-repo",
@@ -2433,10 +2461,9 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
-
-	// Enqueue the pending run
 	orch.Notify(repo.Key(), runID)
 
 	// 1. Wait until the run enters Preparing and has a Sandbox created
@@ -2499,9 +2526,14 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 
 func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
 		URL:           "https://github.com/gke-labs/test-repo",
@@ -2545,6 +2577,7 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
 
@@ -2592,9 +2625,14 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 
 func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
-	store := state.NewFileStore(t.TempDir())
+	storeDir := t.TempDir()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
 		URL:           "https://github.com/gke-labs/test-repo",
@@ -2638,6 +2676,7 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	}
 
 	go func() {
+		defer close(done)
 		_ = mgr.Start(ctx)
 	}()
 
@@ -3361,5 +3400,264 @@ func TestOrchestrator_SandboxOwnerReference_PreExistingHeroRunHasUID(t *testing.
 	}
 	if ref.Controller == nil || !*ref.Controller {
 		t.Errorf("expected controller to be true")
+	}
+}
+
+type scriptedOpenPullRequestLLM struct {
+	repo, branch, title, body string
+}
+
+func (s *scriptedOpenPullRequestLLM) CreateChatCompletion(_ context.Context, _ llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	args, _ := json.Marshal(map[string]string{
+		"repository": s.repo, "branch": s.branch, "title": s.title, "body": s.body,
+	})
+	return &llm.ChatCompletionResponse{
+		ID: "pr-llm",
+		Choices: []llm.Choice{{
+			Message: llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{{
+					ID:   "call-open-pr-1",
+					Type: "function",
+					Function: llm.FunctionCall{
+						Name:      "open_pull_request",
+						Arguments: string(args),
+					},
+				}},
+			},
+			FinishReason: "tool_calls",
+		}},
+	}, nil
+}
+
+type scriptedExportServer struct {
+	processv1.UnimplementedProcessServiceServer
+	commands map[string]string
+	pack     []byte
+}
+
+func (s *scriptedExportServer) Execute(_ context.Context, req *processv1.ExecuteRequest) (*processv1.ExecuteResponse, error) {
+	cmd := strings.Join(req.GetConfig().GetCommand(), " ")
+	out, ok := s.commands[cmd]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "unhandled command: %s", cmd)
+	}
+	return &processv1.ExecuteResponse{Stdout: []byte(out)}, nil
+}
+
+func (s *scriptedExportServer) Start(_ *processv1.StartRequest, stream processv1.ProcessService_StartServer) error {
+	if err := stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Init{Init: &processv1.InitEvent{ProcessId: 1}}}); err != nil {
+		return err
+	}
+	if len(s.pack) > 0 {
+		_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Stdout{Stdout: s.pack}})
+	}
+	return stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Exit{Exit: &processv1.ExitEvent{}}})
+}
+
+func (s *scriptedExportServer) WriteStdin(context.Context, *processv1.WriteStdinRequest) (*processv1.WriteStdinResponse, error) {
+	return &processv1.WriteStdinResponse{}, nil
+}
+
+func createTestPackfile(t *testing.T) (string, string, []byte) {
+	t.Helper()
+	work, err := git.PlainInit(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("PlainInit: %v", err)
+	}
+	wt, err := work.Worktree()
+	if err != nil {
+		t.Fatalf("Worktree: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(wt.Filesystem.Root(), "base.txt"), []byte("base"), 0644)
+	_, _ = wt.Add("base.txt")
+	baseCommit, err := wt.Commit("base", &git.CommitOptions{Author: &object.Signature{Name: "A", Email: "a@example.com", When: time.Now()}})
+	if err != nil {
+		t.Fatalf("Commit base: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(wt.Filesystem.Root(), "feat.txt"), []byte("feat"), 0644)
+	_, _ = wt.Add("feat.txt")
+	tipCommit, err := wt.Commit("feat", &git.CommitOptions{Author: &object.Signature{Name: "A", Email: "a@example.com", When: time.Now()}})
+	if err != nil {
+		t.Fatalf("Commit tip: %v", err)
+	}
+	hashes, err := revlist.Objects(work.Storer, []plumbing.Hash{tipCommit}, []plumbing.Hash{baseCommit})
+	if err != nil {
+		t.Fatalf("revlist.Objects: %v", err)
+	}
+	buf := new(bytes.Buffer)
+	if _, err := packfile.NewEncoder(buf, work.Storer, false).Encode(hashes, 10); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	return baseCommit.String(), tipCommit.String(), buf.Bytes()
+}
+
+func setupSelectingRun(t *testing.T, phase state.RunPhase, baseSHA string, procSrv processv1.ProcessServiceServer, llmClient llm.ChatClient) (*Orchestrator, state.Store, *fakeagents.Clientset, *state.Repo, *state.Run) {
+	t.Helper()
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo", DefaultBranch: "main"}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+	runID := "20261030T120000Z-test"
+	sandboxName := "run-20261030t120000z-test"
+	run := &state.Run{
+		ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: phase, BaseCommit: baseSHA, SandboxName: sandboxName,
+		Goal: &goals.Goal{Name: "goal", Body: "goal body"},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, llmClient)
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: "ao-sandboxes"},
+		Spec:       sandboxv1beta1.SandboxSpec{Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: time.Now().Add(5 * time.Minute)}, ShutdownPolicy: &policy}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store: store, SessionStore: session.NewFileStore(t.TempDir()), Harness: harness, Clock: func() time.Time { return fixedTime }, MaxTurns: 30,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	return orch, store, agentsCS, repo, run
+}
+
+func TestOrchestrator_Working_OpenPullRequest_TransitionsToSelecting(t *testing.T) {
+	ctx := t.Context()
+	prLLM := &scriptedOpenPullRequestLLM{
+		repo:   "https://github.com/gke-labs/test-repo",
+		branch: "ao/goal/20261030T120000Z-test",
+		title:  "Optimize search index queries",
+		body:   "Adds composite index on (repo, goal, run_id).",
+	}
+	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseWorking, "base-sha", &mockProcessServer{}, prLLM)
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseSelecting || gotRun.PRTitle != prLLM.title || gotRun.PRBody != prLLM.body {
+		t.Errorf("got run %+v, want Selecting with PRTitle/Body", gotRun)
+	}
+
+	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
+	var found bool
+	for _, e := range events {
+		if e.Phase == state.PhaseSelecting && e.Kind == "pull_request_requested" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected pull_request_requested event, got: %+v", events)
+	}
+
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{}); err != nil {
+		t.Errorf("expected sandbox to still exist, got: %v", err)
+	}
+}
+
+func TestOrchestrator_Selecting_ExportsCommits_PushNotImplemented(t *testing.T) {
+	ctx := t.Context()
+	baseSHA, tipSHA, packBytes := createTestPackfile(t)
+	procSrv := &scriptedExportServer{
+		commands: map[string]string{
+			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+			"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+			"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+			"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+		},
+		pack: packBytes,
+	}
+	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, baseSHA, procSrv, nil)
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed || gotRun.Error != "push not implemented" {
+		t.Errorf("got phase %s error %q, want Failed/push not implemented", gotRun.Phase, gotRun.Error)
+	}
+
+	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
+	var foundExported, foundPushNotImpl bool
+	for _, e := range events {
+		if e.Phase == state.PhaseSelecting && e.Kind == "commits_exported" {
+			if m, ok := e.Data.(map[string]any); ok && m["tip"] == tipSHA {
+				foundExported = true
+			}
+		}
+		if e.Phase == state.PhaseFailed && e.Kind == "push_not_implemented" {
+			foundPushNotImpl = true
+		}
+	}
+	if !foundExported || !foundPushNotImpl {
+		t.Errorf("expected commits_exported then push_not_implemented events, got: %+v", events)
+	}
+
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted, got err: %v", err)
+	}
+}
+
+func TestOrchestrator_Selecting_Refusals_NoImprovement(t *testing.T) {
+	const baseSHA = "1234567890abcdef1234567890abcdef12345678"
+	tests := []struct {
+		name, diffOutput, wantKind, wantMessage string
+	}{
+		{name: "no changes against base", diffOutput: "", wantKind: "no_changes", wantMessage: "no changes against base commit"},
+		{name: "changes under .goals/ refused", diffOutput: ".goals/goal.md\x00", wantKind: "refused", wantMessage: "changes under .goals/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			procSrv := &scriptedExportServer{
+				commands: map[string]string{
+					"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+					"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       tt.diffOutput,
+				},
+			}
+			orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, baseSHA, procSrv, nil)
+
+			if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+				t.Fatalf("orch.Reconcile: %v", err)
+			}
+
+			gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+			if err != nil {
+				t.Fatalf("GetRun: %v", err)
+			}
+			if gotRun.Phase != state.PhaseNoImprovement {
+				t.Errorf("got phase %s, want NoImprovement", gotRun.Phase)
+			}
+
+			events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
+			var found bool
+			for _, e := range events {
+				if e.Phase == state.PhaseNoImprovement && e.Kind == tt.wantKind && e.Message == tt.wantMessage {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("expected event kind=%q message=%q, got: %+v", tt.wantKind, tt.wantMessage, events)
+			}
+
+			if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, run.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+				t.Errorf("expected sandbox deleted, got err: %v", err)
+			}
+		})
 	}
 }
