@@ -492,7 +492,9 @@ To implement `HeroRun`, we will:
 2. Publish thin `HeroRun` objects: the orchestrator creates each object when a
    run leaves `Pending` and rebuilds missing ones in `Resume`, with status
    updates still to come.
-3. Add owner references from each created `Sandbox` to its `HeroRun` object.
+3. Add owner references from each created `Sandbox` to its `HeroRun` object:
+   every Sandbox created for a run carries an owner reference naming its
+   `HeroRun` with `controller: true`.
 4. Replace `sandboxSource` with standard `source.Kind` and
    `handler.EnqueueRequestForOwner`.
 5. Keep session transcripts, tool outputs, and events in the state directory.

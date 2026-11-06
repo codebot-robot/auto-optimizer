@@ -795,6 +795,69 @@ func TestCreateSandboxNamedWithLabels(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxNamedWithOwnerReferences(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+	sbName := "test-sb-owner-refs"
+	cpNamespace := "ao-system"
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	client := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	harness := NewHarness(nil, client, nil, RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: cpNamespace,
+		SigningKey:            privKey,
+	})
+
+	isController := true
+	ownerRefs := []metav1.OwnerReference{
+		{
+			APIVersion: "auto-optimizer.labs.gke.io/v1alpha1",
+			Kind:       "HeroRun",
+			Name:       "hero-run-1",
+			UID:        "uid-123",
+			Controller: &isController,
+		},
+	}
+
+	sb, err := harness.CreateSandboxNamedWithOwnerReferences(ctx, sbName, nil, nil, ownerRefs)
+	if err != nil {
+		t.Fatalf("CreateSandboxNamedWithOwnerReferences failed: %v", err)
+	}
+	defer func() { _ = client.DeleteSandbox(ctx, sb) }()
+
+	created, err := client.GetSandboxResource(ctx, ns, sbName)
+	if err != nil {
+		t.Fatalf("GetSandboxResource failed: %v", err)
+	}
+	if len(created.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 owner reference, got %d", len(created.OwnerReferences))
+	}
+	ref := created.OwnerReferences[0]
+	if ref.APIVersion != "auto-optimizer.labs.gke.io/v1alpha1" {
+		t.Errorf("expected APIVersion auto-optimizer.labs.gke.io/v1alpha1, got %q", ref.APIVersion)
+	}
+	if ref.Kind != "HeroRun" {
+		t.Errorf("expected Kind HeroRun, got %q", ref.Kind)
+	}
+	if ref.Name != "hero-run-1" {
+		t.Errorf("expected Name hero-run-1, got %q", ref.Name)
+	}
+	if ref.UID != "uid-123" {
+		t.Errorf("expected UID uid-123, got %q", ref.UID)
+	}
+	if ref.Controller == nil || !*ref.Controller {
+		t.Errorf("expected Controller true")
+	}
+}
+
 func TestSandbox_SetPodInfo(t *testing.T) {
 	sb := &Sandbox{}
 	sb.SetPodInfo("pod-abc", "10.0.0.1")

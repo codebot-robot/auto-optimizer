@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 
@@ -2790,7 +2791,7 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	harness, _, _ := setupTestHarness(t, nil)
+	harness, agentsCS, _ := setupTestHarness(t, nil)
 
 	scheme, err := NewScheme()
 	if err != nil {
@@ -2861,6 +2862,31 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 	}
 	if hr.Annotations[AnnotationRepo] != repo.Key().String() {
 		t.Errorf("expected annotation %s=%q, got %q", AnnotationRepo, repo.Key().String(), hr.Annotations[AnnotationRepo])
+	}
+
+	// Verify the Sandbox was created with exactly one owner reference to the HeroRun
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, expectedName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
+	}
+	if len(sb.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 owner reference on sandbox, got %d", len(sb.OwnerReferences))
+	}
+	ref := sb.OwnerReferences[0]
+	if ref.APIVersion != herorunv1alpha1.GroupVersion.String() {
+		t.Errorf("expected APIVersion %q, got %q", herorunv1alpha1.GroupVersion.String(), ref.APIVersion)
+	}
+	if ref.Kind != "HeroRun" {
+		t.Errorf("expected Kind 'HeroRun', got %q", ref.Kind)
+	}
+	if ref.Name != hr.Name {
+		t.Errorf("expected owner ref name %q, got %q", hr.Name, ref.Name)
+	}
+	if ref.UID != hr.UID {
+		t.Errorf("expected owner ref UID %q, got %q", hr.UID, ref.UID)
+	}
+	if ref.Controller == nil || !*ref.Controller {
+		t.Errorf("expected owner ref controller to be true")
 	}
 }
 
@@ -3043,7 +3069,7 @@ func TestOrchestrator_PublishHeroRun_NilKubeClient(t *testing.T) {
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	harness, _, _ := setupTestHarness(t, nil)
+	harness, agentsCS, _ := setupTestHarness(t, nil)
 
 	orch, err := NewOrchestrator(OrchestratorOptions{
 		Store:      store,
@@ -3070,6 +3096,15 @@ func TestOrchestrator_PublishHeroRun_NilKubeClient(t *testing.T) {
 	}
 	if gotRun.Phase != state.PhasePreparing {
 		t.Errorf("expected phase %s, got %s", state.PhasePreparing, gotRun.Phase)
+	}
+
+	// Verify Sandbox was created without owner references
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
+	}
+	if len(sb.OwnerReferences) != 0 {
+		t.Errorf("expected 0 owner references on sandbox with nil KubeClient, got %d", len(sb.OwnerReferences))
 	}
 }
 
@@ -3100,7 +3135,7 @@ func TestOrchestrator_PublishHeroRun_FailureDoesNotFailRun(t *testing.T) {
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	harness, _, _ := setupTestHarness(t, nil)
+	harness, agentsCS, _ := setupTestHarness(t, nil)
 
 	scheme, err := NewScheme()
 	if err != nil {
@@ -3136,5 +3171,195 @@ func TestOrchestrator_PublishHeroRun_FailureDoesNotFailRun(t *testing.T) {
 	}
 	if gotRun.Phase != state.PhasePreparing {
 		t.Errorf("expected phase %s, got %s", state.PhasePreparing, gotRun.Phase)
+	}
+
+	// Verify Sandbox was created without owner references when publish failed
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
+	}
+	if len(sb.OwnerReferences) != 0 {
+		t.Errorf("expected 0 owner references on sandbox on publish failure, got %d", len(sb.OwnerReferences))
+	}
+}
+
+func TestOrchestrator_SandboxOwnerReference_NilKubeClientReachesWorking(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-nowork"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "optimize-search",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit-base123",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &mockProcessServer{
+		exitCode: 0,
+		stdout:   "Cloned successfully\n",
+	}
+	harness, agentsCS, _ := setupTestHarness(t, procSrv)
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: nil,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Step 1: Reconcile Pending -> Preparing
+	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	if err != nil {
+		t.Fatalf("orch.Reconcile step 1: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("expected RequeueAfter > 0, got %v", res.RequeueAfter)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhasePreparing {
+		t.Fatalf("expected phase Preparing, got %s", gotRun.Phase)
+	}
+
+	// Sandbox has no owner references
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
+	}
+	if len(sb.OwnerReferences) != 0 {
+		t.Errorf("expected 0 owner references on sandbox, got %d", len(sb.OwnerReferences))
+	}
+
+	// Step 2: Mark sandbox Ready and reconcile Preparing -> Working
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating fake sandbox to Ready: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile step 2: %v", err)
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseWorking {
+		t.Errorf("expected phase %s, got %s", state.PhaseWorking, gotRun.Phase)
+	}
+}
+
+func TestOrchestrator_SandboxOwnerReference_PreExistingHeroRunHasUID(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-uidtest"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "optimize-search",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit-base123",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	expectedName := "run-20261030t120000z-uidtest"
+	const expectedUID = types.UID("custom-herorun-uid-456")
+	preExistingHR := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      expectedName,
+			Namespace: "ao-sandboxes",
+			UID:       expectedUID,
+		},
+		Spec: herorunv1alpha1.HeroRunSpec{
+			Repository: repo.URL,
+			Goal:       "optimize-search",
+			RunID:      runID,
+			BaseCommit: "commit-base123",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(preExistingHR).Build()
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, expectedName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
+	}
+	if len(sb.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 owner reference, got %d", len(sb.OwnerReferences))
+	}
+	ref := sb.OwnerReferences[0]
+	if ref.APIVersion != herorunv1alpha1.GroupVersion.String() {
+		t.Errorf("expected APIVersion %q, got %q", herorunv1alpha1.GroupVersion.String(), ref.APIVersion)
+	}
+	if ref.Kind != "HeroRun" {
+		t.Errorf("expected Kind 'HeroRun', got %q", ref.Kind)
+	}
+	if ref.Name != expectedName {
+		t.Errorf("expected owner ref name %q, got %q", expectedName, ref.Name)
+	}
+	if ref.UID != expectedUID {
+		t.Errorf("expected owner ref UID %q, got %q", expectedUID, ref.UID)
+	}
+	if ref.Controller == nil || !*ref.Controller {
+		t.Errorf("expected controller to be true")
 	}
 }

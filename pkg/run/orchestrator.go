@@ -455,9 +455,10 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req Request) (reconcile.Re
 	return reconcile.Result{}, nil
 }
 
-// prepareRun executes the first step of Preparing: creates the Sandbox with a label
-// naming the run and annotation naming the repository, records SandboxName and ReadyDeadline,
-// moves the run to Preparing, appends a phase event, and returns.
+// prepareRun executes the first step of Preparing: publishes the HeroRun,
+// creates the Sandbox with an owner reference to the HeroRun (or unowned if
+// HeroRun is unavailable), records SandboxName and ReadyDeadline, moves the
+// run to Preparing, appends a phase event, and returns.
 func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
 	log := scoped.Log(ctx)
 	now := o.clock().UTC()
@@ -475,14 +476,33 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 
 	log.Info("preparing run: creating sandbox", "repo", repo.URL, "run", run.ID, "sandbox", sandboxName)
 
-	// 3. Create sandbox with a label naming the run and annotation naming the repository
+	// 3. Publish HeroRun before creating the sandbox so the sandbox can reference it as owner
+	heroRun := o.publishHeroRun(ctx, repo, run)
+
+	var ownerRefs []metav1.OwnerReference
+	if heroRun != nil {
+		isController := true
+		ownerRefs = []metav1.OwnerReference{
+			{
+				APIVersion: herorunv1alpha1.GroupVersion.String(),
+				Kind:       "HeroRun",
+				Name:       heroRun.Name,
+				UID:        heroRun.UID,
+				Controller: &isController,
+			},
+		}
+	} else {
+		log.Info("creating unowned sandbox: no HeroRun available", "run", run.ID, "sandbox", sandboxName)
+	}
+
+	// 4. Create sandbox with a label naming the run, annotation naming the repository, and owner reference
 	labels := map[string]string{
 		LabelRun: run.ID,
 	}
 	annotations := map[string]string{
 		AnnotationRepo: repo.Key().String(),
 	}
-	if _, err := o.harness.CreateSandboxNamedWithLabels(ctx, sandboxName, labels, annotations); err != nil {
+	if _, err := o.harness.CreateSandboxNamedWithOwnerReferences(ctx, sandboxName, labels, annotations, ownerRefs); err != nil {
 		failTime := o.clock().UTC()
 		run.SetPhase(state.PhaseFailed, failTime)
 		run.Error = fmt.Sprintf("creating sandbox: %v", err)
@@ -504,7 +524,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		return fmt.Errorf("creating sandbox: %w", err)
 	}
 
-	// 4. Transition to Preparing
+	// 5. Transition to Preparing
 	run.SetPhase(state.PhasePreparing, now)
 	if err := o.store.PutRun(ctx, run); err != nil {
 		return fmt.Errorf("updating run to Preparing: %w", err)
@@ -519,8 +539,6 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		log.Error(err, "failed to append Preparing phase event", "run", run.ID)
 	}
 
-	o.publishHeroRun(ctx, repo, run)
-
 	return nil
 }
 
@@ -531,16 +549,17 @@ func sandboxNameForRun(runID string) string {
 
 // publishHeroRun publishes a thin HeroRun custom resource for run in the sandbox namespace.
 // It creates the object if it does not already exist; if it exists, it leaves it alone.
+// It returns the published or existing object, or nil if there is no KubeClient or publishing failed.
 // A publish failure never fails the run; it is logged and the next reconcile or restart retries.
-func (o *Orchestrator) publishHeroRun(ctx context.Context, repo *state.Repo, run *state.Run) {
+func (o *Orchestrator) publishHeroRun(ctx context.Context, repo *state.Repo, run *state.Run) *herorunv1alpha1.HeroRun {
 	if o.kubeClient == nil {
 		o.logNoKubeClient.Do(func() {
 			scoped.Log(ctx).Info("HeroRun publishing skipped: no Kubernetes client configured")
 		})
-		return
+		return nil
 	}
 	if repo == nil || run == nil {
-		return
+		return nil
 	}
 
 	name := sandboxNameForRun(run.ID)
@@ -555,11 +574,11 @@ func (o *Orchestrator) publishHeroRun(ctx context.Context, repo *state.Repo, run
 	err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &existing)
 	if err == nil {
 		// Already exists; leave it alone (status handling is part 4).
-		return
+		return &existing
 	}
 	if !k8serrors.IsNotFound(err) {
 		log.Error(err, "failed to get HeroRun", "run", run.ID, "heroRun", name)
-		return
+		return nil
 	}
 
 	goal := run.GoalName
@@ -589,9 +608,15 @@ func (o *Orchestrator) publishHeroRun(ctx context.Context, repo *state.Repo, run
 	if err := o.kubeClient.Create(ctx, hr); err != nil {
 		if !k8serrors.IsAlreadyExists(err) {
 			log.Error(err, "failed to create HeroRun", "run", run.ID, "heroRun", name)
+			return nil
 		}
-		return
+		if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &existing); err != nil {
+			log.Error(err, "failed to get existing HeroRun after already-exists", "run", run.ID, "heroRun", name)
+			return nil
+		}
+		return &existing
 	}
+	return hr
 }
 
 // isSandboxFailed inspects sandbox status conditions to detect failure before readiness.
