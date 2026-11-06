@@ -409,14 +409,18 @@ Runs are reconciled in response to events:
    happen, so the UI shows progress live.
 4. **Selecting.** When the agent requests a pull request, it commits its own
    work before calling `open_pull_request`, moving the run to `Selecting`.
-   The control plane exports a git packfile containing the commits from the
-   base commit to HEAD out of the sandbox. It enforces refusals: runs with no
-   changes against the base commit end in `NoImprovement` (event `no_changes`),
-   changes under `.goals/` are refused as `NoImprovement` (event `refused`),
-   and uncommitted changes fail the run. The control plane pushes the branch
-   with a lease on the base commit through the forge, and hands over to
-   `OpeningPR`. Whatever the outcome, the sandbox is deleted when the run leaves
-   `Selecting`.
+   If the goal specifies a `verify` command, the orchestrator runs it in the
+   sandbox bounded by `--verify-timeout` (default 10 minutes); a failing
+   command ends the run as `NoImprovement` (event `verify_failed`), while
+   execution errors fail the run (`verify_error`). When verify passes, or if
+   the goal has no verify command, the control plane exports a git packfile
+   containing the commits from the base commit to HEAD out of the sandbox. It
+   enforces refusals: runs with no changes against the base commit end in
+   `NoImprovement` (event `no_changes`), changes under `.goals/` are refused
+   as `NoImprovement` (event `refused`), and uncommitted changes fail the run.
+   The control plane pushes the branch with a lease on the base commit through
+   the forge, and hands over to `OpeningPR`. Whatever the outcome, the sandbox is
+   deleted when the run leaves `Selecting`.
 5. **OpeningPR.** When the forge implements change requests, the orchestrator
    checks for an existing open pull request for the branch and reuses it;
    otherwise it opens a new pull request through the forge. The harness writes
