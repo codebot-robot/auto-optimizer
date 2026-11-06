@@ -496,6 +496,13 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req Request) (reconcile.Re
 			return reconcile.Result{}, nil
 		}
 		return res, nil
+
+	case state.PhaseOpeningPR:
+		if err := o.openPullRequest(ctx, repo, run); err != nil {
+			log.Error(err, "opening pull request failed", "repo", repo.URL, "run", run.ID)
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, nil
 	}
 
 	return reconcile.Result{}, nil
@@ -971,7 +978,7 @@ func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.
 	return nil
 }
 
-func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, phase state.RunPhase, kind, message string) {
+func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, phase state.RunPhase, kind, message string, data map[string]any) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -994,6 +1001,7 @@ func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *sta
 		Phase:   phase,
 		Kind:    kind,
 		Message: msg,
+		Data:    data,
 	}
 	if phase == state.PhaseFailed {
 		event.Error = message
@@ -1010,7 +1018,7 @@ func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *sta
 }
 
 func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
-	o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", errMsg)
+	o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", errMsg, nil)
 	return errors.New(errMsg)
 }
 
@@ -1165,12 +1173,12 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 
 	if errors.Is(turnErr, session.ErrSessionFinished) {
 		run.Summary = finishTool.Summary
-		o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "finished", finishTool.Summary)
+		o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "finished", finishTool.Summary, nil)
 		return nil
 	}
 
 	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
-		o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "no_improvement", "session ended without a pull request")
+		o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "no_improvement", "session ended without a pull request", nil)
 		return nil
 	}
 
@@ -1197,19 +1205,19 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 
 	sandboxName := run.SandboxName
 	if sandboxName == "" {
-		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", "sandbox name is empty for selecting run")
+		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", "sandbox name is empty for selecting run", nil)
 		return reconcile.Result{}, nil
 	}
 
 	sb := o.harness.GetOrAttachSandbox(sandboxName)
 	if sb == nil {
-		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", "failed to get sandbox handle")
+		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "failed", "failed to get sandbox handle", nil)
 		return reconcile.Result{}, nil
 	}
 
 	destDir, err := os.MkdirTemp("", "ao-export-*")
 	if err != nil {
-		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "failed", fmt.Sprintf("creating temp dir for export: %v", err))
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "failed", fmt.Sprintf("creating temp dir for export: %v", err), nil)
 		return reconcile.Result{}, nil
 	}
 	defer func() {
@@ -1225,18 +1233,18 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 	})
 	if err != nil {
 		if errors.Is(err, session.ErrNoChanges) {
-			o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "no_changes", "no changes against base commit")
+			o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "no_changes", "no changes against base commit", nil)
 			return reconcile.Result{}, nil
 		}
 		if errors.Is(err, session.ErrGoalsChanged) {
-			o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "refused", "changes under .goals/")
+			o.finishRun(ctx, repo, run, sb, state.PhaseNoImprovement, "refused", "changes under .goals/", nil)
 			return reconcile.Result{}, nil
 		}
 		if errors.Is(err, session.ErrUncommittedChanges) {
-			o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "failed", err.Error())
+			o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "failed", err.Error(), nil)
 			return reconcile.Result{}, nil
 		}
-		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "failed", fmt.Sprintf("export commits: %v", err))
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "failed", fmt.Sprintf("export commits: %v", err), nil)
 		return reconcile.Result{}, nil
 	}
 
@@ -1265,23 +1273,23 @@ func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run 
 	}
 
 	if o.forgeFor == nil {
-		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("no forge configured for repository %s", repo.URL))
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("no forge configured for repository %s", repo.URL), nil)
 		return nil
 	}
 
 	f, err := o.forgeFor(repo.URL)
 	if err != nil {
-		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("selecting forge for %s: %v", repo.URL, err))
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("selecting forge for %s: %v", repo.URL, err), nil)
 		return nil
 	}
 	if f == nil {
-		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("no forge configured for repository %s", repo.URL))
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("no forge configured for repository %s", repo.URL), nil)
 		return nil
 	}
 
 	packFile, err := os.Open(res.PackfilePath)
 	if err != nil {
-		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("opening packfile: %v", err))
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("opening packfile: %v", err), nil)
 		return nil
 	}
 	defer func() {
@@ -1306,10 +1314,10 @@ func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run 
 	})
 	if pushErr != nil {
 		if errors.Is(pushErr, forge.ErrBranchMoved) {
-			o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "branch_moved", "remote branch is not at base commit")
+			o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "branch_moved", "remote branch is not at base commit", nil)
 			return nil
 		}
-		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("push packfile: %v", pushErr))
+		o.finishRun(ctx, repo, run, sb, state.PhaseFailed, "push_failed", fmt.Sprintf("push packfile: %v", pushErr), nil)
 		return nil
 	}
 
@@ -1329,9 +1337,105 @@ func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run 
 		scoped.Log(ctx).Error(err, "failed to append branch_pushed event", "run", run.ID)
 	}
 
+	if sb != nil {
+		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+			scoped.Log(ctx).V(2).Info("error deleting sandbox after run left selecting", "sandbox", run.SandboxName, "error", delErr)
+		}
+	}
+
 	run.SetPhase(state.PhaseOpeningPR, pushTime)
-	o.finishRun(ctx, repo, run, sb, state.PhaseSucceeded, "pull_request_not_opened", "opening the pull request through the forge is the next step")
+	if err := o.store.PutRun(ctx, run); err != nil {
+		scoped.Log(ctx).Error(err, "failed to update run to OpeningPR", "run", run.ID)
+	}
+
+	return o.openPullRequest(ctx, repo, run)
+}
+
+func (o *Orchestrator) openPullRequest(ctx context.Context, repo *state.Repo, run *state.Run) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	if o.forgeFor == nil {
+		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "pull_request_failed", fmt.Sprintf("no forge configured for repository %s", repo.URL), nil)
+		return nil
+	}
+
+	f, err := o.forgeFor(repo.URL)
+	if err != nil {
+		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "pull_request_failed", fmt.Sprintf("selecting forge for %s: %v", repo.URL, err), nil)
+		return nil
+	}
+	if f == nil {
+		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "pull_request_failed", fmt.Sprintf("no forge configured for repository %s", repo.URL), nil)
+		return nil
+	}
+
+	cr, ok := f.(forge.ChangeRequestCreator)
+	if !ok {
+		o.finishRun(ctx, repo, run, nil, state.PhaseSucceeded, "pull_request_not_opened", "forge cannot open pull requests", nil)
+		return nil
+	}
+
+	branch := run.BranchName()
+	if run.Branch == "" {
+		run.Branch = branch
+	}
+
+	prs, err := cr.ListPullRequests(ctx, repo.URL, branch)
+	if err != nil {
+		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "pull_request_failed", fmt.Sprintf("listing pull requests: %v", err), nil)
+		return nil
+	}
+
+	for _, pr := range prs {
+		if pr.State == "open" && pr.Head == branch {
+			run.PRURL = pr.URL
+			o.finishRun(ctx, repo, run, nil, state.PhaseSucceeded, "pull_request_reused", pr.URL, map[string]any{"url": pr.URL})
+			return nil
+		}
+	}
+
+	base := repo.DefaultBranch
+	if base == "" {
+		base = "main"
+	}
+	title := run.PRTitle
+	if title == "" {
+		title = fmt.Sprintf("Optimize %s", run.GoalName)
+	}
+	body := o.buildPRBody(repo, run)
+
+	pr, err := cr.OpenPullRequest(ctx, repo.URL, branch, base, title, body)
+	if err != nil {
+		o.finishRun(ctx, repo, run, nil, state.PhaseFailed, "pull_request_failed", err.Error(), nil)
+		return nil
+	}
+
+	run.PRURL = pr.URL
+	o.finishRun(ctx, repo, run, nil, state.PhaseSucceeded, "pull_request_opened", pr.URL, map[string]any{"url": pr.URL})
 	return nil
+}
+
+func (o *Orchestrator) buildPRBody(repo *state.Repo, run *state.Run) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Goal: %s\n", run.GoalName))
+	b.WriteString(fmt.Sprintf("Base commit: %s\n", shortCommit(run.BaseCommit)))
+	b.WriteString(fmt.Sprintf("Branch: %s\n", run.Branch))
+	b.WriteString(fmt.Sprintf("Run ID: %s\n", run.ID))
+	if runURL := o.RunPageURL(repo, run); runURL != "" {
+		b.WriteString(fmt.Sprintf("Run page: [%s](%s)\n", runURL, runURL))
+	}
+	b.WriteString("\n## What the agent says\n\n")
+	b.WriteString(run.PRBody)
+	return b.String()
+}
+
+func shortCommit(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 func buildSystemPrompt(basePrompt string, repo *state.Repo, run *state.Run, goalBody string) string {
