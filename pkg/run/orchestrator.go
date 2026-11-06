@@ -1355,8 +1355,9 @@ func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run 
 		}
 	}
 
+	prev := run.Phase
 	run.SetPhase(state.PhaseOpeningPR, pushTime)
-	if err := o.store.PutRun(ctx, run); err != nil {
+	if err := o.putRun(ctx, repo, run, prev); err != nil {
 		scoped.Log(ctx).Error(err, "failed to update run to OpeningPR", "run", run.ID)
 	}
 
