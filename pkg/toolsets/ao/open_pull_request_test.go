@@ -67,7 +67,7 @@ func TestOpenPullRequestTool_Schema(t *testing.T) {
 		t.Fatalf("parameters is %T, want map[string]any", schema.Function.Parameters)
 	}
 	req, ok := params["required"].([]string)
-	wantReq := []string{"repository", "branch", "title", "body"}
+	wantReq := []string{"title", "body"}
 	if !ok || !slices.Equal(req, wantReq) {
 		t.Errorf("required parameters = %v, want %v", req, wantReq)
 	}
@@ -76,7 +76,7 @@ func TestOpenPullRequestTool_Schema(t *testing.T) {
 	if !ok {
 		t.Fatalf("properties is %T, want map[string]any", params["properties"])
 	}
-	for _, prop := range wantReq {
+	for _, prop := range []string{"repository", "branch", "title", "body"} {
 		p, ok := props[prop].(map[string]any)
 		if !ok || p["type"] != "string" {
 			t.Errorf("property %q = %v, want type: string", prop, p)
@@ -149,14 +149,15 @@ func TestOpenPullRequestTool_Run(t *testing.T) {
 	wrongRepoTool.Branch = expected.Branch
 	wrongRepoTool.Title = "Valid title"
 	wrongRepoTool.Body = "Valid body"
+	wantErrRepo := `unexpected repository "https://github.com/other/repo", expected "https://github.com/example/repo"`
 	if _, err := wrongRepoTool.Run(ctx, nil); err == nil {
 		t.Error("Run with wrong repo returned nil error, want error")
 	} else {
 		if errors.Is(err, session.ErrPullRequestRequested) {
 			t.Error("Run with wrong repo returned ErrPullRequestRequested, want ordinary error")
 		}
-		if !strings.Contains(err.Error(), expected.Repository) {
-			t.Errorf("Run with wrong repo error %q does not name expected repo %q", err.Error(), expected.Repository)
+		if err.Error() != wantErrRepo {
+			t.Errorf("Run with wrong repo error = %q, want %q", err.Error(), wantErrRepo)
 		}
 	}
 
@@ -166,14 +167,15 @@ func TestOpenPullRequestTool_Run(t *testing.T) {
 	wrongBranchTool.Branch = "main"
 	wrongBranchTool.Title = "Valid title"
 	wrongBranchTool.Body = "Valid body"
+	wantErrBranch := `unexpected branch "main", expected "ao/goal/run-1"`
 	if _, err := wrongBranchTool.Run(ctx, nil); err == nil {
 		t.Error("Run with wrong branch returned nil error, want error")
 	} else {
 		if errors.Is(err, session.ErrPullRequestRequested) {
 			t.Error("Run with wrong branch returned ErrPullRequestRequested, want ordinary error")
 		}
-		if !strings.Contains(err.Error(), expected.Branch) {
-			t.Errorf("Run with wrong branch error %q does not name expected branch %q", err.Error(), expected.Branch)
+		if err.Error() != wantErrBranch {
+			t.Errorf("Run with wrong branch error = %q, want %q", err.Error(), wantErrBranch)
 		}
 	}
 
@@ -232,6 +234,106 @@ func TestOpenPullRequestTool_Run(t *testing.T) {
 	}
 	if jsonMsg.Content == nil || !strings.Contains(*jsonMsg.Content, "recorded") {
 		t.Errorf("jsonMsg.Content = %v, want non-nil containing 'recorded'", jsonMsg.Content)
+	}
+
+	// 8. Omitted repository and branch succeed and default to expected values
+	omittedTool := NewOpenPullRequestTool(expected)
+	omittedTool.Title = "Optimize database index queries"
+	omittedTool.Body = "Adds compound index on (repo, goal, run_id)."
+	omittedMsg, err := omittedTool.Run(ctx, &fakeSandbox{})
+	if !errors.Is(err, session.ErrPullRequestRequested) {
+		t.Fatalf("Run with omitted values err = %v, want ErrPullRequestRequested", err)
+	}
+	if omittedMsg.Content == nil || !strings.Contains(*omittedMsg.Content, "recorded") {
+		t.Errorf("omittedMsg.Content = %v, want non-nil containing 'recorded'", omittedMsg.Content)
+	}
+	if omittedTool.Repository != expected.Repository {
+		t.Errorf("omittedTool.Repository = %q, want %q", omittedTool.Repository, expected.Repository)
+	}
+	if omittedTool.Branch != expected.Branch {
+		t.Errorf("omittedTool.Branch = %q, want %q", omittedTool.Branch, expected.Branch)
+	}
+	if omittedTool.Title != "Optimize database index queries" {
+		t.Errorf("omittedTool.Title = %q, want 'Optimize database index queries'", omittedTool.Title)
+	}
+	if omittedTool.Body != "Adds compound index on (repo, goal, run_id)." {
+		t.Errorf("omittedTool.Body = %q, want 'Adds compound index on (repo, goal, run_id).'", omittedTool.Body)
+	}
+
+	// 9. Omitted repository with valid branch succeeds and defaults repository
+	omitRepoTool := NewOpenPullRequestTool(expected)
+	omitRepoTool.Branch = expected.Branch
+	omitRepoTool.Title = "Valid title"
+	omitRepoTool.Body = "Valid body"
+	if _, err := omitRepoTool.Run(ctx, &fakeSandbox{}); !errors.Is(err, session.ErrPullRequestRequested) {
+		t.Fatalf("Run with omitted repo err = %v, want ErrPullRequestRequested", err)
+	}
+	if omitRepoTool.Repository != expected.Repository {
+		t.Errorf("omitRepoTool.Repository = %q, want %q", omitRepoTool.Repository, expected.Repository)
+	}
+
+	// 10. Omitted branch with valid repository succeeds and defaults branch
+	omitBranchTool := NewOpenPullRequestTool(expected)
+	omitBranchTool.Repository = expected.Repository
+	omitBranchTool.Title = "Valid title"
+	omitBranchTool.Body = "Valid body"
+	if _, err := omitBranchTool.Run(ctx, &fakeSandbox{}); !errors.Is(err, session.ErrPullRequestRequested) {
+		t.Fatalf("Run with omitted branch err = %v, want ErrPullRequestRequested", err)
+	}
+	if omitBranchTool.Branch != expected.Branch {
+		t.Errorf("omitBranchTool.Branch = %q, want %q", omitBranchTool.Branch, expected.Branch)
+	}
+
+	// 11. Wrong repository with omitted branch is refused with same error text
+	wrongRepoOmitBranch := NewOpenPullRequestTool(expected)
+	wrongRepoOmitBranch.Repository = "https://github.com/other/repo"
+	wrongRepoOmitBranch.Title = "Valid title"
+	wrongRepoOmitBranch.Body = "Valid body"
+	if _, err := wrongRepoOmitBranch.Run(ctx, nil); err == nil || err.Error() != wantErrRepo {
+		t.Errorf("Run with wrong repo (omitted branch) err = %v, want %q", err, wantErrRepo)
+	}
+
+	// 12. Wrong branch with omitted repository is refused with same error text
+	wrongBranchOmitRepo := NewOpenPullRequestTool(expected)
+	wrongBranchOmitRepo.Branch = "main"
+	wrongBranchOmitRepo.Title = "Valid title"
+	wrongBranchOmitRepo.Body = "Valid body"
+	if _, err := wrongBranchOmitRepo.Run(ctx, nil); err == nil || err.Error() != wantErrBranch {
+		t.Errorf("Run with wrong branch (omitted repo) err = %v, want %q", err, wantErrBranch)
+	}
+
+	// 13. Unmarshal JSON without repository and branch defaults them on Run and preserves title and body
+	unmarshalOmitted := NewOpenPullRequestTool(expected)
+	jsonOmitted := `{"title":"Refactor cache layer","body":"Replaces map with sync.Map."}`
+	if err := json.Unmarshal([]byte(jsonOmitted), unmarshalOmitted); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	if unmarshalOmitted.Repository != "" {
+		t.Errorf("Repository before Run = %q, want empty", unmarshalOmitted.Repository)
+	}
+	if unmarshalOmitted.Branch != "" {
+		t.Errorf("Branch before Run = %q, want empty", unmarshalOmitted.Branch)
+	}
+	if unmarshalOmitted.Title != "Refactor cache layer" {
+		t.Errorf("Title = %q, want 'Refactor cache layer'", unmarshalOmitted.Title)
+	}
+	if unmarshalOmitted.Body != "Replaces map with sync.Map." {
+		t.Errorf("Body = %q, want 'Replaces map with sync.Map.'", unmarshalOmitted.Body)
+	}
+	if _, err := unmarshalOmitted.Run(ctx, &fakeSandbox{}); !errors.Is(err, session.ErrPullRequestRequested) {
+		t.Fatalf("unmarshalOmitted.Run err = %v, want ErrPullRequestRequested", err)
+	}
+	if unmarshalOmitted.Repository != expected.Repository {
+		t.Errorf("Repository after Run = %q, want %q", unmarshalOmitted.Repository, expected.Repository)
+	}
+	if unmarshalOmitted.Branch != expected.Branch {
+		t.Errorf("Branch after Run = %q, want %q", unmarshalOmitted.Branch, expected.Branch)
+	}
+	if unmarshalOmitted.Title != "Refactor cache layer" {
+		t.Errorf("Title after Run = %q, want 'Refactor cache layer'", unmarshalOmitted.Title)
+	}
+	if unmarshalOmitted.Body != "Replaces map with sync.Map." {
+		t.Errorf("Body after Run = %q, want 'Replaces map with sync.Map.'", unmarshalOmitted.Body)
 	}
 }
 

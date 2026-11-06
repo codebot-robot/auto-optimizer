@@ -39,8 +39,8 @@ type OpenPullRequestExpectation struct {
 type OpenPullRequestTool struct {
 	expected OpenPullRequestExpectation
 
-	Repository string `json:"repository"`
-	Branch     string `json:"branch"`
+	Repository string `json:"repository,omitempty"`
+	Branch     string `json:"branch,omitempty"`
 	Title      string `json:"title"`
 	Body       string `json:"body"`
 }
@@ -68,11 +68,11 @@ func (t *OpenPullRequestTool) Schema() llm.Tool {
 				"properties": map[string]any{
 					"repository": map[string]any{
 						"type":        "string",
-						"description": "Repository URL for this run as given in the repository facts.",
+						"description": "Repository URL for this run as given in the repository facts. Optional; defaults to the expected repository, but a wrong value is refused.",
 					},
 					"branch": map[string]any{
 						"type":        "string",
-						"description": "Branch name for this run as given in the repository facts.",
+						"description": "Branch name for this run as given in the repository facts. Optional; defaults to the expected branch, but a wrong value is refused.",
 					},
 					"title": map[string]any{
 						"type":        "string",
@@ -83,21 +83,26 @@ func (t *OpenPullRequestTool) Schema() llm.Tool {
 						"description": "Description of the pull request.",
 					},
 				},
-				"required": []string{"repository", "branch", "title", "body"},
+				"required": []string{"title", "body"},
 			},
 		},
 	}
 }
 
-// Run implements tools.Tool. It verifies the repository URL and branch match
-// the expected values, rejects an empty title with a tool error, verifies the
-// working tree is clean via git status in the sandbox, and returns
-// session.ErrPullRequestRequested to signal the control plane to take over.
+// Run implements tools.Tool. It defaults omitted repository and branch values
+// to the expected values, verifies any provided values match the expected values,
+// rejects an empty title with a tool error, verifies the working tree is clean via
+// git status in the sandbox, and returns session.ErrPullRequestRequested to signal
+// the control plane to take over.
 func (t *OpenPullRequestTool) Run(ctx context.Context, sandbox tools.Sandbox) (llm.Message, error) {
-	if !repoMatches(t.Repository, t.expected.Repository) {
+	if t.Repository == "" {
+		t.Repository = t.expected.Repository
+	} else if !repoMatches(t.Repository, t.expected.Repository) {
 		return llm.Message{}, fmt.Errorf("unexpected repository %q, expected %q", t.Repository, t.expected.Repository)
 	}
-	if t.Branch != t.expected.Branch {
+	if t.Branch == "" {
+		t.Branch = t.expected.Branch
+	} else if t.Branch != t.expected.Branch {
 		return llm.Message{}, fmt.Errorf("unexpected branch %q, expected %q", t.Branch, t.expected.Branch)
 	}
 	if strings.TrimSpace(t.Title) == "" {
