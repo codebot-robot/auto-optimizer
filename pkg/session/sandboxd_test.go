@@ -54,6 +54,7 @@ type fakeProcessServer struct {
 	startStderr     [][]byte
 	startExit       int32
 	startErr        error
+	startedCh       chan struct{}
 	startBlockCh    chan struct{}
 	stdinReceivedCh chan struct{}
 
@@ -183,6 +184,27 @@ func (f *fakeProcessServer) SendSignal(ctx context.Context, req *processv1.SendS
 	return &processv1.SendSignalResponse{}, nil
 }
 
+type initTrackingStream struct {
+	grpc.ClientStream
+	srv *fakeProcessServer
+}
+
+func (s *initTrackingStream) RecvMsg(m any) error {
+	err := s.ClientStream.RecvMsg(m)
+	if err == nil {
+		if resp, ok := m.(*processv1.StartResponse); ok && resp.GetInit() != nil {
+			if s.srv.startedCh != nil {
+				select {
+				case <-s.srv.startedCh:
+				default:
+					close(s.srv.startedCh)
+				}
+			}
+		}
+	}
+	return err
+}
+
 func setupTestProcessClient(t *testing.T, srv *fakeProcessServer, key ed25519.PrivateKey, aud string) (*Sandbox, func()) {
 	t.Helper()
 	lis := bufconn.Listen(1024 * 1024)
@@ -199,6 +221,13 @@ func setupTestProcessClient(t *testing.T, srv *fakeProcessServer, key ed25519.Pr
 			return lis.DialContext(ctx)
 		}),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, callOpts ...grpc.CallOption) (grpc.ClientStream, error) {
+			cs, err := streamer(ctx, desc, cc, method, callOpts...)
+			if err != nil {
+				return nil, err
+			}
+			return &initTrackingStream{ClientStream: cs, srv: srv}, nil
+		}),
 	)
 	if len(key) > 0 {
 		dialOpts = append(dialOpts,
@@ -456,8 +485,10 @@ func TestExecCommand_Start_WithStdin(t *testing.T) {
 }
 
 func TestExecCommand_Start_ContextCancellationDeliversSignal(t *testing.T) {
+	startedCh := make(chan struct{})
 	srv := &fakeProcessServer{
 		startPID:     9999,
+		startedCh:    startedCh,
 		startBlockCh: make(chan struct{}),
 		startExit:    137, // SIGKILL
 	}
@@ -476,7 +507,11 @@ func TestExecCommand_Start_ContextCancellationDeliversSignal(t *testing.T) {
 	}()
 
 	// Wait for process to start and receive InitEvent
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-startedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for process to start")
+	}
 
 	// Cancel context
 	cancel()
