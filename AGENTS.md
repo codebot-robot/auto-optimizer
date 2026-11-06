@@ -89,7 +89,10 @@ repository.
 
 ### Scope
 
-- **One idea, one issue, one PR.** If a PR can be split into two ideas, split it. Problems found during review that lie outside the PR's idea become new issues.
+- **One idea, one issue, one PR.** Split a big issue into sub-issues before
+  work starts, each sized for one PR of about 200 lines. If a PR can be split
+  into two ideas, split it. Problems found during review that lie outside the
+  PR's idea become new issues.
 - **A good PR changes at most 200 lines, including tests.** Review effort grows roughly with the square of the diff, so two 100-line PRs cost about a quarter of one 200-line PR. If one idea needs more than 200 lines, say so on the issue before pushing and propose where to cut or how to order the parts.
 - **Issues carry a line budget.** An issue without one should be given one before it is assigned.
 - **Stack dependent PRs in order.** Open the first against `main`, and open each later one after the previous merges, so every diff shows only its own idea.
@@ -106,7 +109,10 @@ repository.
   - **Review answers:** if a reviewer had to ask, the answer probably belongs in the message.
 - **One logical change per commit**, each building and passing tests where practical (for example: proto changes, then implementation, then tests or CI).
 - **Keep messages true to the final code.** When review changes the approach, make sure the commit messages describe what the code does now, not the history of attempts. Either amend the original commit, or add `fixup!` commits and leave them in place: do not squash them. The fixups are useful history, because code that needed many rounds of tweaking is also the code most likely to still hold bugs, and the record shows where that was. A `fixup!` commit whose diff speaks for itself needs no body; one that changes behaviour or reverses a decision gets a body saying what changed and why. Whichever route you take, never leave a message describing code that was later removed.
-- **Reference issues** in the commit body: `Fixes #N` for the commit that completes an issue, `Part of #N` otherwise.
+- **Reference issues.** In the commit body, reference the issue the commit
+  completes with `Fixes #N`. When a change is one step of a larger piece of
+  work, file a sub-issue for that step and close it. Let the parent issue carry
+  the checklist. Do not write `Part of #N`.
 - **PR description = the commit messages**, in order, for multi-commit PRs. If a reviewer would need information that isn't in the commits, add it to the commits rather than only to the PR description.
 
 ### Commands
