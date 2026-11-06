@@ -65,17 +65,23 @@ func (f *FakeForge) OpenPullRequest(ctx context.Context, repoURL, head, base, ti
 	return &cpy, nil
 }
 
-// ListPullRequests lists open pull requests for repoURL whose head branch begins with headPrefix, newest first.
-// An empty headPrefix matches all open pull requests.
+// ListPullRequests lists pull requests for repoURL whose head branch begins with headPrefix, newest first.
+// An empty headPrefix matches all pull requests.
 func (f *FakeForge) ListPullRequests(ctx context.Context, repoURL, headPrefix string) ([]PullRequest, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.listPullRequestsError != nil {
+		err := f.listPullRequestsError
+		f.listPullRequestsError = nil
+		return nil, err
+	}
 
 	var result []PullRequest
 	prs := f.pullRequests[repoURL]
 	for i := len(prs) - 1; i >= 0; i-- {
 		pr := prs[i]
-		if pr.State == "open" && strings.HasPrefix(pr.Head, headPrefix) {
+		if strings.HasPrefix(pr.Head, headPrefix) {
 			result = append(result, pr)
 		}
 	}
@@ -93,9 +99,29 @@ func (f *FakeForge) PullRequests(repoURL string) []PullRequest {
 	return cpy
 }
 
+// SetPullRequests sets the pull requests recorded for repoURL.
+func (f *FakeForge) SetPullRequests(repoURL string, prs []PullRequest) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.pullRequests == nil {
+		f.pullRequests = make(map[string][]PullRequest)
+	}
+	cpy := make([]PullRequest, len(prs))
+	copy(cpy, prs)
+	f.pullRequests[repoURL] = cpy
+}
+
 // SetOpenPullRequestError sets an error to be returned once by the next OpenPullRequest call.
 func (f *FakeForge) SetOpenPullRequestError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.openPullRequestError = err
+}
+
+// SetListPullRequestsError sets an error to be returned once by the next ListPullRequests call.
+func (f *FakeForge) SetListPullRequestsError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listPullRequestsError = err
 }

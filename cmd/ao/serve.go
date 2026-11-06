@@ -338,6 +338,10 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	scheduler, err := run.NewScheduler(run.SchedulerOptions{
 		Store:        stateStore,
 		Orchestrator: orchestrator,
+		ForgeFor: func(repoURL string) (forge.Forge, error) {
+			f, _, err := selectForge(repoURL, githubToken)
+			return f, err
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("initializing scheduler: %w", err)

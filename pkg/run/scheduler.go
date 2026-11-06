@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
@@ -37,6 +38,7 @@ type SchedulerOptions struct {
 	Orchestrator *Orchestrator
 	Clock        func() time.Time
 	Interval     time.Duration
+	ForgeFor     func(repoURL string) (forge.Forge, error)
 }
 
 // Scheduler inspects goals and creates pending runs for goals that have changed.
@@ -45,6 +47,7 @@ type Scheduler struct {
 	Orchestrator *Orchestrator
 	Clock        func() time.Time
 	Interval     time.Duration
+	ForgeFor     func(repoURL string) (forge.Forge, error)
 }
 
 // NewScheduler creates a new Scheduler with the given options.
@@ -68,6 +71,7 @@ func NewScheduler(opts SchedulerOptions) (*Scheduler, error) {
 		Orchestrator: opts.Orchestrator,
 		Clock:        clock,
 		Interval:     interval,
+		ForgeFor:     opts.ForgeFor,
 	}, nil
 }
 
@@ -140,6 +144,18 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 	log := scoped.Log(ctx)
 	key := repo.Key()
 
+	var repoForge forge.Forge
+	if s.ForgeFor == nil {
+		log.V(2).Info("no forge configured; skipping pull-request check", "repo", repo.URL)
+	} else {
+		f, err := s.ForgeFor(repo.URL)
+		if err != nil {
+			log.V(2).Info("error selecting forge; skipping pull-request check", "repo", repo.URL, "error", err)
+		} else {
+			repoForge = f
+		}
+	}
+
 	goalsList, err := s.Store.ListGoals(ctx, key)
 	if err != nil {
 		return fmt.Errorf("listing goals: %w", err)
@@ -186,6 +202,25 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 		if latestRun != nil && !latestRun.Phase.IsTerminal() {
 			log.V(2).Info("goal already has an active run; doing nothing", "repo", repo.URL, "goal", g.Name, "run", latestRun.ID, "phase", latestRun.Phase)
 			continue
+		}
+
+		if cr, ok := repoForge.(forge.ChangeRequestCreator); ok {
+			prs, err := cr.ListPullRequests(ctx, repo.URL, "ao/"+g.Name+"/")
+			if err != nil {
+				log.Error(err, "listing pull requests; continuing", "repo", repo.URL, "goal", g.Name)
+			} else {
+				var openPR *forge.PullRequest
+				for i := range prs {
+					if prs[i].State == "open" {
+						openPR = &prs[i]
+						break
+					}
+				}
+				if openPR != nil {
+					log.V(2).Info("goal already has an open pull request; doing nothing", "repo", repo.URL, "goal", g.Name, "pr", openPR.URL)
+					continue
+				}
+			}
 		}
 
 		// Create a new run when there is no run yet, or when hash or base commit differs.

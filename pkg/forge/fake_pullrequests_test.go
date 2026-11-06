@@ -127,3 +127,41 @@ func TestFakeForge_InjectedErrorReturnedOnce(t *testing.T) {
 		t.Errorf("expected PR number 1, got %d", pr.Number)
 	}
 }
+
+func TestFakeForge_SetPullRequestsAndListError(t *testing.T) {
+	ctx := t.Context()
+	f := NewFake()
+	repoURL := "https://github.com/gke-labs/test-repo"
+
+	prs := []PullRequest{
+		{Number: 1, Head: "ao/goal-1/run-1", Base: "main", State: "open"},
+		{Number: 2, Head: "ao/goal-1/run-2", Base: "main", State: "closed"},
+		{Number: 3, Head: "ao/goal-2/run-1", Base: "main", State: "merged"},
+	}
+	f.SetPullRequests(repoURL, prs)
+
+	list, err := f.ListPullRequests(ctx, repoURL, "ao/goal-1/")
+	if err != nil {
+		t.Fatalf("ListPullRequests: %v", err)
+	}
+	if len(list) != 2 || list[0].Number != 2 || list[1].Number != 1 {
+		t.Errorf("expected [PR 2 (closed), PR 1 (open)], got %+v", list)
+	}
+
+	injected := errors.New("simulated list failure")
+	f.SetListPullRequestsError(injected)
+
+	_, err = f.ListPullRequests(ctx, repoURL, "")
+	if !errors.Is(err, injected) {
+		t.Fatalf("expected injected error, got %v", err)
+	}
+
+	// Next call should succeed and return all PRs newest-first
+	list2, err := f.ListPullRequests(ctx, repoURL, "")
+	if err != nil {
+		t.Fatalf("ListPullRequests after error: %v", err)
+	}
+	if len(list2) != 3 {
+		t.Errorf("expected 3 PRs, got %d", len(list2))
+	}
+}

@@ -15,9 +15,11 @@
 package run
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
@@ -532,5 +534,213 @@ func TestScheduler_BaseCommitChangedCreatesRun(t *testing.T) {
 	}
 	if events[0].Data.(map[string]any)["reason"] != "base commit changed" {
 		t.Errorf("expected reason 'base commit changed', got %v", events[0].Data)
+	}
+}
+
+func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	store := state.NewFileStore(dir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/example-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "example-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	goalRec := &state.GoalRecord{
+		Goal: &goals.Goal{
+			Name:     "optimize-latency",
+			Body:     "Optimize latency below 50ms",
+			Hash:     "hash-v1",
+			Schedule: "on-change",
+		},
+		Hash:       "hash-v1",
+		BaseCommit: "commit-aaa",
+	}
+	if err := store.PutGoal(ctx, repo.Key(), goalRec); err != nil {
+		t.Fatalf("PutGoal: %v", err)
+	}
+
+	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	fakeForge := forge.NewFake()
+	scheduler, err := NewScheduler(SchedulerOptions{
+		Store:    store,
+		Clock:    func() time.Time { return now },
+		ForgeFor: func(repoURL string) (forge.Forge, error) { return fakeForge, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	// First tick creates Run 1
+	if err := scheduler.Tick(ctx); err != nil {
+		t.Fatalf("Tick 1: %v", err)
+	}
+	runs, err := store.ListRuns(ctx, repo.Key())
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("expected 1 run, got %d (err: %v)", len(runs), err)
+	}
+
+	// Mark run 1 terminal
+	runs[0].SetPhase(state.PhaseSucceeded, now)
+	if err := store.PutRun(ctx, runs[0]); err != nil {
+		t.Fatalf("PutRun terminal: %v", err)
+	}
+
+	// Update base commit so goal would trigger a new run
+	goalRec.BaseCommit = "commit-bbb"
+	if err := store.PutGoal(ctx, repo.Key(), goalRec); err != nil {
+		t.Fatalf("PutGoal bbb: %v", err)
+	}
+
+	// 1. Open pull request for the goal prevents a new run even when base commit changed
+	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
+		{
+			Number: 1,
+			Head:   "ao/optimize-latency/20261030T120000Z-0001",
+			Base:   "main",
+			State:  "open",
+			URL:    repo.URL + "/pull/1",
+		},
+	})
+
+	now = now.Add(time.Minute)
+	if err := scheduler.Tick(ctx); err != nil {
+		t.Fatalf("Tick with open PR: %v", err)
+	}
+	runs, err = store.ListRuns(ctx, repo.Key())
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("expected open PR to prevent new run, got %d runs", len(runs))
+	}
+
+	// 2. Closed or merged pull request does not prevent a new run
+	expectedRuns := 1
+	for _, stateVal := range []string{"closed", "merged"} {
+		expectedRuns++
+		fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
+			{
+				Number: 1,
+				Head:   "ao/optimize-latency/20261030T120000Z-0001",
+				Base:   "main",
+				State:  stateVal,
+				URL:    repo.URL + "/pull/1",
+			},
+		})
+		now = now.Add(time.Minute)
+		if err := scheduler.Tick(ctx); err != nil {
+			t.Fatalf("Tick with %s PR: %v", stateVal, err)
+		}
+		runs, err = store.ListRuns(ctx, repo.Key())
+		if err != nil || len(runs) != expectedRuns {
+			t.Fatalf("expected %s PR not to prevent new run, got %d runs (wanted %d)", stateVal, len(runs), expectedRuns)
+		}
+		// Reset latest run to terminal for next subtest
+		runs[len(runs)-1].SetPhase(state.PhaseSucceeded, now)
+		_ = store.PutRun(ctx, runs[len(runs)-1])
+		goalRec.BaseCommit = "commit-" + stateVal
+		_ = store.PutGoal(ctx, repo.Key(), goalRec)
+	}
+
+	// 3. Open pull request for another goal does not prevent this goal's run
+	expectedRuns++
+	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
+		{
+			Number: 2,
+			Head:   "ao/other-goal/20261030T120000Z-0002",
+			Base:   "main",
+			State:  "open",
+			URL:    repo.URL + "/pull/2",
+		},
+	})
+	now = now.Add(time.Minute)
+	if err := scheduler.Tick(ctx); err != nil {
+		t.Fatalf("Tick with other goal PR: %v", err)
+	}
+	runs, err = store.ListRuns(ctx, repo.Key())
+	if err != nil || len(runs) != expectedRuns {
+		t.Fatalf("expected other goal PR not to prevent new run, got %d runs (wanted %d)", len(runs), expectedRuns)
+	}
+
+	// Mark last run terminal and update base commit
+	runs[len(runs)-1].SetPhase(state.PhaseSucceeded, now)
+	_ = store.PutRun(ctx, runs[len(runs)-1])
+	goalRec.BaseCommit = "commit-ddd"
+	_ = store.PutGoal(ctx, repo.Key(), goalRec)
+
+	// 4. A forge without ChangeRequestCreator (e.g. GitRemote) schedules as before
+	expectedRuns++
+	schedulerNoCR, err := NewScheduler(SchedulerOptions{
+		Store:    store,
+		Clock:    func() time.Time { return now },
+		ForgeFor: func(repoURL string) (forge.Forge, error) { return forge.NewGitRemote(), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+	now = now.Add(time.Minute)
+	if err := schedulerNoCR.Tick(ctx); err != nil {
+		t.Fatalf("Tick with GitRemote: %v", err)
+	}
+	runs, err = store.ListRuns(ctx, repo.Key())
+	if err != nil || len(runs) != expectedRuns {
+		t.Fatalf("expected forge without ChangeRequestCreator to schedule run, got %d runs (wanted %d)", len(runs), expectedRuns)
+	}
+
+	// Mark last run terminal and update base commit
+	runs[len(runs)-1].SetPhase(state.PhaseSucceeded, now)
+	_ = store.PutRun(ctx, runs[len(runs)-1])
+	goalRec.BaseCommit = "commit-eee"
+	_ = store.PutGoal(ctx, repo.Key(), goalRec)
+
+	// 5. Flaky forge error on ListPullRequests does not block scheduling
+	expectedRuns++
+	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
+		{
+			Number: 1,
+			Head:   "ao/optimize-latency/20261030T120000Z-0001",
+			Base:   "main",
+			State:  "open",
+			URL:    repo.URL + "/pull/1",
+		},
+	})
+	fakeForge.SetListPullRequestsError(errors.New("flaky forge network error"))
+	now = now.Add(time.Minute)
+	if err := scheduler.Tick(ctx); err != nil {
+		t.Fatalf("Tick with flaky forge error: %v", err)
+	}
+	runs, err = store.ListRuns(ctx, repo.Key())
+	if err != nil || len(runs) != expectedRuns {
+		t.Fatalf("expected flaky forge error not to block run creation, got %d runs (wanted %d)", len(runs), expectedRuns)
+	}
+
+	// Mark last run terminal and update base commit
+	runs[len(runs)-1].SetPhase(state.PhaseSucceeded, now)
+	_ = store.PutRun(ctx, runs[len(runs)-1])
+	goalRec.BaseCommit = "commit-fff"
+	_ = store.PutGoal(ctx, repo.Key(), goalRec)
+
+	// 6. Forge selection error does not block scheduling
+	expectedRuns++
+	schedulerErrForge, err := NewScheduler(SchedulerOptions{
+		Store:    store,
+		Clock:    func() time.Time { return now },
+		ForgeFor: func(repoURL string) (forge.Forge, error) { return nil, errors.New("forge lookup error") },
+	})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+	now = now.Add(time.Minute)
+	if err := schedulerErrForge.Tick(ctx); err != nil {
+		t.Fatalf("Tick with forge selection error: %v", err)
+	}
+	runs, err = store.ListRuns(ctx, repo.Key())
+	if err != nil || len(runs) != expectedRuns {
+		t.Fatalf("expected forge selection error not to block run creation, got %d runs (wanted %d)", len(runs), expectedRuns)
 	}
 }
