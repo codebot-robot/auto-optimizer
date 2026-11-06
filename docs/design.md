@@ -487,9 +487,8 @@ backstop. A missing or deleted `HeroRun` is not data loss, because the
 orchestrator can rebuild every `HeroRun` from the state directory.
 
 To implement `HeroRun`, we will:
-1. Define a `HeroRun` custom resource definition with spec fields for the forge
-   repository, goal, and base commit, and status fields for phase, conditions,
-   and summary metrics.
+1. Define the `HeroRun` custom resource: the type lives in
+   `api/herorun/v1alpha1` and the CRD under `k8s/crds/`.
 2. Update the orchestrator to publish and update thin `HeroRun` objects from
    `run.json`, rate-limiting status updates to at most once every few seconds.
 3. Add owner references from each created `Sandbox` to its `HeroRun` object.
