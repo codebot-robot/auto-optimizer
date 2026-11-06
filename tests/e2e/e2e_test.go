@@ -908,40 +908,32 @@ func TestSessionAPIInCluster(t *testing.T) {
 	t.Logf("PASS: in-cluster ao server successfully handled turn for session %s (sandbox created at %s, found in pod %s logs)", sessionName, creationTimestampStr, aoPodName)
 }
 
-func TestRunLifecycle(t *testing.T) {
-	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("RUN_E2E env var not set, skipping e2e run lifecycle tests")
-	}
-
-	clusterName := os.Getenv("KIND_CLUSTER_NAME")
-	if clusterName == "" {
-		clusterName = "auto-optimizer"
-	}
-
-	h := NewHarness(t, clusterName)
-	h.Setup()
-
-	gitRoot, err := h.getGitRoot()
+func runGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("failed to get git root: %v", err)
+		t.Fatalf("git %v in %s failed: %v\nOutput: %s", args, dir, err, string(out))
 	}
+	return strings.TrimSpace(string(out))
+}
 
+func buildAOBinary(t *testing.T, gitRoot string) string {
+	t.Helper()
 	aoBin := filepath.Join(t.TempDir(), "ao")
 	buildCmd := exec.Command("go", "build", "-o", aoBin, "./cmd/ao")
 	buildCmd.Dir = gitRoot
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
 	}
+	return aoBin
+}
 
-	subH := h.WithT(t)
-	_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
-	t.Cleanup(func() {
-		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
-	})
-
-	// 1. Create a bare git repository with a goal in .goals/hello.md
+func setupHelloRepoFixture(t *testing.T) (bareRepoDir, repoURL, baseCommit string) {
+	t.Helper()
 	gitBaseDir := t.TempDir()
-	bareRepoDir := filepath.Join(gitBaseDir, "hello-repo.git")
+	bareRepoDir = filepath.Join(gitBaseDir, "hello-repo.git")
 	if out, err := exec.Command("git", "init", "--bare", bareRepoDir).CombinedOutput(); err != nil {
 		t.Fatalf("failed to init bare git repo: %v\n%s", err, string(out))
 	}
@@ -965,55 +957,56 @@ func TestRunLifecycle(t *testing.T) {
 		t.Fatalf("failed to write goal file: %v", err)
 	}
 
-	runGit := func(dir string, args ...string) string {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v in %s failed: %v\nOutput: %s", args, dir, err, string(out))
-		}
-		return strings.TrimSpace(string(out))
-	}
+	runGit(t, workDir, "add", ".")
+	runGit(t, workDir, "-c", "user.name=test", "-c", "user.email=test@test.com", "commit", "-m", "add hello goal")
+	baseCommit = runGit(t, workDir, "rev-parse", "HEAD")
+	runGit(t, workDir, "push", "origin", "HEAD:main")
+	runGit(t, bareRepoDir, "symbolic-ref", "HEAD", "refs/heads/main")
+	runGit(t, bareRepoDir, "config", "http.receivepack", "true")
 
-	runGit(workDir, "add", ".")
-	runGit(workDir, "-c", "user.name=test", "-c", "user.email=test@test.com", "commit", "-m", "add hello goal")
-	baseCommit := runGit(workDir, "rev-parse", "HEAD")
-	runGit(workDir, "push", "origin", "HEAD:main")
-	runGit(bareRepoDir, "symbolic-ref", "HEAD", "refs/heads/main")
-	runGit(bareRepoDir, "config", "http.receivepack", "true")
-
-	// 2. Start fixture git server accessible to kind nodes
-	repoURL := startFixtureGitServer(t, bareRepoDir)
+	repoURL = startFixtureGitServer(t, bareRepoDir)
 	t.Logf("Git repository available at %s (base commit %s)", repoURL, baseCommit)
 
 	// Assert the fixture git server accepts pushes
-	runGit(workDir, "push", repoURL, "HEAD:probe")
-	if got := runGit(bareRepoDir, "rev-parse", "refs/heads/probe"); got != baseCommit {
+	runGit(t, workDir, "push", repoURL, "HEAD:probe")
+	if got := runGit(t, bareRepoDir, "rev-parse", "refs/heads/probe"); got != baseCommit {
 		t.Fatalf("expected bare repo to have branch probe at %s, got %s", baseCommit, got)
 	}
-	runGit(bareRepoDir, "branch", "-D", "probe")
+	runGit(t, bareRepoDir, "branch", "-D", "probe")
+	return bareRepoDir, repoURL, baseCommit
+}
 
-	// 3. Start ao serve with the repository registered
+func startAOServe(t *testing.T, aoBin, repoURL string, env ...string) (serverAddr, httpAddr, stateDir string, serveStderr *bytes.Buffer) {
+	t.Helper()
 	aoListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to allocate free port for ao serve: %v", err)
 	}
-	serverAddr := aoListener.Addr().String()
+	serverAddr = aoListener.Addr().String()
 	_ = aoListener.Close()
 
-	stateDir := t.TempDir()
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate free port for ao serve http: %v", err)
+	}
+	httpAddr = httpListener.Addr().String()
+	_ = httpListener.Close()
+
+	stateDir = t.TempDir()
 	serveCmd := exec.Command(aoBin, "serve",
 		"--listen", serverAddr,
+		"--http", httpAddr,
 		"--state-dir", stateDir,
 		"--repo", repoURL,
 	)
-	serveCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
+	serveCmd.Env = append(os.Environ(), env...)
 
-	var serveStdout, serveStderr bytes.Buffer
+	var serveStdout bytes.Buffer
+	serveStderr = &bytes.Buffer{}
 	serveCmd.Stdout = &serveStdout
-	serveCmd.Stderr = &serveStderr
+	serveCmd.Stderr = serveStderr
 
-	t.Logf("Starting ao serve on %s with registered repo %s...", serverAddr, repoURL)
+	t.Logf("Starting ao serve on %s (http %s) with registered repo %s...", serverAddr, httpAddr, repoURL)
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("failed to start ao serve: %v", err)
 	}
@@ -1024,7 +1017,6 @@ func TestRunLifecycle(t *testing.T) {
 		}
 	})
 
-	// Wait for server to accept connections
 	serverReady := false
 	for range 50 {
 		conn, err := net.DialTimeout("tcp", serverAddr, 100*time.Millisecond)
@@ -1038,30 +1030,42 @@ func TestRunLifecycle(t *testing.T) {
 	if !serverReady {
 		t.Fatalf("timed out waiting for ao serve on %s\nStderr: %s", serverAddr, serveStderr.String())
 	}
+	return serverAddr, httpAddr, stateDir, serveStderr
+}
 
-	// 4. Poll for run to reach Working phase
-	type jsonRun struct {
-		ID          string `json:"id"`
-		Phase       string `json:"phase"`
-		BaseCommit  string `json:"baseCommit"`
-		SessionID   string `json:"sessionId"`
-		SandboxName string `json:"sandboxName"`
-		Error       string `json:"error"`
-	}
-	type jsonGetRunResponse struct {
-		Run jsonRun `json:"run"`
-	}
-	type jsonListRunsResponse struct {
-		Runs []jsonRun `json:"runs"`
-	}
+type jsonRun struct {
+	ID          string `json:"id"`
+	Phase       string `json:"phase"`
+	BaseCommit  string `json:"baseCommit"`
+	Branch      string `json:"branch"`
+	SessionID   string `json:"sessionId"`
+	SandboxName string `json:"sandboxName"`
+	Error       string `json:"error"`
+}
 
+type jsonEvent struct {
+	Phase   string `json:"phase"`
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+}
+
+type jsonGetRunResponse struct {
+	Run    jsonRun     `json:"run"`
+	Events []jsonEvent `json:"events"`
+}
+
+type jsonListRunsResponse struct {
+	Runs []jsonRun `json:"runs"`
+}
+
+func pollRunPhase(t *testing.T, aoBin, serverAddr, repoURL, targetPhase string, timeout time.Duration, serveStderr *bytes.Buffer) (*jsonRun, []jsonEvent) {
+	t.Helper()
 	var runID string
 	var finalRun *jsonRun
+	var finalEvents []jsonEvent
 
-	t.Log("Waiting for run to reach Working and then NoImprovement phase...")
-	deadline := time.Now().Add(90 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		// List runs
 		listCmd := exec.Command(aoBin, "run", "list",
 			"--server", serverAddr,
 			"--repo", repoURL,
@@ -1072,7 +1076,6 @@ func TestRunLifecycle(t *testing.T) {
 			var listResp jsonListRunsResponse
 			if jsonErr := json.Unmarshal(out, &listResp); jsonErr == nil && len(listResp.Runs) > 0 {
 				runID = listResp.Runs[0].ID
-				// Get run details
 				getCmd := exec.Command(aoBin, "run", "get", runID,
 					"--server", serverAddr,
 					"--json",
@@ -1081,11 +1084,12 @@ func TestRunLifecycle(t *testing.T) {
 				if getErr == nil {
 					var getResp jsonGetRunResponse
 					if unmarshalErr := json.Unmarshal(getOut, &getResp); unmarshalErr == nil {
-						if getResp.Run.Phase == "NoImprovement" {
+						if getResp.Run.Phase == targetPhase {
 							finalRun = &getResp.Run
+							finalEvents = getResp.Events
 							break
 						} else if getResp.Run.Phase == "Failed" {
-							t.Fatalf("run failed prematurely with error: %s", getResp.Run.Error)
+							t.Fatalf("run failed prematurely with error: %s\nServe stderr:\n%s", getResp.Run.Error, serveStderr.String())
 						}
 					}
 				}
@@ -1095,8 +1099,43 @@ func TestRunLifecycle(t *testing.T) {
 	}
 
 	if finalRun == nil {
-		t.Fatalf("timed out waiting for run to reach NoImprovement phase. Serve stderr:\n%s", serveStderr.String())
+		t.Fatalf("timed out waiting for run to reach %s phase. Serve stderr:\n%s", targetPhase, serveStderr.String())
 	}
+	return finalRun, finalEvents
+}
+
+func TestRunLifecycle(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("RUN_E2E env var not set, skipping e2e run lifecycle tests")
+	}
+
+	clusterName := os.Getenv("KIND_CLUSTER_NAME")
+	if clusterName == "" {
+		clusterName = "auto-optimizer"
+	}
+
+	h := NewHarness(t, clusterName)
+	h.Setup()
+
+	gitRoot, err := h.getGitRoot()
+	if err != nil {
+		t.Fatalf("failed to get git root: %v", err)
+	}
+
+	aoBin := buildAOBinary(t, gitRoot)
+
+	subH := h.WithT(t)
+	_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	t.Cleanup(func() {
+		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	})
+
+	_, repoURL, baseCommit := setupHelloRepoFixture(t)
+	serverAddr, _, stateDir, serveStderr := startAOServe(t, aoBin, repoURL, "OPENAI_MODEL=fake-eliza")
+
+	t.Log("Waiting for run to reach Working and then NoImprovement phase...")
+	finalRun, _ := pollRunPhase(t, aoBin, serverAddr, repoURL, "NoImprovement", 90*time.Second, serveStderr)
+	runID := finalRun.ID
 
 	t.Logf("PASS: Run %s reached phase %s with session %s", finalRun.ID, finalRun.Phase, finalRun.SessionID)
 	if finalRun.BaseCommit != baseCommit {
@@ -1186,4 +1225,126 @@ func TestRunLifecycle(t *testing.T) {
 	}
 
 	t.Logf("PASS: session transcript for run %s shows agent reading cloned repository README", runID)
+}
+
+func TestRunPushesBranch(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("RUN_E2E env var not set, skipping e2e run pushes branch tests")
+	}
+
+	clusterName := os.Getenv("KIND_CLUSTER_NAME")
+	if clusterName == "" {
+		clusterName = "auto-optimizer"
+	}
+
+	h := NewHarness(t, clusterName)
+	h.Setup()
+
+	gitRoot, err := h.getGitRoot()
+	if err != nil {
+		t.Fatalf("failed to get git root: %v", err)
+	}
+
+	aoBin := buildAOBinary(t, gitRoot)
+	bareRepoDir, repoURL, baseCommit := setupHelloRepoFixture(t)
+
+	scriptJSON := `[{"tool":"run_command","args":{"command":"cd /workspace/repo && echo 'appended line for scripted run' >> README.md && git add README.md && git commit -m 'docs: add a line to the README'"}},{"tool":"open_pull_request","args":{"title":"docs: add a line to the README","body":"This scripted run adds a line to the README."}}]`
+
+	serverAddr, httpAddr, _, serveStderr := startAOServe(t, aoBin, repoURL,
+		"OPENAI_MODEL=fake-script",
+		"AO_FAKE_SCRIPT="+scriptJSON,
+	)
+
+	t.Log("Waiting for run to reach Succeeded phase...")
+	finalRun, finalEvents := pollRunPhase(t, aoBin, serverAddr, repoURL, "Succeeded", 90*time.Second, serveStderr)
+	runID := finalRun.ID
+
+	wantBranch := fmt.Sprintf("ao/hello/%s", runID)
+	t.Logf("PASS: Run %s reached phase %s with branch %s", runID, finalRun.Phase, finalRun.Branch)
+
+	// 1. Assert run record has Branch equal to ao/hello/<run-id>
+	if finalRun.Branch != wantBranch {
+		t.Errorf("run record branch = %q, want %q", finalRun.Branch, wantBranch)
+	}
+
+	// 2. Assert bare repository has that branch, its tip's parent is base commit, and its tree changes README.md
+	branchRef := "refs/heads/" + wantBranch
+	tipCommit := runGit(t, bareRepoDir, "rev-parse", branchRef)
+	if tipCommit == "" || tipCommit == baseCommit {
+		t.Errorf("expected branch %s to have a new tip commit distinct from base %s, got %s", wantBranch, baseCommit, tipCommit)
+	}
+
+	tipParent := runGit(t, bareRepoDir, "rev-parse", branchRef+"^")
+	if tipParent != baseCommit {
+		t.Errorf("expected branch %s tip parent to be base commit %s, got %s", wantBranch, baseCommit, tipParent)
+	}
+
+	diffTree := runGit(t, bareRepoDir, "diff-tree", "--no-commit-id", "--name-only", "-r", baseCommit, tipCommit)
+	if !strings.Contains(diffTree, "README.md") {
+		t.Errorf("expected branch %s tree diff against %s to contain README.md, got:\n%s", wantBranch, baseCommit, diffTree)
+	}
+
+	// 3. Assert events include branch_pushed and pull_request_not_opened
+	var foundBranchPushed, foundPRNotOpened bool
+	for _, ev := range finalEvents {
+		if ev.Kind == "branch_pushed" {
+			foundBranchPushed = true
+		}
+		if ev.Kind == "pull_request_not_opened" {
+			foundPRNotOpened = true
+		}
+	}
+	if !foundBranchPushed {
+		t.Errorf("expected events to include branch_pushed, got events: %+v", finalEvents)
+	}
+	if !foundPRNotOpened {
+		t.Errorf("expected events to include pull_request_not_opened, got events: %+v", finalEvents)
+	}
+
+	// Also verify via ao run get formatted output
+	getFmtCmd := exec.Command(aoBin, "run", "get", runID, "--server", serverAddr)
+	getFmtOut, err := getFmtCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ao run get failed: %v\nOutput: %s", err, string(getFmtOut))
+	}
+	fmtStr := string(getFmtOut)
+	if !strings.Contains(fmtStr, "branch_pushed") || !strings.Contains(fmtStr, "pull_request_not_opened") {
+		t.Errorf("expected formatted run output to mention events branch_pushed and pull_request_not_opened, got:\n%s", fmtStr)
+	}
+
+	// 4. Assert run page returns 200 and mentions the branch
+	runPageURL := fmt.Sprintf("http://%s/runs/%s", httpAddr, runID)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(runPageURL)
+	if err != nil {
+		t.Fatalf("failed to fetch run page %s: %v", runPageURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("run page returned status %d, want 200 OK", resp.StatusCode)
+	}
+	pageBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read run page body: %v", err)
+	}
+	if !strings.Contains(string(pageBody), wantBranch) {
+		t.Errorf("expected run page to mention branch %q, got body:\n%s", wantBranch, string(pageBody))
+	}
+	t.Logf("PASS: Run page %s returned 200 and contained branch %s", runPageURL, wantBranch)
+
+	// 5. Verify sandbox was deleted in Kubernetes after session ended
+	subH := h.WithT(t)
+	deleteDeadline := time.Now().Add(30 * time.Second)
+	var sbDeleted bool
+	for time.Now().Before(deleteDeadline) {
+		_, getErr := subH.Kubectl("get", "-n", "ao-sandboxes", "sandbox", finalRun.SandboxName)
+		if getErr != nil {
+			sbDeleted = true
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if !sbDeleted {
+		t.Errorf("expected sandbox %s to be deleted after session ended, but it still exists", finalRun.SandboxName)
+	}
 }
