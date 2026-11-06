@@ -177,7 +177,7 @@ func PushPackfile(ctx context.Context, opts PushPackfileOptions) error {
 		Auth:              auth,
 		RefSpecs:          []config.RefSpec{config.RefSpec(fmt.Sprintf("%s:%s", branchRef.String(), branchRef.String()))},
 		RequireRemoteRefs: requireRemoteRefs,
-		Force:             true,
+		Force:             false,
 	}
 
 	if err := r.PushContext(ctx, pushOpts); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {

@@ -241,7 +241,10 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		_, err = stateStore.GetRepo(ctx, key)
 		if err != nil {
 			if errors.Is(err, state.ErrNotFound) {
-				repoForge, forgeKind := selectForge(repoURL, githubToken)
+				repoForge, forgeKind, err := selectForge(repoURL, githubToken)
+				if err != nil {
+					return fmt.Errorf("selecting forge for %s: %w", repoURL, err)
+				}
 				defBranch, err := repoForge.DefaultBranch(ctx, repoURL)
 				if err != nil {
 					log.Error(err, "querying default branch; defaulting to main", "url", repoURL)
@@ -320,6 +323,10 @@ func runServe(ctx context.Context, flags serveFlags) error {
 		GitAuthor:         flags.gitAuthor,
 		PublicURL:         flags.publicURL,
 		ReadyTimeout:      flags.readyTimeout,
+		ForgeFor: func(repoURL string) (forge.Forge, error) {
+			f, _, err := selectForge(repoURL, githubToken)
+			return f, err
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("initializing orchestrator: %w", err)
@@ -424,10 +431,13 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	}
 }
 
-func selectForge(repoURL, githubToken string) (forge.Forge, string) {
+func selectForge(repoURL, githubToken string) (forge.Forge, string, error) {
 	key, err := state.ParseRepoURL(repoURL)
-	if err == nil && (key.Host == "github.com" || strings.HasSuffix(key.Host, ".github.com")) && githubToken != "" {
-		return github.New(githubToken), "github"
+	if err != nil {
+		return nil, "", fmt.Errorf("parsing repository URL %q: %w", repoURL, err)
 	}
-	return forge.NewGitRemote(), "gitremote"
+	if (key.Host == "github.com" || strings.HasSuffix(key.Host, ".github.com")) && githubToken != "" {
+		return github.New(githubToken), "github", nil
+	}
+	return forge.NewGitRemote(), "gitremote", nil
 }
