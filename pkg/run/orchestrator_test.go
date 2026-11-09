@@ -25,6 +25,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -5279,5 +5280,605 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 	// Outcome was not consumed twice (map is still empty)
 	if _, ok := orch.popTurnOutcome(runID); ok {
 		t.Fatal("outcome appeared again after pass 2")
+	}
+}
+
+type scriptedMultiToolLLM struct {
+	mu           sync.Mutex
+	callCount    int
+	step3Entered chan struct{}
+	step3Allowed chan struct{}
+}
+
+func (s *scriptedMultiToolLLM) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	s.mu.Lock()
+	s.callCount++
+	count := s.callCount
+	s.mu.Unlock()
+
+	switch count {
+	case 1:
+		args, _ := json.Marshal(map[string]any{"command": "echo step1"})
+		return &llm.ChatCompletionResponse{
+			Choices: []llm.Choice{
+				{
+					Message: llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:   "call-1",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "run_command",
+									Arguments: string(args),
+								},
+							},
+						},
+					},
+				},
+			},
+		}, nil
+	case 2:
+		args, _ := json.Marshal(map[string]any{"command": "echo step2"})
+		return &llm.ChatCompletionResponse{
+			Choices: []llm.Choice{
+				{
+					Message: llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:   "call-2",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "run_command",
+									Arguments: string(args),
+								},
+							},
+						},
+					},
+				},
+			},
+		}, nil
+	default:
+		if s.step3Entered != nil {
+			select {
+			case <-s.step3Entered:
+			default:
+				close(s.step3Entered)
+			}
+		}
+		if s.step3Allowed != nil {
+			<-s.step3Allowed
+		}
+		content := "done"
+		return &llm.ChatCompletionResponse{
+			Choices: []llm.Choice{
+				{
+					Message: llm.Message{
+						Role:    "assistant",
+						Content: &content,
+					},
+				},
+			},
+		}, nil
+	}
+}
+
+func findGoroutinesContaining(target string) []string {
+	buf := make([]byte, 64*1024)
+	n := runtime.Stack(buf, true)
+	stacks := string(buf[:n])
+	var matches []string
+	for _, g := range strings.Split(stacks, "\n\n") {
+		if strings.Contains(g, target) {
+			matches = append(matches, g)
+		}
+	}
+	return matches
+}
+
+func TestOrchestrator_ToolCall_EnqueuesRunAndExtendsSandboxLifetime(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-extend-test"
+	sandboxName := "run-extend-test"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "extend-test",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha",
+		SandboxName: sandboxName,
+		Goal: &goals.Goal{
+			Name: "extend-test",
+			Body: "test goal",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	step1Finished := make(chan struct{})
+	step2Entered := make(chan struct{})
+	step2Allowed := make(chan struct{})
+	step2Finished := make(chan struct{})
+	step3Entered := make(chan struct{})
+	step3Allowed := make(chan struct{})
+
+	procSrv := &blockingProcessServer{
+		onCommand: func(cmd []string) {
+			for _, arg := range cmd {
+				if strings.Contains(arg, "step1") {
+					close(step1Finished)
+					return
+				}
+				if strings.Contains(arg, "step2") {
+					close(step2Entered)
+					<-step2Allowed
+					close(step2Finished)
+					return
+				}
+			}
+		},
+	}
+
+	scriptedLLM := &scriptedMultiToolLLM{
+		step3Entered: step3Entered,
+		step3Allowed: step3Allowed,
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, scriptedLLM)
+
+	currentTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	initialShutdown := currentTime.Add(5 * time.Minute)
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   &metav1.Time{Time: initialShutdown},
+				ShutdownPolicy: &policy,
+			},
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionTrue,
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	clockMu := sync.Mutex{}
+	getClock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return currentTime
+	}
+	advanceClock := func(d time.Duration) time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		currentTime = currentTime.Add(d)
+		return currentTime
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        getClock,
+		MaxTurns:     30,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// 1. First reconcile pass starts the turn worker.
+	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	if err != nil {
+		t.Fatalf("orch.Reconcile start: %v", err)
+	}
+	if res.RequeueAfter != session.SandboxInactivityTimeout/3 {
+		t.Errorf("expected RequeueAfter %v, got %v", session.SandboxInactivityTimeout/3, res.RequeueAfter)
+	}
+
+	// Wait for tool 1 to execute and finish, and tool 2 to be entered and blocked
+	select {
+	case <-step1Finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for step 1 to execute")
+	}
+
+	select {
+	case <-step2Entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for step 2 to be entered")
+	}
+
+	// At this point, tool 1's ToolCallFinished has executed and enqueued the run.
+	deadline := time.Now().Add(5 * time.Second)
+	foundNotify := false
+	for time.Now().Before(deadline) {
+		select {
+		case evt := <-orch.notifyCh:
+			if evt.Object.RunID == runID {
+				foundNotify = true
+			}
+		default:
+			if foundNotify {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if foundNotify {
+			break
+		}
+	}
+	if !foundNotify {
+		t.Fatal("expected notification for run on tool 1 finish, but none found")
+	}
+
+	// While blocked in step 2:
+	// Verify no goroutine other than the worker is running
+	heartbeatG := findGoroutinesContaining("heartbeat")
+	if len(heartbeatG) > 0 {
+		t.Errorf("expected 0 heartbeat goroutines, found %d: %v", len(heartbeatG), heartbeatG)
+	}
+	workerG := findGoroutinesContaining("runTurnWorker")
+	if len(workerG) != 1 {
+		t.Errorf("expected exactly 1 worker goroutine, found %d: %v", len(workerG), workerG)
+	}
+
+	// Advance clock and reconcile while worker is running
+	t1 := advanceClock(2 * time.Minute)
+	res1, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	if err != nil {
+		t.Fatalf("orch.Reconcile after tool 1: %v", err)
+	}
+	if res1.RequeueAfter != session.SandboxInactivityTimeout/3 {
+		t.Errorf("expected RequeueAfter %v, got %v", session.SandboxInactivityTimeout/3, res1.RequeueAfter)
+	}
+
+	// Verify sandbox ShutdownTime was extended in Kubernetes
+	sb1, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	wantShutdown1 := t1.Add(session.SandboxInactivityTimeout)
+	if sb1.Spec.ShutdownTime == nil || !sb1.Spec.ShutdownTime.Time.Equal(wantShutdown1) {
+		t.Errorf("expected sandbox shutdown time %v, got %v", wantShutdown1, sb1.Spec.ShutdownTime)
+	}
+
+	// Verify run.LastActivity recorded on run record
+	gotRun1, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun1.LastActivity == nil || !gotRun1.LastActivity.Equal(t1) {
+		t.Errorf("expected LastActivity %v, got %v", t1, gotRun1.LastActivity)
+	}
+
+	// Verify rate-limiting: advancing less than SandboxInactivityTimeout/3 skips extension
+	advanceClock(30 * time.Second)
+	resRateLimit, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	if err != nil {
+		t.Fatalf("orch.Reconcile during rate limit: %v", err)
+	}
+	if resRateLimit.RequeueAfter != session.SandboxInactivityTimeout/3 {
+		t.Errorf("expected RequeueAfter %v, got %v", session.SandboxInactivityTimeout/3, resRateLimit.RequeueAfter)
+	}
+	sbRateLimit, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	if sbRateLimit.Spec.ShutdownTime == nil || !sbRateLimit.Spec.ShutdownTime.Time.Equal(wantShutdown1) {
+		t.Errorf("expected sandbox shutdown time to remain %v, got %v", wantShutdown1, sbRateLimit.Spec.ShutdownTime)
+	}
+	gotRunRateLimit, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRunRateLimit.LastActivity == nil || !gotRunRateLimit.LastActivity.Equal(t1) {
+		t.Errorf("expected LastActivity to remain %v, got %v", t1, gotRunRateLimit.LastActivity)
+	}
+
+	// 2. Allow tool 2 to complete and wait for step 3 to be entered (waiting on step3Allowed)
+	close(step2Allowed)
+	select {
+	case <-step2Finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for step 2 to finish")
+	}
+
+	select {
+	case <-step3Entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for step 3 to be entered")
+	}
+
+	// Tool 2 finished and called ToolCallFinished, enqueuing the run again.
+	// Wait until notification is observed in orch.notifyCh.
+	deadline = time.Now().Add(5 * time.Second)
+	foundNotify2 := false
+	for time.Now().Before(deadline) {
+		select {
+		case evt := <-orch.notifyCh:
+			if evt.Object.RunID == runID {
+				foundNotify2 = true
+			}
+		default:
+			if foundNotify2 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if foundNotify2 {
+			break
+		}
+	}
+	if !foundNotify2 {
+		t.Fatal("expected notification for run on tool 2 finish, but none found")
+	}
+
+	// Advance clock again past rate limit window and reconcile while worker is still blocked on step3Allowed
+	t2 := advanceClock(2 * time.Minute)
+	res2, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	if err != nil {
+		t.Fatalf("orch.Reconcile after tool 2: %v", err)
+	}
+	if res2.RequeueAfter != session.SandboxInactivityTimeout/3 {
+		t.Errorf("expected RequeueAfter %v, got %v", session.SandboxInactivityTimeout/3, res2.RequeueAfter)
+	}
+
+	// Verify sandbox ShutdownTime was extended again
+	sb2, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	wantShutdown2 := t2.Add(session.SandboxInactivityTimeout)
+	if sb2.Spec.ShutdownTime == nil || !sb2.Spec.ShutdownTime.Time.Equal(wantShutdown2) {
+		t.Errorf("expected sandbox shutdown time %v, got %v", wantShutdown2, sb2.Spec.ShutdownTime)
+	}
+
+	// Verify run.LastActivity updated
+	gotRun2, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun2.LastActivity == nil || !gotRun2.LastActivity.Equal(t2) {
+		t.Errorf("expected LastActivity %v, got %v", t2, gotRun2.LastActivity)
+	}
+
+	// 3. Allow LLM call 3 to complete ("done")
+	close(step3Allowed)
+
+	// Wait for worker goroutine to exit
+	deadline = time.Now().Add(5 * time.Second)
+	for orch.isRunActive(runID) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for worker to finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Reconcile to consume outcome
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile outcome: %v", err)
+	}
+
+	gotRunFinal, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRunFinal.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s, got %s", state.PhaseNoImprovement, gotRunFinal.Phase)
+	}
+
+	// Verify no goroutine other than test is left after turn ends
+	leftoverWorkers := findGoroutinesContaining("runTurnWorker")
+	if len(leftoverWorkers) != 0 {
+		t.Errorf("expected 0 worker goroutines left after turn ends, got %d: %v", len(leftoverWorkers), leftoverWorkers)
+	}
+	leftoverHB := findGoroutinesContaining("heartbeat")
+	if len(leftoverHB) != 0 {
+		t.Errorf("expected 0 heartbeat goroutines left after turn ends, got %d: %v", len(leftoverHB), leftoverHB)
+	}
+}
+
+func TestOrchestrator_Working_SandboxExpired_CancelsWorkerAndFailsRun(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-expired-cancel"
+	sandboxName := "run-expired-cancel"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "expired-cancel",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha",
+		SandboxName: sandboxName,
+		Goal: &goals.Goal{
+			Name: "expired-cancel",
+			Body: "test goal",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	toolEntered := make(chan struct{})
+	toolRelease := make(chan struct{})
+
+	procSrv := &blockingProcessServer{
+		onCommand: func(cmd []string) {
+			for _, arg := range cmd {
+				if arg == "block-test" {
+					close(toolEntered)
+					<-toolRelease
+					return
+				}
+			}
+		},
+	}
+
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, &blockingToolLLM{})
+
+	currentTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	initialShutdown := currentTime.Add(5 * time.Minute)
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   &metav1.Time{Time: initialShutdown},
+				ShutdownPolicy: &policy,
+			},
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionTrue,
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	clockMu := sync.Mutex{}
+	getClock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return currentTime
+	}
+	advanceClock := func(d time.Duration) time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		currentTime = currentTime.Add(d)
+		return currentTime
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        getClock,
+		MaxTurns:     30,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Start worker pass
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile start: %v", err)
+	}
+
+	// Wait until worker is inside the tool call
+	select {
+	case <-toolEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for worker to enter tool call")
+	}
+
+	// Delete sandbox from Kubernetes to simulate expiration/deletion
+	if err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, sandboxName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("deleting sandbox: %v", err)
+	}
+
+	// Advance clock past rate-limit window
+	advanceClock(2 * time.Minute)
+
+	// Reconcile pass detects ErrSandboxExpired, cancels the worker, and marks run Failed
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile on expired sandbox: %v", err)
+	}
+
+	// Verify run transitioned to Failed
+	failedRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if failedRun.Phase != state.PhaseFailed {
+		t.Errorf("expected phase %s, got %s", state.PhaseFailed, failedRun.Phase)
+	}
+
+	// Verify terminal event has kind "sandbox_expired"
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	foundExpiredEvent := false
+	for _, e := range events {
+		if e.Kind == "sandbox_expired" && e.Phase == state.PhaseFailed {
+			foundExpiredEvent = true
+			break
+		}
+	}
+	if !foundExpiredEvent {
+		t.Errorf("expected event kind sandbox_expired, got events: %+v", events)
+	}
+
+	// Release tool call
+	close(toolRelease)
+
+	// Worker should exit promptly because its context was cancelled
+	deadline := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(runID) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for worker to exit after cancel")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Reconcile again: outcome was stored by exiting worker, but run is already terminal
+	// The outcome is dropped cleanly without changing terminal state.
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile after worker exit: %v", err)
+	}
+
+	finalRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun final: %v", err)
+	}
+	if finalRun.Phase != state.PhaseFailed {
+		t.Errorf("expected phase %s, got %s", state.PhaseFailed, finalRun.Phase)
 	}
 }
