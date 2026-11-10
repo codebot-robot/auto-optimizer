@@ -100,6 +100,10 @@ data:
   AO_FAKE_SCRIPT: ""
   VERTEX_PROJECT: ""
   VERTEX_LOCATION: ""
+  # Comma-separated repository URLs.
+  AO_REPOS: ""
+  # The base URL used in pull request bodies.
+  AO_PUBLIC_URL: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -151,6 +155,9 @@ spec:
                 name: ao-config
             - secretRef:
                 name: ao-model-keys
+                optional: true
+            - secretRef:
+                name: ao-forge
                 optional: true
           volumeMounts:
             - name: state
