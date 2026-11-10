@@ -906,6 +906,31 @@ func TestSessionAPIInCluster(t *testing.T) {
 	}
 
 	t.Logf("PASS: in-cluster ao server successfully handled turn for session %s (sandbox created at %s, found in pod %s logs)", sessionName, creationTimestampStr, aoPodName)
+
+	// 7. Verify ao-config ConfigMap has AO_REPOS and AO_PUBLIC_URL keys, and deployment/ao has ao-forge secretRef in envFrom
+	reposVal, err := subH.Kubectl("get", "configmap", "-n", "ao-system", "ao-config", "-o", "jsonpath={.data.AO_REPOS}")
+	if err != nil {
+		t.Fatalf("failed to read AO_REPOS from ao-config: %v", err)
+	}
+	if reposVal != "" {
+		t.Errorf("expected AO_REPOS in ao-config to default to empty, got: %q", reposVal)
+	}
+
+	publicURLVal, err := subH.Kubectl("get", "configmap", "-n", "ao-system", "ao-config", "-o", "jsonpath={.data.AO_PUBLIC_URL}")
+	if err != nil {
+		t.Fatalf("failed to read AO_PUBLIC_URL from ao-config: %v", err)
+	}
+	if publicURLVal != "" {
+		t.Errorf("expected AO_PUBLIC_URL in ao-config to default to empty, got: %q", publicURLVal)
+	}
+
+	envFromVal, err := subH.Kubectl("get", "deployment", "-n", "ao-system", "ao", "-o", "jsonpath={.spec.template.spec.containers[0].envFrom}")
+	if err != nil {
+		t.Fatalf("failed to read envFrom from deployment ao: %v", err)
+	}
+	if !strings.Contains(envFromVal, "ao-forge") {
+		t.Errorf("expected deployment envFrom to contain ao-forge, got: %s", envFromVal)
+	}
 }
 
 func runGit(t *testing.T, dir string, args ...string) string {

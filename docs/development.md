@@ -178,22 +178,30 @@ To deploy `auto-optimizer` to a real cluster (such as Google Kubernetes Engine):
    ```
    *(Alternatively, use Vertex AI with Workload Identity described below to avoid storing API keys in the cluster.)*
 
-4. Deploy `ao` with `IMAGE_PREFIX` pointing to your container registry:
+4. Create the `ao-forge` Secret in `ao-system` with your GitHub token:
+   ```bash
+   kubectl create secret generic ao-forge \
+     -n ao-system \
+     --from-literal=GITHUB_TOKEN=...
+   ```
+   The token needs `repo` scope on the target repository (a fork, since the account that holds the token opens the pull requests), and `AO_REPOS` lists the repositories to watch.
+
+5. Deploy `ao` with `IMAGE_PREFIX` pointing to your container registry:
    ```bash
    IMAGE_PREFIX=us-west1-docker.pkg.dev/gke-labs-corp-dev/images ./dev/tasks/deploy-to-kube --only ao
    ```
 
-   When deploying to non-kind clusters, `deploy-to-kube` creates the `ao-system` and `ao-sandboxes` namespaces, pushes the `ao` and `geminicli-toolbox` images to `IMAGE_PREFIX`, deploys manifests using `ap deploy`, and sets `SANDBOX_IMAGE` to `${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}` in `ao-config`. You can pass `OPENAI_MODEL` to specify the model to use (for example, `OPENAI_MODEL=gemini-2.5-flash`). The sandbox image must exist in `IMAGE_PREFIX` for sandboxes to pull; you can verify it is present in the registry with:
+   When deploying to non-kind clusters, `deploy-to-kube` creates the `ao-system` and `ao-sandboxes` namespaces, pushes the `ao` and `geminicli-toolbox` images to `IMAGE_PREFIX`, deploys manifests using `ap deploy`, and sets `SANDBOX_IMAGE` to `${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}` in `ao-config`. You can pass `OPENAI_MODEL` to specify the model to use (for example, `OPENAI_MODEL=gemini-2.5-flash`), `AO_REPOS` to configure the repositories to watch (comma-separated URLs), and `AO_PUBLIC_URL` for links in pull request bodies. The sandbox image must exist in `IMAGE_PREFIX` for sandboxes to pull; you can verify it is present in the registry with:
    ```bash
    gcloud artifacts docker images list ${IMAGE_PREFIX}
    ```
 
-5. Port-forward the in-cluster service to your workstation:
+6. Port-forward the in-cluster service to your workstation:
    ```bash
    kubectl -n ao-system port-forward svc/ao 8081:8081
    ```
 
-6. Send a request to verify the server and sandbox:
+7. Send a request to verify the server and sandbox:
    ```bash
    ao session send demo "run: uname -a"
    ```

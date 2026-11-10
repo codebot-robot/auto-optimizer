@@ -436,8 +436,10 @@ if has_component "ao"; then
     OPENAI_MODEL="${OPENAI_MODEL:-fake-eliza}"
     VERTEX_PROJECT="${VERTEX_PROJECT:-}"
     VERTEX_LOCATION="${VERTEX_LOCATION:-}"
+    AO_REPOS="${AO_REPOS:-}"
+    AO_PUBLIC_URL="${AO_PUBLIC_URL:-}"
 
-    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE}, VERTEX_PROJECT=${VERTEX_PROJECT}, VERTEX_LOCATION=${VERTEX_LOCATION})..."
+    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE}, VERTEX_PROJECT=${VERTEX_PROJECT}, VERTEX_LOCATION=${VERTEX_LOCATION}, AO_REPOS=${AO_REPOS}, AO_PUBLIC_URL=${AO_PUBLIC_URL})..."
     cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -453,6 +455,8 @@ data:
   SANDBOXD_IMAGE: "${SANDBOXD_IMAGE}"
   VERTEX_PROJECT: "${VERTEX_PROJECT}"
   VERTEX_LOCATION: "${VERTEX_LOCATION}"
+  AO_REPOS: "${AO_REPOS}"
+  AO_PUBLIC_URL: "${AO_PUBLIC_URL}"
 EOF
 
     kubectl rollout restart deployment/ao -n ao-system
@@ -471,9 +475,11 @@ EOF
       fi
     fi
     VERTEX_LOCATION="${VERTEX_LOCATION:-}"
+    AO_REPOS="${AO_REPOS:-}"
+    AO_PUBLIC_URL="${AO_PUBLIC_URL:-}"
 
-    if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" || -n "${VERTEX_PROJECT:-}" || -n "${VERTEX_LOCATION:-}" || -n "${SANDBOXD_IMAGE:-}" ]]; then
-      echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE:-}, VERTEX_PROJECT=${VERTEX_PROJECT:-}, VERTEX_LOCATION=${VERTEX_LOCATION:-})..."
+    if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" || -n "${VERTEX_PROJECT:-}" || -n "${VERTEX_LOCATION:-}" || -n "${SANDBOXD_IMAGE:-}" || -n "${AO_REPOS:-}" || -n "${AO_PUBLIC_URL:-}" ]]; then
+      echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE:-}, VERTEX_PROJECT=${VERTEX_PROJECT:-}, VERTEX_LOCATION=${VERTEX_LOCATION:-}, AO_REPOS=${AO_REPOS}, AO_PUBLIC_URL=${AO_PUBLIC_URL})..."
       cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -487,8 +493,10 @@ data:
   OPENAI_MODEL: "${OPENAI_MODEL:-}"
   SANDBOX_IMAGE: "${SANDBOX_IMAGE:-}"
   SANDBOXD_IMAGE: "${SANDBOXD_IMAGE}"
-  VERTEX_PROJECT: "${VERTEX_PROJECT}"
-  VERTEX_LOCATION: "${VERTEX_LOCATION}"
+  VERTEX_PROJECT: "${VERTEX_PROJECT:-}"
+  VERTEX_LOCATION: "${VERTEX_LOCATION:-}"
+  AO_REPOS: "${AO_REPOS}"
+  AO_PUBLIC_URL: "${AO_PUBLIC_URL}"
 EOF
 
       kubectl rollout restart deployment/ao -n ao-system
