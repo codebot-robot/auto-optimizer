@@ -41,6 +41,33 @@ type SchedulerOptions struct {
 	ForgeFor     func(repoURL string) (forge.Forge, error)
 }
 
+// InitDefaults fills every zero-valued field that has a default with its Default* constant.
+func (o *SchedulerOptions) InitDefaults() {
+	if o == nil {
+		return
+	}
+	if o.Clock == nil {
+		o.Clock = func() time.Time { return time.Now().UTC() }
+	}
+	if o.Interval == 0 {
+		o.Interval = DefaultSchedulerInterval
+	}
+}
+
+// Validate reports any missing required dependencies or invalid option values.
+func (o *SchedulerOptions) Validate() error {
+	if o == nil {
+		return errors.New("options are required")
+	}
+	if o.Store == nil {
+		return errors.New("state store is required")
+	}
+	if o.Interval <= 0 {
+		return errors.New("Interval must be positive")
+	}
+	return nil
+}
+
 // Scheduler inspects goals and creates pending runs for goals that have changed.
 type Scheduler struct {
 	Store        state.Store
@@ -52,25 +79,16 @@ type Scheduler struct {
 
 // NewScheduler creates a new Scheduler with the given options.
 func NewScheduler(opts SchedulerOptions) (*Scheduler, error) {
-	if opts.Store == nil {
-		return nil, errors.New("state store is required")
-	}
-
-	interval := opts.Interval
-	if interval <= 0 {
-		interval = DefaultSchedulerInterval
-	}
-
-	clock := opts.Clock
-	if clock == nil {
-		clock = func() time.Time { return time.Now().UTC() }
+	opts.InitDefaults()
+	if err := opts.Validate(); err != nil {
+		return nil, err
 	}
 
 	return &Scheduler{
 		Store:        opts.Store,
 		Orchestrator: opts.Orchestrator,
-		Clock:        clock,
-		Interval:     interval,
+		Clock:        opts.Clock,
+		Interval:     opts.Interval,
 		ForgeFor:     opts.ForgeFor,
 	}, nil
 }

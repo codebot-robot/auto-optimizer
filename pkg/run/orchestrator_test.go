@@ -6035,3 +6035,188 @@ func TestOrchestrator_Working_SandboxExpiredAtStart_ProducesSandboxExpiredOutcom
 		}
 	})
 }
+
+func TestOrchestratorOptions_Defaults(t *testing.T) {
+	var opts OrchestratorOptions
+	opts.InitDefaults()
+
+	if opts.Clock == nil {
+		t.Fatal("expected Clock to be defaulted, got nil")
+	}
+	if time.Since(opts.Clock()) > time.Minute {
+		t.Errorf("expected Clock to return current time, got %v", opts.Clock())
+	}
+	if opts.MaxTurns != DefaultMaxTurns {
+		t.Errorf("MaxTurns = %d, want %d", opts.MaxTurns, DefaultMaxTurns)
+	}
+	if opts.MaxConcurrentRuns != DefaultMaxConcurrentRuns {
+		t.Errorf("MaxConcurrentRuns = %d, want %d", opts.MaxConcurrentRuns, DefaultMaxConcurrentRuns)
+	}
+	if opts.ReadyTimeout != DefaultReadyTimeout {
+		t.Errorf("ReadyTimeout = %v, want %v", opts.ReadyTimeout, DefaultReadyTimeout)
+	}
+	if opts.HeroRunStatusInterval != DefaultHeroRunStatusInterval {
+		t.Errorf("HeroRunStatusInterval = %v, want %v", opts.HeroRunStatusInterval, DefaultHeroRunStatusInterval)
+	}
+	if opts.VerifyTimeout != DefaultVerifyTimeout {
+		t.Errorf("VerifyTimeout = %v, want %v", opts.VerifyTimeout, DefaultVerifyTimeout)
+	}
+	if opts.DefaultMaxDuration != DefaultMaxDuration {
+		t.Errorf("DefaultMaxDuration = %v, want %v", opts.DefaultMaxDuration, DefaultMaxDuration)
+	}
+
+	// Verify custom non-zero fields are not overwritten
+	customTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	customOpts := OrchestratorOptions{
+		Clock:                 func() time.Time { return customTime },
+		MaxTurns:              15,
+		MaxConcurrentRuns:     2,
+		ReadyTimeout:          10 * time.Second,
+		HeroRunStatusInterval: 5 * time.Second,
+		VerifyTimeout:         2 * time.Minute,
+		DefaultMaxDuration:    20 * time.Minute,
+	}
+	customOpts.InitDefaults()
+	if !customOpts.Clock().Equal(customTime) {
+		t.Errorf("custom Clock was overwritten")
+	}
+	if customOpts.MaxTurns != 15 {
+		t.Errorf("custom MaxTurns was overwritten: %d", customOpts.MaxTurns)
+	}
+	if customOpts.MaxConcurrentRuns != 2 {
+		t.Errorf("custom MaxConcurrentRuns was overwritten: %d", customOpts.MaxConcurrentRuns)
+	}
+	if customOpts.ReadyTimeout != 10*time.Second {
+		t.Errorf("custom ReadyTimeout was overwritten: %v", customOpts.ReadyTimeout)
+	}
+	if customOpts.HeroRunStatusInterval != 5*time.Second {
+		t.Errorf("custom HeroRunStatusInterval was overwritten: %v", customOpts.HeroRunStatusInterval)
+	}
+	if customOpts.VerifyTimeout != 2*time.Minute {
+		t.Errorf("custom VerifyTimeout was overwritten: %v", customOpts.VerifyTimeout)
+	}
+	if customOpts.DefaultMaxDuration != 20*time.Minute {
+		t.Errorf("custom DefaultMaxDuration was overwritten: %v", customOpts.DefaultMaxDuration)
+	}
+}
+
+func TestOrchestratorOptions_Validate(t *testing.T) {
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+
+	baseValid := func() OrchestratorOptions {
+		opts := OrchestratorOptions{
+			Store:   store,
+			Harness: harness,
+		}
+		opts.InitDefaults()
+		return opts
+	}
+
+	base := baseValid()
+	if err := base.Validate(); err != nil {
+		t.Fatalf("expected valid options to pass, got: %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		mutate        func(o *OrchestratorOptions)
+		wantErrSubstr string
+	}{
+		{
+			name: "missing store",
+			mutate: func(o *OrchestratorOptions) {
+				o.Store = nil
+			},
+			wantErrSubstr: "store",
+		},
+		{
+			name: "missing harness",
+			mutate: func(o *OrchestratorOptions) {
+				o.Harness = nil
+			},
+			wantErrSubstr: "harness",
+		},
+		{
+			name: "negative MaxTurns",
+			mutate: func(o *OrchestratorOptions) {
+				o.MaxTurns = -1
+			},
+			wantErrSubstr: "MaxTurns",
+		},
+		{
+			name: "zero MaxTurns",
+			mutate: func(o *OrchestratorOptions) {
+				o.MaxTurns = 0
+			},
+			wantErrSubstr: "MaxTurns",
+		},
+		{
+			name: "negative MaxConcurrentRuns",
+			mutate: func(o *OrchestratorOptions) {
+				o.MaxConcurrentRuns = -1
+			},
+			wantErrSubstr: "MaxConcurrentRuns",
+		},
+		{
+			name: "zero MaxConcurrentRuns",
+			mutate: func(o *OrchestratorOptions) {
+				o.MaxConcurrentRuns = 0
+			},
+			wantErrSubstr: "MaxConcurrentRuns",
+		},
+		{
+			name: "negative ReadyTimeout",
+			mutate: func(o *OrchestratorOptions) {
+				o.ReadyTimeout = -1 * time.Second
+			},
+			wantErrSubstr: "ReadyTimeout",
+		},
+		{
+			name: "negative HeroRunStatusInterval",
+			mutate: func(o *OrchestratorOptions) {
+				o.HeroRunStatusInterval = -1 * time.Second
+			},
+			wantErrSubstr: "HeroRunStatusInterval",
+		},
+		{
+			name: "negative VerifyTimeout",
+			mutate: func(o *OrchestratorOptions) {
+				o.VerifyTimeout = -1 * time.Second
+			},
+			wantErrSubstr: "VerifyTimeout",
+		},
+		{
+			name: "negative DefaultMaxDuration",
+			mutate: func(o *OrchestratorOptions) {
+				o.DefaultMaxDuration = -1 * time.Second
+			},
+			wantErrSubstr: "DefaultMaxDuration",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := baseValid()
+			tc.mutate(&opts)
+			err := opts.Validate()
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("error %q does not contain expected substring %q", err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+
+	t.Run("NewOrchestrator propagates validation error", func(t *testing.T) {
+		_, err := NewOrchestrator(OrchestratorOptions{
+			Store:        store,
+			Harness:      harness,
+			ReadyTimeout: -1 * time.Minute,
+		})
+		if err == nil || !strings.Contains(err.Error(), "ReadyTimeout") {
+			t.Fatalf("expected ReadyTimeout error from NewOrchestrator, got: %v", err)
+		}
+	})
+}

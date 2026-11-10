@@ -64,6 +64,12 @@ const (
 	// AnnotationRepo is the Sandbox annotation key containing the repository key.
 	AnnotationRepo = "auto-optimizer.labs.gke.io/repo"
 
+	// DefaultMaxTurns is the default maximum number of turns for a run.
+	DefaultMaxTurns = 30
+
+	// DefaultMaxConcurrentRuns is the default maximum number of concurrent runs.
+	DefaultMaxConcurrentRuns = 4
+
 	// DefaultReadyTimeout is the default duration to wait for a Sandbox to become ready.
 	DefaultReadyTimeout = 3 * time.Minute
 
@@ -130,6 +136,66 @@ type OrchestratorOptions struct {
 	// ForgeFor returns the Forge for a repository URL.
 	// If nil or returns an error, push operations in Selecting fail.
 	ForgeFor func(repoURL string) (forge.Forge, error)
+}
+
+// InitDefaults fills every zero-valued field that has a default with its Default* constant.
+func (o *OrchestratorOptions) InitDefaults() {
+	if o == nil {
+		return
+	}
+	if o.Clock == nil {
+		o.Clock = time.Now
+	}
+	if o.MaxTurns == 0 {
+		o.MaxTurns = DefaultMaxTurns
+	}
+	if o.MaxConcurrentRuns == 0 {
+		o.MaxConcurrentRuns = DefaultMaxConcurrentRuns
+	}
+	if o.ReadyTimeout == 0 {
+		o.ReadyTimeout = DefaultReadyTimeout
+	}
+	if o.HeroRunStatusInterval == 0 {
+		o.HeroRunStatusInterval = DefaultHeroRunStatusInterval
+	}
+	if o.VerifyTimeout == 0 {
+		o.VerifyTimeout = DefaultVerifyTimeout
+	}
+	if o.DefaultMaxDuration == 0 {
+		o.DefaultMaxDuration = DefaultMaxDuration
+	}
+}
+
+// Validate reports any missing required dependencies or invalid option values.
+func (o *OrchestratorOptions) Validate() error {
+	if o == nil {
+		return errors.New("options are required")
+	}
+	if o.Store == nil {
+		return errors.New("state store is required")
+	}
+	if o.Harness == nil {
+		return errors.New("harness is required")
+	}
+	if o.MaxTurns < 1 {
+		return errors.New("MaxTurns must be at least 1")
+	}
+	if o.MaxConcurrentRuns < 1 {
+		return errors.New("MaxConcurrentRuns must be at least 1")
+	}
+	if o.ReadyTimeout <= 0 {
+		return errors.New("ReadyTimeout must be positive")
+	}
+	if o.HeroRunStatusInterval <= 0 {
+		return errors.New("HeroRunStatusInterval must be positive")
+	}
+	if o.VerifyTimeout <= 0 {
+		return errors.New("VerifyTimeout must be positive")
+	}
+	if o.DefaultMaxDuration <= 0 {
+		return errors.New("DefaultMaxDuration must be positive")
+	}
+	return nil
 }
 
 type turnOutcome struct {
@@ -206,72 +272,31 @@ func NewManager(restConfig *rest.Config) (manager.Manager, error) {
 
 // NewOrchestrator creates a new run Orchestrator.
 func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
-	if opts.Store == nil {
-		return nil, errors.New("state store is required")
-	}
-	if opts.Harness == nil {
-		return nil, errors.New("harness is required")
-	}
-
-	clock := opts.Clock
-	if clock == nil {
-		clock = time.Now
-	}
-
-	maxTurns := opts.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = 30
-	}
-
-	maxConcurrentRuns := opts.MaxConcurrentRuns
-	if maxConcurrentRuns <= 0 {
-		maxConcurrentRuns = 4
-	}
-
-	readyTimeout := opts.ReadyTimeout
-	if readyTimeout <= 0 {
-		readyTimeout = DefaultReadyTimeout
-	}
-
-	interval := opts.HeroRunStatusInterval
-	if interval <= 0 {
-		interval = DefaultHeroRunStatusInterval
-	}
-	namespace := ""
-	if opts.Harness != nil {
-		namespace = opts.Harness.Namespace()
-	}
-
-	verifyTimeout := opts.VerifyTimeout
-	if verifyTimeout <= 0 {
-		verifyTimeout = DefaultVerifyTimeout
-	}
-
-	defaultMaxDuration := opts.DefaultMaxDuration
-	if defaultMaxDuration <= 0 {
-		defaultMaxDuration = DefaultMaxDuration
+	opts.InitDefaults()
+	if err := opts.Validate(); err != nil {
+		return nil, err
 	}
 
 	orch := &Orchestrator{
 		store:              opts.Store,
 		sessionStore:       opts.SessionStore,
 		harness:            opts.Harness,
-		clock:              clock,
-		maxTurns:           maxTurns,
-		maxConcurrentRuns:  maxConcurrentRuns,
+		clock:              opts.Clock,
+		maxTurns:           opts.MaxTurns,
+		maxConcurrentRuns:  opts.MaxConcurrentRuns,
 		gitAuthor:          opts.GitAuthor,
 		publicURL:          strings.TrimRight(opts.PublicURL, "/"),
-		readyTimeout:       readyTimeout,
+		readyTimeout:       opts.ReadyTimeout,
 		kubeClient:         opts.KubeClient,
-		verifyTimeout:      verifyTimeout,
-		defaultMaxDuration: defaultMaxDuration,
+		verifyTimeout:      opts.VerifyTimeout,
+		defaultMaxDuration: opts.DefaultMaxDuration,
 		forgeFor:           opts.ForgeFor,
 		notifyCh:           make(chan event.TypedGenericEvent[Request], 1024),
 		activeRuns:         make(map[string]bool),
 		workerCancels:      make(map[string]context.CancelFunc),
 		turnOutcomes:       make(map[string]turnOutcome),
 	}
-	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, clock, interval, namespace, orch.publishHeroRun)
+	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, opts.Clock, opts.HeroRunStatusInterval, opts.Harness.Namespace(), orch.publishHeroRun)
 	return orch, nil
 }
 
