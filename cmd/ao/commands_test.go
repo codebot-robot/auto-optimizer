@@ -135,6 +135,12 @@ func TestServeFlags(t *testing.T) {
 	} else if verifyTimeoutFlag.DefValue != "10m0s" {
 		t.Errorf("expected default verify-timeout to be 10m0s, got %s", verifyTimeoutFlag.DefValue)
 	}
+	maxRunDurationFlag := cmd.Flag("max-run-duration")
+	if maxRunDurationFlag == nil {
+		t.Error("expected --max-run-duration flag on ao serve")
+	} else if maxRunDurationFlag.DefValue != "1h0m0s" {
+		t.Errorf("expected default max-run-duration to be 1h0m0s, got %s", maxRunDurationFlag.DefValue)
+	}
 	publicURLFlag := cmd.Flag("public-url")
 	if publicURLFlag == nil {
 		t.Error("expected --public-url flag on ao serve")

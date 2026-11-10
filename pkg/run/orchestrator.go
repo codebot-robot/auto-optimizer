@@ -73,6 +73,12 @@ const (
 	// DefaultVerifyTimeout is the default duration to wait for a goal's verify command to complete.
 	DefaultVerifyTimeout = 10 * time.Minute
 
+	// DefaultMaxDuration is the default maximum duration for a run when the goal does not specify budget.maxDuration.
+	DefaultMaxDuration = 1 * time.Hour
+
+	// SandboxShutdownGrace is the grace period added to a run's deadline when computing its Sandbox shutdown time.
+	SandboxShutdownGrace = 15 * time.Minute
+
 	// readySafetyRequeueInterval is the slow safety requeue interval when waiting for a Sandbox to become ready.
 	readySafetyRequeueInterval = 1 * time.Minute
 )
@@ -117,6 +123,10 @@ type OrchestratorOptions struct {
 	// VerifyTimeout is the maximum duration for running a goal's verify command.
 	VerifyTimeout time.Duration
 
+	// DefaultMaxDuration is the default maximum duration for a run when the goal does not specify budget.maxDuration.
+	// When unset or <= 0, defaults to DefaultMaxDuration (1 hour).
+	DefaultMaxDuration time.Duration
+
 	// ForgeFor returns the Forge for a repository URL.
 	// If nil or returns an error, push operations in Selecting fail.
 	ForgeFor func(repoURL string) (forge.Forge, error)
@@ -132,20 +142,21 @@ type turnOutcome struct {
 
 // Orchestrator reconciles runs in phase Pending and Working using a controller-runtime controller.
 type Orchestrator struct {
-	store             state.Store
-	sessionStore      session.Store
-	harness           *session.Harness
-	clock             func() time.Time
-	maxTurns          int
-	maxConcurrentRuns int
-	gitAuthor         string
-	publicURL         string
-	readyTimeout      time.Duration
-	kubeClient        client.Client
-	logNoKubeClient   sync.Once
-	statusPublisher   *heroRunStatusPublisher
-	verifyTimeout     time.Duration
-	forgeFor          func(repoURL string) (forge.Forge, error)
+	store              state.Store
+	sessionStore       session.Store
+	harness            *session.Harness
+	clock              func() time.Time
+	maxTurns           int
+	maxConcurrentRuns  int
+	gitAuthor          string
+	publicURL          string
+	readyTimeout       time.Duration
+	kubeClient         client.Client
+	logNoKubeClient    sync.Once
+	statusPublisher    *heroRunStatusPublisher
+	verifyTimeout      time.Duration
+	defaultMaxDuration time.Duration
+	forgeFor           func(repoURL string) (forge.Forge, error)
 
 	notifyCh chan event.TypedGenericEvent[Request]
 
@@ -236,23 +247,29 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		verifyTimeout = DefaultVerifyTimeout
 	}
 
+	defaultMaxDuration := opts.DefaultMaxDuration
+	if defaultMaxDuration <= 0 {
+		defaultMaxDuration = DefaultMaxDuration
+	}
+
 	orch := &Orchestrator{
-		store:             opts.Store,
-		sessionStore:      opts.SessionStore,
-		harness:           opts.Harness,
-		clock:             clock,
-		maxTurns:          maxTurns,
-		maxConcurrentRuns: maxConcurrentRuns,
-		gitAuthor:         opts.GitAuthor,
-		publicURL:         strings.TrimRight(opts.PublicURL, "/"),
-		readyTimeout:      readyTimeout,
-		kubeClient:        opts.KubeClient,
-		verifyTimeout:     verifyTimeout,
-		forgeFor:          opts.ForgeFor,
-		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
-		activeRuns:        make(map[string]bool),
-		workerCancels:     make(map[string]context.CancelFunc),
-		turnOutcomes:      make(map[string]turnOutcome),
+		store:              opts.Store,
+		sessionStore:       opts.SessionStore,
+		harness:            opts.Harness,
+		clock:              clock,
+		maxTurns:           maxTurns,
+		maxConcurrentRuns:  maxConcurrentRuns,
+		gitAuthor:          opts.GitAuthor,
+		publicURL:          strings.TrimRight(opts.PublicURL, "/"),
+		readyTimeout:       readyTimeout,
+		kubeClient:         opts.KubeClient,
+		verifyTimeout:      verifyTimeout,
+		defaultMaxDuration: defaultMaxDuration,
+		forgeFor:           opts.ForgeFor,
+		notifyCh:           make(chan event.TypedGenericEvent[Request], 1024),
+		activeRuns:         make(map[string]bool),
+		workerCancels:      make(map[string]context.CancelFunc),
+		turnOutcomes:       make(map[string]turnOutcome),
 	}
 	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, clock, interval, namespace, orch.publishHeroRun)
 	return orch, nil
@@ -572,8 +589,23 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 	}
 
 	// 2. Set deadline on the run
-	deadline := now.Add(o.readyTimeout)
-	run.ReadyDeadline = &deadline
+	maxDuration := o.defaultMaxDuration
+	if run.Goal != nil && run.Goal.Budget != nil && run.Goal.Budget.MaxDuration != "" {
+		d, err := time.ParseDuration(run.Goal.Budget.MaxDuration)
+		if err != nil || d <= 0 {
+			msg := fmt.Sprintf("invalid budget.maxDuration %q: %v", run.Goal.Budget.MaxDuration, err)
+			if err == nil {
+				msg = fmt.Sprintf("invalid budget.maxDuration %q: duration must be positive", run.Goal.Budget.MaxDuration)
+			}
+			return o.failRunWithEvent(ctx, repo, run, msg)
+		}
+		maxDuration = d
+	}
+	runDeadline := now.Add(maxDuration)
+	run.Deadline = &runDeadline
+
+	readyDeadline := now.Add(o.readyTimeout)
+	run.ReadyDeadline = &readyDeadline
 
 	log.Info("preparing run: creating sandbox", "repo", repo.URL, "run", run.ID, "sandbox", sandboxName)
 
@@ -596,14 +628,22 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		log.Info("creating unowned sandbox: no HeroRun available", "run", run.ID, "sandbox", sandboxName)
 	}
 
-	// 4. Create sandbox with a label naming the run, annotation naming the repository, and owner reference
+	// 4. Create sandbox with a label naming the run, annotation naming the repository, owner reference, and shutdown time
 	labels := map[string]string{
 		LabelRun: run.ID,
 	}
 	annotations := map[string]string{
 		AnnotationRepo: repo.Key().String(),
 	}
-	if _, err := o.harness.CreateSandboxNamedWithOwnerReferences(ctx, sandboxName, labels, annotations, ownerRefs); err != nil {
+	sbShutdown := runDeadline.Add(SandboxShutdownGrace)
+	sbOpts := session.CreateSandboxOptions{
+		Name:            sandboxName,
+		Labels:          labels,
+		Annotations:     annotations,
+		OwnerReferences: ownerRefs,
+		ShutdownTime:    sbShutdown,
+	}
+	if _, err := o.harness.CreateSandboxWithOptions(ctx, sbOpts); err != nil {
 		prev := run.Phase
 		failTime := o.clock().UTC()
 		run.SetPhase(state.PhaseFailed, failTime)
@@ -1148,6 +1188,8 @@ func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *sta
 		scoped.Log(ctx).Error(err, "failed to append event", "kind", end.Kind, "run", run.ID)
 	}
 
+	o.cancelWorker(run.ID)
+
 	if end.Sandbox != nil {
 		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), end.Sandbox); delErr != nil {
 			scoped.Log(ctx).V(2).Info("error deleting sandbox after run ended", "sandbox", run.SandboxName, "error", delErr)
@@ -1177,57 +1219,11 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 
 	if o.isRunActive(run.ID) {
 		log.V(2).Info("run is already actively executing a session", "run", run.ID)
-		if err := o.extendWorkingSandbox(ctx, repo, run); err != nil {
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{RequeueAfter: session.SandboxInactivityTimeout / 3}, nil
+		return reconcile.Result{}, nil
 	}
 
 	o.startTurn(ctx, repo, run)
-	return reconcile.Result{RequeueAfter: session.SandboxInactivityTimeout / 3}, nil
-}
-
-func (o *Orchestrator) extendWorkingSandbox(ctx context.Context, repo *state.Repo, run *state.Run) error {
-	now := o.clock().UTC()
-	if run.LastActivity != nil && now.Sub(*run.LastActivity) < session.SandboxInactivityTimeout/3 {
-		return nil
-	}
-
-	latestRun, err := o.store.GetRun(ctx, repo.Key(), run.ID)
-	if err != nil {
-		return fmt.Errorf("getting run for sandbox extension: %w", err)
-	}
-	*run = *latestRun
-	if run.LastActivity != nil && now.Sub(*run.LastActivity) < session.SandboxInactivityTimeout/3 {
-		return nil
-	}
-
-	var sb *session.Sandbox
-	if o.harness != nil && run.SandboxName != "" {
-		sb = o.harness.GetOrAttachSandbox(run.SandboxName)
-		if sb == nil {
-			return errors.New("failed to get sandbox handle")
-		}
-		if err := sb.CheckAliveAndExtendLifecycle(ctx, now, session.SandboxInactivityTimeout); err != nil {
-			if errors.Is(err, session.ErrSandboxExpired) {
-				o.cancelWorker(run.ID)
-				msg := fmt.Sprintf("sandbox %s expired or was deleted: %v", run.SandboxName, err)
-				o.finishRun(ctx, repo, run, runEnd{
-					Phase:   state.PhaseFailed,
-					Kind:    "sandbox_expired",
-					Message: msg,
-					Sandbox: sb,
-				})
-				return errors.New(msg)
-			}
-			return err
-		}
-	}
-	run.LastActivity = &now
-	if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
-		return fmt.Errorf("updating run with last activity: %w", err)
-	}
-	return nil
+	return reconcile.Result{}, nil
 }
 
 func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *state.Run) {
@@ -1282,7 +1278,7 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 
 	// Verify sandbox exists in Kubernetes and has not expired.
 	// If expired or deleted, fail the run with a clear event.
-	if err := sb.CheckAliveAndExtendLifecycle(ctx, o.clock().UTC(), session.SandboxInactivityTimeout); err != nil {
+	if err := sb.CheckAlive(ctx, o.clock().UTC()); err != nil {
 		return turnOutcome{
 			Err:      fmt.Errorf("sandbox %s expired or deleted: %w", sandboxName, err),
 			Finished: o.clock().UTC(),
@@ -1432,7 +1428,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		}
 		o.finishRun(ctx, repo, run, runEnd{
 			Phase:   state.PhaseFailed,
-			Kind:    "failed",
+			Kind:    "sandbox_expired",
 			Message: msg,
 			Sandbox: sb,
 		})

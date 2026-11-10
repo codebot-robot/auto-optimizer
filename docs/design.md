@@ -41,6 +41,7 @@ goal the PR is a proposal and the maintainer is the judge.
 
 | Date | Topic | Decision |
 |---|---|---|
+| 2026-11-09 | Sandbox lifetime | A run's Sandbox gets one shutdownTime at creation (the run deadline plus a grace period), and nothing extends it afterwards. The orchestrator deletes the Sandbox when the run ends. |
 | 2026-10-23 | Sandbox transport | The control plane drives sandboxes through agent-sandbox's `sandboxd`. sandboxd serves a gRPC `ProcessService` on port 9090 and a REST filesystem API on port 8080. We write no custom in-sandbox server and we do not use `pods/exec`. We also maintain agent-sandbox, so we fix the gaps we find upstream instead of working around them. |
 | 2026-10-23 | Agent loop | A Go orchestrator watches GitHub and starts sessions. The session loop is the one from agent-sandbox's `examples/sandboxed-tools`, forked into this repository. The LLM loop runs in the control plane, and every tool call executes in the session's sandbox. In phase 1 each run has one all-in-one session that does the work and opens the PR. Later an outer session gets a tool to start inner sessions, and each inner session runs an agent personality such as gemini-cli, Claude Code, codex, opencode, pi, or a native toolset. |
 | 2026-10-23 | Goal format | A goal is `.goals/<name>.md`. The Markdown body is for the agent. Optional YAML front matter holds the machine-readable fields, which are the metric, the verify command, the budget, and the schedule. More goal types come later. |
@@ -246,10 +247,10 @@ We change the upstream example in five ways.
 - **Persistence** comes from the workspace volume. There is no snapshot step.
   If the sandbox is recreated after expiry, node loss, or a resume for review
   comments, the new pod mounts the same volume.
-- **Lifetime** is extended on every tool call. The session manager pushes
-  `spec.shutdownTime` forward by the inactivity window of five minutes, but
-  never past the run deadline. `shutdownPolicy: Delete` cleans up if the
-  control plane dies.
+- **Lifetime** is set once at creation to the run deadline plus a 15-minute
+  grace period, and nothing extends it afterwards. The orchestrator deletes
+  the Sandbox when the run ends. `shutdownPolicy: Delete` is the safety net
+  when the control plane dies.
 - **Model access** differs by session kind. The control plane calls the model
   with the platform keys for native sessions. Inner CLI agents inside the
   sandbox reach the model APIs through the portal sidecar.
