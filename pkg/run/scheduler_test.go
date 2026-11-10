@@ -16,6 +16,7 @@ package run
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -743,4 +744,102 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	if err != nil || len(runs) != expectedRuns {
 		t.Fatalf("expected forge selection error not to block run creation, got %d runs (wanted %d)", len(runs), expectedRuns)
 	}
+}
+
+func TestSchedulerOptions_Defaults(t *testing.T) {
+	var opts SchedulerOptions
+	opts.InitDefaults()
+
+	if opts.Clock == nil {
+		t.Fatal("expected Clock to be defaulted, got nil")
+	}
+	if time.Since(opts.Clock()) > time.Minute {
+		t.Errorf("expected Clock to return current time, got %v", opts.Clock())
+	}
+	if opts.Interval != DefaultSchedulerInterval {
+		t.Errorf("Interval = %v, want %v", opts.Interval, DefaultSchedulerInterval)
+	}
+
+	// Verify custom non-zero fields are not overwritten
+	customTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	customOpts := SchedulerOptions{
+		Clock:    func() time.Time { return customTime },
+		Interval: 10 * time.Second,
+	}
+	customOpts.InitDefaults()
+	if !customOpts.Clock().Equal(customTime) {
+		t.Errorf("custom Clock was overwritten")
+	}
+	if customOpts.Interval != 10*time.Second {
+		t.Errorf("custom Interval was overwritten: %v", customOpts.Interval)
+	}
+}
+
+func TestSchedulerOptions_Validate(t *testing.T) {
+	store := state.NewFileStore(t.TempDir())
+
+	baseValid := func() SchedulerOptions {
+		opts := SchedulerOptions{
+			Store: store,
+		}
+		opts.InitDefaults()
+		return opts
+	}
+
+	base := baseValid()
+	if err := base.Validate(); err != nil {
+		t.Fatalf("expected valid options to pass, got: %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		mutate        func(o *SchedulerOptions)
+		wantErrSubstr string
+	}{
+		{
+			name: "missing store",
+			mutate: func(o *SchedulerOptions) {
+				o.Store = nil
+			},
+			wantErrSubstr: "store",
+		},
+		{
+			name: "negative Interval",
+			mutate: func(o *SchedulerOptions) {
+				o.Interval = -1 * time.Second
+			},
+			wantErrSubstr: "Interval",
+		},
+		{
+			name: "zero Interval",
+			mutate: func(o *SchedulerOptions) {
+				o.Interval = 0
+			},
+			wantErrSubstr: "Interval",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := baseValid()
+			tc.mutate(&opts)
+			err := opts.Validate()
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("error %q does not contain expected substring %q", err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+
+	t.Run("NewScheduler propagates validation error", func(t *testing.T) {
+		_, err := NewScheduler(SchedulerOptions{
+			Store:    store,
+			Interval: -1 * time.Second,
+		})
+		if err == nil || !strings.Contains(err.Error(), "Interval") {
+			t.Fatalf("expected Interval error from NewScheduler, got: %v", err)
+		}
+	})
 }
