@@ -5,6 +5,7 @@ Autonomous agentic loops to hill-climb on sandboxed scenarios.
 Put goals in `.goals/` in your repository; auto-optimizer runs coding agents in
 Kubernetes sandboxes and sends pull requests that make progress on them.
 See [docs/design.md](docs/design.md) for the architecture.
+Follow [docs/running.md](docs/running.md) to run your first goal against a real repository.
 
 ## Contributing
 

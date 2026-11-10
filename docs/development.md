@@ -157,6 +157,8 @@ To use a real model such as Gemini:
 
 #### Deploying to a Real Cluster
 
+See [docs/running.md](running.md) for a step-by-step runbook on setting up credentials, writing your first goal, and watching a run produce a pull request.
+
 To deploy `auto-optimizer` to a real cluster (such as Google Kubernetes Engine):
 
 1. Set your `kubectl` context to your target cluster:
