@@ -101,13 +101,28 @@ data:
   VERTEX_PROJECT: ""
   VERTEX_LOCATION: ""
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ao-state
+  namespace: ao-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ao
   namespace: ao-system
 spec:
+  # Exactly one replica because state is on a ReadWriteOnce PVC; a second replica needs ObjectFS (epic #33).
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ao
@@ -119,6 +134,11 @@ spec:
       serviceAccountName: ao
       securityContext:
         runAsNonRoot: true
+        # The nonroot user in the distroless base image is uid and gid 65532. Fresh PersistentVolumes
+        # on most provisioners (such as GCE PD and ext4-backed volumes) are owned by root with mode 0755,
+        # whereas kind's local-path provisioner creates the directory world-writable (which is why e2e
+        # tests cannot catch this). Setting fsGroup ensures Kubernetes makes the volume group-writable on mount.
+        fsGroup: 65532
       containers:
         - name: ao
           image: ao
@@ -156,9 +176,9 @@ spec:
             - name: state
               mountPath: /home/nonroot/.local/auto-optimizer
       volumes:
-        # State directory stored on an emptyDir for now; epic #33 will switch this to ObjectFS.
         - name: state
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: ao-state
 ---
 apiVersion: v1
 kind: Service

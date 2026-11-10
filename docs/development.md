@@ -74,7 +74,8 @@ Installs all cluster infrastructure and prerequisites needed by `auto-optimizer`
      - `ServiceAccount` `ao` in `ao-system`.
      - `Role` and `RoleBinding` in `ao-sandboxes` granting least-privilege access to manage `sandboxes` and sandbox execution.
      - `ConfigMap` `ao-config` in `ao-system` setting server and sandbox configuration.
-     - `Deployment` `ao` in `ao-system` running `ao serve` with an `emptyDir` state volume and read-only root filesystem.
+     - `PersistentVolumeClaim` `ao-state` in `ao-system` for state directory persistence.
+     - `Deployment` `ao` in `ao-system` running `ao serve` with a `PersistentVolumeClaim` state volume and read-only root filesystem.
      - `Service` `ao` ClusterIP on port 8080 named `http` and port 8081 named `grpc`.
    - Builds container images (`ao`, `geminicli-toolbox`) and loads them into kind (or pushes to `IMAGE_PREFIX`).
    - Runs `ap deploy` to apply manifests with image tags replaced.
@@ -197,7 +198,7 @@ To deploy `auto-optimizer` to a real cluster (such as Google Kubernetes Engine):
    ao session send demo "run: uname -a"
    ```
 
-> **Note on Session Persistence:** In-cluster sessions do not survive an `ao` pod restart or node reschedule today because `ao` stores state on an `emptyDir` volume. Session persistence across pod restarts will be addressed in epic #33 when state is backed by ObjectFS.
+> **Note on Session Persistence:** State now survives `ao` pod restarts on the PersistentVolumeClaim. ObjectFS (epic #33) is what makes it survive node loss and allows more than one replica.
 
 If you also need ObjectFS on a real cluster, provide `OBJECTFS_BACKEND` (such as `gs://my-bucket/prefix` or `s3://my-bucket/prefix`) and include `objectfs` in `--only` (for example, `--only ao,objectfs`).
 
