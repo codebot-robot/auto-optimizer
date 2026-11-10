@@ -1231,6 +1231,21 @@ func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, r
 	return errors.New(errMsg)
 }
 
+func runStartTime(run *state.Run) time.Time {
+	if run == nil {
+		return time.Time{}
+	}
+	for _, phase := range []state.RunPhase{state.PhasePreparing, state.PhasePending, state.PhaseWorking} {
+		if t, ok := run.PhaseTimestamps[phase]; ok && !t.IsZero() {
+			return t
+		}
+	}
+	if t, err := state.ParseRunIDTime(run.ID); err == nil && !t.IsZero() {
+		return t
+	}
+	return time.Time{}
+}
+
 func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
@@ -1242,13 +1257,71 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 		return reconcile.Result{}, o.handleTurnOutcome(ctx, repo, run, outcome)
 	}
 
-	if o.isRunActive(run.ID) {
-		log.V(2).Info("run is already actively executing a session", "run", run.ID)
+	now := o.clock().UTC()
+	if run.Deadline != nil && !now.Before(*run.Deadline) {
+		var sb *session.Sandbox
+		if o.harness != nil && run.SandboxName != "" {
+			sb = o.harness.GetOrAttachSandbox(run.SandboxName)
+		}
+		var elapsed time.Duration
+		if start := runStartTime(run); !start.IsZero() {
+			if e := now.Sub(start); e > 0 {
+				elapsed = e
+			}
+		}
+		o.cancelWorker(run.ID)
+		o.finishRun(ctx, repo, run, runEnd{
+			Phase:   state.PhaseFailed,
+			Kind:    "deadline_exceeded",
+			Message: "deadline exceeded",
+			Data: map[string]any{
+				"deadline": run.Deadline.Format(time.RFC3339),
+				"elapsed":  elapsed.String(),
+			},
+			Sandbox: sb,
+		})
 		return reconcile.Result{}, nil
 	}
 
+	requeueAfter := time.Duration(0)
+	if run.Deadline != nil {
+		requeueAfter = run.Deadline.Sub(now)
+	}
+
+	if o.isRunActive(run.ID) {
+		if o.harness != nil && o.harness.SandboxClient() != nil && run.SandboxName != "" {
+			// Deliberately an uncached live read to immediately detect sandbox deletion
+			// or pod failure conditions during active execution; part 5b (#201) will make
+			// this a cache lookup.
+			sbObj, err := o.harness.SandboxClient().GetSandboxResource(ctx, o.harness.Namespace(), run.SandboxName)
+			if err != nil && !k8serrors.IsNotFound(err) {
+				return reconcile.Result{}, fmt.Errorf("getting sandbox %s: %w", run.SandboxName, err)
+			}
+			var failMsg string
+			if err != nil {
+				failMsg = fmt.Sprintf("sandbox %s was deleted", run.SandboxName)
+			} else if msg, failed := isSandboxFailed(sbObj); failed {
+				failMsg = fmt.Sprintf("sandbox %s failed: %s", run.SandboxName, msg)
+			}
+			if failMsg != "" {
+				o.cancelWorker(run.ID)
+				sb := o.harness.GetOrAttachSandbox(run.SandboxName)
+				o.finishRun(ctx, repo, run, runEnd{
+					Phase:   state.PhaseFailed,
+					Kind:    "sandbox_deleted",
+					Message: failMsg,
+					Sandbox: sb,
+				})
+				return reconcile.Result{}, nil
+			}
+		}
+
+		log.V(2).Info("run is already actively executing a session", "run", run.ID)
+		return reconcile.Result{RequeueAfter: requeueAfter}, nil
+	}
+
 	o.startTurn(ctx, repo, run)
-	return reconcile.Result{}, nil
+	return reconcile.Result{RequeueAfter: requeueAfter}, nil
 }
 
 func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *state.Run) {

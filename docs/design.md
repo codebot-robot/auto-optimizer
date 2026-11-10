@@ -402,7 +402,8 @@ Runs are reconciled in response to events:
      to `Working`, and enqueues it. If the Sandbox disappears or reports a
      failure before becoming ready, or if the ready deadline passes without
      the Sandbox becoming ready, the run transitions to `Failed`.
-3. **Working.** The session runs turn by turn in the sandbox. The session ends
+3. **Working.** The session runs turn by turn in the sandbox. The orchestrator
+   ends the run at the deadline if it has not finished. The session ends
    when the agent calls the `finish` or `open_pull_request` tool, when the model
    stops, or when a run limit is reached. The limits are `maxDuration`,
    `maxCostUSD`, a maximum number of turns, and the tool timeout. The agent

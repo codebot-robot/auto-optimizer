@@ -6220,3 +6220,351 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 		}
 	})
 }
+
+type midTurnBlockingLLM struct {
+	started   chan struct{}
+	release   chan struct{}
+	cancelled chan struct{}
+	once      sync.Once
+	cancOnce  sync.Once
+}
+
+func newMidTurnBlockingLLM() *midTurnBlockingLLM {
+	return &midTurnBlockingLLM{
+		started:   make(chan struct{}),
+		release:   make(chan struct{}),
+		cancelled: make(chan struct{}),
+	}
+}
+
+func (m *midTurnBlockingLLM) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	m.once.Do(func() { close(m.started) })
+	select {
+	case <-ctx.Done():
+		m.cancOnce.Do(func() { close(m.cancelled) })
+		return nil, ctx.Err()
+	case <-m.release:
+		done := "done"
+		return &llm.ChatCompletionResponse{
+			Choices: []llm.Choice{{Message: llm.Message{Role: "assistant", Content: &done}}},
+		}, nil
+	}
+}
+
+func setupWorkingTestRun(t *testing.T, runID, sbName string, deadline *time.Time, llmClient llm.ChatClient) (*state.FileStore, *session.FileStore, *state.Repo, *state.Run, *session.Harness, *fakeagents.Clientset) {
+	t.Helper()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(t.Context(), repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "test-goal",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha",
+		SandboxName: sbName,
+		Deadline:    deadline,
+		Goal:        &goals.Goal{Name: "test-goal", Body: "body"},
+	}
+	if err := store.PutRun(t.Context(), run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, llmClient)
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	shutdownTime := time.Now().Add(time.Hour)
+	if deadline != nil {
+		shutdownTime = deadline.Add(15 * time.Minute)
+	}
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(t.Context(), &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: "ao-sandboxes", Labels: map[string]string{LabelRun: runID}},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: shutdownTime}, ShutdownPolicy: &policy},
+		},
+		Status: sandboxv1beta1.SandboxStatus{Conditions: []metav1.Condition{{Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue}}},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+	return store, sessionStore, repo, run, harness, agentsCS
+}
+
+func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261030T120000Z-deadline", "run-deadline"
+	startTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	deadline := startTime.Add(10 * time.Minute)
+
+	blockingLLM := newMidTurnBlockingLLM()
+	store, sessionStore, repo, run, harness, agentsCS := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
+	run.SetPhase(state.PhaseWorking, startTime)
+	_ = store.PutRun(ctx, run)
+
+	currentTime := startTime
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store: store, SessionStore: sessionStore, Harness: harness,
+		Clock: func() time.Time { return currentTime },
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	if err != nil || res.RequeueAfter != 10*time.Minute {
+		t.Fatalf("Reconcile got res=%v err=%v, want RequeueAfter=10m", res, err)
+	}
+
+	select {
+	case <-blockingLLM.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for worker to start LLM call")
+	}
+
+	currentTime = deadline.Add(time.Minute)
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("Reconcile after deadline: %v", err)
+	}
+
+	select {
+	case <-blockingLLM.cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected worker context to be cancelled")
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil || gotRun.Phase != state.PhaseFailed {
+		t.Fatalf("expected phase Failed, got %v (err %v)", gotRun.Phase, err)
+	}
+
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sbName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox to be deleted, got err: %v", err)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundEvent bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && e.Kind == "deadline_exceeded" {
+			foundEvent = true
+			m, ok := e.Data.(map[string]any)
+			if !ok || m["deadline"] != deadline.Format(time.RFC3339) || m["elapsed"] == "" {
+				t.Errorf("expected deadline and elapsed in data, got: %+v", e.Data)
+			}
+			break
+		}
+	}
+	if !foundEvent {
+		t.Errorf("expected deadline_exceeded event, got events: %+v", events)
+	}
+
+	// Later outcome from finished worker is ignored
+	deadlineWait := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(runID) {
+		if time.Now().After(deadlineWait) {
+			t.Fatal("timed out waiting for worker goroutine to exit")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("Reconcile with leftover outcome: %v", err)
+	}
+	gotRunAfter, _ := store.GetRun(ctx, repo.Key(), runID)
+	if gotRunAfter.Phase != state.PhaseFailed {
+		t.Errorf("expected phase to remain Failed, got %s", gotRunAfter.Phase)
+	}
+}
+
+func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(ctx context.Context, cs *fakeagents.Clientset, sbName string) error
+		wantMsg string
+	}{
+		{
+			name: "deleted",
+			mutate: func(ctx context.Context, cs *fakeagents.Clientset, sbName string) error {
+				return cs.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, sbName, metav1.DeleteOptions{})
+			},
+			wantMsg: "deleted",
+		},
+		{
+			name: "failed condition",
+			mutate: func(ctx context.Context, cs *fakeagents.Clientset, sbName string) error {
+				sbObj, err := cs.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sbName, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				sbObj.Status.Conditions = append(sbObj.Status.Conditions, metav1.Condition{
+					Type:    string(sandboxv1beta1.SandboxConditionFinished),
+					Status:  metav1.ConditionTrue,
+					Reason:  sandboxv1beta1.SandboxReasonPodFailed,
+					Message: "pod terminated with error",
+				})
+				_, err = cs.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sbObj, metav1.UpdateOptions{})
+				return err
+			},
+			wantMsg: "pod terminated with error",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			runID, sbName := "20261030T120000Z-"+tc.name, "run-"+tc.name
+			startTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+			deadline := startTime.Add(30 * time.Minute)
+
+			blockingLLM := newMidTurnBlockingLLM()
+			store, sessionStore, repo, _, harness, agentsCS := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
+
+			orch, err := NewOrchestrator(OrchestratorOptions{
+				Store: store, SessionStore: sessionStore, Harness: harness,
+				Clock: func() time.Time { return startTime },
+			})
+			if err != nil {
+				t.Fatalf("NewOrchestrator: %v", err)
+			}
+
+			if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+
+			select {
+			case <-blockingLLM.started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for worker to start LLM call")
+			}
+
+			if err := tc.mutate(ctx, agentsCS, sbName); err != nil {
+				t.Fatalf("mutating sandbox: %v", err)
+			}
+
+			if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+				t.Fatalf("Reconcile after sandbox change: %v", err)
+			}
+
+			select {
+			case <-blockingLLM.cancelled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("expected worker context to be cancelled")
+			}
+
+			gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+			if err != nil || gotRun.Phase != state.PhaseFailed {
+				t.Fatalf("expected phase Failed, got %v (err %v)", gotRun.Phase, err)
+			}
+
+			events, err := store.ReadEvents(ctx, repo.Key(), runID)
+			if err != nil {
+				t.Fatalf("ReadEvents: %v", err)
+			}
+			var foundEvent bool
+			for _, e := range events {
+				if e.Phase == state.PhaseFailed && e.Kind == "sandbox_deleted" && strings.Contains(e.Message, tc.wantMsg) {
+					foundEvent = true
+					break
+				}
+			}
+			if !foundEvent {
+				t.Errorf("expected sandbox_deleted event mentioning %q, got events: %+v", tc.wantMsg, events)
+			}
+		})
+	}
+}
+
+func TestOrchestrator_Working_RequeueRemainingDeadline(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261030T120000Z-requeue", "run-requeue"
+	startTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	deadline := startTime.Add(25 * time.Minute)
+
+	blockingLLM := newMidTurnBlockingLLM()
+	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
+
+	currentTime := startTime
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store: store, SessionStore: sessionStore, Harness: harness,
+		Clock: func() time.Time { return currentTime },
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	if err != nil || res.RequeueAfter != 25*time.Minute {
+		t.Fatalf("Reconcile got res=%v err=%v, want RequeueAfter=25m", res, err)
+	}
+
+	select {
+	case <-blockingLLM.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for worker to start")
+	}
+
+	// Reconcile while active should return remaining time
+	currentTime = startTime.Add(5 * time.Minute)
+	res2, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	if err != nil || res2.RequeueAfter != 20*time.Minute {
+		t.Fatalf("Reconcile active got res2=%v err=%v, want RequeueAfter=20m", res2, err)
+	}
+
+	close(blockingLLM.release)
+}
+
+func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261030T120000Z-outcome-first", "run-outcome-first"
+	startTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	deadline := startTime.Add(10 * time.Minute)
+
+	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, &deadline, &llm.ElizaClient{})
+
+	currentTime := startTime
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store: store, SessionStore: sessionStore, Harness: harness,
+		Clock: func() time.Time { return currentTime },
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Store an outcome that finished before the deadline
+	orch.storeTurnOutcome(runID, turnOutcome{
+		Err:      session.ErrSessionFinished,
+		Finished: startTime.Add(5 * time.Minute),
+	})
+
+	// Advance clock past the deadline before Reconcile runs
+	currentTime = deadline.Add(5 * time.Minute)
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s (from finished outcome), got %s", state.PhaseNoImprovement, gotRun.Phase)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	for _, e := range events {
+		if e.Kind == "deadline_exceeded" {
+			t.Errorf("did not expect deadline_exceeded event when turn outcome was waiting")
+		}
+	}
+}
