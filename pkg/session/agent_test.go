@@ -746,59 +746,82 @@ func TestCheckAliveAndExtendLifecycle(t *testing.T) {
 	}
 }
 
-func TestCreateSandboxNamedWithLabels(t *testing.T) {
+func TestSandbox_CheckAlive(t *testing.T) {
 	ctx := t.Context()
-	ns := "test-sandboxes"
-	sbName := "test-sb-metadata"
-	cpNamespace := "ao-system"
+	ns := "test-ns"
+	sbName := "test-sb-alive"
+
+	now := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	initialShutdownTime := now.Add(10 * time.Minute)
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      sbName,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			ShutdownTime: &metav1.Time{Time: initialShutdownTime},
+		},
+	}
 
 	agentsCS := fakeagents.NewSimpleClientset()
-	coreCS := fakek8s.NewSimpleClientset()
-	client := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(ns).Create(ctx, sb, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create fake sandbox: %v", err)
+	}
 
-	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	client := &SandboxClient{
+		agentsClient: agentsCS,
+	}
+	sandbox := &Sandbox{
+		client: client,
+		id: types.NamespacedName{
+			Namespace: ns,
+			Name:      sbName,
+		},
+	}
+
+	// 1. Success: verifies alive and does NOT update ShutdownTime
+	if err := sandbox.CheckAlive(ctx, now); err != nil {
+		t.Fatalf("CheckAlive failed: %v", err)
+	}
+	got, err := agentsCS.AgentsV1beta1().Sandboxes(ns).Get(ctx, sbName, metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	if !got.Spec.ShutdownTime.Time.Equal(initialShutdownTime) {
+		t.Errorf("expected ShutdownTime to remain %v, got %v", initialShutdownTime, got.Spec.ShutdownTime.Time)
 	}
 
-	harness := NewHarness(nil, client, nil, RunOptions{
-		Namespace:             ns,
-		ControlPlaneNamespace: cpNamespace,
-		SigningKey:            privKey,
-	})
-
-	labels := map[string]string{
-		"auto-optimizer.labs.gke.io/run": "run-123",
+	// 2. Expired: now is after ShutdownTime
+	laterNow := now.Add(20 * time.Minute)
+	err = sandbox.CheckAlive(ctx, laterNow)
+	if err == nil {
+		t.Fatal("expected error for expired sandbox, got nil")
 	}
-	annotations := map[string]string{
-		"auto-optimizer.labs.gke.io/repo": "github.com/gke-labs/test",
+	if !errors.Is(err, ErrSandboxExpired) {
+		t.Errorf("expected ErrSandboxExpired, got: %v", err)
 	}
 
-	sb, err := harness.CreateSandboxNamedWithLabels(ctx, sbName, labels, annotations)
-	if err != nil {
-		t.Fatalf("CreateSandboxNamedWithLabels failed: %v", err)
+	// 3. Not found: sandbox does not exist
+	missingSandbox := &Sandbox{
+		client: client,
+		id: types.NamespacedName{
+			Namespace: ns,
+			Name:      "nonexistent",
+		},
 	}
-	defer func() { _ = client.DeleteSandbox(ctx, sb) }()
-
-	created, err := client.GetSandboxResource(ctx, ns, sbName)
-	if err != nil {
-		t.Fatalf("GetSandboxResource failed: %v", err)
+	err = missingSandbox.CheckAlive(ctx, now)
+	if err == nil {
+		t.Fatal("expected error for missing sandbox, got nil")
 	}
-	if created.Labels["auto-optimizer.labs.gke.io/run"] != "run-123" {
-		t.Errorf("expected label run-123, got %q", created.Labels["auto-optimizer.labs.gke.io/run"])
-	}
-	if created.Annotations["auto-optimizer.labs.gke.io/repo"] != "github.com/gke-labs/test" {
-		t.Errorf("expected annotation github.com/gke-labs/test, got %q", created.Annotations["auto-optimizer.labs.gke.io/repo"])
-	}
-	if client.AgentsClient() != agentsCS {
-		t.Errorf("expected AgentsClient to return agentsCS")
+	if !errors.Is(err, ErrSandboxExpired) {
+		t.Errorf("expected ErrSandboxExpired, got: %v", err)
 	}
 }
 
-func TestCreateSandboxNamedWithOwnerReferences(t *testing.T) {
+func TestCreateSandboxWithOptions(t *testing.T) {
 	ctx := t.Context()
 	ns := "test-sandboxes"
-	sbName := "test-sb-owner-refs"
+	sbName := "test-sb-options"
 	cpNamespace := "ao-system"
 
 	agentsCS := fakeagents.NewSimpleClientset()
@@ -826,16 +849,35 @@ func TestCreateSandboxNamedWithOwnerReferences(t *testing.T) {
 			Controller: &isController,
 		},
 	}
+	labels := map[string]string{
+		"auto-optimizer.labs.gke.io/run": "run-123",
+	}
+	annotations := map[string]string{
+		"auto-optimizer.labs.gke.io/repo": "github.com/gke-labs/test",
+	}
 
-	sb, err := harness.CreateSandboxNamedWithOwnerReferences(ctx, sbName, nil, nil, ownerRefs)
+	customShutdown := time.Date(2026, 11, 2, 12, 45, 0, 0, time.UTC)
+	sb, err := harness.CreateSandboxWithOptions(ctx, CreateSandboxOptions{
+		Name:            sbName,
+		Labels:          labels,
+		Annotations:     annotations,
+		OwnerReferences: ownerRefs,
+		ShutdownTime:    customShutdown,
+	})
 	if err != nil {
-		t.Fatalf("CreateSandboxNamedWithOwnerReferences failed: %v", err)
+		t.Fatalf("CreateSandboxWithOptions failed: %v", err)
 	}
 	defer func() { _ = client.DeleteSandbox(ctx, sb) }()
 
 	created, err := client.GetSandboxResource(ctx, ns, sbName)
 	if err != nil {
 		t.Fatalf("GetSandboxResource failed: %v", err)
+	}
+	if created.Labels["auto-optimizer.labs.gke.io/run"] != "run-123" {
+		t.Errorf("expected label run-123, got %q", created.Labels["auto-optimizer.labs.gke.io/run"])
+	}
+	if created.Annotations["auto-optimizer.labs.gke.io/repo"] != "github.com/gke-labs/test" {
+		t.Errorf("expected annotation github.com/gke-labs/test, got %q", created.Annotations["auto-optimizer.labs.gke.io/repo"])
 	}
 	if len(created.OwnerReferences) != 1 {
 		t.Fatalf("expected 1 owner reference, got %d", len(created.OwnerReferences))
@@ -855,6 +897,32 @@ func TestCreateSandboxNamedWithOwnerReferences(t *testing.T) {
 	}
 	if ref.Controller == nil || !*ref.Controller {
 		t.Errorf("expected Controller true")
+	}
+	if !created.Spec.ShutdownTime.Time.Equal(customShutdown) {
+		t.Errorf("expected ShutdownTime %v, got %v", customShutdown, created.Spec.ShutdownTime.Time)
+	}
+
+	// Zero ShutdownTime defaults to now + SandboxInactivityTimeout
+	zeroSbName := "test-sb-zero-shutdown"
+	zeroSb, err := harness.CreateSandboxWithOptions(ctx, CreateSandboxOptions{
+		Name: zeroSbName,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandboxWithOptions with zero ShutdownTime failed: %v", err)
+	}
+	defer func() { _ = client.DeleteSandbox(ctx, zeroSb) }()
+
+	zeroCreated, err := client.GetSandboxResource(ctx, ns, zeroSbName)
+	if err != nil {
+		t.Fatalf("GetSandboxResource failed: %v", err)
+	}
+	if zeroCreated.Spec.ShutdownTime == nil {
+		t.Fatal("expected non-nil ShutdownTime for default zero option")
+	}
+	expectedMin := time.Now().Add(SandboxInactivityTimeout - 10*time.Second)
+	expectedMax := time.Now().Add(SandboxInactivityTimeout + 10*time.Second)
+	if zeroCreated.Spec.ShutdownTime.Time.Before(expectedMin) || zeroCreated.Spec.ShutdownTime.Time.After(expectedMax) {
+		t.Errorf("expected default ShutdownTime near now + %v, got %v", SandboxInactivityTimeout, zeroCreated.Spec.ShutdownTime.Time)
 	}
 }
 

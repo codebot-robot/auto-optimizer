@@ -120,9 +120,9 @@ type Run struct {
 	SessionID       string                 `json:"sessionId,omitempty"`
 	SandboxName     string                 `json:"sandboxName,omitempty"`
 	ReadyDeadline   *time.Time             `json:"readyDeadline,omitempty"`
+	Deadline        *time.Time             `json:"deadline,omitempty"`
 	Summary         string                 `json:"summary,omitempty"`
 	Error           string                 `json:"error,omitempty"`
-	LastActivity    *time.Time             `json:"lastActivity,omitempty"`
 
 	// Goal holds the frozen goal definition captured for this run.
 	Goal *goals.Goal `json:"goal,omitempty"`

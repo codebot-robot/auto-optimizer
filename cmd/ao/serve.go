@@ -64,6 +64,7 @@ type serveFlags struct {
 	publicURL         string
 	readyTimeout      time.Duration
 	verifyTimeout     time.Duration
+	maxRunDuration    time.Duration
 }
 
 func newServeCommand() *cobra.Command {
@@ -164,6 +165,7 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&flags.publicURL, "public-url", "", "Public base URL of this server, used for links in pull request bodies, for example https://ao.example.com")
 	cmd.Flags().DurationVar(&flags.readyTimeout, "ready-timeout", run.DefaultReadyTimeout, "Maximum duration to wait for a sandbox to become ready")
 	cmd.Flags().DurationVar(&flags.verifyTimeout, "verify-timeout", run.DefaultVerifyTimeout, "Maximum duration for running a goal's verify command")
+	cmd.Flags().DurationVar(&flags.maxRunDuration, "max-run-duration", run.DefaultMaxDuration, "Default maximum duration for a run when the goal does not specify budget.maxDuration")
 
 	return cmd
 }
@@ -316,16 +318,17 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	}
 
 	orchestrator, err := run.NewOrchestrator(run.OrchestratorOptions{
-		Store:             stateStore,
-		SessionStore:      sessionStore,
-		Harness:           orchestratorHarness,
-		KubeClient:        mgr.GetClient(),
-		MaxTurns:          flags.maxTurns,
-		MaxConcurrentRuns: flags.maxConcurrentRuns,
-		GitAuthor:         flags.gitAuthor,
-		PublicURL:         flags.publicURL,
-		ReadyTimeout:      flags.readyTimeout,
-		VerifyTimeout:     flags.verifyTimeout,
+		Store:              stateStore,
+		SessionStore:       sessionStore,
+		Harness:            orchestratorHarness,
+		KubeClient:         mgr.GetClient(),
+		MaxTurns:           flags.maxTurns,
+		MaxConcurrentRuns:  flags.maxConcurrentRuns,
+		GitAuthor:          flags.gitAuthor,
+		PublicURL:          flags.publicURL,
+		ReadyTimeout:       flags.readyTimeout,
+		VerifyTimeout:      flags.verifyTimeout,
+		DefaultMaxDuration: flags.maxRunDuration,
 		ForgeFor: func(repoURL string) (forge.Forge, error) {
 			f, _, err := selectForge(repoURL, githubToken)
 			return f, err

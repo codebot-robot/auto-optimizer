@@ -325,18 +325,18 @@ func TestRun_ReadyDeadline(t *testing.T) {
 	}
 }
 
-func TestRun_LastActivity(t *testing.T) {
+func TestRun_Deadline(t *testing.T) {
 	ctx := t.Context()
 	store := NewFileStore(t.TempDir())
 	key := RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
 
-	activity := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	deadline := time.Date(2026, 10, 30, 13, 0, 0, 0, time.UTC)
 	run := &Run{
-		ID:           "20261030T120000Z-0002",
-		Repo:         key,
-		Phase:        PhaseWorking,
-		SandboxName:  "run-sandbox-2",
-		LastActivity: &activity,
+		ID:          "20261030T120000Z-0002",
+		Repo:        key,
+		Phase:       PhaseWorking,
+		SandboxName: "run-sandbox-2",
+		Deadline:    &deadline,
 	}
 
 	if err := store.PutRun(ctx, run); err != nil {
@@ -347,8 +347,8 @@ func TestRun_LastActivity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
-	if got.LastActivity == nil || !got.LastActivity.Equal(activity) {
-		t.Errorf("expected LastActivity %v, got %v", activity, got.LastActivity)
+	if got.Deadline == nil || !got.Deadline.Equal(deadline) {
+		t.Errorf("expected Deadline %v, got %v", deadline, got.Deadline)
 	}
 }
 

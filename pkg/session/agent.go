@@ -325,8 +325,37 @@ func (s *Sandbox) ExtendLifecycle(ctx context.Context, inactivityTimeout time.Du
 	})
 }
 
+// CheckAlive verifies that the sandbox exists in Kubernetes and has not expired past now.
+// If the sandbox is missing or its ShutdownTime is in the past relative to now, it returns ErrSandboxExpired.
+func (s *Sandbox) CheckAlive(ctx context.Context, now time.Time) error {
+	_, err := s.getAliveSandbox(ctx, now)
+	return err
+}
+
+func (s *Sandbox) getAliveSandbox(ctx context.Context, now time.Time) (*sandboxv1beta1.Sandbox, error) {
+	agentsClient := s.agentsClient()
+	if agentsClient == nil {
+		return nil, errors.New("agentsClient not available")
+	}
+
+	latest, err := agentsClient.AgentsV1beta1().Sandboxes(s.id.Namespace).Get(ctx, s.id.Name, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil, fmt.Errorf("%w: sandbox %s not found in namespace %s", ErrSandboxExpired, s.id.Name, s.id.Namespace)
+		}
+		return nil, err
+	}
+
+	if latest.Spec.ShutdownTime != nil && now.After(latest.Spec.ShutdownTime.Time) {
+		return nil, fmt.Errorf("%w: sandbox %s expired at %s", ErrSandboxExpired, s.id.Name, latest.Spec.ShutdownTime.Time)
+	}
+
+	return latest, nil
+}
+
 // CheckAliveAndExtendLifecycle verifies that the sandbox exists and has not expired past now,
 // and updates the shutdownTime to now + inactivityTimeout.
+// It is kept for interactive CLI sessions where a user may walk away between turns.
 func (s *Sandbox) CheckAliveAndExtendLifecycle(ctx context.Context, now time.Time, inactivityTimeout time.Duration) error {
 	agentsClient := s.agentsClient()
 	if agentsClient == nil {
@@ -334,16 +363,9 @@ func (s *Sandbox) CheckAliveAndExtendLifecycle(ctx context.Context, now time.Tim
 	}
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest, err := agentsClient.AgentsV1beta1().Sandboxes(s.id.Namespace).Get(ctx, s.id.Name, metav1.GetOptions{})
+		latest, err := s.getAliveSandbox(ctx, now)
 		if err != nil {
-			if k8serrors.IsNotFound(err) {
-				return fmt.Errorf("%w: sandbox %s not found in namespace %s", ErrSandboxExpired, s.id.Name, s.id.Namespace)
-			}
 			return err
-		}
-
-		if latest.Spec.ShutdownTime != nil && now.After(latest.Spec.ShutdownTime.Time) {
-			return fmt.Errorf("%w: sandbox %s expired at %s", ErrSandboxExpired, s.id.Name, latest.Spec.ShutdownTime.Time)
 		}
 
 		latest.Spec.ShutdownTime = &metav1.Time{Time: now.Add(inactivityTimeout)}
@@ -1154,29 +1176,29 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 	return h.createSandboxResource(ctx, session.sandboxID, session)
 }
 
-// CreateSandboxNamedWithOwnerReferences creates a Sandbox resource with the specified name, metadata, and owner references using topology B.
-func (h *Harness) CreateSandboxNamedWithOwnerReferences(ctx context.Context, sandboxName string, labels, annotations map[string]string, ownerRefs []metav1.OwnerReference) (*Sandbox, error) {
+// CreateSandboxOptions contains configuration options for creating a Sandbox.
+type CreateSandboxOptions struct {
+	Name            string
+	Labels          map[string]string
+	Annotations     map[string]string
+	OwnerReferences []metav1.OwnerReference
+	ShutdownTime    time.Time
+}
+
+// CreateSandboxWithOptions creates a Sandbox resource with the specified options using topology B.
+// When opts.ShutdownTime is zero, the default inactivity timeout (SandboxInactivityTimeout) is used.
+func (h *Harness) CreateSandboxWithOptions(ctx context.Context, opts CreateSandboxOptions) (*Sandbox, error) {
 	id := types.NamespacedName{
 		Namespace: h.opts.Namespace,
-		Name:      sandboxName,
+		Name:      opts.Name,
 	}
-	return h.createSandboxResourceWithMetadata(ctx, id, nil, labels, annotations, ownerRefs)
-}
-
-// CreateSandboxNamedWithLabels creates a Sandbox resource with the specified name and metadata using topology B.
-func (h *Harness) CreateSandboxNamedWithLabels(ctx context.Context, sandboxName string, labels, annotations map[string]string) (*Sandbox, error) {
-	return h.CreateSandboxNamedWithOwnerReferences(ctx, sandboxName, labels, annotations, nil)
-}
-
-// CreateSandboxNamed creates a Sandbox resource with the specified name using topology B.
-func (h *Harness) CreateSandboxNamed(ctx context.Context, sandboxName string) (*Sandbox, error) {
-	return h.CreateSandboxNamedWithLabels(ctx, sandboxName, nil, nil)
+	return h.createSandboxResourceWithMetadata(ctx, id, nil, opts.Labels, opts.Annotations, opts.OwnerReferences, opts.ShutdownTime)
 }
 
 // StartSandbox creates a Sandbox resource with the specified name and waits for it to become ready.
 // If waiting for readiness fails, the created sandbox is deleted and an error is returned.
 func (h *Harness) StartSandbox(ctx context.Context, sandboxName string) (*Sandbox, error) {
-	sb, err := h.CreateSandboxNamed(ctx, sandboxName)
+	sb, err := h.CreateSandboxWithOptions(ctx, CreateSandboxOptions{Name: sandboxName})
 	if err != nil {
 		return nil, fmt.Errorf("creating sandbox: %w", err)
 	}
@@ -1210,10 +1232,10 @@ func (h *Harness) Namespace() string {
 }
 
 func (h *Harness) createSandboxResource(ctx context.Context, id types.NamespacedName, session *Session) (*Sandbox, error) {
-	return h.createSandboxResourceWithMetadata(ctx, id, session, nil, nil, nil)
+	return h.createSandboxResourceWithMetadata(ctx, id, session, nil, nil, nil, time.Time{})
 }
 
-func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id types.NamespacedName, session *Session, labels, annotations map[string]string, ownerRefs []metav1.OwnerReference) (*Sandbox, error) {
+func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id types.NamespacedName, session *Session, labels, annotations map[string]string, ownerRefs []metav1.OwnerReference, shutdownTime time.Time) (*Sandbox, error) {
 	agentsClient := h.sandboxClient.agentsClient
 	image := h.opts.Image
 	if image == "" {
@@ -1249,6 +1271,10 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 	}
 	pubKeyBase64 := base64.StdEncoding.EncodeToString(pubKey)
 	audience := fmt.Sprintf("%s/%s", id.Namespace, id.Name)
+
+	if shutdownTime.IsZero() {
+		shutdownTime = time.Now().Add(SandboxInactivityTimeout)
+	}
 
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	sb := &sandboxv1beta1.Sandbox{
@@ -1387,7 +1413,7 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 				},
 			},
 			Lifecycle: sandboxv1beta1.Lifecycle{
-				ShutdownTime:   &metav1.Time{Time: time.Now().Add(SandboxInactivityTimeout)},
+				ShutdownTime:   &metav1.Time{Time: shutdownTime},
 				ShutdownPolicy: &policy,
 			},
 		},
@@ -1938,9 +1964,9 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 				// filesystem state consistent with the session state.
 				shouldSnapshot = true
 
-				// The tool call could take a while, so extend the lifecycle.
-				// This might need more careful handling later; what if the command takes 20 minutes to run?
-				if sb, ok := sandbox.(*Sandbox); ok {
+				// The tool call could take a while, so extend the lifecycle for interactive sessions.
+				// A run's sandbox gets one shutdownTime at creation and is not extended.
+				if sb, ok := sandbox.(*Sandbox); ok && !session.FailOnSandboxExpiry {
 					if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {
 						log.Error(err, "extending sandbox lifecycle")
 					}
@@ -1997,18 +2023,27 @@ func (h *Harness) ensureSandbox(ctx context.Context, session *Session) (tools.Sa
 	log := scoped.Log(ctx)
 
 	if sb := session.activeSandbox; sb != nil {
-		if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {
-			if k8serrors.IsNotFound(err) {
-				if session.FailOnSandboxExpiry {
-					return nil, fmt.Errorf("%w: active sandbox %s expired or was deleted", ErrSandboxExpired, session.sandboxID.Name)
+		if session.FailOnSandboxExpiry {
+			agentsClient := sb.agentsClient()
+			if agentsClient != nil {
+				if _, err := agentsClient.AgentsV1beta1().Sandboxes(sb.id.Namespace).Get(ctx, sb.id.Name, metav1.GetOptions{}); err != nil {
+					if k8serrors.IsNotFound(err) {
+						return nil, fmt.Errorf("%w: active sandbox %s expired or was deleted", ErrSandboxExpired, session.sandboxID.Name)
+					}
+					return nil, err
 				}
-				log.Info("Active sandbox was deleted or expired, will recreate it", "sandbox.name", session.sandboxID.Name)
-				if closeErr := sb.Close(); closeErr != nil {
-					log.V(2).Info("error closing expired sandbox connection", "error", closeErr)
+			}
+		} else {
+			if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {
+				if k8serrors.IsNotFound(err) {
+					log.Info("Active sandbox was deleted or expired, will recreate it", "sandbox.name", session.sandboxID.Name)
+					if closeErr := sb.Close(); closeErr != nil {
+						log.V(2).Info("error closing expired sandbox connection", "error", closeErr)
+					}
+					session.activeSandbox = nil
+				} else {
+					return nil, fmt.Errorf("extending sandbox TTL: %w", err)
 				}
-				session.activeSandbox = nil
-			} else {
-				return nil, fmt.Errorf("extending sandbox TTL: %w", err)
 			}
 		}
 	}
