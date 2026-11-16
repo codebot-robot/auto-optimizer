@@ -1178,11 +1178,12 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 
 // CreateSandboxOptions contains configuration options for creating a Sandbox.
 type CreateSandboxOptions struct {
-	Name            string
-	Labels          map[string]string
-	Annotations     map[string]string
-	OwnerReferences []metav1.OwnerReference
-	ShutdownTime    time.Time
+	Name               string
+	Labels             map[string]string
+	Annotations        map[string]string
+	OwnerReferences    []metav1.OwnerReference
+	ShutdownTime       time.Time
+	WorkspaceClaimName string
 }
 
 // CreateSandboxWithOptions creates a Sandbox resource with the specified options using topology B.
@@ -1192,7 +1193,7 @@ func (h *Harness) CreateSandboxWithOptions(ctx context.Context, opts CreateSandb
 		Namespace: h.opts.Namespace,
 		Name:      opts.Name,
 	}
-	return h.createSandboxResourceWithMetadata(ctx, id, nil, opts.Labels, opts.Annotations, opts.OwnerReferences, opts.ShutdownTime)
+	return h.createSandboxResourceWithMetadata(ctx, id, nil, opts)
 }
 
 // StartSandbox creates a Sandbox resource with the specified name and waits for it to become ready.
@@ -1232,10 +1233,10 @@ func (h *Harness) Namespace() string {
 }
 
 func (h *Harness) createSandboxResource(ctx context.Context, id types.NamespacedName, session *Session) (*Sandbox, error) {
-	return h.createSandboxResourceWithMetadata(ctx, id, session, nil, nil, nil, time.Time{})
+	return h.createSandboxResourceWithMetadata(ctx, id, session, CreateSandboxOptions{Name: id.Name})
 }
 
-func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id types.NamespacedName, session *Session, labels, annotations map[string]string, ownerRefs []metav1.OwnerReference, shutdownTime time.Time) (*Sandbox, error) {
+func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id types.NamespacedName, session *Session, opts CreateSandboxOptions) (*Sandbox, error) {
 	agentsClient := h.sandboxClient.agentsClient
 	image := h.opts.Image
 	if image == "" {
@@ -1272,8 +1273,23 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 	pubKeyBase64 := base64.StdEncoding.EncodeToString(pubKey)
 	audience := fmt.Sprintf("%s/%s", id.Namespace, id.Name)
 
+	shutdownTime := opts.ShutdownTime
 	if shutdownTime.IsZero() {
 		shutdownTime = time.Now().Add(SandboxInactivityTimeout)
+	}
+
+	workspaceVolume := corev1.Volume{
+		Name: "workspace",
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	}
+	if opts.WorkspaceClaimName != "" {
+		workspaceVolume.VolumeSource = corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: opts.WorkspaceClaimName,
+			},
+		}
 	}
 
 	policy := sandboxv1beta1.ShutdownPolicyDelete
@@ -1281,9 +1297,9 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            id.Name,
 			Namespace:       id.Namespace,
-			Labels:          labels,
-			Annotations:     annotations,
-			OwnerReferences: ownerRefs,
+			Labels:          opts.Labels,
+			Annotations:     opts.Annotations,
+			OwnerReferences: opts.OwnerReferences,
 		},
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
@@ -1395,12 +1411,7 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 									EmptyDir: &corev1.EmptyDirVolumeSource{},
 								},
 							},
-							{
-								Name: "workspace",
-								VolumeSource: corev1.VolumeSource{
-									EmptyDir: &corev1.EmptyDirVolumeSource{},
-								},
-							},
+							workspaceVolume,
 							{
 								Name: "home",
 								VolumeSource: corev1.VolumeSource{
