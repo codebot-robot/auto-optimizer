@@ -136,6 +136,38 @@ func TestRenderRunPage_FailedRun(t *testing.T) {
 	if strings.Contains(body, "<meta http-equiv=\"refresh\" content=\"2\">") {
 		t.Error("expected terminal run NOT to have refresh meta tag")
 	}
+	if !strings.Contains(body, "Run again") {
+		t.Error("expected terminal run to contain 'Run again' button")
+	}
+}
+
+func TestRenderRunPage_ActionError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	data := RunPageData{
+		Run: &state.Run{
+			ID: "20261028T130000Z-fail",
+			Repo: state.RepoKey{
+				Host:  "github.com",
+				Owner: "gke-labs",
+				Name:  "auto-optimizer",
+			},
+			GoalName: "failing-goal",
+			Phase:    state.PhaseFailed,
+		},
+		ActionError: "goal already has an active run",
+	}
+
+	if err := RenderRunPage(t.Context(), rec, data); err != nil {
+		t.Fatalf("RenderRunPage: %v", err)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Cannot Start Run") {
+		t.Error("expected body to contain 'Cannot Start Run'")
+	}
+	if !strings.Contains(body, "goal already has an active run") {
+		t.Error("expected body to contain action error message")
+	}
 }
 
 func TestRenderRunPage_CancelledContext(t *testing.T) {

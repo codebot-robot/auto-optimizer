@@ -16,6 +16,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"html"
 	"io"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	"github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
@@ -109,7 +111,7 @@ func setupTestWebServer(t *testing.T, sb tools.Sandbox) (*httptest.Server, *sess
 		t.Fatalf("sessionapi.NewServer: %v", err)
 	}
 
-	webServer, err := NewServer(srv, nil)
+	webServer, err := NewServer(srv, nil, nil)
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -564,7 +566,7 @@ func TestTranscriptTruncation_UTF8(t *testing.T) {
 		},
 	}
 
-	webServer, err := NewServer(fakeSvc, nil)
+	webServer, err := NewServer(fakeSvc, nil, nil)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -655,7 +657,7 @@ func TestServer_ReposAndRuns(t *testing.T) {
 		t.Fatalf("sessionapi.NewServer: %v", err)
 	}
 
-	webServer, err := NewServer(srv, stateStore)
+	webServer, err := NewServer(srv, stateStore, nil)
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -854,4 +856,210 @@ func TestServer_ReposAndRuns(t *testing.T) {
 	if !strings.Contains(bodyStr, `href="/repos"`) {
 		t.Errorf("expected session list to link to /repos, got:\n%s", bodyStr)
 	}
+}
+
+func TestRunAgain(t *testing.T) {
+	ctx := t.Context()
+	stateStore := state.NewFileStore(t.TempDir())
+
+	scheduler, err := run.NewScheduler(run.SchedulerOptions{
+		Store: stateStore,
+	})
+	if err != nil {
+		t.Fatalf("run.NewScheduler: %v", err)
+	}
+
+	webServer, err := NewServer(&fakeSessionService{}, stateStore, scheduler)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	ts := httptest.NewServer(webServer)
+	t.Cleanup(ts.Close)
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/auto-optimizer",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "auto-optimizer",
+		DefaultBranch: "main",
+	}
+	if err := stateStore.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	goalRec := &state.GoalRecord{
+		Goal: &goals.Goal{
+			Name: "test-goal",
+			Body: "Test goal description",
+		},
+		BaseCommit: "commit-base-123",
+	}
+	if err := stateStore.PutGoal(ctx, repoKey, goalRec); err != nil {
+		t.Fatalf("PutGoal: %v", err)
+	}
+
+	now := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	failedRunID, err := state.NewRunIDAt(now)
+	if err != nil {
+		t.Fatalf("NewRunIDAt: %v", err)
+	}
+
+	failedRun := &state.Run{
+		ID:         failedRunID,
+		Repo:       repoKey,
+		GoalName:   "test-goal",
+		Phase:      state.PhaseFailed,
+		BaseCommit: "commit-base-123",
+		Error:      "verification failed",
+		Goal:       goalRec.Goal,
+	}
+	if err := stateStore.PutRun(ctx, failedRun); err != nil {
+		t.Fatalf("PutRun failed: %v", err)
+	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar.New: %v", err)
+	}
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	post := func(c *http.Client, path string) (*http.Response, string) {
+		t.Helper()
+		resp, err := c.Post(ts.URL+path, "application/x-www-form-urlencoded", nil)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp, string(b)
+	}
+
+	// 1. Refuses without a valid CSRF token
+	if resp, _ := post(&http.Client{}, "/runs/"+failedRunID+"/rerun"); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 Forbidden", resp.StatusCode)
+	}
+
+	// 2. Establish CSRF cookie via GET /runs/<runID> and check "Run again" button
+	getResp, err := client.Get(ts.URL + "/runs/" + failedRunID)
+	if err != nil {
+		t.Fatalf("GET /runs: %v", err)
+	}
+	getBody, _ := io.ReadAll(getResp.Body)
+	_ = getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /runs status = %d, want 200", getResp.StatusCode)
+	}
+	if !strings.Contains(string(getBody), `action="/runs/`+failedRunID+`/rerun"`) {
+		t.Errorf("expected finished run page to point form to /rerun, got:\n%s", string(getBody))
+	}
+	if !strings.Contains(string(getBody), "Run again") {
+		t.Errorf("expected finished run page to contain 'Run again' button, got:\n%s", string(getBody))
+	}
+
+	// 3. POST to the run's own URL /runs/<id> is not accepted (returns 404)
+	if resp, _ := post(client, "/runs/"+failedRunID); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("POST /runs/<id> status = %d, want 404 Not Found", resp.StatusCode)
+	}
+
+	// 4. Successfully starts a run for the failed goal
+	postResp, _ := post(client, "/runs/"+failedRunID+"/rerun")
+	if postResp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST /runs/<id>/rerun status = %d, want 303 See Other", postResp.StatusCode)
+	}
+	newRunLocation := postResp.Header.Get("Location")
+	if !strings.HasPrefix(newRunLocation, "/runs/") {
+		t.Fatalf("Location = %q, want prefix /runs/", newRunLocation)
+	}
+	newRunID := strings.TrimPrefix(newRunLocation, "/runs/")
+
+	// Verify new run in store
+	newRun, err := stateStore.GetRun(ctx, repoKey, newRunID)
+	if err != nil {
+		t.Fatalf("GetRun newRunID: %v", err)
+	}
+	if newRun.Phase != state.PhasePending {
+		t.Errorf("new run phase = %s, want Pending", newRun.Phase)
+	}
+	events, err := stateStore.ReadEvents(ctx, repoKey, newRunID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d (err: %v)", len(events), err)
+	}
+	if events[0].Data.(map[string]any)["reason"] != "manual" {
+		t.Errorf("event reason = %v, want manual", events[0].Data)
+	}
+
+	// 5. Refuses while run is in progress
+	activeResp, activeBody := post(client, "/runs/"+newRunID+"/rerun")
+	if activeResp.StatusCode != http.StatusConflict {
+		t.Fatalf("POST active run status = %d, want 409 Conflict", activeResp.StatusCode)
+	}
+	if !strings.Contains(activeBody, "Cannot Start Run") || !strings.Contains(activeBody, "already has an active run") {
+		t.Errorf("expected refusal error on run page, got:\n%s", activeBody)
+	}
+
+	// Active run page does not show "Run again" button
+	activeGetResp, err := client.Get(ts.URL + "/runs/" + newRunID)
+	if err != nil {
+		t.Fatalf("GET active run: %v", err)
+	}
+	activeGetBody, _ := io.ReadAll(activeGetResp.Body)
+	_ = activeGetResp.Body.Close()
+	if strings.Contains(string(activeGetBody), "Run again") {
+		t.Errorf("active run page should NOT contain 'Run again' button")
+	}
+
+	// 6. Refuses with 409 Conflict when goal is no longer in repository
+	missingGoalRunID, err := state.NewRunIDAt(now.Add(2 * time.Minute))
+	if err != nil {
+		t.Fatalf("NewRunIDAt: %v", err)
+	}
+	missingRun := &state.Run{
+		ID:       missingGoalRunID,
+		Repo:     repoKey,
+		GoalName: "removed-goal",
+		Phase:    state.PhaseFailed,
+	}
+	if err := stateStore.PutRun(ctx, missingRun); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+	missingResp, missingBody := post(client, "/runs/"+missingGoalRunID+"/rerun")
+	if missingResp.StatusCode != http.StatusConflict {
+		t.Fatalf("POST missing goal status = %d, want 409 Conflict", missingResp.StatusCode)
+	}
+	if !strings.Contains(missingBody, "is no longer in the repository") {
+		t.Errorf("expected missing goal error on run page, got:\n%s", missingBody)
+	}
+
+	// 7. Store / server error produces 500 Internal Server Error
+	errServer, err := NewServer(&fakeSessionService{}, stateStore, &failRunStarter{err: errors.New("simulated internal store failure")})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	tsErr := httptest.NewServer(errServer)
+	t.Cleanup(tsErr.Close)
+	errClient := tsErr.Client()
+	errClient.Jar = jar
+	errResp, err := errClient.Post(tsErr.URL+"/runs/"+failedRunID+"/rerun", "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		t.Fatalf("POST with error starter: %v", err)
+	}
+	_ = errResp.Body.Close()
+	if errResp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("POST error starter status = %d, want 500 Internal Server Error", errResp.StatusCode)
+	}
+}
+
+type failRunStarter struct {
+	err error
+}
+
+func (f *failRunStarter) StartRun(_ context.Context, _ *state.Repo, _ string, _ string) (*state.Run, error) {
+	return nil, f.err
 }

@@ -29,6 +29,15 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
+// ErrActiveRun is returned by StartRun when the goal already has an active run.
+var ErrActiveRun = errors.New("goal already has an active run")
+
+// ErrOpenPullRequest is returned by StartRun when the goal already has an open pull request.
+var ErrOpenPullRequest = errors.New("goal already has an open pull request")
+
+// ErrGoalNotFound is returned by StartRun when the goal is not found in the repository state.
+var ErrGoalNotFound = errors.New("goal is no longer in the repository")
+
 // DefaultSchedulerInterval is the default tick interval for the scheduler loop.
 const DefaultSchedulerInterval = 60 * time.Second
 
@@ -162,18 +171,6 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 	log := scoped.Log(ctx)
 	key := repo.Key()
 
-	var repoForge forge.Forge
-	if s.ForgeFor == nil {
-		log.V(2).Info("no forge configured; skipping pull-request check", "repo", repo.URL)
-	} else {
-		f, err := s.ForgeFor(repo.URL)
-		if err != nil {
-			log.V(2).Info("error selecting forge; skipping pull-request check", "repo", repo.URL, "error", err)
-		} else {
-			repoForge = f
-		}
-	}
-
 	goalsList, err := s.Store.ListGoals(ctx, key)
 	if err != nil {
 		return fmt.Errorf("listing goals: %w", err)
@@ -222,25 +219,6 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 			continue
 		}
 
-		if cr, ok := repoForge.(forge.ChangeRequestCreator); ok {
-			prs, err := cr.ListPullRequests(ctx, repo.URL, "ao/"+g.Name+"/")
-			if err != nil {
-				log.Error(err, "listing pull requests; continuing", "repo", repo.URL, "goal", g.Name)
-			} else {
-				var openPR *forge.PullRequest
-				for i := range prs {
-					if prs[i].State == "open" {
-						openPR = &prs[i]
-						break
-					}
-				}
-				if openPR != nil {
-					log.V(2).Info("goal already has an open pull request; doing nothing", "repo", repo.URL, "goal", g.Name, "pr", openPR.URL)
-					continue
-				}
-			}
-		}
-
 		// Create a new run when there is no run yet, or when hash or base commit differs.
 		var reason string
 		if latestRun == nil {
@@ -262,50 +240,132 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 			continue
 		}
 
-		now := s.now()
-		runID, err := state.NewRunIDAt(now)
+		run, err := s.StartRun(ctx, repo, g.Name, reason)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("generating run id for goal %s: %w", g.Name, err))
+			if errors.Is(err, ErrOpenPullRequest) {
+				log.V(2).Info("goal already has an open pull request; doing nothing", "repo", repo.URL, "goal", g.Name, "error", err)
+				continue
+			}
+			if errors.Is(err, ErrActiveRun) {
+				log.V(2).Info("goal already has an active run; doing nothing", "repo", repo.URL, "goal", g.Name, "error", err)
+				continue
+			}
+			errs = append(errs, fmt.Errorf("starting run for goal %s: %w", g.Name, err))
 			continue
 		}
-
-		// Freeze goal
-		frozenGoal := cloneGoal(g)
-		run := &state.Run{
-			ID:         runID,
-			Repo:       key,
-			GoalName:   g.Name,
-			BaseCommit: goalRec.BaseCommit,
-			Goal:       frozenGoal,
-		}
-		run.SetPhase(state.PhasePending, now)
-
-		if err := s.Store.PutRun(ctx, run); err != nil {
-			errs = append(errs, fmt.Errorf("creating run %s for goal %s: %w", runID, g.Name, err))
-			continue
-		}
-
-		event := state.Event{
-			Time:    now,
-			Phase:   state.PhasePending,
-			Kind:    "created",
-			Message: fmt.Sprintf("Run created: %s", reason),
-			Data:    map[string]any{"reason": reason},
-		}
-		if err := s.Store.AppendEvent(ctx, key, runID, event); err != nil {
-			errs = append(errs, fmt.Errorf("appending event for run %s: %w", runID, err))
-			continue
-		}
-
-		log.Info("created pending run", "repo", repo.URL, "goal", g.Name, "run", runID, "reason", reason)
-		if s.Orchestrator != nil {
-			s.Orchestrator.publishHeroRun(ctx, repo, run)
-		}
-		s.Orchestrator.Notify(key, runID)
 		runs = append(runs, run)
 	}
 
 	return errors.Join(errs...)
+}
+
+// StartRun validates and creates a new Pending run for a named goal in repo.
+// It refuses with an error if the goal already has a non-terminal run, an open pull request,
+// or if the goal is no longer in the repository.
+func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName string, reason string) (*state.Run, error) {
+	if s.Store == nil {
+		return nil, errors.New("state store is required")
+	}
+	if repo == nil {
+		return nil, errors.New("repo is required")
+	}
+	if goalName == "" {
+		return nil, errors.New("goal name is required")
+	}
+
+	key := repo.Key()
+	goalRec, err := s.Store.GetGoal(ctx, key, goalName)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return nil, fmt.Errorf("goal %q is no longer in the repository: %w", goalName, ErrGoalNotFound)
+		}
+		return nil, fmt.Errorf("getting goal %s: %w", goalName, err)
+	}
+	if goalRec == nil || goalRec.Goal == nil {
+		return nil, fmt.Errorf("goal %q is no longer in the repository: %w", goalName, ErrGoalNotFound)
+	}
+	if goalRec.BaseCommit == "" {
+		return nil, fmt.Errorf("goal %q has no base commit", goalName)
+	}
+
+	runs, err := s.Store.ListRuns(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("listing runs: %w", err)
+	}
+	latestRun := latestRunForGoal(runs, goalName)
+	if latestRun != nil && !latestRun.Phase.IsTerminal() {
+		return nil, fmt.Errorf("%w: goal %q has run %s in phase %s", ErrActiveRun, goalName, latestRun.ID, latestRun.Phase)
+	}
+
+	openPR, err := s.findOpenPullRequest(ctx, repo, goalName)
+	if err != nil {
+		scoped.Log(ctx).Error(err, "listing pull requests; continuing", "repo", repo.URL, "goal", goalName)
+	} else if openPR != nil {
+		return nil, fmt.Errorf("%w: goal %q has pull request %s", ErrOpenPullRequest, goalName, openPR.URL)
+	}
+
+	now := s.now()
+	runID, err := state.NewRunIDAt(now)
+	if err != nil {
+		return nil, fmt.Errorf("generating run id for goal %s: %w", goalName, err)
+	}
+
+	frozenGoal := cloneGoal(goalRec.Goal)
+	run := &state.Run{
+		ID:         runID,
+		Repo:       key,
+		GoalName:   goalName,
+		BaseCommit: goalRec.BaseCommit,
+		Goal:       frozenGoal,
+	}
+	run.SetPhase(state.PhasePending, now)
+
+	if err := s.Store.PutRun(ctx, run); err != nil {
+		return nil, fmt.Errorf("creating run %s for goal %s: %w", runID, goalName, err)
+	}
+
+	event := state.Event{
+		Time:    now,
+		Phase:   state.PhasePending,
+		Kind:    "created",
+		Message: fmt.Sprintf("Run created: %s", reason),
+		Data:    map[string]any{"reason": reason},
+	}
+	if err := s.Store.AppendEvent(ctx, key, runID, event); err != nil {
+		return nil, fmt.Errorf("appending event for run %s: %w", runID, err)
+	}
+
+	scoped.Log(ctx).Info("created pending run", "repo", repo.URL, "goal", goalName, "run", runID, "reason", reason)
+	if s.Orchestrator != nil {
+		s.Orchestrator.publishHeroRun(ctx, repo, run)
+		s.Orchestrator.Notify(key, runID)
+	}
+
+	return run, nil
+}
+
+func (s *Scheduler) findOpenPullRequest(ctx context.Context, repo *state.Repo, goalName string) (*forge.PullRequest, error) {
+	if s.ForgeFor == nil {
+		return nil, nil
+	}
+	f, err := s.ForgeFor(repo.URL)
+	if err != nil {
+		return nil, nil
+	}
+	cr, ok := f.(forge.ChangeRequestCreator)
+	if !ok {
+		return nil, nil
+	}
+	prs, err := cr.ListPullRequests(ctx, repo.URL, "ao/"+goalName+"/")
+	if err != nil {
+		return nil, err
+	}
+	for i := range prs {
+		if prs[i].State == "open" {
+			return &prs[i], nil
+		}
+	}
+	return nil, nil
 }
 
 func latestRunForGoal(runs []*state.Run, goalName string) *state.Run {

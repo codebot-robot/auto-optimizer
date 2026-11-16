@@ -26,8 +26,9 @@ import (
 
 // RunPageData contains data for rendering the run detail page.
 type RunPageData struct {
-	Run    *state.Run
-	Events []state.Event
+	Run         *state.Run
+	Events      []state.Event
+	ActionError string
 }
 
 // Title returns the page title for the layout header.
@@ -41,6 +42,11 @@ func (d RunPageData) Title() string {
 // InFlight reports whether the run is currently active (non-terminal).
 func (d RunPageData) InFlight() bool {
 	return d.Run != nil && !d.Run.Phase.IsTerminal()
+}
+
+// Finished reports whether the run is in a terminal phase.
+func (d RunPageData) Finished() bool {
+	return d.Run != nil && d.Run.Phase.IsTerminal()
 }
 
 //go:embed run_page.html
