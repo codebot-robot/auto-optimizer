@@ -59,6 +59,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
@@ -3208,6 +3210,43 @@ func TestOrchestrator_SetupWithManager(t *testing.T) {
 
 	if err := orch.SetupWithManager(mgr); err != nil {
 		t.Fatalf("SetupWithManager failed: %v", err)
+	}
+}
+
+func TestHeroRunGenerationChangedPredicate(t *testing.T) {
+	pred := predicate.GenerationChangedPredicate{}
+
+	oldRun := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "run-1",
+			Generation: 1,
+		},
+		Status: herorunv1alpha1.HeroRunStatus{
+			Phase: string(state.PhasePending),
+		},
+	}
+
+	// Status-only update: generation unchanged, status differs.
+	statusOnlyUpdate := oldRun.DeepCopy()
+	statusOnlyUpdate.Status.Phase = string(state.PhaseWorking)
+	if pred.Update(event.UpdateEvent{ObjectOld: oldRun, ObjectNew: statusOnlyUpdate}) {
+		t.Error("expected status-only update event to be filtered, but predicate returned true")
+	}
+
+	// Generation change: spec update increments generation.
+	genChangedUpdate := oldRun.DeepCopy()
+	genChangedUpdate.Generation = 2
+	genChangedUpdate.Status.Phase = string(state.PhaseWorking)
+	if !pred.Update(event.UpdateEvent{ObjectOld: oldRun, ObjectNew: genChangedUpdate}) {
+		t.Error("expected generation change update event to pass, but predicate returned false")
+	}
+
+	// Creates and deletes still pass.
+	if !pred.Create(event.CreateEvent{Object: oldRun}) {
+		t.Error("expected create event to pass")
+	}
+	if !pred.Delete(event.DeleteEvent{Object: oldRun}) {
+		t.Error("expected delete event to pass")
 	}
 }
 

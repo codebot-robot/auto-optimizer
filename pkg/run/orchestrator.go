@@ -36,6 +36,7 @@ import (
 	"k8s.io/klog/v2"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -43,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
@@ -417,7 +419,7 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 	)
 
 	if err := ctrl.NewControllerManagedBy(mgr).
-		For(&herorunv1alpha1.HeroRun{}).
+		For(&herorunv1alpha1.HeroRun{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&sandboxv1beta1.Sandbox{}).
 		WatchesRawSource(src).
 		WithOptions(controller.Options{
