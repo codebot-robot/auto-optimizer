@@ -1426,3 +1426,296 @@ func TestCreateSandboxWithOptions_WorkspaceClaim(t *testing.T) {
 		})
 	}
 }
+
+func TestCreateSandboxWithOptions_PortalSidecar(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	client := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	harness := NewHarness(nil, client, nil, RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: "ao-system",
+		SigningKey:            privKey,
+		PortalInitImage:       "portal-init:v1",
+		PortalImage:           "portal:v1",
+	})
+
+	t.Run("with rules secret", func(t *testing.T) {
+		sb, err := harness.CreateSandboxWithOptions(ctx, CreateSandboxOptions{
+			Name:              "sb-portal",
+			PortalRulesSecret: "portal-rules-secret",
+		})
+		if err != nil {
+			t.Fatalf("CreateSandboxWithOptions failed: %v", err)
+		}
+		defer func() { _ = client.DeleteSandbox(ctx, sb) }()
+
+		created, err := client.GetSandboxResource(ctx, ns, "sb-portal")
+		if err != nil {
+			t.Fatalf("GetSandboxResource failed: %v", err)
+		}
+		spec := created.Spec.SandboxBlueprint.PodTemplate.Spec
+
+		// Init container
+		var initPortal *corev1.Container
+		for i := range spec.InitContainers {
+			if spec.InitContainers[i].Name == "init-service-portals" {
+				initPortal = &spec.InitContainers[i]
+				break
+			}
+		}
+		if initPortal == nil {
+			t.Fatal("expected init-service-portals init container")
+		}
+		if initPortal.Image != "portal-init:v1" {
+			t.Errorf("initPortal.Image = %q, want portal-init:v1", initPortal.Image)
+		}
+		if initPortal.SecurityContext == nil || initPortal.SecurityContext.RunAsUser == nil || *initPortal.SecurityContext.RunAsUser != 0 {
+			t.Errorf("initPortal RunAsUser = %v, want 0", initPortal.SecurityContext)
+		}
+		if initPortal.SecurityContext.Capabilities == nil || len(initPortal.SecurityContext.Capabilities.Drop) != 0 {
+			t.Errorf("initPortal Capabilities.Drop = %v, want empty", initPortal.SecurityContext.Capabilities)
+		}
+		if initPortal.SecurityContext.Capabilities == nil || !slices.Contains(initPortal.SecurityContext.Capabilities.Add, corev1.Capability("NET_ADMIN")) {
+			t.Errorf("initPortal Capabilities.Add does not contain NET_ADMIN")
+		}
+		findEnv := func(envs []corev1.EnvVar, name string) string {
+			for _, e := range envs {
+				if e.Name == name {
+					return e.Value
+				}
+			}
+			return ""
+		}
+		if got := findEnv(initPortal.Env, "PROXY_PORT"); got != "15080" {
+			t.Errorf("initPortal PROXY_PORT = %q, want 15080", got)
+		}
+		if got := findEnv(initPortal.Env, "PROXY_HTTPS_PORT"); got != "15443" {
+			t.Errorf("initPortal PROXY_HTTPS_PORT = %q, want 15443", got)
+		}
+		if got := findEnv(initPortal.Env, "PROXY_UID"); got != "1337" {
+			t.Errorf("initPortal PROXY_UID = %q, want 1337", got)
+		}
+		if got := findEnv(initPortal.Env, "INTERCEPT_PORTS"); got != "80,443" {
+			t.Errorf("initPortal INTERCEPT_PORTS = %q, want 80,443", got)
+		}
+
+		// Sidecar container
+		var sidecar *corev1.Container
+		var sandbox *corev1.Container
+		for i := range spec.Containers {
+			if spec.Containers[i].Name == "all-in-one-portal" {
+				sidecar = &spec.Containers[i]
+			}
+			if spec.Containers[i].Name == "sandbox" {
+				sandbox = &spec.Containers[i]
+			}
+		}
+		if sidecar == nil {
+			t.Fatal("expected all-in-one-portal sidecar container")
+		}
+		if sidecar.Image != "portal:v1" {
+			t.Errorf("sidecar.Image = %q, want portal:v1", sidecar.Image)
+		}
+		if sidecar.SecurityContext == nil || *sidecar.SecurityContext.RunAsUser != 1337 || *sidecar.SecurityContext.RunAsGroup != 1337 {
+			t.Errorf("sidecar UID/GID = %v, want 1337/1337", sidecar.SecurityContext)
+		}
+		if sidecar.SecurityContext.AllowPrivilegeEscalation == nil || *sidecar.SecurityContext.AllowPrivilegeEscalation != false {
+			t.Errorf("sidecar AllowPrivilegeEscalation = %v, want false", sidecar.SecurityContext.AllowPrivilegeEscalation)
+		}
+		if sidecar.SecurityContext.ReadOnlyRootFilesystem == nil || *sidecar.SecurityContext.ReadOnlyRootFilesystem != true {
+			t.Errorf("sidecar ReadOnlyRootFilesystem = %v, want true", sidecar.SecurityContext.ReadOnlyRootFilesystem)
+		}
+		if sidecar.SecurityContext.Capabilities == nil || !slices.Contains(sidecar.SecurityContext.Capabilities.Drop, corev1.Capability("ALL")) {
+			t.Errorf("sidecar Capabilities.Drop does not contain ALL")
+		}
+		if !slices.Contains(sidecar.Args, "--rules-dir=/etc/portals") {
+			t.Errorf("sidecar args %v missing --rules-dir=/etc/portals", sidecar.Args)
+		}
+		if got := findEnv(sidecar.Env, "PORT"); got != "15080" {
+			t.Errorf("sidecar PORT = %q, want 15080", got)
+		}
+		if got := findEnv(sidecar.Env, "HTTPS_PORT"); got != "15443" {
+			t.Errorf("sidecar HTTPS_PORT = %q, want 15443", got)
+		}
+		if got := findEnv(sidecar.Env, "PROXY_PORT"); got != "" {
+			t.Errorf("sidecar PROXY_PORT should not be set, got %q", got)
+		}
+		if got := findEnv(sidecar.Env, "PROXY_HTTPS_PORT"); got != "" {
+			t.Errorf("sidecar PROXY_HTTPS_PORT should not be set, got %q", got)
+		}
+
+		// Check sidecar container ports
+		var hasProxyPort, hasHTTPSPort bool
+		for _, p := range sidecar.Ports {
+			if p.ContainerPort == 15080 {
+				hasProxyPort = true
+			}
+			if p.ContainerPort == 15443 {
+				hasHTTPSPort = true
+			}
+		}
+		if !hasProxyPort || !hasHTTPSPort {
+			t.Errorf("sidecar ports %v missing 15080 or 15443", sidecar.Ports)
+		}
+
+		// Sandbox container
+		if sandbox == nil {
+			t.Fatal("expected sandbox container")
+		}
+		if *sandbox.SecurityContext.RunAsUser != 1000 {
+			t.Errorf("sandbox RunAsUser = %d, want 1000", *sandbox.SecurityContext.RunAsUser)
+		}
+		if *sandbox.SecurityContext.AllowPrivilegeEscalation != false {
+			t.Errorf("sandbox AllowPrivilegeEscalation = true, want false")
+		}
+		if got := findEnv(sandbox.Env, "SSL_CERT_FILE"); got != "/etc/service-portal/ca/tls.crt" {
+			t.Errorf("sandbox SSL_CERT_FILE = %q, want /etc/service-portal/ca/tls.crt", got)
+		}
+		if got := findEnv(sandbox.Env, "NODE_EXTRA_CA_CERTS"); got != "/etc/service-portal/ca/tls.crt" {
+			t.Errorf("sandbox NODE_EXTRA_CA_CERTS = %q, want /etc/service-portal/ca/tls.crt", got)
+		}
+		if got := findEnv(sandbox.Env, "GIT_SSL_CAINFO"); got != "/etc/service-portal/ca/tls.crt" {
+			t.Errorf("sandbox GIT_SSL_CAINFO = %q, want /etc/service-portal/ca/tls.crt", got)
+		}
+		var hasCACertMount, hasCAKeyMount bool
+		for _, m := range sandbox.VolumeMounts {
+			if m.Name == "ca-cert" {
+				hasCACertMount = true
+				if !m.ReadOnly {
+					t.Errorf("ca-cert mount in sandbox should be read-only")
+				}
+			}
+			if m.Name == "ca-key" {
+				hasCAKeyMount = true
+			}
+		}
+		if !hasCACertMount {
+			t.Errorf("sandbox missing ca-cert volume mount")
+		}
+		if hasCAKeyMount {
+			t.Errorf("sandbox must not mount ca-key volume")
+		}
+
+		// Pod volumes
+		findVol := func(name string) *corev1.Volume {
+			for i := range spec.Volumes {
+				if spec.Volumes[i].Name == name {
+					return &spec.Volumes[i]
+				}
+			}
+			return nil
+		}
+		rulesVol := findVol("rules-volume")
+		if rulesVol == nil || rulesVol.Secret == nil || rulesVol.Secret.SecretName != "portal-rules-secret" {
+			t.Errorf("expected rules-volume with secretName portal-rules-secret, got %+v", rulesVol)
+		}
+		if caCertVol := findVol("ca-cert"); caCertVol == nil || caCertVol.EmptyDir == nil {
+			t.Errorf("expected ca-cert emptyDir volume, got %+v", caCertVol)
+		}
+		if caKeyVol := findVol("ca-key"); caKeyVol == nil || caKeyVol.EmptyDir == nil {
+			t.Errorf("expected ca-key emptyDir volume, got %+v", caKeyVol)
+		}
+	})
+
+	t.Run("without rules secret pod is unchanged", func(t *testing.T) {
+		sb, err := harness.CreateSandboxWithOptions(ctx, CreateSandboxOptions{
+			Name: "sb-noportal",
+		})
+		if err != nil {
+			t.Fatalf("CreateSandboxWithOptions failed: %v", err)
+		}
+		defer func() { _ = client.DeleteSandbox(ctx, sb) }()
+
+		created, err := client.GetSandboxResource(ctx, ns, "sb-noportal")
+		if err != nil {
+			t.Fatalf("GetSandboxResource failed: %v", err)
+		}
+		spec := created.Spec.SandboxBlueprint.PodTemplate.Spec
+		for _, ic := range spec.InitContainers {
+			if ic.Name == "init-service-portals" {
+				t.Errorf("unexpected init-service-portals init container")
+			}
+		}
+		for _, c := range spec.Containers {
+			if c.Name == "all-in-one-portal" {
+				t.Errorf("unexpected all-in-one-portal container")
+			}
+			if c.Name == "sandbox" {
+				for _, e := range c.Env {
+					if e.Name == "SSL_CERT_FILE" || e.Name == "NODE_EXTRA_CA_CERTS" || e.Name == "GIT_SSL_CAINFO" {
+						t.Errorf("unexpected CA env %s in sandbox container", e.Name)
+					}
+				}
+				for _, m := range c.VolumeMounts {
+					if m.Name == "ca-cert" || m.Name == "ca-key" {
+						t.Errorf("unexpected mount %s in sandbox container", m.Name)
+					}
+				}
+			}
+		}
+		for _, v := range spec.Volumes {
+			if v.Name == "rules-volume" || v.Name == "ca-cert" || v.Name == "ca-key" {
+				t.Errorf("unexpected volume %s", v.Name)
+			}
+		}
+	})
+}
+
+func TestCreateSandboxWithOptions_PortalMissingImage(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	client := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		initImage string
+		image     string
+		wantErr   string
+	}{
+		{
+			name:      "missing PortalInitImage",
+			initImage: "",
+			image:     "portal:v1",
+			wantErr:   "PortalInitImage must be configured in RunOptions",
+		},
+		{
+			name:      "missing PortalImage",
+			initImage: "portal-init:v1",
+			image:     "",
+			wantErr:   "PortalImage must be configured in RunOptions",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			harness := NewHarness(nil, client, nil, RunOptions{
+				Namespace:             ns,
+				ControlPlaneNamespace: "ao-system",
+				SigningKey:            privKey,
+				PortalInitImage:       tc.initImage,
+				PortalImage:           tc.image,
+			})
+
+			_, err := harness.CreateSandboxWithOptions(ctx, CreateSandboxOptions{
+				Name:              "sb-missing-img",
+				PortalRulesSecret: "rules-secret",
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
+			}
+		})
+	}
+}

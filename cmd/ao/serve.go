@@ -72,6 +72,12 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 	if envImage := os.Getenv("SANDBOX_IMAGE"); envImage != "" {
 		opts.sandbox.Image = envImage
 	}
+	if envPortalInitImage := os.Getenv("PORTAL_INIT_IMAGE"); envPortalInitImage != "" {
+		opts.sandbox.PortalInitImage = envPortalInitImage
+	}
+	if envPortalImage := os.Getenv("PORTAL_IMAGE"); envPortalImage != "" {
+		opts.sandbox.PortalImage = envPortalImage
+	}
 	if envHomeDir := os.Getenv("SANDBOX_HOME_DIR"); envHomeDir != "" {
 		opts.sandbox.HomeDir = envHomeDir
 	}

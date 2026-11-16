@@ -29,10 +29,12 @@ const DefaultHomeDir = "/home/clawtainer"
 
 // SandboxOptions configures a sandbox container environment.
 type SandboxOptions struct {
-	Namespace   string
-	Image       string
-	HomeDir     string
-	ToolTimeout time.Duration
+	Namespace       string
+	Image           string
+	PortalInitImage string
+	PortalImage     string
+	HomeDir         string
+	ToolTimeout     time.Duration
 }
 
 // InitDefaults fills zero-valued fields with default constants.
@@ -56,6 +58,8 @@ func (o *SandboxOptions) AddFlags(fs *pflag.FlagSet) {
 	o.InitDefaults()
 	fs.StringVar(&o.Namespace, "namespace", o.Namespace, "Kubernetes namespace where sandbox pods are created")
 	fs.StringVar(&o.Image, "image", o.Image, "Default sandbox container image (overrides toolset default)")
+	fs.StringVar(&o.PortalInitImage, "portal-init-image", o.PortalInitImage, "Service portals init container image")
+	fs.StringVar(&o.PortalImage, "portal-image", o.PortalImage, "Service portals sidecar container image")
 	fs.StringVar(&o.HomeDir, "homedir", o.HomeDir, "Home directory inside the sandbox persisted via snapshot/restore")
 	fs.DurationVar(&o.ToolTimeout, "tool-timeout", o.ToolTimeout, "Maximum duration for a single tool execution")
 }
@@ -95,5 +99,11 @@ func (o *RunOptions) ApplySandbox(s SandboxOptions) {
 	}
 	if s.Image != "" {
 		o.Image = s.Image
+	}
+	if s.PortalInitImage != "" {
+		o.PortalInitImage = s.PortalInitImage
+	}
+	if s.PortalImage != "" {
+		o.PortalImage = s.PortalImage
 	}
 }

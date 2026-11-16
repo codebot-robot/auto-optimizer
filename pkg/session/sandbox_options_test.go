@@ -67,6 +67,8 @@ func TestSandboxOptions_AddFlags(t *testing.T) {
 	if err := fs.Parse([]string{
 		"--namespace", "flag-ns",
 		"--image", "flag-image:v2",
+		"--portal-init-image", "flag-portal-init:v1",
+		"--portal-image", "flag-portal:v1",
 		"--homedir", "/flag/home",
 		"--tool-timeout", "5m",
 	}); err != nil {
@@ -78,6 +80,12 @@ func TestSandboxOptions_AddFlags(t *testing.T) {
 	}
 	if opts.Image != "flag-image:v2" {
 		t.Errorf("Image = %q, want flag-image:v2", opts.Image)
+	}
+	if opts.PortalInitImage != "flag-portal-init:v1" {
+		t.Errorf("PortalInitImage = %q, want flag-portal-init:v1", opts.PortalInitImage)
+	}
+	if opts.PortalImage != "flag-portal:v1" {
+		t.Errorf("PortalImage = %q, want flag-portal:v1", opts.PortalImage)
 	}
 	if opts.HomeDir != "/flag/home" {
 		t.Errorf("HomeDir = %q, want /flag/home", opts.HomeDir)
@@ -128,10 +136,12 @@ func TestRunOptions_ApplySandbox(t *testing.T) {
 	runOpts.InitDefaults()
 
 	sandboxOpts := SandboxOptions{
-		Namespace:   "applied-ns",
-		Image:       "applied-img",
-		HomeDir:     "/applied/home",
-		ToolTimeout: 30 * time.Second,
+		Namespace:       "applied-ns",
+		Image:           "applied-img",
+		PortalInitImage: "applied-portal-init",
+		PortalImage:     "applied-portal",
+		HomeDir:         "/applied/home",
+		ToolTimeout:     30 * time.Second,
 	}
 	runOpts.ApplySandbox(sandboxOpts)
 
@@ -140,6 +150,12 @@ func TestRunOptions_ApplySandbox(t *testing.T) {
 	}
 	if runOpts.Image != "applied-img" {
 		t.Errorf("Image = %q, want applied-img", runOpts.Image)
+	}
+	if runOpts.PortalInitImage != "applied-portal-init" {
+		t.Errorf("PortalInitImage = %q, want applied-portal-init", runOpts.PortalInitImage)
+	}
+	if runOpts.PortalImage != "applied-portal" {
+		t.Errorf("PortalImage = %q, want applied-portal", runOpts.PortalImage)
 	}
 	if runOpts.HomeDir != "/applied/home" {
 		t.Errorf("HomeDir = %q, want /applied/home", runOpts.HomeDir)

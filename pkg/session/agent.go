@@ -33,6 +33,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -83,6 +84,12 @@ const DefaultToolTimeout = 2 * time.Minute
 // DefaultSandboxdImage is the default container image containing the sandboxd binary.
 // It matches the image built and loaded into kind by dev/tasks/deploy-to-kube.
 const DefaultSandboxdImage = "auto-optimizer.local/sandboxd:dev"
+
+// PortalProxyPort is the cleartext HTTP port used by the portal sidecar and redirected to by the init container.
+const PortalProxyPort = 15080
+
+// PortalProxyHTTPSPort is the TLS/HTTPS port used by the portal sidecar and redirected to by the init container.
+const PortalProxyHTTPSPort = 15443
 
 // ProcessClientFactory is a function that creates a processv1.ProcessServiceClient for a sandbox.
 // Used in tests to connect to mock/fake sandboxd servers without network port-forwarding.
@@ -1184,6 +1191,7 @@ type CreateSandboxOptions struct {
 	OwnerReferences    []metav1.OwnerReference
 	ShutdownTime       time.Time
 	WorkspaceClaimName string
+	PortalRulesSecret  string
 }
 
 // CreateSandboxWithOptions creates a Sandbox resource with the specified options using topology B.
@@ -1273,6 +1281,15 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 	pubKeyBase64 := base64.StdEncoding.EncodeToString(pubKey)
 	audience := fmt.Sprintf("%s/%s", id.Namespace, id.Name)
 
+	if opts.PortalRulesSecret != "" {
+		if h.opts.PortalInitImage == "" {
+			return nil, errors.New("PortalInitImage must be configured in RunOptions when PortalRulesSecret is set")
+		}
+		if h.opts.PortalImage == "" {
+			return nil, errors.New("PortalImage must be configured in RunOptions when PortalRulesSecret is set")
+		}
+	}
+
 	shutdownTime := opts.ShutdownTime
 	if shutdownTime.IsZero() {
 		shutdownTime = time.Now().Add(SandboxInactivityTimeout)
@@ -1290,6 +1307,238 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 				ClaimName: opts.WorkspaceClaimName,
 			},
 		}
+	}
+
+	initContainers := []corev1.Container{
+		{
+			Name:  "install-sandboxd",
+			Image: sandboxdImage,
+			Command: []string{
+				"/bin/sh", "-c", "cp /usr/local/bin/sandboxd /sandboxd-bin/sandboxd",
+			},
+			SecurityContext: &corev1.SecurityContext{
+				RunAsUser:                new(int64(1000)),
+				RunAsGroup:               new(int64(1000)),
+				RunAsNonRoot:             new(true),
+				AllowPrivilegeEscalation: new(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "sandboxd-bin",
+					MountPath: "/sandboxd-bin",
+				},
+			},
+		},
+	}
+
+	sandboxVolumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "sandboxd-bin",
+			MountPath: "/sandboxd-bin",
+			ReadOnly:  true,
+		},
+		{
+			Name:      "workspace",
+			MountPath: "/workspace",
+		},
+		{
+			Name:      "home",
+			MountPath: homeDir,
+		},
+	}
+
+	sandboxEnv := []corev1.EnvVar{
+		{
+			Name:  "HOME",
+			Value: homeDir,
+		},
+	}
+
+	volumes := []corev1.Volume{
+		{
+			Name: "sandboxd-bin",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		workspaceVolume,
+		{
+			Name: "home",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+	}
+
+	if opts.PortalRulesSecret != "" {
+		initContainers = append([]corev1.Container{
+			{
+				Name:  "init-service-portals",
+				Image: h.opts.PortalInitImage,
+				SecurityContext: &corev1.SecurityContext{
+					RunAsUser:    new(int64(0)),
+					RunAsGroup:   new(int64(0)),
+					RunAsNonRoot: new(false),
+					Privileged:   new(false),
+					Capabilities: &corev1.Capabilities{
+						Add: []corev1.Capability{"NET_ADMIN"},
+					},
+				},
+				Env: []corev1.EnvVar{
+					{Name: "PROXY_PORT", Value: strconv.Itoa(PortalProxyPort)},
+					{Name: "PROXY_HTTPS_PORT", Value: strconv.Itoa(PortalProxyHTTPSPort)},
+					{Name: "PROXY_UID", Value: "1337"},
+					{Name: "INTERCEPT_PORTS", Value: "80,443"},
+					{Name: "CHOWN_UID", Value: "1337"},
+					{Name: "CHOWN_GID", Value: "1337"},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      "ca-cert",
+						MountPath: "/etc/service-portal/ca",
+					},
+					{
+						Name:      "ca-key",
+						MountPath: "/etc/service-portal/ca-private",
+					},
+				},
+			},
+		}, initContainers...)
+
+		sandboxVolumeMounts = append(sandboxVolumeMounts, corev1.VolumeMount{
+			Name:      "ca-cert",
+			MountPath: "/etc/service-portal/ca",
+			ReadOnly:  true,
+		})
+
+		sandboxEnv = append(sandboxEnv,
+			corev1.EnvVar{Name: "SSL_CERT_FILE", Value: "/etc/service-portal/ca/tls.crt"},
+			corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: "/etc/service-portal/ca/tls.crt"},
+			corev1.EnvVar{Name: "GIT_SSL_CAINFO", Value: "/etc/service-portal/ca/tls.crt"},
+		)
+
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: "rules-volume",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: opts.PortalRulesSecret,
+					},
+				},
+			},
+			corev1.Volume{
+				Name: "ca-cert",
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+			corev1.Volume{
+				Name: "ca-key",
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+		)
+	}
+
+	containers := []corev1.Container{
+		{
+			Name:  "sandbox",
+			Image: image,
+			// tini runs as PID 1 to act as a proper subreaper for child processes
+			// spawned by commands executed via sandboxd, ensuring orphan zombie
+			// process reaping, signal forwarding to process groups, and graceful cleanup.
+			Command: []string{
+				"tini", "-g", "--",
+				"/sandboxd-bin/sandboxd",
+				"--root-dir=/workspace",
+				"--listen-host=0.0.0.0",
+				"--grpc-port=9090",
+				"--rest-port=8080",
+				fmt.Sprintf("--auth-public-key=%s", pubKeyBase64),
+				fmt.Sprintf("--auth-audience=%s", audience),
+			},
+			SecurityContext: &corev1.SecurityContext{
+				RunAsUser:                new(int64(1000)),
+				RunAsGroup:               new(int64(1000)),
+				RunAsNonRoot:             new(true),
+				AllowPrivilegeEscalation: new(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+			Ports: []corev1.ContainerPort{
+				{
+					Name:          "rest",
+					ContainerPort: 8080,
+				},
+				{
+					Name:          "grpc",
+					ContainerPort: 9090,
+				},
+			},
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path: "/v1/health",
+						Port: intstr.FromInt32(8080),
+					},
+				},
+				InitialDelaySeconds: 1,
+				PeriodSeconds:       1,
+			},
+			VolumeMounts: sandboxVolumeMounts,
+			Env:          sandboxEnv,
+		},
+	}
+
+	if opts.PortalRulesSecret != "" {
+		containers = append(containers, corev1.Container{
+			Name:  "all-in-one-portal",
+			Image: h.opts.PortalImage,
+			SecurityContext: &corev1.SecurityContext{
+				RunAsUser:                new(int64(1337)),
+				RunAsGroup:               new(int64(1337)),
+				RunAsNonRoot:             new(true),
+				AllowPrivilegeEscalation: new(false),
+				ReadOnlyRootFilesystem:   new(true),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+			Ports: []corev1.ContainerPort{
+				{
+					Name:          "proxy",
+					ContainerPort: PortalProxyPort,
+				},
+				{
+					Name:          "proxy-https",
+					ContainerPort: PortalProxyHTTPSPort,
+				},
+			},
+			Env: []corev1.EnvVar{
+				{Name: "PORT", Value: strconv.Itoa(PortalProxyPort)},
+				{Name: "HTTPS_PORT", Value: strconv.Itoa(PortalProxyHTTPSPort)},
+				{Name: "CA_CERT_PATH", Value: "/etc/service-portal/ca-private/tls.crt"},
+				{Name: "CA_KEY_PATH", Value: "/etc/service-portal/ca-private/tls.key"},
+			},
+			Args: []string{"--rules-dir=/etc/portals"},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "rules-volume",
+					MountPath: "/etc/portals",
+					ReadOnly:  true,
+				},
+				{
+					Name:      "ca-key",
+					MountPath: "/etc/service-portal/ca-private",
+					ReadOnly:  true,
+				},
+			},
+		})
 	}
 
 	policy := sandboxv1beta1.ShutdownPolicyDelete
@@ -1311,115 +1560,10 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 							RunAsNonRoot: new(true),
 							FSGroup:      new(int64(1000)),
 						},
-						InitContainers: []corev1.Container{
-							{
-								Name:  "install-sandboxd",
-								Image: sandboxdImage,
-								Command: []string{
-									"/bin/sh", "-c", "cp /usr/local/bin/sandboxd /sandboxd-bin/sandboxd",
-								},
-								SecurityContext: &corev1.SecurityContext{
-									RunAsUser:                new(int64(1000)),
-									RunAsGroup:               new(int64(1000)),
-									RunAsNonRoot:             new(true),
-									AllowPrivilegeEscalation: new(false),
-									Capabilities: &corev1.Capabilities{
-										Drop: []corev1.Capability{"ALL"},
-									},
-								},
-								VolumeMounts: []corev1.VolumeMount{
-									{
-										Name:      "sandboxd-bin",
-										MountPath: "/sandboxd-bin",
-									},
-								},
-							},
-						},
-						Containers: []corev1.Container{
-							{
-								Name:  "sandbox",
-								Image: image,
-								// tini runs as PID 1 to act as a proper subreaper for child processes
-								// spawned by commands executed via sandboxd, ensuring orphan zombie
-								// process reaping, signal forwarding to process groups, and graceful cleanup.
-								Command: []string{
-									"tini", "-g", "--",
-									"/sandboxd-bin/sandboxd",
-									"--root-dir=/workspace",
-									"--listen-host=0.0.0.0",
-									"--grpc-port=9090",
-									"--rest-port=8080",
-									fmt.Sprintf("--auth-public-key=%s", pubKeyBase64),
-									fmt.Sprintf("--auth-audience=%s", audience),
-								},
-								SecurityContext: &corev1.SecurityContext{
-									RunAsUser:                new(int64(1000)),
-									RunAsGroup:               new(int64(1000)),
-									RunAsNonRoot:             new(true),
-									AllowPrivilegeEscalation: new(false),
-									Capabilities: &corev1.Capabilities{
-										Drop: []corev1.Capability{"ALL"},
-									},
-								},
-								Ports: []corev1.ContainerPort{
-									{
-										Name:          "rest",
-										ContainerPort: 8080,
-									},
-									{
-										Name:          "grpc",
-										ContainerPort: 9090,
-									},
-								},
-								ReadinessProbe: &corev1.Probe{
-									ProbeHandler: corev1.ProbeHandler{
-										HTTPGet: &corev1.HTTPGetAction{
-											Path: "/v1/health",
-											Port: intstr.FromInt32(8080),
-										},
-									},
-									InitialDelaySeconds: 1,
-									PeriodSeconds:       1,
-								},
-								VolumeMounts: []corev1.VolumeMount{
-									{
-										Name:      "sandboxd-bin",
-										MountPath: "/sandboxd-bin",
-										ReadOnly:  true,
-									},
-									{
-										Name:      "workspace",
-										MountPath: "/workspace",
-									},
-									{
-										Name:      "home",
-										MountPath: homeDir,
-									},
-								},
-								Env: []corev1.EnvVar{
-									{
-										Name:  "HOME",
-										Value: homeDir,
-									},
-								},
-							},
-						},
-						Volumes: []corev1.Volume{
-							{
-								Name: "sandboxd-bin",
-								VolumeSource: corev1.VolumeSource{
-									EmptyDir: &corev1.EmptyDirVolumeSource{},
-								},
-							},
-							workspaceVolume,
-							{
-								Name: "home",
-								VolumeSource: corev1.VolumeSource{
-									EmptyDir: &corev1.EmptyDirVolumeSource{},
-								},
-							},
-						},
-						RestartPolicy: corev1.RestartPolicyNever,
+						InitContainers: initContainers,
+						Containers:     containers,
+						Volumes:        volumes,
+						RestartPolicy:  corev1.RestartPolicyNever,
 					},
 				},
 			},
@@ -1563,6 +1707,8 @@ type RunOptions struct {
 	Namespace             string
 	ControlPlaneNamespace string
 	Image                 string
+	PortalInitImage       string
+	PortalImage           string
 	SandboxdImage         string
 
 	// HomeDir is the home directory inside the sandbox.
@@ -1598,6 +1744,8 @@ const DefaultImage = "auto-optimizer.local/geminicli-toolbox:dev"
 // default image (falling back to DefaultImage).
 func (o *RunOptions) InitDefaults() {
 	o.Image = os.Getenv("SANDBOX_IMAGE")
+	o.PortalInitImage = os.Getenv("PORTAL_INIT_IMAGE")
+	o.PortalImage = os.Getenv("PORTAL_IMAGE")
 
 	o.Namespace = os.Getenv("SANDBOX_NAMESPACE")
 	if o.Namespace == "" {

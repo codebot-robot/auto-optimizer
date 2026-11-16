@@ -621,6 +621,8 @@ func TestServeFlags_DirectBinding(t *testing.T) {
 		"--max-run-duration", "2h",
 		"--namespace", "custom-ns",
 		"--image", "custom-img:tag",
+		"--portal-init-image", "custom-portal-init:tag",
+		"--portal-image", "custom-portal:tag",
 		"--homedir", "/custom/home",
 		"--tool-timeout", "4m",
 	}
@@ -657,6 +659,12 @@ func TestServeFlags_DirectBinding(t *testing.T) {
 	if opts.sandbox.Image != "custom-img:tag" {
 		t.Errorf("sandbox.Image = %q, want 'custom-img:tag'", opts.sandbox.Image)
 	}
+	if opts.sandbox.PortalInitImage != "custom-portal-init:tag" {
+		t.Errorf("sandbox.PortalInitImage = %q, want 'custom-portal-init:tag'", opts.sandbox.PortalInitImage)
+	}
+	if opts.sandbox.PortalImage != "custom-portal:tag" {
+		t.Errorf("sandbox.PortalImage = %q, want 'custom-portal:tag'", opts.sandbox.PortalImage)
+	}
 	if opts.sandbox.HomeDir != "/custom/home" {
 		t.Errorf("sandbox.HomeDir = %q, want '/custom/home'", opts.sandbox.HomeDir)
 	}
@@ -668,6 +676,8 @@ func TestServeFlags_DirectBinding(t *testing.T) {
 func TestServeSandboxEnvironmentOverrides(t *testing.T) {
 	t.Setenv("SANDBOX_NAMESPACE", "env-ns")
 	t.Setenv("SANDBOX_IMAGE", "env-img:v1")
+	t.Setenv("PORTAL_INIT_IMAGE", "env-portal-init:v1")
+	t.Setenv("PORTAL_IMAGE", "env-portal:v1")
 	t.Setenv("SANDBOX_HOME_DIR", "/env/home")
 
 	var opts serveOptions
@@ -681,6 +691,12 @@ func TestServeSandboxEnvironmentOverrides(t *testing.T) {
 	}
 	if opts.sandbox.Image != "env-img:v1" {
 		t.Errorf("sandbox.Image = %q, want 'env-img:v1'", opts.sandbox.Image)
+	}
+	if opts.sandbox.PortalInitImage != "env-portal-init:v1" {
+		t.Errorf("sandbox.PortalInitImage = %q, want 'env-portal-init:v1'", opts.sandbox.PortalInitImage)
+	}
+	if opts.sandbox.PortalImage != "env-portal:v1" {
+		t.Errorf("sandbox.PortalImage = %q, want 'env-portal:v1'", opts.sandbox.PortalImage)
 	}
 	if opts.sandbox.HomeDir != "/env/home" {
 		t.Errorf("sandbox.HomeDir = %q, want '/env/home'", opts.sandbox.HomeDir)
