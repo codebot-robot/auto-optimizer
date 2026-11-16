@@ -8,8 +8,17 @@
       <span class="badge phase-{{.Run.Phase}}">{{.Run.Phase}}</span>
       {{if .InFlight}}<span class="badge badge-in-flight">active</span>{{end}}
     </div>
-  </div>
-</div>
+  </div>{{if .Finished}}
+  <div>
+    <form method="POST" action="/runs/{{.Run.ID}}/rerun">
+      <button type="submit" class="btn primary">Run again</button>
+    </form>
+  </div>{{end}}
+</div>{{if .ActionError}}
+<div class="card error-banner">
+  <h3>Cannot Start Run</h3>
+  <pre class="error-message">{{.ActionError}}</pre>
+</div>{{end}}
 
 {{if .Run.Error}}
 <div class="card error-banner">

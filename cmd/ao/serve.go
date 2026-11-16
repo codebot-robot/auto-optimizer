@@ -366,7 +366,7 @@ func runServe(ctx context.Context, opts serveOptions) error {
 	var httpListener net.Listener
 	var httpServer *http.Server
 	if opts.http != "" {
-		webHandler, err := web.NewServer(srv, stateStore)
+		webHandler, err := web.NewServer(srv, stateStore, scheduler)
 		if err != nil {
 			return fmt.Errorf("initializing web server: %w", err)
 		}

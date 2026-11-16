@@ -927,3 +927,82 @@ func TestSchedulerOptions_Validate(t *testing.T) {
 		}
 	})
 }
+
+func TestScheduler_StartRun(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	store := state.NewFileStore(dir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/example-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "example-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	goalRec := &state.GoalRecord{
+		Goal: &goals.Goal{
+			Name: "optimize-latency",
+			Body: "Optimize latency",
+		},
+		BaseCommit: "commit-base1",
+	}
+	if err := store.PutGoal(ctx, repo.Key(), goalRec); err != nil {
+		t.Fatalf("PutGoal: %v", err)
+	}
+
+	fakeForge := forge.NewFake()
+	scheduler, err := NewScheduler(SchedulerOptions{
+		Store:    store,
+		ForgeFor: func(repoURL string) (forge.Forge, error) { return fakeForge, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	// 1. Successful manual start
+	run, err := scheduler.StartRun(ctx, repo, goalRec.Goal.Name, "manual")
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if run.GoalName != "optimize-latency" || run.Phase != state.PhasePending {
+		t.Fatalf("unexpected run state: %+v", run)
+	}
+	events, err := store.ReadEvents(ctx, repo.Key(), run.ID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d (err: %v)", len(events), err)
+	}
+	if events[0].Data.(map[string]any)["reason"] != "manual" {
+		t.Errorf("expected reason 'manual', got %v", events[0].Data)
+	}
+
+	// 2. Refuses when goal has an active run
+	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, "manual")
+	if !errors.Is(err, ErrActiveRun) {
+		t.Fatalf("expected ErrActiveRun, got: %v", err)
+	}
+
+	// 3. Mark run terminal and add open PR -> refuses with ErrOpenPullRequest
+	run.SetPhase(state.PhaseFailed, time.Now().UTC())
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun terminal: %v", err)
+	}
+
+	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
+		{Number: 1, Head: "ao/optimize-latency/run-1", State: "open", URL: repo.URL + "/pull/1"},
+	})
+	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, "manual")
+	if !errors.Is(err, ErrOpenPullRequest) {
+		t.Fatalf("expected ErrOpenPullRequest, got: %v", err)
+	}
+
+	// 4. Refuses when goal record is missing from repository
+	_, err = scheduler.StartRun(ctx, repo, "missing-goal", "manual")
+	if !errors.Is(err, ErrGoalNotFound) {
+		t.Fatalf("expected ErrGoalNotFound, got: %v", err)
+	}
+}

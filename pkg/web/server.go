@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
@@ -46,14 +47,20 @@ type SessionService interface {
 	StartTurn(ctx context.Context, name, text string) error
 }
 
+// RunStarter can start a new run for a goal in a repository.
+type RunStarter interface {
+	StartRun(ctx context.Context, repo *state.Repo, goalName string, reason string) (*state.Run, error)
+}
+
 // Server handles HTTP requests for the web UI.
 type Server struct {
 	service    SessionService
 	stateStore state.Store
+	starter    RunStarter
 }
 
-// NewServer creates a new web Server backed by the given SessionService and state.Store.
-func NewServer(service SessionService, stateStore state.Store) (*Server, error) {
+// NewServer creates a new web Server backed by the given SessionService, state.Store, and RunStarter.
+func NewServer(service SessionService, stateStore state.Store, starter RunStarter) (*Server, error) {
 	if service == nil {
 		return nil, errors.New("service is required")
 	}
@@ -61,6 +68,7 @@ func NewServer(service SessionService, stateStore state.Store) (*Server, error) 
 	return &Server{
 		service:    service,
 		stateStore: stateStore,
+		starter:    starter,
 	}, nil
 }
 
@@ -115,6 +123,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(rest, "/")
 		if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodGet {
 			s.handleGetRun(w, r, parts[0])
+			return
+		}
+		if len(parts) == 2 && parts[0] != "" && parts[1] == "rerun" && r.Method == http.MethodPost {
+			s.handlePostRun(w, r, parts[0])
 			return
 		}
 		s.render404(w, r, "Run not found")
@@ -312,6 +324,70 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request, runID stri
 	}); err != nil {
 		scoped.Log(r.Context()).Error(err, "rendering run page", "run", runID)
 	}
+}
+
+func isConflict(err error) bool {
+	return errors.Is(err, run.ErrActiveRun) || errors.Is(err, run.ErrOpenPullRequest) || errors.Is(err, run.ErrGoalNotFound)
+}
+
+func (s *Server) handlePostRun(w http.ResponseWriter, r *http.Request, runID string) {
+	if s.stateStore == nil {
+		s.render404(w, r, "Run not found")
+		return
+	}
+
+	if err := state.ValidateRunID(runID); err != nil {
+		s.render404(w, r, fmt.Sprintf("Invalid run ID %q: %v", runID, err))
+		return
+	}
+
+	runRec, err := s.stateStore.FindRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			s.render404(w, r, fmt.Sprintf("Run %q not found", runID))
+			return
+		}
+		scoped.Log(r.Context()).Error(err, "finding run", "run", runID)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if s.starter == nil {
+		scoped.Log(r.Context()).Error(errors.New("starter not configured"), "starting run", "run", runID)
+		http.Error(w, "Run starter not configured", http.StatusInternalServerError)
+		return
+	}
+
+	repo, err := s.stateStore.GetRepo(r.Context(), runRec.Repo)
+	if err != nil {
+		scoped.Log(r.Context()).Error(err, "getting repo for run", "repo", runRec.Repo)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	newRun, err := s.starter.StartRun(r.Context(), repo, runRec.GoalName, "manual")
+	if err != nil {
+		if isConflict(err) {
+			events, readErr := s.stateStore.ReadEvents(r.Context(), runRec.Repo, runRec.ID)
+			if readErr != nil {
+				scoped.Log(r.Context()).V(2).Info("reading events for run page refusal", "error", readErr)
+			}
+			w.WriteHeader(http.StatusConflict)
+			if renderErr := RenderRunPage(r.Context(), w, RunPageData{
+				Run:         runRec,
+				Events:      events,
+				ActionError: err.Error(),
+			}); renderErr != nil {
+				scoped.Log(r.Context()).Error(renderErr, "rendering run page with refusal error", "run", runID)
+			}
+			return
+		}
+		scoped.Log(r.Context()).Error(err, "starting run", "run", runID, "goal", runRec.GoalName)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/runs/"+url.PathEscape(newRun.ID), http.StatusSeeOther)
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, name string) {

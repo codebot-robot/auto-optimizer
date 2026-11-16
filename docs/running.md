@@ -166,6 +166,7 @@ The pull request originates from the account that owns the `GITHUB_TOKEN`.
 The pull request description contains the harness-written summary and run metadata.
 The scheduler does not start another run for that goal while the pull request remains open.
 Review and merge or close the pull request before the scheduler runs that goal again.
+Once a run finishes, you can use the **Run again** button on the run page to start a new run of the goal.
 
 ## Limits to Know About Today
 
