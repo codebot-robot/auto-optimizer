@@ -20,9 +20,12 @@ import (
 	"testing"
 	"time"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestScheduler_NewGoalCreatesRun(t *testing.T) {
@@ -111,6 +114,87 @@ func TestScheduler_NewGoalCreatesRun(t *testing.T) {
 	}
 	if recAfter.LastRunID != "" {
 		t.Errorf("expected goal.json not to be touched; LastRunID = %q", recAfter.LastRunID)
+	}
+}
+
+func TestScheduler_PublishesHeroRunOnRunCreation(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	store := state.NewFileStore(dir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/example-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "example-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	goalRec := &state.GoalRecord{
+		Goal: &goals.Goal{
+			Name:     "optimize-latency",
+			Body:     "Optimize latency below 50ms",
+			Hash:     "hash-v1",
+			Schedule: "on-change",
+		},
+		Hash:       "hash-v1",
+		BaseCommit: "commit-aaa",
+	}
+	if err := store.PutGoal(ctx, repo.Key(), goalRec); err != nil {
+		t.Fatalf("PutGoal: %v", err)
+	}
+
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	harness, _, _ := setupTestHarness(t, nil)
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	scheduler, err := NewScheduler(SchedulerOptions{
+		Store:        store,
+		Orchestrator: orch,
+		Clock:        func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	if err := scheduler.Tick(ctx); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	runs, err := store.ListRuns(ctx, repo.Key())
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("expected 1 run, got %d (err: %v)", len(runs), err)
+	}
+
+	var hr herorunv1alpha1.HeroRun
+	hrKey := client.ObjectKey{
+		Namespace: harness.Namespace(),
+		Name:      sandboxNameForRun(runs[0].ID),
+	}
+	if err := fakeClient.Get(ctx, hrKey, &hr); err != nil {
+		t.Fatalf("expected HeroRun to be created on run creation, got: %v", err)
+	}
+	if hr.Labels[LabelRun] != runs[0].ID {
+		t.Errorf("expected LabelRun %q, got %q", runs[0].ID, hr.Labels[LabelRun])
+	}
+	if hr.Annotations[AnnotationRepo] != repo.Key().String() {
+		t.Errorf("expected AnnotationRepo %q, got %q", repo.Key().String(), hr.Annotations[AnnotationRepo])
 	}
 }
 

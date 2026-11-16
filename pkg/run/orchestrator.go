@@ -31,6 +31,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -90,15 +91,9 @@ const (
 	readySafetyRequeueInterval = 1 * time.Minute
 )
 
-// Request identifies a run to be reconciled.
-type Request struct {
-	Repo  state.RepoKey
-	RunID string
-}
-
-// String returns a human-readable identifier for the request.
-func (r Request) String() string {
-	return fmt.Sprintf("%s/%s", r.Repo, r.RunID)
+type runIndexEntry struct {
+	repo  state.RepoKey
+	runID string
 }
 
 // OrchestratorOptions configures the run Orchestrator.
@@ -236,7 +231,10 @@ type Orchestrator struct {
 	defaultMaxDuration time.Duration
 	forgeFor           func(repoURL string) (forge.Forge, error)
 
-	notifyCh chan event.TypedGenericEvent[Request]
+	runIndexMu sync.RWMutex
+	runIndex   map[string]runIndexEntry
+
+	notifyCh chan event.TypedGenericEvent[reconcile.Request]
 
 	activeRunsMu  sync.Mutex
 	activeRuns    map[string]bool
@@ -249,7 +247,7 @@ type Orchestrator struct {
 	managerCtx   context.Context
 }
 
-var _ reconcile.TypedReconciler[Request] = (*Orchestrator)(nil)
+var _ reconcile.Reconciler = (*Orchestrator)(nil)
 var _ manager.Runnable = (*Orchestrator)(nil)
 
 // NewScheme builds a runtime.Scheme containing client-go types and the HeroRun types.
@@ -303,13 +301,67 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		verifyTimeout:      opts.VerifyTimeout,
 		defaultMaxDuration: opts.DefaultMaxDuration,
 		forgeFor:           opts.ForgeFor,
-		notifyCh:           make(chan event.TypedGenericEvent[Request], 1024),
+		runIndex:           make(map[string]runIndexEntry),
+		notifyCh:           make(chan event.TypedGenericEvent[reconcile.Request], 1024),
 		activeRuns:         make(map[string]bool),
 		workerCancels:      make(map[string]context.CancelFunc),
 		turnOutcomes:       make(map[string]turnOutcome),
 	}
 	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, opts.Clock, opts.HeroRunStatusInterval, opts.Harness.Namespace(), orch.publishHeroRun)
 	return orch, nil
+}
+
+func (o *Orchestrator) recordRunIndex(name string, repo state.RepoKey, runID string) {
+	o.runIndexMu.Lock()
+	defer o.runIndexMu.Unlock()
+	o.runIndex[name] = runIndexEntry{repo: repo, runID: runID}
+}
+
+func (o *Orchestrator) runForRequest(ctx context.Context, req reconcile.Request) (repo state.RepoKey, runID string, ok bool) {
+	o.runIndexMu.RLock()
+	entry, found := o.runIndex[req.Name]
+	o.runIndexMu.RUnlock()
+	if found {
+		return entry.repo, entry.runID, true
+	}
+
+	if o.kubeClient != nil {
+		ns := req.Namespace
+		if ns == "" && o.harness != nil {
+			ns = o.harness.Namespace()
+		}
+		var hr herorunv1alpha1.HeroRun
+		if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: req.Name}, &hr); err != nil {
+			if !k8serrors.IsNotFound(err) {
+				scoped.Log(ctx).V(2).Info("failed to get HeroRun for request", "request", req.String(), "error", err)
+			}
+		} else {
+			var repoKey state.RepoKey
+			var parsed bool
+			if hr.Annotations != nil {
+				if repoStr := hr.Annotations[AnnotationRepo]; repoStr != "" {
+					k, err := state.ParseRepoKey(repoStr)
+					if err != nil {
+						scoped.Log(ctx).V(2).Info("failed to parse repo key from HeroRun annotation", "repo", repoStr, "error", err)
+					} else {
+						repoKey = k
+						parsed = true
+					}
+				}
+			}
+			var id string
+			if hr.Labels != nil {
+				id = hr.Labels[LabelRun]
+			}
+			if parsed && id != "" {
+				o.recordRunIndex(req.Name, repoKey, id)
+				return repoKey, id, true
+			}
+		}
+	}
+
+	scoped.Log(ctx).V(2).Info("request does not resolve to a run; dropping", "request", req.String())
+	return state.RepoKey{}, "", false
 }
 
 // RunPageURL returns the public URL for a run's detail page, or empty when unset.
@@ -326,12 +378,24 @@ func (o *Orchestrator) Notify(repo state.RepoKey, runID string) {
 	if o == nil {
 		return
 	}
-	req := Request{Repo: repo, RunID: runID}
+	name := sandboxNameForRun(runID)
+	o.recordRunIndex(name, repo, runID)
+
+	var ns string
+	if o.harness != nil {
+		ns = o.harness.Namespace()
+	}
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: ns,
+			Name:      name,
+		},
+	}
 	select {
-	case o.notifyCh <- event.TypedGenericEvent[Request]{Object: req}:
+	case o.notifyCh <- event.TypedGenericEvent[reconcile.Request]{Object: req}:
 	default:
 		go func() {
-			o.notifyCh <- event.TypedGenericEvent[Request]{Object: req}
+			o.notifyCh <- event.TypedGenericEvent[reconcile.Request]{Object: req}
 		}()
 	}
 }
@@ -340,7 +404,7 @@ func (o *Orchestrator) Notify(repo state.RepoKey, runID string) {
 func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 	// Skip name validation so unit tests can build multiple controllers named "run" in one process.
 	skipNameValidation := true
-	c, err := controller.NewTyped[Request]("run", mgr, controller.TypedOptions[Request]{
+	c, err := controller.NewTyped[reconcile.Request]("run", mgr, controller.TypedOptions[reconcile.Request]{
 		Reconciler:              o,
 		MaxConcurrentReconciles: o.maxConcurrentRuns,
 		SkipNameValidation:      &skipNameValidation,
@@ -349,10 +413,10 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 		return fmt.Errorf("creating run controller: %w", err)
 	}
 
-	src := source.TypedChannel[Request, Request](
+	src := source.TypedChannel[reconcile.Request, reconcile.Request](
 		o.notifyCh,
-		handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req Request) []Request {
-			return []Request{req}
+		handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req reconcile.Request) []reconcile.Request {
+			return []reconcile.Request{req}
 		}),
 	)
 	if err := c.Watch(src); err != nil {
@@ -373,31 +437,24 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 	return mgr.Add(o)
 }
 
-// sandboxSource is a hand-written source.TypedSource[Request] that watches
-// Sandboxes in the control-plane namespace, maps the run label and repo
-// annotation to a Request, and enqueues it for reconciliation.
+// sandboxSource is a hand-written source.TypedSource[reconcile.Request] that watches
+// Sandboxes in the control-plane namespace, maps the controller owner of kind HeroRun
+// to a Request, and enqueues it for reconciliation.
 //
 // A conventional controller-runtime setup uses source.Kind with an
-// EnqueueRequestForOwner or EnqueueRequestsFromMapFunc handler, but that
-// does not fit here for two reasons:
-//
-//  1. The reconciler's request type is run.Request{Repo, RunID}, not
-//     reconcile.Request. A run is a JSON record in the state directory, not a
-//     Kubernetes object, so a Sandbox cannot carry an owner reference to it
-//     and EnqueueRequestForOwner has nothing to enqueue.
-//  2. The sandbox watch uses the agent-sandbox typed clientset and a
-//     namespace-scoped shared informer rather than the manager's cache,
-//     because the manager's scheme does not include the Sandbox CRD types
-//     and unit tests supply an in-memory fake clientset.
+// EnqueueRequestForOwner handler, but that does not fit here because the sandbox
+// watch uses the agent-sandbox typed clientset and a namespace-scoped shared informer
+// rather than the manager's cache (the manager's scheme does not include the
+// Sandbox CRD types and unit tests supply an in-memory fake clientset).
 type sandboxSource struct {
 	agentsClient agentsclientset.Interface
 	namespace    string
 	log          logr.Logger
 }
 
-var _ source.TypedSource[Request] = (*sandboxSource)(nil)
+var _ source.TypedSource[reconcile.Request] = (*sandboxSource)(nil)
 
-func (s *sandboxSource) Start(ctx context.Context, queue workqueue.TypedRateLimitingInterface[Request]) error {
+func (s *sandboxSource) Start(ctx context.Context, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) error {
 	factory := informers.NewSharedInformerFactoryWithOptions(s.agentsClient, 0, informers.WithNamespace(s.namespace))
 	informer := factory.Agents().V1beta1().Sandboxes().Informer()
 
@@ -428,7 +485,7 @@ func (s *sandboxSource) Start(ctx context.Context, queue workqueue.TypedRateLimi
 	return nil
 }
 
-func (s *sandboxSource) enqueueSandbox(ctx context.Context, obj any, queue workqueue.TypedRateLimitingInterface[Request]) {
+func (s *sandboxSource) enqueueSandbox(ctx context.Context, obj any, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	sb, ok := obj.(*sandboxv1beta1.Sandbox)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
@@ -441,28 +498,17 @@ func (s *sandboxSource) enqueueSandbox(ctx context.Context, obj any, queue workq
 		}
 	}
 
-	runID := sb.Labels[LabelRun]
-	if runID == "" {
+	owner := metav1.GetControllerOf(sb)
+	if owner == nil || owner.Kind != "HeroRun" {
 		return
 	}
 
-	if req := s.mapSandboxToRequest(ctx, sb, runID); req != nil {
-		queue.Add(*req)
-	}
-}
-
-func (s *sandboxSource) mapSandboxToRequest(ctx context.Context, sb *sandboxv1beta1.Sandbox, runID string) *Request {
-	if sb.Annotations != nil {
-		if repoStr := sb.Annotations[AnnotationRepo]; repoStr != "" {
-			key, err := state.ParseRepoKey(repoStr)
-			if err != nil {
-				s.log.V(2).Info("failed to parse repo key from sandbox annotation", "repo", repoStr, "error", err)
-				return nil
-			}
-			return &Request{Repo: key, RunID: runID}
-		}
-	}
-	return nil
+	queue.Add(reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: sb.Namespace,
+			Name:      owner.Name,
+		},
+	})
 }
 
 // Start implements manager.Runnable. On manager startup it calls Resume,
@@ -507,13 +553,12 @@ func (o *Orchestrator) Resume(ctx context.Context) error {
 		}
 
 		for _, r := range runs {
+			o.recordRunIndex(sandboxNameForRun(r.ID), repo.Key(), r.ID)
 			if o.statusPublisher != nil {
 				o.statusPublisher.MarkDirty(repo.Key(), r.ID)
 			}
 			if !r.Phase.IsTerminal() {
-				if r.Phase != state.PhasePending {
-					o.publishHeroRun(ctx, repo, r)
-				}
+				o.publishHeroRun(ctx, repo, r)
 				o.Notify(repo.Key(), r.ID)
 			}
 		}
@@ -523,23 +568,28 @@ func (o *Orchestrator) Resume(ctx context.Context) error {
 
 // Reconcile loads the run and the repository, dispatches on the phase to
 // prepareRun, reconcilePreparing, or workRun, and returns.
-func (o *Orchestrator) Reconcile(ctx context.Context, req Request) (reconcile.Result, error) {
+func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
-	run, err := o.store.GetRun(ctx, req.Repo, req.RunID)
-	if err != nil {
-		if errors.Is(err, state.ErrNotFound) {
-			return reconcile.Result{}, nil
-		}
-		return reconcile.Result{}, fmt.Errorf("getting run %s: %w", req.RunID, err)
+	repoKey, runID, ok := o.runForRequest(ctx, req)
+	if !ok {
+		return reconcile.Result{}, nil
 	}
 
-	repo, err := o.store.GetRepo(ctx, req.Repo)
+	run, err := o.store.GetRun(ctx, repoKey, runID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			return reconcile.Result{}, nil
 		}
-		return reconcile.Result{}, fmt.Errorf("getting repo %s: %w", req.Repo, err)
+		return reconcile.Result{}, fmt.Errorf("getting run %s: %w", runID, err)
+	}
+
+	repo, err := o.store.GetRepo(ctx, repoKey)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, fmt.Errorf("getting repo %s: %w", repoKey, err)
 	}
 
 	if run.Phase.IsTerminal() {
