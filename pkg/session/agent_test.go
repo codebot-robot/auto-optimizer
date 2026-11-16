@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,8 @@ import (
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	"github.com/gke-labs/auto-optimizer/pkg/tools"
+	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	fakeagents "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
 )
@@ -934,5 +937,325 @@ func TestSandbox_SetPodInfo(t *testing.T) {
 	}
 	if sb.podIP != "10.0.0.1" {
 		t.Errorf("expected podIP '10.0.0.1', got %q", sb.podIP)
+	}
+}
+
+func setupContinueTurnTest(t *testing.T, llmClient llm.ChatClient) (*Harness, *Session, *recordingSandbox, *recordingEvents) {
+	t.Helper()
+	ctx := t.Context()
+
+	toolset, err := toolsets.Get("basic")
+	if err != nil {
+		t.Fatalf("toolsets.Get(basic): %v", err)
+	}
+
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.ToolTimeout = DefaultToolTimeout
+	toolset.RegisterTools(toolsRegistry)
+
+	var opts RunOptions
+	opts.InitDefaults()
+	opts.ModelName = "test-model"
+
+	fakeSB := &recordingSandbox{}
+
+	harness := NewHarness(llmClient, nil, toolsRegistry, opts)
+	harness.SetSandboxOverride(fakeSB)
+
+	storeDir := t.TempDir()
+	sessionStore := NewFileStore(storeDir)
+
+	sess, err := harness.NewSession(ctx, sessionStore, "continueturnsess", Metadata{Toolset: "basic"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	events := &recordingEvents{}
+	return harness, sess, fakeSB, events
+}
+
+func countUserMessages(msgs []llm.Message) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Role == "user" {
+			n++
+		}
+	}
+	return n
+}
+
+func ptr[T any](v T) *T {
+	return &v
+}
+
+func scriptedResponse(msg llm.Message) *llm.ChatCompletionResponse {
+	return &llm.ChatCompletionResponse{
+		ID: "resp-test",
+		Choices: []llm.Choice{
+			{
+				Message:      msg,
+				FinishReason: "stop",
+			},
+		},
+	}
+}
+
+func TestContinueTurn_UnansweredToolCall(t *testing.T) {
+	ctx := t.Context()
+	reply := "Linux verified"
+	llmClient := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			scriptedResponse(llm.Message{Role: "assistant", Content: &reply}),
+		},
+	}
+
+	harness, sess, fakeSB, events := setupContinueTurnTest(t, llmClient)
+
+	userMsg := llm.Message{Role: "user", Content: ptr("check uname")}
+	assistantMsg := llm.Message{
+		Role: "assistant",
+		ToolCalls: []llm.ToolCall{
+			{
+				ID:   "call-1",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "run_command",
+					Arguments: `{"command":"uname -a"}`,
+				},
+			},
+		},
+	}
+	if err := sess.AddMessages(ctx, userMsg, assistantMsg); err != nil {
+		t.Fatalf("AddMessages: %v", err)
+	}
+
+	if err := harness.ContinueTurn(ctx, sess, events); err != nil {
+		t.Fatalf("ContinueTurn: %v", err)
+	}
+
+	if got := len(fakeSB.calls); got != 1 {
+		t.Fatalf("sandbox calls = %d, want 1", got)
+	}
+	expectedCmd := []string{"sh", "-c", "uname -a"}
+	if !slices.Equal(fakeSB.calls[0].Command, expectedCmd) {
+		t.Errorf("command = %v, want %v", fakeSB.calls[0].Command, expectedCmd)
+	}
+	if llmClient.idx != 1 {
+		t.Errorf("llmClient.idx = %d, want 1 (model called once to continue)", llmClient.idx)
+	}
+
+	msgs := sess.Messages()
+	if got := countUserMessages(msgs); got != 1 {
+		t.Errorf("user message count = %d, want 1 (no extra user message appended)", got)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 messages (user, assistant, tool, assistant), got %d", len(msgs))
+	}
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "call-1" {
+		t.Errorf("msg[2] = %+v, want tool message for call-1", msgs[2])
+	}
+	if msgs[3].Role != "assistant" || valueOf(msgs[3].Content) != reply {
+		t.Errorf("msg[3] = %+v, want assistant message with %q", msgs[3], reply)
+	}
+}
+
+func TestContinueTurn_PartialToolResults(t *testing.T) {
+	ctx := t.Context()
+	reply := "both done"
+	llmClient := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			scriptedResponse(llm.Message{Role: "assistant", Content: &reply}),
+		},
+	}
+
+	harness, sess, fakeSB, events := setupContinueTurnTest(t, llmClient)
+
+	userMsg := llm.Message{Role: "user", Content: ptr("run two commands")}
+	assistantMsg := llm.Message{
+		Role: "assistant",
+		ToolCalls: []llm.ToolCall{
+			{
+				ID:   "call-1",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "run_command",
+					Arguments: `{"command":"uname -a"}`,
+				},
+			},
+			{
+				ID:   "call-2",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "run_command",
+					Arguments: `{"command":"date"}`,
+				},
+			},
+		},
+	}
+	toolResult1 := llm.Message{
+		Role:       "tool",
+		ToolCallID: "call-1",
+		Content:    ptr("Linux fake-node"),
+	}
+	if err := sess.AddMessages(ctx, userMsg, assistantMsg, toolResult1); err != nil {
+		t.Fatalf("AddMessages: %v", err)
+	}
+
+	if err := harness.ContinueTurn(ctx, sess, events); err != nil {
+		t.Fatalf("ContinueTurn: %v", err)
+	}
+
+	if got := len(fakeSB.calls); got != 1 {
+		t.Fatalf("sandbox calls = %d, want 1 (only the unanswered tool call should run)", got)
+	}
+	expectedCmd := []string{"sh", "-c", "date"}
+	if !slices.Equal(fakeSB.calls[0].Command, expectedCmd) {
+		t.Errorf("command = %v, want %v", fakeSB.calls[0].Command, expectedCmd)
+	}
+	if llmClient.idx != 1 {
+		t.Errorf("llmClient.idx = %d, want 1 (model called once to continue)", llmClient.idx)
+	}
+
+	msgs := sess.Messages()
+	if got := countUserMessages(msgs); got != 1 {
+		t.Errorf("user message count = %d, want 1 (no extra user message appended)", got)
+	}
+	if len(msgs) != 5 {
+		t.Fatalf("expected 5 messages (user, assistant, tool1, tool2, assistant), got %d", len(msgs))
+	}
+	if msgs[2].ToolCallID != "call-1" || msgs[3].ToolCallID != "call-2" {
+		t.Errorf("tool messages: [2]=%s, [3]=%s; want call-1, call-2", msgs[2].ToolCallID, msgs[3].ToolCallID)
+	}
+	if msgs[4].Role != "assistant" || valueOf(msgs[4].Content) != reply {
+		t.Errorf("msg[4] = %+v, want assistant message with %q", msgs[4], reply)
+	}
+}
+
+func TestContinueTurn_CompleteToolResults(t *testing.T) {
+	ctx := t.Context()
+	reply := "command finished"
+	llmClient := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			scriptedResponse(llm.Message{Role: "assistant", Content: &reply}),
+		},
+	}
+
+	harness, sess, fakeSB, events := setupContinueTurnTest(t, llmClient)
+
+	userMsg := llm.Message{Role: "user", Content: ptr("run command")}
+	assistantMsg := llm.Message{
+		Role: "assistant",
+		ToolCalls: []llm.ToolCall{
+			{
+				ID:   "call-1",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "run_command",
+					Arguments: `{"command":"uname -a"}`,
+				},
+			},
+		},
+	}
+	toolResult1 := llm.Message{
+		Role:       "tool",
+		ToolCallID: "call-1",
+		Content:    ptr("Linux fake-node"),
+	}
+	if err := sess.AddMessages(ctx, userMsg, assistantMsg, toolResult1); err != nil {
+		t.Fatalf("AddMessages: %v", err)
+	}
+
+	if err := harness.ContinueTurn(ctx, sess, events); err != nil {
+		t.Fatalf("ContinueTurn: %v", err)
+	}
+
+	if got := len(fakeSB.calls); got != 0 {
+		t.Fatalf("sandbox calls = %d, want 0 (tool call already had result, should not run again)", got)
+	}
+	if llmClient.idx != 1 {
+		t.Errorf("llmClient.idx = %d, want 1 (model called to continue loop)", llmClient.idx)
+	}
+
+	msgs := sess.Messages()
+	if got := countUserMessages(msgs); got != 1 {
+		t.Errorf("user message count = %d, want 1 (no extra user message appended)", got)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 messages (user, assistant, tool, assistant), got %d", len(msgs))
+	}
+	if msgs[3].Role != "assistant" || valueOf(msgs[3].Content) != reply {
+		t.Errorf("msg[3] = %+v, want assistant message with %q", msgs[3], reply)
+	}
+}
+
+func TestContinueTurn_FinalAssistantMessage(t *testing.T) {
+	ctx := t.Context()
+	// No responses configured; if LLM is called, CreateChatCompletion returns an error.
+	llmClient := &scriptedLLM{}
+
+	harness, sess, fakeSB, events := setupContinueTurnTest(t, llmClient)
+
+	userMsg := llm.Message{Role: "user", Content: ptr("hello")}
+	assistantMsg := llm.Message{Role: "assistant", Content: ptr("How can I help you?")}
+	if err := sess.AddMessages(ctx, userMsg, assistantMsg); err != nil {
+		t.Fatalf("AddMessages: %v", err)
+	}
+
+	if err := harness.ContinueTurn(ctx, sess, events); err != nil {
+		t.Fatalf("ContinueTurn: %v", err)
+	}
+
+	if got := len(fakeSB.calls); got != 0 {
+		t.Errorf("sandbox calls = %d, want 0", got)
+	}
+	if llmClient.idx != 0 {
+		t.Errorf("llmClient.idx = %d, want 0 (model should not be called)", llmClient.idx)
+	}
+
+	msgs := sess.Messages()
+	if got := countUserMessages(msgs); got != 1 {
+		t.Errorf("user message count = %d, want 1 (no extra user message appended)", got)
+	}
+	if len(msgs) != 2 {
+		t.Errorf("session messages count = %d, want 2 (transcript unchanged)", len(msgs))
+	}
+}
+
+func TestContinueTurn_UserMessageTail(t *testing.T) {
+	ctx := t.Context()
+	reply := "Hello user"
+	llmClient := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			scriptedResponse(llm.Message{Role: "assistant", Content: &reply}),
+		},
+	}
+
+	harness, sess, fakeSB, events := setupContinueTurnTest(t, llmClient)
+
+	userMsg := llm.Message{Role: "user", Content: ptr("hello from user")}
+	if err := sess.AddMessages(ctx, userMsg); err != nil {
+		t.Fatalf("AddMessages: %v", err)
+	}
+
+	if err := harness.ContinueTurn(ctx, sess, events); err != nil {
+		t.Fatalf("ContinueTurn: %v", err)
+	}
+
+	if got := len(fakeSB.calls); got != 0 {
+		t.Errorf("sandbox calls = %d, want 0", got)
+	}
+	if llmClient.idx != 1 {
+		t.Errorf("llmClient.idx = %d, want 1", llmClient.idx)
+	}
+
+	msgs := sess.Messages()
+	if got := countUserMessages(msgs); got != 1 {
+		t.Errorf("user message count = %d, want 1 (no extra user message appended)", got)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages (user, assistant), got %d", len(msgs))
+	}
+	if msgs[1].Role != "assistant" || valueOf(msgs[1].Content) != reply {
+		t.Errorf("msg[1] = %+v, want assistant message with %q", msgs[1], reply)
 	}
 }
