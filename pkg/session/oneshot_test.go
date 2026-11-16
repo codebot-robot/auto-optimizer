@@ -30,14 +30,20 @@ import (
 // recordingSandbox is an in-memory double of tools.Sandbox that records
 // commands executed against it without requiring a Kubernetes cluster or network.
 type recordingSandbox struct {
-	mu    sync.Mutex
-	calls []tools.ExecCommandOptions
+	mu     sync.Mutex
+	calls  []tools.ExecCommandOptions
+	onExec func(ctx context.Context, opts tools.ExecCommandOptions) error
 }
 
-func (s *recordingSandbox) ExecCommand(_ context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
+func (s *recordingSandbox) ExecCommand(ctx context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, opts)
+	if s.onExec != nil {
+		if err := s.onExec(ctx, opts); err != nil {
+			return nil, err
+		}
+	}
 
 	return &tools.ExecCommandResult{
 		Stdout:   "Linux fake-test-node 6.6.0 #1 SMP\n",
