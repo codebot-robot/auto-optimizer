@@ -317,51 +317,51 @@ func (o *Orchestrator) recordRunIndex(name string, repo state.RepoKey, runID str
 	o.runIndex[name] = runIndexEntry{repo: repo, runID: runID}
 }
 
-func (o *Orchestrator) runForRequest(ctx context.Context, req reconcile.Request) (repo state.RepoKey, runID string, ok bool) {
+func (o *Orchestrator) deleteRunIndex(name string) {
+	o.runIndexMu.Lock()
+	defer o.runIndexMu.Unlock()
+	delete(o.runIndex, name)
+}
+
+func (o *Orchestrator) runForRequest(ctx context.Context, req reconcile.Request) (repo state.RepoKey, runID string, ok bool, err error) {
 	o.runIndexMu.RLock()
 	entry, found := o.runIndex[req.Name]
 	o.runIndexMu.RUnlock()
 	if found {
-		return entry.repo, entry.runID, true
+		return entry.repo, entry.runID, true, nil
 	}
 
-	if o.kubeClient != nil {
-		ns := req.Namespace
-		if ns == "" && o.harness != nil {
-			ns = o.harness.Namespace()
+	if o.kubeClient == nil {
+		scoped.Log(ctx).V(2).Info("request does not resolve to a run; dropping", "request", req.String())
+		return state.RepoKey{}, "", false, nil
+	}
+
+	ns := req.Namespace
+	if ns == "" && o.harness != nil {
+		ns = o.harness.Namespace()
+	}
+	var hr herorunv1alpha1.HeroRun
+	if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: req.Name}, &hr); err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return state.RepoKey{}, "", false, fmt.Errorf("getting HeroRun %s: %w", req.Name, err)
 		}
-		var hr herorunv1alpha1.HeroRun
-		if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: req.Name}, &hr); err != nil {
-			if !k8serrors.IsNotFound(err) {
-				scoped.Log(ctx).V(2).Info("failed to get HeroRun for request", "request", req.String(), "error", err)
-			}
-		} else {
-			var repoKey state.RepoKey
-			var parsed bool
-			if hr.Annotations != nil {
-				if repoStr := hr.Annotations[AnnotationRepo]; repoStr != "" {
-					k, err := state.ParseRepoKey(repoStr)
-					if err != nil {
-						scoped.Log(ctx).V(2).Info("failed to parse repo key from HeroRun annotation", "repo", repoStr, "error", err)
-					} else {
-						repoKey = k
-						parsed = true
-					}
-				}
-			}
-			var id string
-			if hr.Labels != nil {
-				id = hr.Labels[LabelRun]
-			}
-			if parsed && id != "" {
-				o.recordRunIndex(req.Name, repoKey, id)
-				return repoKey, id, true
-			}
-		}
+		scoped.Log(ctx).V(2).Info("request does not resolve to a run; dropping", "request", req.String())
+		return state.RepoKey{}, "", false, nil
+	}
+
+	repoStr := hr.Annotations[AnnotationRepo]
+	repoKey, err := state.ParseRepoKey(repoStr)
+	id := hr.Labels[LabelRun]
+	if err == nil && id != "" {
+		o.recordRunIndex(req.Name, repoKey, id)
+		return repoKey, id, true, nil
+	}
+	if repoStr != "" && err != nil {
+		scoped.Log(ctx).V(2).Info("failed to parse repo key from HeroRun annotation", "repo", repoStr, "error", err)
 	}
 
 	scoped.Log(ctx).V(2).Info("request does not resolve to a run; dropping", "request", req.String())
-	return state.RepoKey{}, "", false
+	return state.RepoKey{}, "", false, nil
 }
 
 // RunPageURL returns the public URL for a run's detail page, or empty when unset.
@@ -553,11 +553,11 @@ func (o *Orchestrator) Resume(ctx context.Context) error {
 		}
 
 		for _, r := range runs {
-			o.recordRunIndex(sandboxNameForRun(r.ID), repo.Key(), r.ID)
 			if o.statusPublisher != nil {
 				o.statusPublisher.MarkDirty(repo.Key(), r.ID)
 			}
 			if !r.Phase.IsTerminal() {
+				o.recordRunIndex(sandboxNameForRun(r.ID), repo.Key(), r.ID)
 				o.publishHeroRun(ctx, repo, r)
 				o.Notify(repo.Key(), r.ID)
 			}
@@ -571,7 +571,10 @@ func (o *Orchestrator) Resume(ctx context.Context) error {
 func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
-	repoKey, runID, ok := o.runForRequest(ctx, req)
+	repoKey, runID, ok, err := o.runForRequest(ctx, req)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
 	if !ok {
 		return reconcile.Result{}, nil
 	}
@@ -593,6 +596,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 	}
 
 	if run.Phase.IsTerminal() {
+		o.deleteRunIndex(req.Name)
 		if outcome, ok := o.popTurnOutcome(run.ID); ok {
 			if err := o.handleTurnOutcome(ctx, repo, run, outcome); err != nil {
 				log.V(2).Info("error handling leftover outcome for terminal run", "run", run.ID, "error", err)
@@ -1205,6 +1209,9 @@ func (o *Orchestrator) releaseSandbox(sandboxName string) {
 func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.Run, prev state.RunPhase) error {
 	if err := o.store.PutRun(ctx, run); err != nil {
 		return err
+	}
+	if run != nil && run.Phase.IsTerminal() {
+		o.deleteRunIndex(sandboxNameForRun(run.ID))
 	}
 	if o.statusPublisher != nil {
 		var key state.RepoKey
