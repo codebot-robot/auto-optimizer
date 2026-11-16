@@ -20,7 +20,7 @@ This guide covers setting up a development environment, running tests, deploying
 
 ## Prerequisites
 
-- **Go**: Version 1.27.3 or later (or run commands with `GOTOOLCHAIN=auto`).
+- **Go**: Version 1.27.4 or later (or run commands with `GOTOOLCHAIN=auto`).
 - **Docker**: A running Docker daemon accessible locally or via `DOCKER_HOST`.
 - **Git**: For version control and repository metadata.
 
