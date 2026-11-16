@@ -15,6 +15,7 @@
 package session
 
 import (
+	"context"
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
 	"encoding/base64"
@@ -1257,6 +1258,71 @@ func TestContinueTurn_UserMessageTail(t *testing.T) {
 	}
 	if msgs[1].Role != "assistant" || valueOf(msgs[1].Content) != reply {
 		t.Errorf("msg[1] = %+v, want assistant message with %q", msgs[1], reply)
+	}
+}
+
+func TestContinueTurn_CancelledToolCallRetried(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	reply := "Linux verified"
+	llmClient := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			scriptedResponse(llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{{
+					ID: "call-1", Type: "function",
+					Function: llm.FunctionCall{Name: "run_command", Arguments: `{"command":"uname -a"}`},
+				}},
+			}),
+			scriptedResponse(llm.Message{Role: "assistant", Content: &reply}),
+		},
+	}
+
+	harness, sess, fakeSB, events := setupContinueTurnTest(t, llmClient)
+
+	var cancelled bool
+	fakeSB.onExec = func(execCtx context.Context, _ tools.ExecCommandOptions) error {
+		if !cancelled {
+			cancelled = true
+			cancel()
+			return execCtx.Err()
+		}
+		return nil
+	}
+
+	err := harness.RunTurn(ctx, sess, "check uname", events)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunTurn err = %v, want context.Canceled", err)
+	}
+
+	msgs := sess.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages (user, assistant), got %d", len(msgs))
+	}
+	if len(msgs[1].ToolCalls) != 1 || msgs[1].ToolCalls[0].ID != "call-1" {
+		t.Fatalf("expected assistant message with tool call call-1, got %+v", msgs[1])
+	}
+
+	freshCtx := t.Context()
+	if err := harness.ContinueTurn(freshCtx, sess, events); err != nil {
+		t.Fatalf("ContinueTurn: %v", err)
+	}
+
+	if got := len(fakeSB.calls); got != 2 {
+		t.Fatalf("sandbox calls = %d, want 2 (1 cancelled, 1 retry)", got)
+	}
+	if llmClient.idx != 2 {
+		t.Errorf("llmClient.idx = %d, want 2", llmClient.idx)
+	}
+
+	msgs = sess.Messages()
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 messages (user, assistant, tool, assistant), got %d", len(msgs))
+	}
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "call-1" {
+		t.Errorf("msg[2] = %+v, want tool message for call-1", msgs[2])
+	}
+	if msgs[3].Role != "assistant" || valueOf(msgs[3].Content) != reply {
+		t.Errorf("msg[3] = %+v, want assistant message with %q", msgs[3], reply)
 	}
 }
 

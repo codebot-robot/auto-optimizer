@@ -2065,6 +2065,9 @@ func (h *Harness) executeToolCalls(ctx context.Context, session *Session, events
 					toolMsg.Content = &content
 				}
 			} else if callErr != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				log.Error(callErr, "error calling tool", "tool", tc.Function.Name)
 				content := fmt.Sprintf("Error calling tool %q: %v", tc.Function.Name, callErr)
 				toolMsg = llm.Message{Role: "tool", ToolCallID: tc.ID, Content: &content}
