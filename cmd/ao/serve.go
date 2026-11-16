@@ -199,7 +199,7 @@ func runServe(ctx context.Context, opts serveOptions) error {
 		return fmt.Errorf("getting Kubernetes configuration: %w", err)
 	}
 
-	mgr, err := run.NewManager(restConfig)
+	mgr, err := run.NewManager(restConfig, opts.sandbox.Namespace)
 	if err != nil {
 		return fmt.Errorf("initializing controller manager: %w", err)
 	}

@@ -458,16 +458,15 @@ otherwise.
 
 The orchestrator stores runs as JSON and JSONL records in the state
 directory. The reconciler keys work by `reconcile.Request` (the namespace and name
-of the `HeroRun` object). A custom informer source watches Sandboxes and maps them
-to runs through their `HeroRun` controller owner references. Representing runs as
-a Kubernetes custom resource offers clear benefits, but it also carries significant
-costs.
+of the `HeroRun` object). The orchestrator watches HeroRuns and their child
+Sandboxes with controller-runtime's standard `For` and `Owns` builder.
+Representing runs as a Kubernetes custom resource offers clear benefits, but it
+also carries significant costs.
 
 A `HeroRun` custom resource buys standard Kubernetes integration:
-- **Owner references.** Sandboxes can declare an owner reference to their
-  `HeroRun`. The orchestrator can then replace `sandboxSource` with standard
-  controller-runtime primitives such as `source.Kind` and
-  `handler.EnqueueRequestForOwner`.
+- **Owner references.** Sandboxes declare an owner reference to their
+  `HeroRun`, allowing controller-runtime's standard `For` and `Owns` watches to
+  reconcile the run whenever a child Sandbox changes.
 - **Garbage collection.** Kubernetes deletes child Sandboxes automatically when
   someone deletes a `HeroRun`.
 - **Cluster visibility.** Operators can inspect runs directly through
@@ -539,8 +538,7 @@ To implement `HeroRun`, we will:
 3. Add owner references from each created `Sandbox` to its `HeroRun` object:
    every Sandbox created for a run carries an owner reference naming its
    `HeroRun` with `controller: true`.
-4. Replace `sandboxSource` with standard `source.Kind` and
-   `handler.EnqueueRequestForOwner`.
+4. Replace `sandboxSource` with standard `For` and `Owns` watches (done).
 5. Keep session transcripts, tool outputs, and events in the state directory.
 
 ## State
