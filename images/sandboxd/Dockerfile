@@ -19,7 +19,7 @@
 ARG SANDBOXD_REPO=https://github.com/justinsb/agent-sandbox
 ARG SANDBOXD_COMMIT=76156ce957a58d6d82e1cdd60e75d5be0d80a94f
 
-FROM --platform=$BUILDPLATFORM golang:1.27.3 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4 AS builder
 ARG TARGETARCH
 ARG SANDBOXD_REPO
 ARG SANDBOXD_COMMIT

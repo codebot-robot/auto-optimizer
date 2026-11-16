@@ -17,7 +17,7 @@
 # It bundles the geminicli-toolbox binary on top of a Debian base
 # that provides bash and git for run_shell_command.
 
-FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm AS build
 ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
