@@ -1866,15 +1866,73 @@ func (h *Harness) EnsureSystemPrompt(ctx context.Context, session *Session) erro
 // tool calls in the session's sandbox, and repeats until the LLM produces a
 // final text reply, which is delivered via events.AssistantMessage.
 func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, events TurnEvents) error {
-	log := scoped.Log(ctx)
-
 	userMsg := llm.Message{Role: "user", Content: &input}
 	if err := session.AddMessages(ctx, userMsg); err != nil {
 		return fmt.Errorf("adding user message: %w", err)
 	}
 	events.MessageAppended(ctx, userMsg)
 
+	return h.runLoop(ctx, session, events, nil)
+}
+
+// ContinueTurn continues an in-flight turn from the tail of the session's
+// stored transcript without appending a new user message.
+//
+// Retrying a tool call is deliberately naive. A call that finished in the
+// sandbox before the restart, but whose result was not stored, runs a second
+// time. The model sees the second result and recovers.
+func (h *Harness) ContinueTurn(ctx context.Context, session *Session, events TurnEvents) error {
+	msgs := session.Messages()
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	lastMsg := msgs[len(msgs)-1]
+	if lastMsg.Role == "assistant" && len(lastMsg.ToolCalls) == 0 {
+		return nil
+	}
+
+	var lastAssistant *llm.Message
+	lastAssistantIdx := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			lastAssistant = &msgs[i]
+			lastAssistantIdx = i
+			break
+		}
+		if msgs[i].Role == "user" {
+			break
+		}
+	}
+
+	var pendingCalls []llm.ToolCall
+	if lastAssistant != nil && len(lastAssistant.ToolCalls) > 0 {
+		existingResults := make(map[string]bool)
+		for j := lastAssistantIdx + 1; j < len(msgs); j++ {
+			if msgs[j].Role == "tool" && msgs[j].ToolCallID != "" {
+				existingResults[msgs[j].ToolCallID] = true
+			}
+		}
+		for _, tc := range lastAssistant.ToolCalls {
+			if !existingResults[tc.ID] {
+				pendingCalls = append(pendingCalls, tc)
+			}
+		}
+	}
+
+	return h.runLoop(ctx, session, events, pendingCalls)
+}
+
+func (h *Harness) runLoop(ctx context.Context, session *Session, events TurnEvents, pendingCalls []llm.ToolCall) error {
+	log := scoped.Log(ctx)
+
 	shouldSnapshot := false
+	if len(pendingCalls) > 0 {
+		if err := h.executeToolCalls(ctx, session, events, pendingCalls, &shouldSnapshot); err != nil {
+			return err
+		}
+	}
+
 	turnCount := 0
 	for {
 		if h.opts.MaxTurns > 0 && turnCount >= h.opts.MaxTurns {
@@ -1921,95 +1979,103 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 			return nil
 		}
 
-		for _, tc := range assistantMessage.ToolCalls {
-			approved, err := events.ApproveToolCall(ctx, tc)
-			if err != nil {
-				return fmt.Errorf("requesting tool call approval: %w", err)
-			}
+		if err := h.executeToolCalls(ctx, session, events, assistantMessage.ToolCalls, &shouldSnapshot); err != nil {
+			return err
+		}
+	}
+}
 
-			var toolMsg llm.Message
-			var callErr error
-			if !approved {
-				log.Info("tool call denied by user", "tool", tc.Function.Name)
-				content := fmt.Sprintf("The user denied permission to run tool %q.", tc.Function.Name)
-				toolMsg = llm.Message{Role: "tool", ToolCallID: tc.ID, Content: &content}
-			} else if extraTool := h.findExtraTool(tc.Function.Name); extraTool != nil {
-				events.ToolCallStarted(ctx, tc)
-				args := tc.Function.Arguments
-				if args == "" {
-					args = "{}"
-				}
-				if err := json.Unmarshal([]byte(args), extraTool); err != nil {
-					callErr = fmt.Errorf("failed to parse arguments: %w", err)
-				} else {
-					var sb tools.Sandbox
-					if session.activeSandbox != nil {
-						sb = session.activeSandbox
-					}
-					toolMsg, callErr = extraTool.Run(ctx, sb)
-				}
-				events.ToolCallFinished(ctx, tc, callErr)
+func (h *Harness) executeToolCalls(ctx context.Context, session *Session, events TurnEvents, calls []llm.ToolCall, shouldSnapshot *bool) error {
+	log := scoped.Log(ctx)
+
+	for _, tc := range calls {
+		approved, err := events.ApproveToolCall(ctx, tc)
+		if err != nil {
+			return fmt.Errorf("requesting tool call approval: %w", err)
+		}
+
+		var toolMsg llm.Message
+		var callErr error
+		if !approved {
+			log.Info("tool call denied by user", "tool", tc.Function.Name)
+			content := fmt.Sprintf("The user denied permission to run tool %q.", tc.Function.Name)
+			toolMsg = llm.Message{Role: "tool", ToolCallID: tc.ID, Content: &content}
+		} else if extraTool := h.findExtraTool(tc.Function.Name); extraTool != nil {
+			events.ToolCallStarted(ctx, tc)
+			args := tc.Function.Arguments
+			if args == "" {
+				args = "{}"
+			}
+			if err := json.Unmarshal([]byte(args), extraTool); err != nil {
+				callErr = fmt.Errorf("failed to parse arguments: %w", err)
 			} else {
-				sandbox, err := h.ensureSandbox(ctx, session)
-				if err != nil {
-					return err
+				var sb tools.Sandbox
+				if session.activeSandbox != nil {
+					sb = session.activeSandbox
 				}
-
-				events.ToolCallStarted(ctx, tc)
-				toolMsg, callErr = h.toolsRegistry.Call(ctx, sandbox, tc)
-				events.ToolCallFinished(ctx, tc, callErr)
-
-				// The filesystem may have changed (even on error), so
-				// snapshot at the next boundary to keep the persisted
-				// filesystem state consistent with the session state.
-				shouldSnapshot = true
-
-				// The tool call could take a while, so extend the lifecycle for interactive sessions.
-				// A run's sandbox gets one shutdownTime at creation and is not extended.
-				if sb, ok := sandbox.(*Sandbox); ok && !session.FailOnSandboxExpiry {
-					if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {
-						log.Error(err, "extending sandbox lifecycle")
-					}
-				}
+				toolMsg, callErr = extraTool.Run(ctx, sb)
+			}
+			events.ToolCallFinished(ctx, tc, callErr)
+		} else {
+			sandbox, err := h.ensureSandbox(ctx, session)
+			if err != nil {
+				return err
 			}
 
-			if approved {
-				if errors.Is(callErr, ErrSessionFinished) || errors.Is(callErr, ErrPullRequestRequested) {
-					if toolMsg.Role == "" {
-						toolMsg.Role = "tool"
-					}
-					toolMsg.ToolCallID = tc.ID
-					if toolMsg.Content == nil {
-						content := "Session finished."
-						if errors.Is(callErr, ErrPullRequestRequested) {
-							content = "Pull request requested."
-						}
-						toolMsg.Content = &content
-					}
-				} else if callErr != nil {
-					log.Error(callErr, "error calling tool", "tool", tc.Function.Name)
-					content := fmt.Sprintf("Error calling tool %q: %v", tc.Function.Name, callErr)
-					toolMsg = llm.Message{Role: "tool", ToolCallID: tc.ID, Content: &content}
-				} else {
-					if toolMsg.Role == "" {
-						toolMsg.Role = "tool"
-					}
-					toolMsg.ToolCallID = tc.ID
+			events.ToolCallStarted(ctx, tc)
+			toolMsg, callErr = h.toolsRegistry.Call(ctx, sandbox, tc)
+			events.ToolCallFinished(ctx, tc, callErr)
+
+			// The filesystem may have changed (even on error), so
+			// snapshot at the next boundary to keep the persisted
+			// filesystem state consistent with the session state.
+			*shouldSnapshot = true
+
+			// The tool call could take a while, so extend the lifecycle for interactive sessions.
+			// A run's sandbox gets one shutdownTime at creation and is not extended.
+			if sb, ok := sandbox.(*Sandbox); ok && !session.FailOnSandboxExpiry {
+				if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {
+					log.Error(err, "extending sandbox lifecycle")
 				}
-			}
-
-			if err := session.AddMessages(ctx, toolMsg); err != nil {
-				return fmt.Errorf("adding tool response: %w", err)
-			}
-			events.MessageAppended(ctx, toolMsg)
-
-			if errors.Is(callErr, ErrSessionFinished) || errors.Is(callErr, ErrPullRequestRequested) {
-				return callErr
 			}
 		}
 
-		// Here we continue the LLM loop, with the tool responses at the tail of the chat thread.
+		if approved {
+			if errors.Is(callErr, ErrSessionFinished) || errors.Is(callErr, ErrPullRequestRequested) {
+				if toolMsg.Role == "" {
+					toolMsg.Role = "tool"
+				}
+				toolMsg.ToolCallID = tc.ID
+				if toolMsg.Content == nil {
+					content := "Session finished."
+					if errors.Is(callErr, ErrPullRequestRequested) {
+						content = "Pull request requested."
+					}
+					toolMsg.Content = &content
+				}
+			} else if callErr != nil {
+				log.Error(callErr, "error calling tool", "tool", tc.Function.Name)
+				content := fmt.Sprintf("Error calling tool %q: %v", tc.Function.Name, callErr)
+				toolMsg = llm.Message{Role: "tool", ToolCallID: tc.ID, Content: &content}
+			} else {
+				if toolMsg.Role == "" {
+					toolMsg.Role = "tool"
+				}
+				toolMsg.ToolCallID = tc.ID
+			}
+		}
+
+		if err := session.AddMessages(ctx, toolMsg); err != nil {
+			return fmt.Errorf("adding tool response: %w", err)
+		}
+		events.MessageAppended(ctx, toolMsg)
+
+		if errors.Is(callErr, ErrSessionFinished) || errors.Is(callErr, ErrPullRequestRequested) {
+			return callErr
+		}
 	}
+
+	return nil
 }
 
 // ensureSandbox returns the session's running sandbox, creating it (and
