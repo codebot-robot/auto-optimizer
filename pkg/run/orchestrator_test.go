@@ -173,7 +173,10 @@ func runRequest(orch *Orchestrator, repo state.RepoKey, runID string) reconcile.
 }
 
 func reconcileWorkingRun(ctx context.Context, orch *Orchestrator, req reconcile.Request) (reconcile.Result, error) {
-	_, runID, ok := orch.runForRequest(ctx, req)
+	_, runID, ok, err := orch.runForRequest(ctx, req)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
 	if !ok {
 		return reconcile.Result{}, fmt.Errorf("could not resolve request %v to run", req)
 	}
@@ -3233,9 +3236,9 @@ func TestRunForRequest_ResolvesThroughIndex(t *testing.T) {
 			Name:      sandboxNameForRun(runID),
 		},
 	}
-	gotRepo, gotRunID, ok := orch.runForRequest(ctx, req)
-	if !ok {
-		t.Fatal("expected runForRequest to resolve through index")
+	gotRepo, gotRunID, ok, err := orch.runForRequest(ctx, req)
+	if err != nil || !ok {
+		t.Fatalf("expected runForRequest to resolve through index, got ok=%v err=%v", ok, err)
 	}
 	if gotRepo != repoKey {
 		t.Errorf("got repo %+v, want %+v", gotRepo, repoKey)
@@ -3299,9 +3302,9 @@ func TestRunForRequest_ResolvesThroughHeroRunOnIndexMiss(t *testing.T) {
 			Name:      hrName,
 		},
 	}
-	gotRepo, gotRunID, ok := orch.runForRequest(ctx, req)
-	if !ok {
-		t.Fatal("expected runForRequest to resolve through HeroRun on index miss")
+	gotRepo, gotRunID, ok, err := orch.runForRequest(ctx, req)
+	if err != nil || !ok {
+		t.Fatalf("expected runForRequest to resolve through HeroRun on index miss, got ok=%v err=%v", ok, err)
 	}
 	if gotRepo != repoKey {
 		t.Errorf("got repo %+v, want %+v", gotRepo, repoKey)
@@ -3326,9 +3329,50 @@ func TestOrchestrator_Reconcile_UnknownNameDroppedWithoutError(t *testing.T) {
 	ctx := t.Context()
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
+	scheme, _ := NewScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	for _, c := range []client.Client{nil, fakeClient} {
+		orch, err := NewOrchestrator(OrchestratorOptions{
+			Store:      store,
+			Harness:    harness,
+			KubeClient: c,
+		})
+		if err != nil {
+			t.Fatalf("NewOrchestrator: %v", err)
+		}
+
+		req := reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: harness.Namespace(),
+				Name:      "unknown-hero-run-name",
+			},
+		}
+		res, err := orch.Reconcile(ctx, req)
+		if err != nil {
+			t.Fatalf("expected unknown request to be dropped without error, got: %v", err)
+		}
+		if res != (reconcile.Result{}) {
+			t.Errorf("expected empty reconcile.Result, got: %+v", res)
+		}
+	}
+}
+
+func TestOrchestrator_Reconcile_ReadErrorReturnsError(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+	scheme, _ := NewScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			return errors.New("simulated API server read error")
+		},
+	}).Build()
+
 	orch, err := NewOrchestrator(OrchestratorOptions{
-		Store:   store,
-		Harness: harness,
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
 	})
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -3337,15 +3381,67 @@ func TestOrchestrator_Reconcile_UnknownNameDroppedWithoutError(t *testing.T) {
 	req := reconcile.Request{
 		NamespacedName: types.NamespacedName{
 			Namespace: harness.Namespace(),
-			Name:      "unknown-hero-run-name",
+			Name:      "some-run",
 		},
 	}
-	res, err := orch.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("expected unknown request to be dropped without error, got: %v", err)
+	_, err = orch.Reconcile(ctx, req)
+	if err == nil {
+		t.Fatal("expected Reconcile to return error on API read failure")
 	}
-	if res != (reconcile.Result{}) {
-		t.Errorf("expected empty reconcile.Result, got: %+v", res)
+	if !strings.Contains(err.Error(), "simulated API server read error") {
+		t.Errorf("expected error to mention 'simulated API server read error', got: %v", err)
+	}
+}
+
+func TestOrchestrator_FinishedRunHasNoIndexEntry(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+	scheme, _ := NewScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: repoKey.Host, Owner: repoKey.Owner, Name: repoKey.Name}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+	runID := "20261030T120000Z-finished"
+	hrName := sandboxNameForRun(runID)
+	orch.Notify(repoKey, runID)
+
+	run := &state.Run{ID: runID, Repo: repoKey, Phase: state.PhaseWorking}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+	_ = orch.publishHeroRun(ctx, repo, run)
+	orch.finishRun(ctx, repo, run, runEnd{Phase: state.PhaseNoImprovement, Kind: "finished"})
+
+	orch.runIndexMu.RLock()
+	_, found := orch.runIndex[hrName]
+	orch.runIndexMu.RUnlock()
+	if found {
+		t.Errorf("expected finished run %s to have no index entry", runID)
+	}
+
+	// Late event resolves through HeroRun and leaves no index entry.
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: harness.Namespace(), Name: hrName}}
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile on terminal run: %v", err)
+	}
+	orch.runIndexMu.RLock()
+	_, foundLate := orch.runIndex[hrName]
+	orch.runIndexMu.RUnlock()
+	if foundLate {
+		t.Errorf("expected late event for terminal run not to leave index entry")
 	}
 }
 
