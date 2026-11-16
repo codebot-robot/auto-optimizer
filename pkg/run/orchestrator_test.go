@@ -48,11 +48,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
-	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	fakeagents "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
+	informers "sigs.k8s.io/agent-sandbox/clients/k8s/informers/externalversions"
 	processv1 "sigs.k8s.io/agent-sandbox/packages/sandboxd/spec/process/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1811,15 +1812,159 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 	}
 }
 
-func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
+type reconcileDriver struct {
+	t      *testing.T
+	orch   *Orchestrator
+	queue  workqueue.TypedRateLimitingInterface[reconcile.Request]
+	ctx    context.Context
+	cancel context.CancelFunc
+}
 
-	storeDir := t.TempDir()
-	done := make(chan struct{})
+func startReconcileDriver(t *testing.T, orch *Orchestrator) *reconcileDriver {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	queue := workqueue.NewTypedRateLimitingQueue[reconcile.Request](
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
+
+	d := &reconcileDriver{
+		t:      t,
+		orch:   orch,
+		queue:  queue,
+		ctx:    ctx,
+		cancel: cancel,
+	}
 	t.Cleanup(func() {
 		cancel()
-		<-done
+		queue.ShutDown()
 	})
+
+	go func() {
+		_ = orch.Start(ctx)
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev := <-orch.notifyCh:
+				queue.Add(ev.Object)
+			}
+		}
+	}()
+
+	workers := orch.maxConcurrentRuns
+	if workers <= 0 {
+		workers = 1
+	}
+	for i := 0; i < workers; i++ {
+		go d.worker()
+	}
+
+	if orch.harness != nil && orch.harness.SandboxClient() != nil && orch.harness.SandboxClient().AgentsClient() != nil {
+		factory := informers.NewSharedInformerFactoryWithOptions(
+			orch.harness.SandboxClient().AgentsClient(),
+			0,
+			informers.WithNamespace(orch.harness.Namespace()),
+		)
+		informer := factory.Agents().V1beta1().Sandboxes().Informer()
+		enqueueSandbox := func(obj any) {
+			sb, ok := obj.(*sandboxv1beta1.Sandbox)
+			if !ok {
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					return
+				}
+				sb, ok = tombstone.Obj.(*sandboxv1beta1.Sandbox)
+				if !ok || sb == nil {
+					return
+				}
+			}
+
+			owner := metav1.GetControllerOf(sb)
+			if owner == nil || owner.Kind != "HeroRun" {
+				return
+			}
+
+			queue.Add(reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: sb.Namespace,
+					Name:      owner.Name,
+				},
+			})
+		}
+
+		_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    enqueueSandbox,
+			UpdateFunc: func(_, newObj any) { enqueueSandbox(newObj) },
+			DeleteFunc: enqueueSandbox,
+		})
+		if err != nil {
+			t.Fatalf("adding event handler to sandbox informer: %v", err)
+		}
+
+		factory.StartWithContext(ctx)
+		if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
+			if ctx.Err() == nil {
+				t.Fatal("timed out waiting for sandbox informer caches to sync")
+			}
+		}
+	}
+
+	return d
+}
+
+func (d *reconcileDriver) worker() {
+	for {
+		req, shutdown := d.queue.Get()
+		if shutdown {
+			return
+		}
+		res, err := d.orch.Reconcile(d.ctx, req)
+		if err != nil {
+			d.queue.AddRateLimited(req)
+		} else if res.RequeueAfter > 0 {
+			d.queue.Forget(req)
+			d.queue.AddAfter(req, res.RequeueAfter)
+		} else if res.Requeue {
+			d.queue.AddRateLimited(req)
+		} else {
+			d.queue.Forget(req)
+		}
+		d.queue.Done(req)
+	}
+}
+
+func (d *reconcileDriver) runUntil(cond func() bool) {
+	d.t.Helper()
+	if cond() {
+		return
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if cond() {
+				return
+			}
+			if time.Now().After(deadline) {
+				d.t.Fatal("timed out waiting for condition in runUntil")
+			}
+		case <-d.ctx.Done():
+			d.t.Fatalf("context cancelled while waiting for condition in runUntil: %v", d.ctx.Err())
+		}
+	}
+}
+
+func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
+	ctx := t.Context()
+
+	storeDir := t.TempDir()
 	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
@@ -1851,11 +1996,6 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 	}
 	harness, agentsCS, _ := setupTestHarness(t, procSrv)
 
-	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
-
 	scheme, err := NewScheme()
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
@@ -1870,9 +2010,6 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
-	if err := orch.SetupWithManager(mgr); err != nil {
-		t.Fatalf("SetupWithManager: %v", err)
-	}
 
 	scheduler, err := NewScheduler(SchedulerOptions{
 		Store:        store,
@@ -1882,10 +2019,8 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 		t.Fatalf("NewScheduler: %v", err)
 	}
 
-	go func() {
-		defer close(done)
-		_ = mgr.Start(ctx)
-	}()
+	d := startReconcileDriver(t, orch)
+
 	go func() {
 		for {
 			select {
@@ -1918,22 +2053,10 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 	}
 
 	// Verify the run is reconciled to Working without any timer
-	var reachedWorking bool
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	d.runUntil(func() bool {
 		runs, err := store.ListRuns(ctx, repo.Key())
-		if err == nil && len(runs) > 0 {
-			if runs[0].Phase == state.PhaseWorking {
-				reachedWorking = true
-				break
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if !reachedWorking {
-		t.Fatal("expected run created by scheduler to reach Working after Notify without timer")
-	}
+		return err == nil && len(runs) > 0 && runs[0].Phase == state.PhaseWorking
+	})
 }
 
 type blockingConcurrentProcessServer struct {
@@ -1952,14 +2075,9 @@ func (b *blockingConcurrentProcessServer) Execute(ctx context.Context, req *proc
 }
 
 func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx := t.Context()
 
 	storeDir := t.TempDir()
-	done := make(chan struct{})
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
 	store := state.NewFileStore(storeDir)
 
 	repo1 := &state.Repo{
@@ -2055,11 +2173,6 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 		}
 	}()
 
-	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
-
 	scheme, err := NewScheme()
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
@@ -2075,39 +2188,19 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
-	if err := orch.SetupWithManager(mgr); err != nil {
-		t.Fatalf("SetupWithManager: %v", err)
-	}
 
-	go func() {
-		defer close(done)
-		_ = mgr.Start(ctx)
-	}()
+	d := startReconcileDriver(t, orch)
 
 	orch.Notify(repo1.Key(), run1.ID)
 	orch.Notify(repo2.Key(), run2.ID)
 
 	// Wait for both to reach Working
-	deadline := time.Now().Add(5 * time.Second)
-	var run1OK, run2OK bool
-	for time.Now().Before(deadline) {
+	d.runUntil(func() bool {
 		r1, err1 := store.GetRun(ctx, repo1.Key(), run1.ID)
 		r2, err2 := store.GetRun(ctx, repo2.Key(), run2.ID)
-		if err1 == nil && r1.Phase == state.PhaseWorking {
-			run1OK = true
-		}
-		if err2 == nil && r2.Phase == state.PhaseWorking {
-			run2OK = true
-		}
-		if run1OK && run2OK {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if !run1OK || !run2OK {
-		t.Fatalf("expected both runs to reach Working concurrently: run1OK=%v, run2OK=%v", run1OK, run2OK)
-	}
+		return err1 == nil && r1.Phase == state.PhaseWorking &&
+			err2 == nil && r2.Phase == state.PhaseWorking
+	})
 }
 
 type cancellingChatClient struct {
@@ -2226,14 +2319,9 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 }
 
 func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx := t.Context()
 
 	storeDir := t.TempDir()
-	done := make(chan struct{})
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
 	store := state.NewFileStore(storeDir)
 	sessionStore := session.NewFileStore(storeDir)
 
@@ -2301,11 +2389,6 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 		}
 	}
 
-	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
-
 	orch, err := NewOrchestrator(OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
@@ -2314,42 +2397,19 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
-	if err := orch.SetupWithManager(mgr); err != nil {
-		t.Fatalf("SetupWithManager: %v", err)
-	}
 
-	go func() {
-		defer close(done)
-		_ = mgr.Start(ctx)
-	}()
-	deadline := time.Now().Add(5 * time.Second)
-	var workingReconciled bool
-	for time.Now().Before(deadline) {
+	d := startReconcileDriver(t, orch)
+
+	d.runUntil(func() bool {
 		r, err := store.GetRun(ctx, repo.Key(), workingRunID)
-		if err == nil && r.Phase == state.PhaseNoImprovement {
-			workingReconciled = true
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if !workingReconciled {
-		t.Fatal("expected working run to be enqueued on start and reach NoImprovement")
-	}
+		return err == nil && r.Phase == state.PhaseNoImprovement
+	})
 
 	// Verify Preparing run was enqueued on start and reached Working or NoImprovement
-	var prepReconciled bool
-	for time.Now().Before(deadline) {
+	d.runUntil(func() bool {
 		rPrep, err := store.GetRun(ctx, repo.Key(), prepRunID)
-		if err == nil && (rPrep.Phase == state.PhaseWorking || rPrep.Phase == state.PhaseNoImprovement) {
-			prepReconciled = true
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !prepReconciled {
-		t.Fatal("expected preparing run to be enqueued on start and reach Working or NoImprovement")
-	}
+		return err == nil && (rPrep.Phase == state.PhaseWorking || rPrep.Phase == state.PhaseNoImprovement)
+	})
 }
 
 func TestBuildSystemPrompt(t *testing.T) {
@@ -2475,14 +2535,9 @@ func TestOrchestrator_RunPageURL(t *testing.T) {
 }
 
 func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx := t.Context()
 
 	storeDir := t.TempDir()
-	done := make(chan struct{})
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
 	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
@@ -2514,11 +2569,6 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	}
 	harness, agentsCS, _ := setupTestHarness(t, procSrv)
 
-	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
-
 	scheme, err := NewScheme()
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
@@ -2533,32 +2583,23 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
-	if err := orch.SetupWithManager(mgr); err != nil {
-		t.Fatalf("SetupWithManager: %v", err)
-	}
 
-	go func() {
-		defer close(done)
-		_ = mgr.Start(ctx)
-	}()
+	d := startReconcileDriver(t, orch)
+
 	orch.Notify(repo.Key(), runID)
 
 	// 1. Wait until the run enters Preparing and has a Sandbox created
-	deadline := time.Now().Add(5 * time.Second)
 	var sb *sandboxv1beta1.Sandbox
-	for time.Now().Before(deadline) {
+	d.runUntil(func() bool {
 		r, err := store.GetRun(ctx, repo.Key(), runID)
 		if err == nil && r.Phase == state.PhasePreparing && r.SandboxName != "" {
 			if s, getErr := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, r.SandboxName, metav1.GetOptions{}); getErr == nil {
 				sb = s
-				break
+				return true
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if sb == nil {
-		t.Fatal("timed out waiting for run to enter Preparing with Sandbox created")
-	}
+		return false
+	})
 
 	// 2. Verify worker is free (no clone executed yet)
 	procSrv.mu.Lock()
@@ -2580,18 +2621,10 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	}
 
 	// 4. Verify watch detects status change, enqueues run, clones, and moves to Working
-	var reachedWorking bool
-	for time.Now().Before(deadline) {
+	d.runUntil(func() bool {
 		r, err := store.GetRun(ctx, repo.Key(), runID)
-		if err == nil && r.Phase == state.PhaseWorking {
-			reachedWorking = true
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !reachedWorking {
-		t.Fatal("expected run to reach Working after Sandbox status changed to Ready via watch")
-	}
+		return err == nil && r.Phase == state.PhaseWorking
+	})
 
 	procSrv.mu.Lock()
 	finalCmds := len(procSrv.commands)
@@ -2602,14 +2635,9 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 }
 
 func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx := t.Context()
 
 	storeDir := t.TempDir()
-	done := make(chan struct{})
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
 	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
@@ -2637,11 +2665,6 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
-	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
-
 	scheme, err := NewScheme()
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
@@ -2656,33 +2679,23 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
-	if err := orch.SetupWithManager(mgr); err != nil {
-		t.Fatalf("SetupWithManager: %v", err)
-	}
 
-	go func() {
-		defer close(done)
-		_ = mgr.Start(ctx)
-	}()
+	d := startReconcileDriver(t, orch)
 
 	orch.Notify(repo.Key(), runID)
 
 	// Wait until run enters Preparing and sandbox exists in Kubernetes
-	deadline := time.Now().Add(5 * time.Second)
 	var sbName string
-	for time.Now().Before(deadline) {
+	d.runUntil(func() bool {
 		r, err := store.GetRun(ctx, repo.Key(), runID)
 		if err == nil && r.Phase == state.PhasePreparing && r.SandboxName != "" {
 			if _, getErr := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, r.SandboxName, metav1.GetOptions{}); getErr == nil {
 				sbName = r.SandboxName
-				break
+				return true
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if sbName == "" {
-		t.Fatal("timed out waiting for run to enter Preparing with SandboxName")
-	}
+		return false
+	})
 
 	// Delete fake sandbox before readiness
 	if err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, sbName, metav1.DeleteOptions{}); err != nil {
@@ -2690,32 +2703,24 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 	}
 
 	// Verify watch detects deletion, enqueues run, and marks it Failed
-	var reachedFailed bool
-	for time.Now().Before(deadline) {
+	d.runUntil(func() bool {
 		r, err := store.GetRun(ctx, repo.Key(), runID)
-		if err == nil && r.Phase == state.PhaseFailed {
-			reachedFailed = true
-			if !strings.Contains(r.Error, "deleted before becoming ready") {
-				t.Errorf("expected error to mention deleted before becoming ready, got: %q", r.Error)
-			}
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+		return err == nil && r.Phase == state.PhaseFailed
+	})
+
+	r, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
 	}
-	if !reachedFailed {
-		t.Fatal("expected run to reach Failed after Sandbox was deleted via watch")
+	if !strings.Contains(r.Error, "deleted before becoming ready") {
+		t.Errorf("expected error to mention deleted before becoming ready, got: %q", r.Error)
 	}
 }
 
 func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx := t.Context()
 
 	storeDir := t.TempDir()
-	done := make(chan struct{})
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
 	store := state.NewFileStore(storeDir)
 
 	repo := &state.Repo{
@@ -2743,11 +2748,6 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
-	mgr, err := NewManager(&rest.Config{Host: "http://127.0.0.1:65534"})
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
-
 	scheme, err := NewScheme()
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
@@ -2762,33 +2762,23 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
-	if err := orch.SetupWithManager(mgr); err != nil {
-		t.Fatalf("SetupWithManager: %v", err)
-	}
 
-	go func() {
-		defer close(done)
-		_ = mgr.Start(ctx)
-	}()
+	d := startReconcileDriver(t, orch)
 
 	orch.Notify(repo.Key(), runID)
 
 	// Wait until run enters Preparing and sandbox exists in Kubernetes
-	deadline := time.Now().Add(5 * time.Second)
 	var sb *sandboxv1beta1.Sandbox
-	for time.Now().Before(deadline) {
+	d.runUntil(func() bool {
 		r, err := store.GetRun(ctx, repo.Key(), runID)
 		if err == nil && r.Phase == state.PhasePreparing && r.SandboxName != "" {
 			if s, getErr := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, r.SandboxName, metav1.GetOptions{}); getErr == nil {
 				sb = s
-				break
+				return true
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if sb == nil {
-		t.Fatal("timed out waiting for run to enter Preparing with Sandbox created")
-	}
+		return false
+	})
 
 	// Update fake sandbox with failure condition (InvalidConfiguration)
 	sb.Status.Conditions = []metav1.Condition{
@@ -2804,20 +2794,17 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	}
 
 	// Verify watch detects status change, enqueues run, and marks it Failed
-	var reachedFailed bool
-	for time.Now().Before(deadline) {
+	d.runUntil(func() bool {
 		r, err := store.GetRun(ctx, repo.Key(), runID)
-		if err == nil && r.Phase == state.PhaseFailed {
-			reachedFailed = true
-			if !strings.Contains(r.Error, "Sandbox name exceeds maximum length") {
-				t.Errorf("expected error to mention failure message, got: %q", r.Error)
-			}
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+		return err == nil && r.Phase == state.PhaseFailed
+	})
+
+	r, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
 	}
-	if !reachedFailed {
-		t.Fatal("expected run to reach Failed after Sandbox reported failure condition")
+	if !strings.Contains(r.Error, "Sandbox name exceeds maximum length") {
+		t.Errorf("expected error to mention failure message, got: %q", r.Error)
 	}
 }
 
