@@ -48,6 +48,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
@@ -67,7 +68,6 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
-	"github.com/go-logr/logr"
 )
 
 type mockProcessServer struct {
@@ -3151,120 +3151,63 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	}
 }
 
-func TestSandboxSource_MapSandboxToRequest(t *testing.T) {
-	ctx := t.Context()
-	s := &sandboxSource{
-		log: logr.Discard(),
+func TestNewScheme(t *testing.T) {
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme() failed: %v", err)
 	}
 
-	isController := true
-	notController := false
-
-	tests := []struct {
-		name      string
-		sandbox   *sandboxv1beta1.Sandbox
-		wantQueue []reconcile.Request
-	}{
-		{
-			name: "controller owner of kind HeroRun maps to that name",
-			sandbox: &sandboxv1beta1.Sandbox{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "ao-sandboxes",
-					Name:      "sb-1",
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							APIVersion: herorunv1alpha1.GroupVersion.String(),
-							Kind:       "HeroRun",
-							Name:       "hero-run-1",
-							Controller: &isController,
-						},
-					},
-				},
-			},
-			wantQueue: []reconcile.Request{
-				{
-					NamespacedName: types.NamespacedName{
-						Namespace: "ao-sandboxes",
-						Name:      "hero-run-1",
-					},
-				},
-			},
-		},
-		{
-			name: "no owner reference maps to nothing",
-			sandbox: &sandboxv1beta1.Sandbox{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "ao-sandboxes",
-					Name:      "sb-no-owner",
-				},
-			},
-			wantQueue: nil,
-		},
-		{
-			name: "controller owner of different kind maps to nothing",
-			sandbox: &sandboxv1beta1.Sandbox{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "ao-sandboxes",
-					Name:      "sb-pod-owner",
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							APIVersion: "v1",
-							Kind:       "Pod",
-							Name:       "pod-1",
-							Controller: &isController,
-						},
-					},
-				},
-			},
-			wantQueue: nil,
-		},
-		{
-			name: "owner reference of kind HeroRun with controller false maps to nothing",
-			sandbox: &sandboxv1beta1.Sandbox{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "ao-sandboxes",
-					Name:      "sb-not-controller",
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							APIVersion: herorunv1alpha1.GroupVersion.String(),
-							Kind:       "HeroRun",
-							Name:       "hero-run-2",
-							Controller: &notController,
-						},
-					},
-				},
-			},
-			wantQueue: nil,
-		},
+	hrGVK := herorunv1alpha1.GroupVersion.WithKind("HeroRun")
+	if !scheme.Recognizes(hrGVK) {
+		t.Errorf("scheme does not recognize %s", hrGVK)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			queue := workqueue.NewTypedRateLimitingQueue[reconcile.Request](
-				workqueue.DefaultTypedItemBasedRateLimiter[reconcile.Request](),
-			)
-			defer queue.ShutDown()
+	sbGVK := sandboxv1beta1.GroupVersion.WithKind("Sandbox")
+	if !scheme.Recognizes(sbGVK) {
+		t.Errorf("scheme does not recognize %s", sbGVK)
+	}
+}
 
-			s.enqueueSandbox(ctx, tt.sandbox, queue)
+func TestNewManager(t *testing.T) {
+	restConfig := &rest.Config{Host: "http://127.0.0.1:65534"}
 
-			if len(tt.wantQueue) == 0 {
-				if queue.Len() != 0 {
-					item, _ := queue.Get()
-					t.Fatalf("expected queue to be empty, got item: %+v", item)
-				}
-				return
-			}
+	mgr, err := NewManager(restConfig, "test-namespace")
+	if err != nil {
+		t.Fatalf("NewManager() failed: %v", err)
+	}
+	if mgr == nil {
+		t.Fatal("expected non-nil manager")
+	}
 
-			if queue.Len() != len(tt.wantQueue) {
-				t.Fatalf("queue length = %d, want %d", queue.Len(), len(tt.wantQueue))
-			}
-			for _, want := range tt.wantQueue {
-				got, _ := queue.Get()
-				if got != want {
-					t.Errorf("got %v, want %v", got, want)
-				}
-			}
-		})
+	mgrEmpty, err := NewManager(restConfig, "")
+	if err != nil {
+		t.Fatalf("NewManager() with empty namespace failed: %v", err)
+	}
+	if mgrEmpty == nil {
+		t.Fatal("expected non-nil manager with empty namespace")
+	}
+}
+
+func TestOrchestrator_SetupWithManager(t *testing.T) {
+	restConfig := &rest.Config{Host: "http://127.0.0.1:65534"}
+	mgr, err := NewManager(restConfig, "ao-sandboxes")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: mgr.GetClient(),
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if err := orch.SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager failed: %v", err)
 	}
 }
 

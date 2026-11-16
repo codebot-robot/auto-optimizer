@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-logr/logr"
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,13 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
-	agentsclientset "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned"
-	informers "sigs.k8s.io/agent-sandbox/clients/k8s/informers/externalversions"
 	ctrl "sigs.k8s.io/controller-runtime"
+	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -250,7 +246,8 @@ type Orchestrator struct {
 var _ reconcile.Reconciler = (*Orchestrator)(nil)
 var _ manager.Runnable = (*Orchestrator)(nil)
 
-// NewScheme builds a runtime.Scheme containing client-go types and the HeroRun types.
+// NewScheme builds a runtime.Scheme containing client-go types, the HeroRun types,
+// and the agent-sandbox types.
 func NewScheme() (*runtime.Scheme, error) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -259,15 +256,24 @@ func NewScheme() (*runtime.Scheme, error) {
 	if err := herorunv1alpha1.AddToScheme(scheme); err != nil {
 		return nil, fmt.Errorf("adding herorun v1alpha1 to scheme: %w", err)
 	}
+	if err := sandboxv1beta1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("adding sandbox v1beta1 to scheme: %w", err)
+	}
 	return scheme, nil
 }
 
 // NewManager builds a controller-runtime manager from rest.Config with metrics and health
-// endpoints disabled and leader election disabled.
-func NewManager(restConfig *rest.Config) (manager.Manager, error) {
+// endpoints disabled, leader election disabled, and the cache scoped to namespace.
+func NewManager(restConfig *rest.Config, namespace string) (manager.Manager, error) {
 	scheme, err := NewScheme()
 	if err != nil {
 		return nil, err
+	}
+	cacheOpts := crcache.Options{}
+	if namespace != "" {
+		cacheOpts.DefaultNamespaces = map[string]crcache.Config{
+			namespace: {},
+		}
 	}
 	return ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme,
@@ -277,6 +283,7 @@ func NewManager(restConfig *rest.Config) (manager.Manager, error) {
 		},
 		HealthProbeBindAddress: "0",
 		LeaderElection:         false,
+		Cache:                  cacheOpts,
 	})
 }
 
@@ -402,113 +409,25 @@ func (o *Orchestrator) Notify(repo state.RepoKey, runID string) {
 
 // SetupWithManager registers the orchestrator with the controller-runtime manager.
 func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
-	// Skip name validation so unit tests can build multiple controllers named "run" in one process.
-	skipNameValidation := true
-	c, err := controller.NewTyped[reconcile.Request]("run", mgr, controller.TypedOptions[reconcile.Request]{
-		Reconciler:              o,
-		MaxConcurrentReconciles: o.maxConcurrentRuns,
-		SkipNameValidation:      &skipNameValidation,
-	})
-	if err != nil {
-		return fmt.Errorf("creating run controller: %w", err)
-	}
-
 	src := source.TypedChannel[reconcile.Request, reconcile.Request](
 		o.notifyCh,
 		handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req reconcile.Request) []reconcile.Request {
 			return []reconcile.Request{req}
 		}),
 	)
-	if err := c.Watch(src); err != nil {
-		return fmt.Errorf("watching notification channel: %w", err)
-	}
 
-	if o.harness != nil && o.harness.SandboxClient() != nil && o.harness.SandboxClient().AgentsClient() != nil {
-		sbSrc := &sandboxSource{
-			agentsClient: o.harness.SandboxClient().AgentsClient(),
-			namespace:    o.harness.Namespace(),
-			log:          scoped.Log(context.Background()),
-		}
-		if err := c.Watch(sbSrc); err != nil {
-			return fmt.Errorf("watching sandbox resources: %w", err)
-		}
+	if err := ctrl.NewControllerManagedBy(mgr).
+		For(&herorunv1alpha1.HeroRun{}).
+		Owns(&sandboxv1beta1.Sandbox{}).
+		WatchesRawSource(src).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: o.maxConcurrentRuns,
+		}).
+		Complete(o); err != nil {
+		return fmt.Errorf("creating run controller: %w", err)
 	}
 
 	return mgr.Add(o)
-}
-
-// sandboxSource is a hand-written source.TypedSource[reconcile.Request] that watches
-// Sandboxes in the control-plane namespace, maps the controller owner of kind HeroRun
-// to a Request, and enqueues it for reconciliation.
-//
-// A conventional controller-runtime setup uses source.Kind with an
-// EnqueueRequestForOwner handler, but that does not fit here because the sandbox
-// watch uses the agent-sandbox typed clientset and a namespace-scoped shared informer
-// rather than the manager's cache (the manager's scheme does not include the
-// Sandbox CRD types and unit tests supply an in-memory fake clientset).
-type sandboxSource struct {
-	agentsClient agentsclientset.Interface
-	namespace    string
-	log          logr.Logger
-}
-
-var _ source.TypedSource[reconcile.Request] = (*sandboxSource)(nil)
-
-func (s *sandboxSource) Start(ctx context.Context, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) error {
-	factory := informers.NewSharedInformerFactoryWithOptions(s.agentsClient, 0, informers.WithNamespace(s.namespace))
-	informer := factory.Agents().V1beta1().Sandboxes().Informer()
-
-	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
-			s.enqueueSandbox(ctx, obj, queue)
-		},
-		UpdateFunc: func(oldObj, newObj any) {
-			s.enqueueSandbox(ctx, newObj, queue)
-		},
-		DeleteFunc: func(obj any) {
-			s.enqueueSandbox(ctx, obj, queue)
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("adding event handler to sandbox informer: %w", err)
-	}
-
-	factory.StartWithContext(ctx)
-
-	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
-		if ctx.Err() != nil {
-			return nil
-		}
-		return errors.New("timed out waiting for sandbox informer caches to sync")
-	}
-
-	return nil
-}
-
-func (s *sandboxSource) enqueueSandbox(ctx context.Context, obj any, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	sb, ok := obj.(*sandboxv1beta1.Sandbox)
-	if !ok {
-		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			return
-		}
-		sb, ok = tombstone.Obj.(*sandboxv1beta1.Sandbox)
-		if !ok || sb == nil {
-			return
-		}
-	}
-
-	owner := metav1.GetControllerOf(sb)
-	if owner == nil || owner.Kind != "HeroRun" {
-		return
-	}
-
-	queue.Add(reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Namespace: sb.Namespace,
-			Name:      owner.Name,
-		},
-	})
 }
 
 // Start implements manager.Runnable. On manager startup it calls Resume,
