@@ -2223,6 +2223,349 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 			t.Errorf("unexpected failed event recorded on context cancellation: %+v", e)
 		}
 	}
+
+	// Consuming the outcome must also leave the run in Working
+	if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("Reconcile after cancellation: %v", err)
+	}
+
+	// Restart: create a new Orchestrator with the scripted finish LLM and verify run finishes normally.
+	finishLLM := &scriptedFinishLLM{summary: "restarted and finished"}
+	restartedHarness, newAgentsCS, _ := setupTestHarnessWithLLM(t, nil, finishLLM)
+	_, err = newAgentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(t.Context(), &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionTrue,
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox in fake k8s on restart: %v", err)
+	}
+
+	restartedOrch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      restartedHarness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator on restart: %v", err)
+	}
+	if _, err := reconcileWorkingRun(t.Context(), restartedOrch, runRequest(restartedOrch, repo.Key(), runID)); err != nil {
+		t.Fatalf("reconcileWorkingRun on restart: %v", err)
+	}
+
+	resRun, err := store.GetRun(t.Context(), repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun on restart: %v", err)
+	}
+	if resRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s after restart, got %s", state.PhaseNoImprovement, resRun.Phase)
+	}
+	if resRun.Summary != "restarted and finished" {
+		t.Errorf("expected summary 'restarted and finished', got %q", resRun.Summary)
+	}
+}
+
+func TestOrchestrator_Working_GRPCCanceled_LeavesWorking(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-grpccancel"
+	sandboxName := "run-20261030t120000z-grpccancel"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "grpc-goal",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha",
+		SandboxName: sandboxName,
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	harness, _, _ := setupTestHarnessWithLLM(t, nil, nil)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Storing a gRPC codes.Canceled outcome (like an in-flight sandbox call being canceled) must leave the run Working.
+	grpcErr := status.Error(codes.Canceled, "in-flight sandbox rpc canceled")
+	orch.storeTurnOutcome(runID, turnOutcome{
+		Err:      fmt.Errorf("in-flight sandbox call: %w", grpcErr),
+		Finished: time.Now(),
+	})
+
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseWorking {
+		t.Errorf("expected phase %s after gRPC codes.Canceled, got %s", state.PhaseWorking, gotRun.Phase)
+	}
+	if gotRun.Error != "" {
+		t.Errorf("expected empty error, got %q", gotRun.Error)
+	}
+}
+
+func TestOrchestrator_Working_UnansweredToolCall_ContinuesWithoutUserMessage(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-unans"
+	sandboxName := "run-20261030t120000z-unans"
+	sessionID := generateSessionID(runID)
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "unanswered-goal",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha-unans",
+		SandboxName: sandboxName,
+		SessionID:   sessionID,
+		Goal: &goals.Goal{
+			Name: "unanswered-goal",
+			Body: "run command and finish",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	sysPrompt := "system prompt"
+	userPrompt := "Please work on the goal."
+	if err := sessionStore.NewSession(ctx, sessionID, session.Metadata{}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := sessionStore.AppendMessages(ctx, sessionID,
+		llm.Message{Role: "system", Content: &sysPrompt},
+		llm.Message{Role: "user", Content: &userPrompt},
+		llm.Message{
+			Role: "assistant",
+			ToolCalls: []llm.ToolCall{
+				{
+					ID:   "call-unans-1",
+					Type: "function",
+					Function: llm.FunctionCall{
+						Name:      "run_command",
+						Arguments: `{"command":"uname -a"}`,
+					},
+				},
+			},
+		},
+	); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+
+	procSrv := &mockProcessServer{
+		exitCode: 0,
+		stdout:   "Linux unans 6.12.0\n",
+	}
+	finishSummary := "Unanswered tool executed and finished."
+	finishLLM := &scriptedFinishLLM{summary: finishSummary}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, finishLLM)
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   &metav1.Time{Time: time.Now().Add(5 * time.Minute)},
+				ShutdownPolicy: &policy,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox in fake k8s: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
+	}
+
+	procSrv.mu.Lock()
+	cmds := append([][]string(nil), procSrv.commands...)
+	procSrv.mu.Unlock()
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 command executed in sandbox, got %d: %v", len(cmds), cmds)
+	}
+
+	msgs, _, err := sessionStore.LoadSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	userCount := 0
+	for _, m := range msgs {
+		if m.Role == "user" {
+			userCount++
+		}
+	}
+	if userCount != 1 {
+		t.Errorf("expected exactly 1 user message in transcript, got %d", userCount)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
+	}
+	if gotRun.Summary != finishSummary {
+		t.Errorf("expected summary %q, got %q", finishSummary, gotRun.Summary)
+	}
+}
+
+func TestOrchestrator_Working_SystemPromptOnly_RunsTurnWithGoal(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-sysonly"
+	sandboxName := "run-20261030t120000z-sysonly"
+	sessionID := generateSessionID(runID)
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "sysonly-goal",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha-sysonly",
+		SandboxName: sandboxName,
+		SessionID:   sessionID,
+		Goal: &goals.Goal{
+			Name: "sysonly-goal",
+			Body: "goal body",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	// Seed session transcript with ONLY a system prompt (no user message)
+	sysPrompt := "system prompt"
+	if err := sessionStore.NewSession(ctx, sessionID, session.Metadata{}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := sessionStore.AppendMessages(ctx, sessionID, llm.Message{Role: "system", Content: &sysPrompt}); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+
+	finishLLM := &scriptedFinishLLM{summary: "started from system prompt only"}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, finishLLM)
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   &metav1.Time{Time: time.Now().Add(5 * time.Minute)},
+				ShutdownPolicy: &policy,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox in fake k8s: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
+	}
+
+	msgs, _, err := sessionStore.LoadSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	var userMsgs []llm.Message
+	for _, m := range msgs {
+		if m.Role == "user" {
+			userMsgs = append(userMsgs, m)
+		}
+	}
+	if len(userMsgs) != 1 {
+		t.Fatalf("expected exactly 1 user message, got %d", len(userMsgs))
+	}
+	if userMsgs[0].Content == nil || *userMsgs[0].Content != "Please work on the goal." {
+		t.Errorf("expected user message %q, got %v", "Please work on the goal.", userMsgs[0].Content)
+	}
 }
 
 func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
