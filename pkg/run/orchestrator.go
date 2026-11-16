@@ -1242,8 +1242,34 @@ type runEnd struct {
 	Sandbox *session.Sandbox
 }
 
+func (o *Orchestrator) isManagerCanceled() bool {
+	if o == nil {
+		return false
+	}
+	o.managerCtxMu.Lock()
+	defer o.managerCtxMu.Unlock()
+	return o.managerCtx != nil && o.managerCtx.Err() != nil
+}
+
+func isCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if status.Code(err) == codes.Canceled {
+		return true
+	}
+	var se interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &se) {
+		return se.GRPCStatus().Code() == codes.Canceled
+	}
+	return false
+}
+
 func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *state.Run, end runEnd) {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || o.isManagerCanceled() {
 		return
 	}
 
@@ -1319,6 +1345,10 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 		return reconcile.Result{}, o.handleTurnOutcome(ctx, repo, run, outcome)
 	}
 
+	if o.isManagerCanceled() {
+		return reconcile.Result{}, nil
+	}
+
 	now := o.clock().UTC()
 	if run.Deadline != nil && !now.Before(*run.Deadline) {
 		var sb *session.Sandbox
@@ -1387,6 +1417,10 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 }
 
 func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *state.Run) {
+	if o.isManagerCanceled() {
+		return
+	}
+
 	if !o.setRunActive(run.ID, true) {
 		return
 	}
@@ -1495,6 +1529,14 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		}
 	}
 
+	hasUserMessage := false
+	for _, m := range sess.Messages() {
+		if m.Role == "user" {
+			hasUserMessage = true
+			break
+		}
+	}
+
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1509,7 +1551,13 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		Branch:     run.BranchName(),
 	})
 	harness := o.harness.WithMaxTurns(o.maxTurns).WithExtraTools(finishTool, prTool)
-	turnErr := harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
+
+	var turnErr error
+	if hasUserMessage {
+		turnErr = harness.ContinueTurn(sessionCtx, sess, events)
+	} else {
+		turnErr = harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
+	}
 
 	return turnOutcome{
 		Err:      turnErr,
@@ -1577,7 +1625,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		return nil
 	}
 
-	if ctx.Err() != nil || errors.Is(turnErr, context.Canceled) {
+	if ctx.Err() != nil || o.isManagerCanceled() || isCanceled(turnErr) {
 		return nil
 	}
 
