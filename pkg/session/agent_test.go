@@ -1259,3 +1259,104 @@ func TestContinueTurn_UserMessageTail(t *testing.T) {
 		t.Errorf("msg[1] = %+v, want assistant message with %q", msgs[1], reply)
 	}
 }
+
+func TestCreateSandboxWithOptions_WorkspaceClaim(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+	cpNamespace := "ao-system"
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	client := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	harness := NewHarness(nil, client, nil, RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: cpNamespace,
+		SigningKey:            privKey,
+	})
+
+	tests := []struct {
+		name        string
+		sandboxName string
+		claimName   string
+	}{
+		{
+			name:        "mounts PersistentVolumeClaim when claim name is set",
+			sandboxName: "test-sb-pvc",
+			claimName:   "test-claim",
+		},
+		{
+			name:        "mounts emptyDir when claim name is empty",
+			sandboxName: "test-sb-empty-claim",
+			claimName:   "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sb, err := harness.CreateSandboxWithOptions(ctx, CreateSandboxOptions{
+				Name:               tc.sandboxName,
+				WorkspaceClaimName: tc.claimName,
+			})
+			if err != nil {
+				t.Fatalf("CreateSandboxWithOptions failed: %v", err)
+			}
+			defer func() { _ = client.DeleteSandbox(ctx, sb) }()
+
+			created, err := client.GetSandboxResource(ctx, ns, tc.sandboxName)
+			if err != nil {
+				t.Fatalf("GetSandboxResource failed: %v", err)
+			}
+
+			var vol *corev1.Volume
+			for i := range created.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes {
+				if created.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes[i].Name == "workspace" {
+					vol = &created.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes[i]
+					break
+				}
+			}
+			if vol == nil {
+				t.Fatal("expected workspace volume to exist")
+			}
+
+			if tc.claimName != "" {
+				if vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != tc.claimName {
+					t.Errorf("expected PersistentVolumeClaim with ClaimName %q, got %+v", tc.claimName, vol.PersistentVolumeClaim)
+				}
+				if vol.EmptyDir != nil {
+					t.Errorf("expected EmptyDir to be nil, got %+v", vol.EmptyDir)
+				}
+			} else {
+				if vol.EmptyDir == nil {
+					t.Fatal("expected EmptyDir on workspace volume, got nil")
+				}
+				if vol.PersistentVolumeClaim != nil {
+					t.Errorf("expected PersistentVolumeClaim to be nil, got %+v", vol.PersistentVolumeClaim)
+				}
+			}
+
+			containers := created.Spec.SandboxBlueprint.PodTemplate.Spec.Containers
+			if len(containers) == 0 {
+				t.Fatal("expected at least one container")
+			}
+			var mount *corev1.VolumeMount
+			for i := range containers[0].VolumeMounts {
+				if containers[0].VolumeMounts[i].Name == "workspace" {
+					mount = &containers[0].VolumeMounts[i]
+					break
+				}
+			}
+			if mount == nil {
+				t.Fatal("expected workspace volume mount to exist")
+			}
+			if mount.MountPath != "/workspace" {
+				t.Errorf("expected MountPath /workspace, got %q", mount.MountPath)
+			}
+		})
+	}
+}
