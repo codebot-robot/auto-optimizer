@@ -49,6 +49,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/workqueue"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	fakeagents "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
@@ -155,7 +156,26 @@ func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServe
 	return harness, agentsCS, coreCS
 }
 
-func reconcileWorkingRun(ctx context.Context, orch *Orchestrator, req Request) (reconcile.Result, error) {
+func runRequest(orch *Orchestrator, repo state.RepoKey, runID string) reconcile.Request {
+	name := sandboxNameForRun(runID)
+	orch.recordRunIndex(name, repo, runID)
+	var ns string
+	if orch != nil && orch.harness != nil {
+		ns = orch.harness.Namespace()
+	}
+	return reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: ns,
+			Name:      name,
+		},
+	}
+}
+
+func reconcileWorkingRun(ctx context.Context, orch *Orchestrator, req reconcile.Request) (reconcile.Result, error) {
+	_, runID, ok := orch.runForRequest(ctx, req)
+	if !ok {
+		return reconcile.Result{}, fmt.Errorf("could not resolve request %v to run", req)
+	}
 	// First pass starts the worker
 	res, err := orch.Reconcile(ctx, req)
 	if err != nil {
@@ -163,9 +183,9 @@ func reconcileWorkingRun(ctx context.Context, orch *Orchestrator, req Request) (
 	}
 	// Wait for worker to finish
 	deadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(req.RunID) {
+	for orch.isRunActive(runID) {
 		if time.Now().After(deadline) {
-			return res, fmt.Errorf("timed out waiting for worker on run %s", req.RunID)
+			return res, fmt.Errorf("timed out waiting for worker on run %s", runID)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -219,7 +239,7 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 	}
 
 	// Step 1: Reconcile Pending run.
-	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
@@ -274,7 +294,7 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 	}
 
 	// Step 2: Second reconcile step executes clone and moves run to Working.
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 2: %v", err)
 	}
 
@@ -396,7 +416,7 @@ func TestOrchestrator_ConfigureGitIdentityFailure(t *testing.T) {
 	}
 
 	// Step 1: Reconcile Pending run to Preparing.
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
 
@@ -421,7 +441,7 @@ func TestOrchestrator_ConfigureGitIdentityFailure(t *testing.T) {
 	}
 
 	// Step 2: Reconcile Preparing run; clone/checkout succeed, but git identity fails.
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err == nil {
 		t.Logf("orch.Reconcile completed (errors handled)")
 	}
 
@@ -507,7 +527,7 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 	}
 
 	// Step 1: reconcile Pending run to Preparing.
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
 
@@ -535,7 +555,7 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 	}
 
 	// Step 2: reconcile Preparing run with Ready sandbox; clone fails.
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err == nil {
 		t.Logf("orch.Reconcile completed (errors logged or returned)")
 	}
 
@@ -616,7 +636,7 @@ func TestOrchestrator_Preparing_DeleteSandboxFailsRun(t *testing.T) {
 	}
 
 	// Step 1: Reconcile creates sandbox and moves to Preparing
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
 
@@ -634,7 +654,7 @@ func TestOrchestrator_Preparing_DeleteSandboxFailsRun(t *testing.T) {
 	}
 
 	// Step 2: Reconcile detects sandbox is gone and transitions run to Failed
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 2: %v", err)
 	}
 
@@ -707,7 +727,7 @@ func TestOrchestrator_Preparing_NeverReadyDeadlinePasses(t *testing.T) {
 	}
 
 	// Step 1: Reconcile creates sandbox and sets ReadyDeadline = currentTime + 10s
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
 
@@ -726,7 +746,7 @@ func TestOrchestrator_Preparing_NeverReadyDeadlinePasses(t *testing.T) {
 	currentTime = currentTime.Add(15 * time.Second)
 
 	// Step 2: Reconcile when deadline has passed fails the run
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 2: %v", err)
 	}
 
@@ -841,8 +861,8 @@ func TestOrchestrator_Resume_PreparingEnqueued(t *testing.T) {
 	// 3. Verify notification was sent
 	select {
 	case evt := <-orch.notifyCh:
-		if evt.Object.RunID != runID {
-			t.Errorf("expected enqueued run %s, got %s", runID, evt.Object.RunID)
+		if evt.Object.Name != sandboxNameForRun(runID) {
+			t.Errorf("expected enqueued run name %s, got %s", sandboxNameForRun(runID), evt.Object.Name)
 		}
 	default:
 		t.Error("expected Preparing run to be enqueued on Resume")
@@ -921,7 +941,7 @@ func TestOrchestrator_Working_StartsSession_ModelStops_NoImprovement(t *testing.
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
@@ -1090,7 +1110,7 @@ func TestOrchestrator_Working_MaxTurns(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
@@ -1166,7 +1186,7 @@ func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 		t.Logf("reconcileWorkingRun completed (errors handled)")
 	}
 
@@ -1297,7 +1317,7 @@ func TestOrchestrator_Working_ExpiredSandbox_DuringSession(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 		t.Logf("reconcileWorkingRun completed (errors handled)")
 	}
 
@@ -1366,7 +1386,7 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 	}
 
 	// Step 1: Pending -> Preparing
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile 1 (step 1): %v", err)
 	}
 
@@ -1386,12 +1406,12 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 	}
 
 	// Step 2: Preparing -> Working
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile 2 (step 2): %v", err)
 	}
 
 	// Step 3: Working -> NoImprovement
-	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun 3: %v", err)
 	}
 
@@ -1529,7 +1549,7 @@ func TestOrchestrator_Working_FinishTool_EndsSession_RecordsSummary(t *testing.T
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
@@ -1727,7 +1747,7 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
@@ -1836,9 +1856,16 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
 	orch, err := NewOrchestrator(OrchestratorOptions{
-		Store:   store,
-		Harness: harness,
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
 	})
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -2033,9 +2060,16 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
 	orch, err := NewOrchestrator(OrchestratorOptions{
 		Store:             store,
 		Harness:           harness,
+		KubeClient:        fakeClient,
 		MaxConcurrentRuns: 4,
 	})
 	if err != nil {
@@ -2157,7 +2191,7 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 	}()
 
 	// Reconcile with the cancellable context. The LLM will cancel the context during the session.
-	_, _ = orch.Reconcile(testCtx, Request{Repo: repo.Key(), RunID: runID})
+	_, _ = orch.Reconcile(testCtx, runRequest(orch, repo.Key(), runID))
 
 	deadline := time.Now().Add(5 * time.Second)
 	for orch.isRunActive(runID) {
@@ -2485,9 +2519,16 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
 	orch, err := NewOrchestrator(OrchestratorOptions{
-		Store:   store,
-		Harness: harness,
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
 	})
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -2601,9 +2642,16 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
 	orch, err := NewOrchestrator(OrchestratorOptions{
-		Store:   store,
-		Harness: harness,
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
 	})
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -2700,9 +2748,16 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
 	orch, err := NewOrchestrator(OrchestratorOptions{
-		Store:   store,
-		Harness: harness,
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
 	})
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -2772,70 +2827,252 @@ func TestSandboxSource_MapSandboxToRequest(t *testing.T) {
 		log: logr.Discard(),
 	}
 
+	isController := true
+	notController := false
+
 	tests := []struct {
-		name     string
-		repoStr  string
-		runID    string
-		wantRepo state.RepoKey
-		wantNil  bool
+		name      string
+		sandbox   *sandboxv1beta1.Sandbox
+		wantQueue []reconcile.Request
 	}{
 		{
-			name:     "remote repo key",
-			repoStr:  "github.com/gke-labs/auto-optimizer",
-			runID:    "run-1",
-			wantRepo: state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"},
+			name: "controller owner of kind HeroRun maps to that name",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ao-sandboxes",
+					Name:      "sb-1",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: herorunv1alpha1.GroupVersion.String(),
+							Kind:       "HeroRun",
+							Name:       "hero-run-1",
+							Controller: &isController,
+						},
+					},
+				},
+			},
+			wantQueue: []reconcile.Request{
+				{
+					NamespacedName: types.NamespacedName{
+						Namespace: "ao-sandboxes",
+						Name:      "hero-run-1",
+					},
+				},
+			},
 		},
 		{
-			name:     "local repo key with underscore owner",
-			repoStr:  "local/_/hello-repo",
-			runID:    "run-2",
-			wantRepo: state.RepoKey{Host: "local", Owner: "_", Name: "hello-repo"},
+			name: "no owner reference maps to nothing",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ao-sandboxes",
+					Name:      "sb-no-owner",
+				},
+			},
+			wantQueue: nil,
 		},
 		{
-			name:    "invalid repo key format",
-			repoStr: "invalid-format",
-			runID:   "run-3",
-			wantNil: true,
+			name: "controller owner of different kind maps to nothing",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ao-sandboxes",
+					Name:      "sb-pod-owner",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "v1",
+							Kind:       "Pod",
+							Name:       "pod-1",
+							Controller: &isController,
+						},
+					},
+				},
+			},
+			wantQueue: nil,
 		},
 		{
-			name:    "missing annotation",
-			repoStr: "",
-			runID:   "run-4",
-			wantNil: true,
+			name: "owner reference of kind HeroRun with controller false maps to nothing",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ao-sandboxes",
+					Name:      "sb-not-controller",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: herorunv1alpha1.GroupVersion.String(),
+							Kind:       "HeroRun",
+							Name:       "hero-run-2",
+							Controller: &notController,
+						},
+					},
+				},
+			},
+			wantQueue: nil,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var sb *sandboxv1beta1.Sandbox
-			if tt.repoStr != "" {
-				sb = &sandboxv1beta1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							AnnotationRepo: tt.repoStr,
-						},
-					},
-				}
-			} else {
-				sb = &sandboxv1beta1.Sandbox{}
-			}
-			got := s.mapSandboxToRequest(ctx, sb, tt.runID)
-			if tt.wantNil {
-				if got != nil {
-					t.Fatalf("expected nil request, got %+v", got)
+			queue := workqueue.NewTypedRateLimitingQueue[reconcile.Request](
+				workqueue.DefaultTypedItemBasedRateLimiter[reconcile.Request](),
+			)
+			defer queue.ShutDown()
+
+			s.enqueueSandbox(ctx, tt.sandbox, queue)
+
+			if len(tt.wantQueue) == 0 {
+				if queue.Len() != 0 {
+					item, _ := queue.Get()
+					t.Fatalf("expected queue to be empty, got item: %+v", item)
 				}
 				return
 			}
-			if got == nil {
-				t.Fatalf("expected non-nil request")
+
+			if queue.Len() != len(tt.wantQueue) {
+				t.Fatalf("queue length = %d, want %d", queue.Len(), len(tt.wantQueue))
 			}
-			if got.RunID != tt.runID {
-				t.Errorf("got RunID = %q, want %q", got.RunID, tt.runID)
-			}
-			if got.Repo != tt.wantRepo {
-				t.Errorf("got Repo = %+v, want %+v", got.Repo, tt.wantRepo)
+			for _, want := range tt.wantQueue {
+				got, _ := queue.Get()
+				if got != want {
+					t.Errorf("got %v, want %v", got, want)
+				}
 			}
 		})
+	}
+}
+
+func TestRunForRequest_ResolvesThroughIndex(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:   store,
+		Harness: harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+	runID := "20261030T120000Z-index"
+	orch.Notify(repoKey, runID)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: harness.Namespace(),
+			Name:      sandboxNameForRun(runID),
+		},
+	}
+	gotRepo, gotRunID, ok := orch.runForRequest(ctx, req)
+	if !ok {
+		t.Fatal("expected runForRequest to resolve through index")
+	}
+	if gotRepo != repoKey {
+		t.Errorf("got repo %+v, want %+v", gotRepo, repoKey)
+	}
+	if gotRunID != runID {
+		t.Errorf("got runID %q, want %q", gotRunID, runID)
+	}
+}
+
+func TestRunForRequest_ResolvesThroughHeroRunOnIndexMiss(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+	runID := "20261030T120000Z-hrlookup"
+	hrName := sandboxNameForRun(runID)
+
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hrName,
+			Namespace: harness.Namespace(),
+			Labels: map[string]string{
+				LabelRun: runID,
+			},
+			Annotations: map[string]string{
+				AnnotationRepo: repoKey.String(),
+			},
+		},
+	}
+	if err := fakeClient.Create(ctx, hr); err != nil {
+		t.Fatalf("creating HeroRun: %v", err)
+	}
+
+	// Verify index does NOT have it before request
+	orch.runIndexMu.RLock()
+	_, foundBefore := orch.runIndex[hrName]
+	orch.runIndexMu.RUnlock()
+	if foundBefore {
+		t.Fatal("expected index to miss before runForRequest")
+	}
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: harness.Namespace(),
+			Name:      hrName,
+		},
+	}
+	gotRepo, gotRunID, ok := orch.runForRequest(ctx, req)
+	if !ok {
+		t.Fatal("expected runForRequest to resolve through HeroRun on index miss")
+	}
+	if gotRepo != repoKey {
+		t.Errorf("got repo %+v, want %+v", gotRepo, repoKey)
+	}
+	if gotRunID != runID {
+		t.Errorf("got runID %q, want %q", gotRunID, runID)
+	}
+
+	// Verify index is now populated
+	orch.runIndexMu.RLock()
+	cached, foundAfter := orch.runIndex[hrName]
+	orch.runIndexMu.RUnlock()
+	if !foundAfter {
+		t.Fatal("expected index to be populated after runForRequest miss")
+	}
+	if cached.repo != repoKey || cached.runID != runID {
+		t.Errorf("cached entry %+v, want repo %+v runID %s", cached, repoKey, runID)
+	}
+}
+
+func TestOrchestrator_Reconcile_UnknownNameDroppedWithoutError(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:   store,
+		Harness: harness,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: harness.Namespace(),
+			Name:      "unknown-hero-run-name",
+		},
+	}
+	res, err := orch.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("expected unknown request to be dropped without error, got: %v", err)
+	}
+	if res != (reconcile.Result{}) {
+		t.Errorf("expected empty reconcile.Result, got: %+v", res)
 	}
 }
 
@@ -2886,7 +3123,7 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 	}
 
 	// Reconcile Pending run -> leaves Pending to Preparing
-	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
@@ -2980,7 +3217,7 @@ func TestOrchestrator_PublishHeroRun_Resume(t *testing.T) {
 		t.Fatalf("PutRepo: %v", err)
 	}
 
-	// Run 0: non-terminal (Pending), no HeroRun exists -> Resume must NOT publish Pending runs
+	// Run 0: non-terminal (Pending), no HeroRun exists -> Resume publishes for Pending runs too
 	runPending := &state.Run{
 		ID:         "20261030T120000Z-runpending",
 		Repo:       repo.Key(),
@@ -3075,11 +3312,13 @@ func TestOrchestrator_PublishHeroRun_Resume(t *testing.T) {
 		t.Fatalf("orch.Resume: %v", err)
 	}
 
-	// Check runPending: Pending run has no HeroRun created during Resume
+	// Check runPending: Pending run has HeroRun created during Resume
 	var hrPending herorunv1alpha1.HeroRun
-	err = fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: "run-20261030t120000z-runpending"}, &hrPending)
-	if !k8serrors.IsNotFound(err) {
-		t.Errorf("expected NotFound for Pending run HeroRun in Resume, got: %v", err)
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: "run-20261030t120000z-runpending"}, &hrPending); err != nil {
+		t.Fatalf("getting hrPending: %v", err)
+	}
+	if hrPending.Spec.Repository != repo.URL || hrPending.Spec.Goal != "goal-pending" || hrPending.Spec.RunID != runPending.ID {
+		t.Errorf("hrPending spec mismatch: %+v", hrPending.Spec)
 	}
 
 	// Check run1: HeroRun created
@@ -3156,7 +3395,7 @@ func TestOrchestrator_PublishHeroRun_NilKubeClient(t *testing.T) {
 	}
 
 	// Run leaves Pending in prepareRun with nil KubeClient
-	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
@@ -3231,7 +3470,7 @@ func TestOrchestrator_PublishHeroRun_FailureDoesNotFailRun(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
 		t.Fatalf("orch.Reconcile failed unexpectedly: %v", err)
 	}
@@ -3301,7 +3540,7 @@ func TestOrchestrator_SandboxOwnerReference_NilKubeClientReachesWorking(t *testi
 	}
 
 	// Step 1: Reconcile Pending -> Preparing
-	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
@@ -3337,7 +3576,7 @@ func TestOrchestrator_SandboxOwnerReference_NilKubeClientReachesWorking(t *testi
 		t.Fatalf("updating fake sandbox to Ready: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 2: %v", err)
 	}
 
@@ -3410,7 +3649,7 @@ func TestOrchestrator_SandboxOwnerReference_PreExistingHeroRunHasUID(t *testing.
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -3605,7 +3844,7 @@ func TestOrchestrator_Working_OpenPullRequest_TransitionsToSelecting(t *testing.
 	}
 	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseWorking, "base-sha", &mockProcessServer{}, prLLM)
 
-	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
@@ -3706,7 +3945,7 @@ func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -3866,7 +4105,7 @@ func TestOrchestrator_Selecting_BranchMoved_Fails(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -3983,7 +4222,7 @@ func TestOrchestrator_Selecting_PushFailed(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4087,7 +4326,7 @@ func TestOrchestrator_Selecting_NilForge_Fails(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4142,7 +4381,7 @@ func TestOrchestrator_Selecting_Refusals_NoImprovement(t *testing.T) {
 			}
 			orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, baseSHA, procSrv, nil)
 
-			if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+			if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 				t.Fatalf("orch.Reconcile: %v", err)
 			}
 
@@ -4199,7 +4438,7 @@ func TestOrchestrator_Selecting_Verify_PassingProceedsToExport(t *testing.T) {
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4264,7 +4503,7 @@ func TestOrchestrator_Selecting_Verify_FailingEndsInNoImprovement(t *testing.T) 
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4348,7 +4587,7 @@ func TestOrchestrator_Selecting_Verify_TimeoutEndsInNoImprovement(t *testing.T) 
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4400,7 +4639,7 @@ func TestOrchestrator_Selecting_Verify_ExecutionErrorFailsRun(t *testing.T) {
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4446,7 +4685,7 @@ func TestOrchestrator_Selecting_GoalWithoutVerify_RunsNoCommandBeforeExport(t *t
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4552,7 +4791,7 @@ func TestOrchestrator_OpeningPR_OpensPullRequest_Succeeds(t *testing.T) {
 		return fakeForge, nil
 	})
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4615,7 +4854,7 @@ func TestOrchestrator_OpeningPR_ReusesOpenPullRequest(t *testing.T) {
 		return fakeForge, nil
 	})
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4658,7 +4897,7 @@ func TestOrchestrator_OpeningPR_GitRemote_CannotOpenPR(t *testing.T) {
 		return forge.NewGitRemote(), nil
 	})
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4699,7 +4938,7 @@ func TestOrchestrator_OpeningPR_OpenPullRequestError_Fails(t *testing.T) {
 		return fakeForge, nil
 	})
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -4803,7 +5042,7 @@ func TestOrchestrator_Selecting_PushesAndOpensPullRequest_WithFakeForge(t *testi
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
@@ -5033,7 +5272,7 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 	}
 
 	// 1. Reconcile run1 (Working). This starts the turn worker, which runs in a goroutine.
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo1.Key(), RunID: run1ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo1.Key(), run1ID)); err != nil {
 		t.Fatalf("orch.Reconcile run1: %v", err)
 	}
 
@@ -5045,7 +5284,7 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 	}
 
 	// 2. While run1's tool call is blocked, reconcile run2 from Preparing to Working.
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo2.Key(), RunID: run2ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo2.Key(), run2ID)); err != nil {
 		t.Fatalf("orch.Reconcile run2: %v", err)
 	}
 
@@ -5070,7 +5309,7 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 	}
 
 	// Reconcile run1 to consume outcome.
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo1.Key(), RunID: run1ID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo1.Key(), run1ID)); err != nil {
 		t.Fatalf("orch.Reconcile run1 outcome: %v", err)
 	}
 
@@ -5134,7 +5373,7 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 			t.Fatalf("NewOrchestrator: %v", err)
 		}
 
-		if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("reconcileWorkingRun: %v", err)
 		}
 
@@ -5179,7 +5418,7 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 			t.Fatalf("NewOrchestrator: %v", err)
 		}
 
-		if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 			t.Logf("reconcileWorkingRun completed (errors handled)")
 		}
 
@@ -5256,7 +5495,7 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 	})
 
 	// Pass 1: Reconcile consumes the outcome and moves run to NoImprovement
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile pass 1: %v", err)
 	}
 
@@ -5274,7 +5513,7 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 	}
 
 	// Pass 2: Reconcile again with no outcome stored
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile pass 2: %v", err)
 	}
 
@@ -5447,7 +5686,7 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 			t.Fatalf("NewOrchestrator: %v", err)
 		}
 
-		if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
 
@@ -5518,7 +5757,7 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 			t.Fatalf("NewOrchestrator: %v", err)
 		}
 
-		if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
 
@@ -5588,7 +5827,7 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 			t.Fatalf("NewOrchestrator: %v", err)
 		}
 
-		if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
 
@@ -5745,7 +5984,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 	}
 
 	// 1. First reconcile pass starts the turn worker. RequeueAfter should be 0.
-	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
 		t.Fatalf("orch.Reconcile start: %v", err)
 	}
@@ -5768,7 +6007,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 
 	// While blocked in step 2: advance clock and reconcile while worker is running
 	advanceClock(5 * time.Minute)
-	res1, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res1, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
 		t.Fatalf("orch.Reconcile after tool 1: %v", err)
 	}
@@ -5801,7 +6040,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 
 	// Advance clock again and reconcile while worker is waiting on step3Allowed
 	advanceClock(10 * time.Minute)
-	res2, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res2, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
 		t.Fatalf("orch.Reconcile after tool 2: %v", err)
 	}
@@ -5831,7 +6070,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 	}
 
 	// Reconcile to consume outcome
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile outcome: %v", err)
 	}
 
@@ -5935,7 +6174,7 @@ func TestOrchestrator_Working_SandboxExpiredAtStart_ProducesSandboxExpiredOutcom
 			t.Fatalf("NewOrchestrator: %v", err)
 		}
 
-		if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 			t.Logf("reconcileWorkingRun completed (errors handled)")
 		}
 
@@ -6008,7 +6247,7 @@ func TestOrchestrator_Working_SandboxExpiredAtStart_ProducesSandboxExpiredOutcom
 			t.Fatalf("NewOrchestrator: %v", err)
 		}
 
-		if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 			t.Logf("reconcileWorkingRun completed (errors handled)")
 		}
 
@@ -6354,7 +6593,7 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil || res.RequeueAfter != 10*time.Minute {
 		t.Fatalf("Reconcile got res=%v err=%v, want RequeueAfter=10m", res, err)
 	}
@@ -6366,7 +6605,7 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 	}
 
 	currentTime = deadline.Add(time.Minute)
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile after deadline: %v", err)
 	}
 
@@ -6412,7 +6651,7 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile with leftover outcome: %v", err)
 	}
 	gotRunAfter, _ := store.GetRun(ctx, repo.Key(), runID)
@@ -6471,7 +6710,7 @@ func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
 				t.Fatalf("NewOrchestrator: %v", err)
 			}
 
-			if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+			if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 				t.Fatalf("Reconcile: %v", err)
 			}
 
@@ -6485,7 +6724,7 @@ func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
 				t.Fatalf("mutating sandbox: %v", err)
 			}
 
-			if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+			if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 				t.Fatalf("Reconcile after sandbox change: %v", err)
 			}
 
@@ -6536,7 +6775,7 @@ func TestOrchestrator_Working_RequeueRemainingDeadline(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	res, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil || res.RequeueAfter != 25*time.Minute {
 		t.Fatalf("Reconcile got res=%v err=%v, want RequeueAfter=25m", res, err)
 	}
@@ -6549,7 +6788,7 @@ func TestOrchestrator_Working_RequeueRemainingDeadline(t *testing.T) {
 
 	// Reconcile while active should return remaining time
 	currentTime = startTime.Add(5 * time.Minute)
-	res2, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID})
+	res2, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil || res2.RequeueAfter != 20*time.Minute {
 		t.Fatalf("Reconcile active got res2=%v err=%v, want RequeueAfter=20m", res2, err)
 	}
@@ -6583,7 +6822,7 @@ func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T)
 	// Advance clock past the deadline before Reconcile runs
 	currentTime = deadline.Add(5 * time.Minute)
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 

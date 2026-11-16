@@ -456,11 +456,12 @@ otherwise.
 
 ### Runs as custom resources: the HeroRun decision
 
-The orchestrator currently stores runs as JSON and JSONL records in the state
-directory. The reconciler keys work by `run.Request{Repo, RunID}` instead of
-`reconcile.Request`. A custom informer source watches Sandboxes and maps them to
-runs through labels and annotations. Representing runs as a Kubernetes custom
-resource offers clear benefits, but it also carries significant costs.
+The orchestrator stores runs as JSON and JSONL records in the state
+directory. The reconciler keys work by `reconcile.Request` (the namespace and name
+of the `HeroRun` object). A custom informer source watches Sandboxes and maps them
+to runs through their `HeroRun` controller owner references. Representing runs as
+a Kubernetes custom resource offers clear benefits, but it also carries significant
+costs.
 
 A `HeroRun` custom resource buys standard Kubernetes integration:
 - **Owner references.** Sandboxes can declare an owner reference to their
@@ -533,7 +534,7 @@ To implement `HeroRun`, we will:
 1. Define the `HeroRun` custom resource: the type lives in
    `api/herorun/v1alpha1` and the CRD under `k8s/crds/`.
 2. Publish thin `HeroRun` objects and report status: the orchestrator creates
-   each object when a run leaves `Pending`, rebuilds missing ones in `Resume`,
+   each object when a run is created, rebuilds missing ones in `Resume`,
    and keeps status updated at a bounded rate (every 3 seconds per dirty object).
 3. Add owner references from each created `Sandbox` to its `HeroRun` object:
    every Sandbox created for a run carries an owner reference naming its

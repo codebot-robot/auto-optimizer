@@ -298,6 +298,9 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 		}
 
 		log.Info("created pending run", "repo", repo.URL, "goal", g.Name, "run", runID, "reason", reason)
+		if s.Orchestrator != nil {
+			s.Orchestrator.publishHeroRun(ctx, repo, run)
+		}
 		s.Orchestrator.Notify(key, runID)
 		runs = append(runs, run)
 	}
