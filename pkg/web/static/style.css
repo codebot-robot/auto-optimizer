@@ -86,6 +86,38 @@ a:hover { text-decoration: underline; }
   font-weight: 500;
 }
 
+.header-user {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+}
+
+.header-user .user-login {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.header-user form {
+  margin: 0;
+}
+
+.btn-signout {
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink-2);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.btn-signout:hover {
+  background: var(--bg);
+  color: var(--ink);
+}
+
 .main-content {
   max-width: 1100px;
   margin: 28px auto;

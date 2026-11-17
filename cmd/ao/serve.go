@@ -46,19 +46,49 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
 	"github.com/gke-labs/auto-optimizer/pkg/web"
+	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
 
 type serveOptions struct {
-	listen   string
-	http     string
-	toolset  string
-	stateDir string
-	repos    []string
+	listen         string
+	http           string
+	toolset        string
+	stateDir       string
+	repos          []string
+	insecureNoAuth bool
 
 	sandbox      session.SandboxOptions
 	git          session.GitOptions
 	orchestrator run.OrchestratorOptions
 	portal       portal.Options
+	github       auth.GitHubOptions
+}
+
+func (opts *serveOptions) InitDefaults() {
+	opts.sandbox.InitDefaults()
+	opts.git.InitDefaults()
+	opts.orchestrator.InitDefaults()
+	opts.portal.InitDefaults()
+	opts.github.InitDefaults()
+}
+
+func (opts *serveOptions) Validate() error {
+	if opts.github.ClientID == "" && !opts.insecureNoAuth {
+		return errors.New("GitHub client ID is required unless --insecure-no-auth is set")
+	}
+	if opts.github.ClientID != "" {
+		if opts.github.PublicURL == "" {
+			opts.github.PublicURL = opts.orchestrator.PublicURL
+		}
+		if err := opts.github.Validate(); err != nil {
+			return fmt.Errorf("invalid GitHub auth configuration: %w", err)
+		}
+		sessionKey := os.Getenv("AO_SESSION_KEY")
+		if len(sessionKey) < auth.MinKeyLength {
+			return fmt.Errorf("AO_SESSION_KEY is missing or shorter than %d bytes", auth.MinKeyLength)
+		}
+	}
+	return nil
 }
 
 func newServeCommand() *cobra.Command {
@@ -67,7 +97,7 @@ func newServeCommand() *cobra.Command {
 }
 
 func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
-	opts.sandbox.InitDefaults()
+	opts.InitDefaults()
 	if envNamespace := os.Getenv("SANDBOX_NAMESPACE"); envNamespace != "" {
 		opts.sandbox.Namespace = envNamespace
 	}
@@ -78,9 +108,6 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 		opts.sandbox.HomeDir = envHomeDir
 	}
 
-	opts.git.InitDefaults()
-	opts.orchestrator.InitDefaults()
-	opts.portal.InitDefaults()
 	if envPortalAddr := os.Getenv("PORTAL_CONTROLLER_ADDR"); envPortalAddr != "" {
 		opts.portal.ControllerAddr = envPortalAddr
 	}
@@ -90,7 +117,6 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 	if envPortalToken := os.Getenv("PORTAL_TOKEN_FILE"); envPortalToken != "" {
 		opts.portal.TokenFile = envPortalToken
 	}
-
 	defaultListen := os.Getenv("AO_LISTEN")
 	if defaultListen == "" {
 		defaultListen = "127.0.0.1:8081"
@@ -157,6 +183,9 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 					return fmt.Errorf("invalid portal configuration: %w", err)
 				}
 			}
+			if opts.github.PublicURL == "" {
+				opts.github.PublicURL = opts.orchestrator.PublicURL
+			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -169,11 +198,13 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 	cmd.Flags().StringVar(&opts.toolset, "toolset", defaultToolset, fmt.Sprintf("Default toolset to expose to the LLM (%s)", strings.Join(toolsets.Names(), ", ")))
 	cmd.Flags().StringVar(&opts.stateDir, "state-dir", defaultStateDir, "Directory where session state and snapshots are saved")
 	cmd.Flags().StringArrayVar(&opts.repos, "repo", nil, "Repository URL to register with the forge (repeatable, or AO_REPOS env var)")
+	cmd.Flags().BoolVar(&opts.insecureNoAuth, "insecure-no-auth", false, "Disable authentication for the web UI (insecure; for development and testing only)")
 
 	opts.sandbox.AddFlags(cmd.Flags())
 	opts.git.AddFlags(cmd.Flags())
 	opts.orchestrator.AddFlags(cmd.Flags())
 	opts.portal.AddFlags(cmd.Flags())
+	opts.github.AddFlags(cmd.Flags())
 
 	return cmd
 }
@@ -182,6 +213,13 @@ func runServe(ctx context.Context, opts serveOptions) error {
 	ctrl.SetLogger(klog.NewKlogr())
 
 	log := scoped.Log(ctx)
+
+	if err := opts.Validate(); err != nil {
+		return err
+	}
+	if opts.github.ClientID == "" && opts.insecureNoAuth {
+		log.Info("WARNING: running without authentication (--insecure-no-auth)")
+	}
 
 	if err := opts.sandbox.Validate(); err != nil {
 		return err
@@ -401,6 +439,15 @@ func runServe(ctx context.Context, opts serveOptions) error {
 		if err != nil {
 			return fmt.Errorf("initializing web server: %w", err)
 		}
+		var handler http.Handler = webHandler
+		if opts.github.ClientID != "" {
+			sessionKey := os.Getenv("AO_SESSION_KEY")
+			h, err := auth.NewGitHubHandler(opts.github, []byte(sessionKey), time.Now, webHandler)
+			if err != nil {
+				return fmt.Errorf("initializing auth handler: %w", err)
+			}
+			handler = h
+		}
 		httpListener, err = net.Listen("tcp", opts.http)
 		if err != nil {
 			return fmt.Errorf("failed to listen on HTTP %s: %w", opts.http, err)
@@ -410,7 +457,7 @@ func runServe(ctx context.Context, opts serveOptions) error {
 				log.V(2).Info("failed to close HTTP listener", "error", closeErr)
 			}
 		}()
-		httpServer = &http.Server{Handler: webHandler}
+		httpServer = &http.Server{Handler: handler}
 		log.Info("web UI listening", "http", opts.http)
 	}
 

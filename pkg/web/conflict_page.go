@@ -25,6 +25,7 @@ import (
 // ConflictPageData contains data for rendering the 409 Conflict page.
 type ConflictPageData struct {
 	Name string
+	User string
 }
 
 // Title returns the page title for the layout header.
@@ -49,6 +50,7 @@ func RenderConflictPage(ctx context.Context, w http.ResponseWriter, data Conflic
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusConflict)
 	return conflictPageTmpl().Execute(w, data)

@@ -15,7 +15,13 @@
         <a href="/">Sessions</a>
         <a href="/repos">Repositories</a>
       </nav>
-    </div>
+    </div>{{if .User}}
+    <div class="header-user">
+      <span class="user-login">{{.User}}</span>
+      <form method="POST" action="/logout">
+        <button type="submit" class="btn-signout">Sign out</button>
+      </form>
+    </div>{{end}}
   </header>
   <main class="main-content">
     {{template "content" .}}
