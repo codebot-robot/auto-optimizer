@@ -91,9 +91,6 @@ const DefaultSandboxdImage = "auto-optimizer.local/sandboxd:dev"
 // service-portals transparent network interception.
 const PortalInterceptLabel = "service-portal.gke.io/intercept"
 
-// ServicePortalInterceptLabel is an alias for PortalInterceptLabel.
-const ServicePortalInterceptLabel = PortalInterceptLabel
-
 // ProcessClientFactory is a function that creates a processv1.ProcessServiceClient for a sandbox.
 // Used in tests to connect to mock/fake sandboxd servers without network port-forwarding.
 type ProcessClientFactory func(ctx context.Context, sb *Sandbox) (processv1.ProcessServiceClient, func(), error)

@@ -46,7 +46,7 @@ goal the PR is a proposal and the maintainer is the judge.
 | 2026-10-23 | Agent loop | A Go orchestrator watches GitHub and starts sessions. The session loop is the one from agent-sandbox's `examples/sandboxed-tools`, forked into this repository. The LLM loop runs in the control plane, and every tool call executes in the session's sandbox. In phase 1 each run has one all-in-one session that does the work and opens the PR. Later an outer session gets a tool to start inner sessions, and each inner session runs an agent personality such as gemini-cli, Claude Code, codex, opencode, pi, or a native toolset. |
 | 2026-10-23 | Goal format | A goal is `.goals/<name>.md`. The Markdown body is for the agent. Optional YAML front matter holds the machine-readable fields, which are the metric, the verify command, the budget, and the schedule. More goal types come later. |
 | 2026-10-23 | GitHub | Production uses a GitHub App. Development must not require one. A forge abstraction, adapted from gke-labs/eval-runner, has a `gitremote` implementation that polls `git ls-remote`, a `github` implementation that works with a personal access token or an App, and a `fake` for tests. |
-| 2026-10-23 | Credentials and egress | Every sandbox pod runs gke-labs/service-portals as a sidecar. The sandbox holds no real tokens. The sidecar enforces an iptables egress allowlist, terminates TLS with a pod-local certificate authority, injects credentials per host, and logs LLM usage. |
+| 2026-10-23 | Credentials and egress | Every sandbox pod uses gke-labs/service-portals in per-node NRI mode rather than a sidecar. Sandbox pods are labeled for interception, and the orchestrator binds an egress policy via the Service Portal Controller before commands run. The sandbox holds no real tokens. The node agent enforces egress allowlists transparently, terminates TLS, injects credentials per host, and logs LLM usage. |
 | 2026-10-23 | Filesystem storage | gke-labs/in-cluster-storage, called ObjectFS, provides the workspace volume. A workspace therefore survives sandbox recreation, and a session can resume. This replaces the tar snapshot and restore of the upstream example. Control-plane state is files under one state directory. In production that directory is an ObjectFS volume. |
 | 2026-10-23 | Control plane | One Go binary, `ao`. `ao serve` runs as a normal Deployment on the cluster that has agent-sandbox installed. The UI is server-rendered with `html/template` and uses no JavaScript framework. |
 | 2026-10-23 | Metric trust | The agent never decides that a PR is good. For metric goals the orchestrator re-measures the candidate in a clean sandbox before it opens a PR. |
@@ -81,16 +81,13 @@ token-only first cut, so a token and an App both work from day one.
                                              v
  +------------------------------------------------------------------+
  |  Sandbox (agents.x-k8s.io/v1beta1), namespace ao-sandboxes        |
+ |  label: service-portal.gke.io/intercept: "true"                  |
+ |  (egress policy bound dynamically via Service Portal Controller) |
  |                                                                  |
- |   init: init-service-portals  (pod CA, iptables egress rules)    |
  |   init: install-sandboxd      (copies sandboxd into /ao-bin)     |
  |   container worker: tool-rich image, runs sandboxd as PID 1      |
  |       /workspace  <- ObjectFS PVC (exclusive-local, RWOP)        |
  |       repo clone, git worktrees, agent CLIs (inner sessions)     |
- |   container portal: all-in-one-portal (UID 1337)                 |
- |       api.github.com, github.com (git) -> installation token     |
- |       api.anthropic.com, generativelanguage.googleapis.com, ...  |
- |       -> platform LLM keys, usage logged per request             |
  +------------------------------------------------------------------+
 ```
 
@@ -332,19 +329,17 @@ image ships `tini`, so sandboxd is not PID 1 in a long-lived sandbox.
 tokens per call with its ed25519 key, and no Secrets are created for sandbox
 authentication.
 
-The **portal** sidecar runs `all-in-one-portal` as uid 1337 and reads its
-rules from a per-run Secret. The `init-service-portals` init container
-installs the iptables rules. Only the proxy may leave the pod, DNS goes only
-to the cluster resolvers, and the metadata server is blocked. The rules match
-the real hostnames, such as `api.github.com`, `github.com`,
-`api.anthropic.com`, `generativelanguage.googleapis.com`, and the package
-registries the repository needs. Agent CLIs therefore need no base-URL
-changes. They only need the pod CA in `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`,
-and git's `http.sslCAInfo`.
+The **portal** integration uses service-portals in per-node NRI mode rather than
+a sidecar. Sandbox pods are created with the `service-portal.gke.io/intercept: "true"`
+label, and the node agent intercepts network traffic transparently. When the Sandbox
+becomes ready, the orchestrator binds an egress policy via the Service Portal Controller
+before any commands run. Only the allowed egress hosts, such as `api.github.com`,
+`github.com`, and package registries, may be reached. The node agent denies all egress
+until the policy is bound. Agent CLIs therefore need no base-URL changes.
 
 There is no per-sandbox ingress **NetworkPolicy** (removed as too expensive at
 sandbox scale); the signed token gates access to sandboxd, and transport
-security (TLS) is tracked in #102. The portal's iptables rules and a
+security (TLS) is tracked in #102. The portal's per-node NRI interception and
 deny-by-default policy handle egress.
 
 The control plane connects to sandboxd in-cluster, by Pod IP or by the
@@ -391,17 +386,22 @@ Runs are reconciled in response to events:
    changed, or someone asked. The scheduler allows one active run per goal
    and enforces the repository's budget cap.
 2. **Preparing.** Split into two reconcile steps without blocking a worker:
-   - *Step 1 (creation):* The orchestrator creates the workspace PVC, portal
-     rules Secret, and the Sandbox with a label naming the run, records
-     `SandboxName` and a `ReadyDeadline` on the run, appends an event, and
-     returns with `RequeueAfter`.
+   - *Step 1 (creation):* The orchestrator creates the workspace PVC and the
+     Sandbox with a label naming the run (and with `service-portal.gke.io/intercept`
+     label when a portal binder is configured), records `SandboxName` and a
+     `ReadyDeadline` on the run, appends an event, and returns with `RequeueAfter`.
    - *Step 2 (readiness):* A watch on Sandbox resources enqueues the run when
-     its status changes. When the Sandbox becomes `Ready`, the orchestrator
-     clones the repository at the base commit into `/workspace/repo`, freezes
-     the goal file, measures the baseline for a metric goal, moves the run
-     to `Working`, and enqueues it. If the Sandbox disappears or reports a
-     failure before becoming ready, or if the ready deadline passes without
-     the Sandbox becoming ready, the run transitions to `Failed`.
+     its status changes. When the Sandbox becomes `Ready`, if a portal binder is
+     configured the orchestrator reads the pod UID and binds an egress policy via
+     the Service Portal Controller before any commands run in the sandbox
+     (retrying on error until `ReadyDeadline`, failing with `portal_bind_failed`
+     on timeout, and recording `portal_bound` with the host list on success).
+     Then the orchestrator clones the repository at the base commit into
+     `/workspace/repo`, freezes the goal file, measures the baseline for a
+     metric goal, moves the run to `Working`, and enqueues it. If the Sandbox
+     disappears or reports a failure before becoming ready, or if the ready
+     deadline passes without the Sandbox becoming ready, the run transitions
+     to `Failed`.
 3. **Working.** The session runs turn by turn in the sandbox. The orchestrator
    ends the run at the deadline if it has not finished. The session ends
    when the agent calls the `finish` or `open_pull_request` tool, when the model

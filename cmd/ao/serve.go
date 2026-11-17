@@ -36,6 +36,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/forge/github"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	"github.com/gke-labs/auto-optimizer/pkg/portal"
 	"github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -57,6 +58,7 @@ type serveOptions struct {
 	sandbox      session.SandboxOptions
 	git          session.GitOptions
 	orchestrator run.OrchestratorOptions
+	portal       portal.Options
 }
 
 func newServeCommand() *cobra.Command {
@@ -78,6 +80,16 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 
 	opts.git.InitDefaults()
 	opts.orchestrator.InitDefaults()
+	opts.portal.InitDefaults()
+	if envPortalAddr := os.Getenv("PORTAL_CONTROLLER_ADDR"); envPortalAddr != "" {
+		opts.portal.ControllerAddr = envPortalAddr
+	}
+	if envPortalCA := os.Getenv("PORTAL_CONTROLLER_CA_FILE"); envPortalCA != "" {
+		opts.portal.CAFile = envPortalCA
+	}
+	if envPortalToken := os.Getenv("PORTAL_TOKEN_FILE"); envPortalToken != "" {
+		opts.portal.TokenFile = envPortalToken
+	}
 
 	defaultListen := os.Getenv("AO_LISTEN")
 	if defaultListen == "" {
@@ -140,6 +152,11 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 				}
 				opts.orchestrator.PublicURL = strings.TrimRight(opts.orchestrator.PublicURL, "/")
 			}
+			if opts.portal.Enabled() {
+				if err := opts.portal.Validate(); err != nil {
+					return fmt.Errorf("invalid portal configuration: %w", err)
+				}
+			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -156,6 +173,7 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 	opts.sandbox.AddFlags(cmd.Flags())
 	opts.git.AddFlags(cmd.Flags())
 	opts.orchestrator.AddFlags(cmd.Flags())
+	opts.portal.AddFlags(cmd.Flags())
 
 	return cmd
 }
@@ -306,6 +324,19 @@ func runServe(ctx context.Context, opts serveOptions) error {
 	orchOpts.ForgeFor = func(repoURL string) (forge.Forge, error) {
 		f, _, err := selectForge(repoURL, githubToken)
 		return f, err
+	}
+	if opts.portal.Enabled() {
+		portalClient, err := portal.New(opts.portal)
+		if err != nil {
+			return fmt.Errorf("initializing portal client: %w", err)
+		}
+		defer func() {
+			if closeErr := portalClient.Close(); closeErr != nil {
+				log.V(2).Info("closing portal client", "error", closeErr)
+			}
+		}()
+		orchOpts.PortalBinder = portalClient
+		orchOpts.EgressHosts = opts.portal.EgressHosts
 	}
 	orchestrator, err := run.NewOrchestrator(orchOpts)
 	if err != nil {
