@@ -150,6 +150,7 @@ To use a real model such as Gemini:
 - **Command-line flag**: `--only <component>` accepts one or more comma-separated components, or can be passed multiple times (for example, `--only ao` or `--only agent-sandbox,ao`).
 - **Existing controller protection**: `deploy-to-kube` checks whether `crd/sandboxes.agents.x-k8s.io` is already present with version `v1beta1` served. If an existing install is detected, `deploy-to-kube` skips installing agent-sandbox and preserves the existing controller. To force reinstallation, set `FORCE_AGENT_SANDBOX=1`.
 - **Optional storage**: On non-kind clusters, `deploy-to-kube` skips ObjectFS if `OBJECTFS_BACKEND` is unset instead of failing.
+- **Service portals on non-kind clusters**: On non-kind clusters, `deploy-to-kube` skips installing service-portals unless explicitly requested via `INSTALL_SERVICE_PORTALS=true`, printing the prerequisites that the operator must provide (NRI on the nodes and the TLS Secret).
 
 #### Idempotence
 
@@ -264,7 +265,7 @@ All upstream dependencies are pinned in variables at the top of `dev/tasks/deplo
 
 ```bash
 AGENT_SANDBOX_VERSION="v1.0.8"
-SERVICE_PORTALS_COMMIT="686b34d8aa74546af1039119bbfa6e05ead15f53"
+SERVICE_PORTALS_COMMIT="f34dec9ccc7282c0821129bb515a39a28de77c0f"
 IN_CLUSTER_STORAGE_COMMIT="923578df519c02cd0da1b7455d8a1e0278a103c4"
 ```
 
@@ -343,7 +344,7 @@ RUN_E2E=1 go test -v -count=1 -run TestSmoke/SandboxHealth ./tests/e2e/...
 Subtests in `TestSmoke` verify:
 - `SandboxHealth`: Creates a minimal `Sandbox` (`agents.x-k8s.io/v1beta1`) in `ao-sandboxes` running upstream `sandboxd`, waits for `Ready`, port-forwards to port 8080, queries `/v1/health` for `{"status":"ok"}`, and deletes the sandbox.
 - `ObjectFSPVCWrite`: Creates a `PersistentVolumeClaim` with `storageClassName: objectfs-exclusive-local` and `ReadWriteOncePod` access mode. Launches a test Pod writing to the mounted volume, verifies successful exit and output, and deletes test resources.
-- `ServicePortalsImages`: Launches a test Pod in namespace `default` running `init-service-portals --help` from the built image (`${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}`) and verifies it exits `0`.
+- `ServicePortals`: Verifies that the `service-portal-controller` Deployment and `portal-node-agent` DaemonSet in `service-portal-system` are ready.
 
 ---
 

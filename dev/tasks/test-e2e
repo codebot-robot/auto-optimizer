@@ -72,6 +72,8 @@ echo "Pinned tools (kind, kubectl, docker) ready in ${REPO_ROOT}/.build/bin"
 # ------------------------------------------------------------------------------
 # 2. Kind Cluster Management
 # ------------------------------------------------------------------------------
+KIND_CONFIG="${REPO_ROOT}/dev/kind-config.yaml"
+
 if [[ "${DELETE_EXISTING}" == "true" ]]; then
   echo "Deleting existing cluster ${CLUSTER_NAME} if present..."
   kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
@@ -81,9 +83,25 @@ EXISTING_CLUSTERS="$(kind get clusters 2>/dev/null || true)"
 if echo "${EXISTING_CLUSTERS}" | grep -qx "${CLUSTER_NAME}"; then
   echo "Reusing existing kind cluster: ${CLUSTER_NAME}"
   kubectl config use-context "kind-${CLUSTER_NAME}"
+  if ! docker exec "${CLUSTER_NAME}-control-plane" test -S /var/run/nri/nri.sock 2>/dev/null; then
+    echo "NRI socket not found on existing cluster ${CLUSTER_NAME}; recreating cluster with NRI enabled..."
+    kind delete cluster --name "${CLUSTER_NAME}"
+    kind create cluster --name "${CLUSTER_NAME}" --config "${KIND_CONFIG}"
+  fi
 else
   echo "Creating kind cluster: ${CLUSTER_NAME}..."
-  kind create cluster --name "${CLUSTER_NAME}"
+  kind create cluster --name "${CLUSTER_NAME}" --config "${KIND_CONFIG}"
+fi
+
+# Check that the kind node image runs Kubernetes 1.32 or newer (required for node agent token checks)
+KUBE_VERSION="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null | sed 's/^v//')"
+if [[ -n "${KUBE_VERSION}" ]]; then
+  IFS='.' read -r KUBE_MAJOR KUBE_MINOR _ <<< "${KUBE_VERSION}"
+  if [[ "${KUBE_MAJOR}" -lt 1 || ("${KUBE_MAJOR}" -eq 1 && "${KUBE_MINOR}" -lt 32) ]]; then
+    echo "ERROR: Kubernetes version must be 1.32 or newer for node agent token checks, got v${KUBE_VERSION}" >&2
+    exit 1
+  fi
+  echo "Kind node running Kubernetes v${KUBE_VERSION} (>= 1.32)"
 fi
 
 # Set image parameters for kind

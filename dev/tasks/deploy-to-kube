@@ -25,7 +25,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 # - SERVICE_PORTALS_COMMIT: Check latest commit at https://github.com/gke-labs/service-portals/commits/main
 # - IN_CLUSTER_STORAGE_COMMIT: Check latest commit at https://github.com/gke-labs/in-cluster-storage/commits/main
 AGENT_SANDBOX_VERSION="v1.0.8"
-SERVICE_PORTALS_COMMIT="686b34d8aa74546af1039119bbfa6e05ead15f53"
+SERVICE_PORTALS_COMMIT="f34dec9ccc7282c0821129bb515a39a28de77c0f"
 IN_CLUSTER_STORAGE_COMMIT="8ece1bbfdefb4afaceac89dec3eaa112428917a9"
 
 GOBIN="${REPO_ROOT}/.build/bin" GOTOOLCHAIN=auto go install github.com/gke-labs/gke-labs-infra/ap@latest
@@ -243,26 +243,89 @@ fi
 # 3. service-portals
 # ------------------------------------------------------------------------------
 if has_component "service-portals"; then
-  echo "--- Building service-portals images (${SERVICE_PORTALS_COMMIT}) with ap build ---"
-  # Sandboxes use service-portals exclusively in transparent sidecar mode (see docs/design.md).
-  # We do not deploy the central explicit proxy (k8s/manifests.yaml) or require cert-manager.
-  # We build the container images (init-service-portals, all-in-one-portal, gitproxy-server, service-portal)
-  # using 'ap build'.
   SERVICE_PORTALS_DIR="$(ensure_cached_repo "service-portals" "https://github.com/gke-labs/service-portals.git" "${SERVICE_PORTALS_COMMIT}")"
 
   if [[ "${IS_KIND}" == "true" ]]; then
-    echo "Building service-portals images locally..."
-    (cd "${SERVICE_PORTALS_DIR}" && "${REPO_ROOT}/.build/bin/ap" build)
-    echo "Loading service-portals images into kind cluster ${KIND_CLUSTER_NAME}..."
-    kind load docker-image \
-      "${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}" \
-      "${IMAGE_PREFIX}/all-in-one-portal:${IMAGE_TAG}" \
-      "${IMAGE_PREFIX}/gitproxy-server:${IMAGE_TAG}" \
-      "${IMAGE_PREFIX}/service-portal:${IMAGE_TAG}" \
-      --name "${KIND_CLUSTER_NAME}"
+    echo "--- Deploying service-portals (${SERVICE_PORTALS_COMMIT}) on kind with ap deploy ---"
+
+    cat << 'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: service-portal-system
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+EOF
+
+    if ! kubectl get secret service-portal-controller-tls -n service-portal-system >/dev/null 2>&1 || \
+       ! kubectl get secret service-portal-controller-ca -n service-portal-system >/dev/null 2>&1; then
+      echo "Generating throwaway CA and server certificate for service-portal-controller..."
+      CERT_TMPDIR="$(mktemp -d)"
+      openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "${CERT_TMPDIR}/ca.key" -out "${CERT_TMPDIR}/ca.crt" -days 365 \
+        -subj "/CN=service-portal-ca" 2>/dev/null
+
+      openssl req -newkey rsa:2048 -nodes \
+        -keyout "${CERT_TMPDIR}/tls.key" -out "${CERT_TMPDIR}/server.csr" \
+        -subj "/CN=service-portal-controller" 2>/dev/null
+
+      cat << 'EOF' > "${CERT_TMPDIR}/extfile.cnf"
+subjectAltName = DNS:service-portal-controller,DNS:service-portal-controller.service-portal-system,DNS:service-portal-controller.service-portal-system.svc,DNS:service-portal-controller.service-portal-system.svc.cluster.local,DNS:localhost,IP:127.0.0.1
+EOF
+
+      openssl x509 -req -in "${CERT_TMPDIR}/server.csr" \
+        -CA "${CERT_TMPDIR}/ca.crt" -CAkey "${CERT_TMPDIR}/ca.key" -CAcreateserial \
+        -out "${CERT_TMPDIR}/tls.crt" -days 365 -extfile "${CERT_TMPDIR}/extfile.cnf" 2>/dev/null
+
+      kubectl create secret tls service-portal-controller-tls \
+        --cert="${CERT_TMPDIR}/tls.crt" --key="${CERT_TMPDIR}/tls.key" \
+        -n service-portal-system --dry-run=client -o yaml | kubectl apply -f -
+
+      kubectl create secret generic service-portal-controller-ca \
+        --from-file=tls.crt="${CERT_TMPDIR}/ca.crt" \
+        -n service-portal-system --dry-run=client -o yaml | kubectl apply -f -
+
+      rm -rf "${CERT_TMPDIR}"
+    fi
+
+    echo "Deploying service-portals manifests with ap deploy..."
+    # Do not wait for workloads here; the controller requires the ConfigMap created below by dev/tasks/configure.
+    (cd "${SERVICE_PORTALS_DIR}" && "${REPO_ROOT}/.build/bin/ap" deploy --skip-push --wait=false k8s/controller.yaml k8s/node-agent.yaml)
+
+    echo "Configuring service-portals controller with dev/tasks/configure..."
+    "${SERVICE_PORTALS_DIR}/dev/tasks/configure" --client-allowlist="system:serviceaccount:ao-system:ao"
+
+    echo "Waiting for service-portal-controller deployment in service-portal-system..."
+    kubectl rollout status deployment/service-portal-controller -n service-portal-system --timeout=120s
+
+    echo "Waiting for portal-node-agent daemonset in service-portal-system..."
+    kubectl rollout status daemonset/portal-node-agent -n service-portal-system --timeout=120s
   else
-    echo "Building and pushing service-portals images to ${IMAGE_PREFIX}..."
-    (cd "${SERVICE_PORTALS_DIR}" && "${REPO_ROOT}/.build/bin/ap" build --push)
+    if [[ "${INSTALL_SERVICE_PORTALS:-false}" != "true" ]]; then
+      echo "--- Skipping service-portals install on non-kind cluster (set INSTALL_SERVICE_PORTALS=true to proceed) ---"
+      echo "To deploy service-portals on a non-kind cluster, the operator must provide:"
+      echo "  1. containerd with the Node Resource Interface (NRI) enabled on all nodes"
+      echo "  2. The TLS Secret 'service-portal-controller-tls' in the 'service-portal-system' namespace"
+    else
+      echo "--- Installing service-portals on non-kind cluster (explicitly requested) ---"
+      if ! kubectl get secret service-portal-controller-tls -n service-portal-system >/dev/null 2>&1; then
+        echo "ERROR: secret 'service-portal-controller-tls' not found in namespace 'service-portal-system'" >&2
+        exit 1
+      fi
+
+      echo "Deploying service-portals manifests with ap deploy..."
+      # Do not wait for workloads here; the controller requires the ConfigMap created below by dev/tasks/configure.
+      (cd "${SERVICE_PORTALS_DIR}" && "${REPO_ROOT}/.build/bin/ap" deploy --wait=false k8s/controller.yaml k8s/node-agent.yaml)
+
+      echo "Configuring service-portals controller with dev/tasks/configure..."
+      "${SERVICE_PORTALS_DIR}/dev/tasks/configure" --client-allowlist="system:serviceaccount:ao-system:ao"
+
+      echo "Waiting for service-portal-controller deployment in service-portal-system..."
+      kubectl rollout status deployment/service-portal-controller -n service-portal-system --timeout=120s
+
+      echo "Waiting for portal-node-agent daemonset in service-portal-system..."
+      kubectl rollout status daemonset/portal-node-agent -n service-portal-system --timeout=120s
+    fi
   fi
 fi
 
