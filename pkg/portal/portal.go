@@ -129,16 +129,6 @@ func New(opts Options, dialOpts ...grpc.DialOption) (*Client, error) {
 	}, nil
 }
 
-// NewClient is an alias for New.
-func NewClient(opts Options, dialOpts ...grpc.DialOption) (*Client, error) {
-	return New(opts, dialOpts...)
-}
-
-// NewBinder creates a Binder configured with opts.
-func NewBinder(opts Options, dialOpts ...grpc.DialOption) (Binder, error) {
-	return New(opts, dialOpts...)
-}
-
 // Close closes the underlying gRPC connection.
 func (c *Client) Close() error {
 	if c.conn != nil {

@@ -172,7 +172,7 @@ Once a run finishes, you can use the **Run again** button on the run page to sta
 
 Keep current system limits in mind when running goals.
 
-- Sandboxes have the cluster's default network egress and hold no credentials. Transparent network proxying and credential injection via the portal sidecar are planned in epic #33.
+- Without a Service Portal Controller configured, sandboxes have the cluster's default network egress and hold no credentials. When `--portal-controller-addr` is configured, sandboxes are intercepted by service-portals in per-node NRI mode and bound to an egress allowlist before execution begins.
 - The harness records `budget.maxCostUSD` in run records, but it does not enforce monetary limits yet. Enforce bounds by setting `--max-turns` on the server and `budget.maxDuration` in each goal.
 - State lives on the ReadWriteOnce PersistentVolumeClaim named `ao-state`. The volume is bound to one zone.
 - The deployment runs exactly one replica. Shared storage such as ObjectFS (epic #33) is what allows more than one replica.

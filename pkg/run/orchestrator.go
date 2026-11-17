@@ -51,6 +51,7 @@ import (
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	"github.com/gke-labs/auto-optimizer/pkg/portal"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
@@ -87,6 +88,9 @@ const (
 
 	// readySafetyRequeueInterval is the slow safety requeue interval when waiting for a Sandbox to become ready.
 	readySafetyRequeueInterval = 1 * time.Minute
+
+	// portalBindRetryInterval is the retry interval used when binding an egress policy fails.
+	portalBindRetryInterval = 5 * time.Second
 )
 
 type runIndexEntry struct {
@@ -130,6 +134,14 @@ type OrchestratorOptions struct {
 	// ForgeFor returns the Forge for a repository URL.
 	// If nil or returns an error, push operations in Selecting fail.
 	ForgeFor func(repoURL string) (forge.Forge, error)
+
+	// PortalBinder binds an egress policy to a sandbox pod.
+	// Optional: when nil, portal egress policy binding is disabled.
+	PortalBinder portal.Binder
+
+	// EgressHosts is the list of allowed egress hosts when PortalBinder is configured.
+	// When unset or empty, defaults to portal.DefaultEgressHosts.
+	EgressHosts []string
 }
 
 // InitDefaults fills every zero-valued field that has a default with its Default* constant.
@@ -157,6 +169,9 @@ func (o *OrchestratorOptions) InitDefaults() {
 	}
 	if o.DefaultMaxDuration == 0 {
 		o.DefaultMaxDuration = DefaultMaxDuration
+	}
+	if len(o.EgressHosts) == 0 {
+		o.EgressHosts = append([]string(nil), portal.DefaultEgressHosts...)
 	}
 }
 
@@ -228,6 +243,8 @@ type Orchestrator struct {
 	verifyTimeout      time.Duration
 	defaultMaxDuration time.Duration
 	forgeFor           func(repoURL string) (forge.Forge, error)
+	portalBinder       portal.Binder
+	egressHosts        []string
 
 	runIndexMu sync.RWMutex
 	runIndex   map[string]runIndexEntry
@@ -296,6 +313,11 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		return nil, err
 	}
 
+	egressHosts := opts.EgressHosts
+	if len(egressHosts) == 0 {
+		egressHosts = append([]string(nil), portal.DefaultEgressHosts...)
+	}
+
 	orch := &Orchestrator{
 		store:              opts.Store,
 		sessionStore:       opts.SessionStore,
@@ -310,6 +332,8 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		verifyTimeout:      opts.VerifyTimeout,
 		defaultMaxDuration: opts.DefaultMaxDuration,
 		forgeFor:           opts.ForgeFor,
+		portalBinder:       opts.PortalBinder,
+		egressHosts:        append([]string(nil), egressHosts...),
 		runIndex:           make(map[string]runIndexEntry),
 		notifyCh:           make(chan event.TypedGenericEvent[reconcile.Request], 1024),
 		activeRuns:         make(map[string]bool),
@@ -654,6 +678,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		Annotations:     annotations,
 		OwnerReferences: ownerRefs,
 		ShutdownTime:    sbShutdown,
+		PortalIntercept: o.portalBinder != nil,
 	}
 	if _, err := o.harness.CreateSandboxWithOptions(ctx, sbOpts); err != nil {
 		prev := run.Phase
@@ -879,7 +904,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 		return reconcile.Result{RequeueAfter: requeueAfter}, nil
 	}
 
-	// 4. Sandbox is Ready! Attach, run clone and checkout, move to Working, and return.
+	// 4. Sandbox is Ready! Attach, bind egress policy if configured, run clone and checkout, move to Working, and return.
 	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 		Time:    o.clock().UTC(),
 		Phase:   state.PhasePreparing,
@@ -903,6 +928,56 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 		podIP = sbObj.Status.PodIPs[0]
 	}
 	sb.SetPodInfo(sbObj.Name, podIP)
+
+	if o.portalBinder != nil && run.PortalBoundAt == nil {
+		podUID, err := sb.PodUID(ctx)
+		if err == nil {
+			err = o.portalBinder.Bind(ctx, podUID, portal.PolicyForHosts(o.egressHosts))
+		}
+		if err != nil {
+			log.Error(err, "failed to bind portal egress policy", "run", run.ID, "sandbox", run.SandboxName)
+			if run.ReadyDeadline != nil && !now.Before(*run.ReadyDeadline) {
+				run.ReadyDeadline = nil
+				o.finishRun(ctx, repo, run, runEnd{
+					Phase:   state.PhaseFailed,
+					Kind:    "portal_bind_failed",
+					Message: err.Error(),
+					Sandbox: sb,
+				})
+				return reconcile.Result{}, err
+			}
+
+			requeueAfter := portalBindRetryInterval
+			if run.ReadyDeadline != nil {
+				rem := run.ReadyDeadline.Sub(now)
+				if rem < requeueAfter {
+					requeueAfter = rem
+				}
+			}
+			if requeueAfter <= 0 {
+				requeueAfter = time.Millisecond
+			}
+			return reconcile.Result{RequeueAfter: requeueAfter}, nil
+		}
+
+		nowBound := o.clock().UTC()
+		run.PortalBoundAt = &nowBound
+		if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
+			log.Error(err, "failed to update run with PortalBoundAt", "run", run.ID)
+		}
+
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    nowBound,
+			Phase:   state.PhasePreparing,
+			Kind:    "portal_bound",
+			Message: fmt.Sprintf("portal egress policy bound for hosts: %s", strings.Join(o.egressHosts, ", ")),
+			Data: map[string]any{
+				"hosts": append([]string(nil), o.egressHosts...),
+			},
+		}); err != nil {
+			log.Error(err, "failed to append portal_bound event", "run", run.ID)
+		}
+	}
 
 	commands := []struct {
 		desc string

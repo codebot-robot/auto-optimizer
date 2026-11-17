@@ -44,6 +44,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,6 +53,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
+	portalsv1 "github.com/gke-labs/service-portals/pkg/portals/v1"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	fakeagents "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
 	informers "sigs.k8s.io/agent-sandbox/clients/k8s/informers/externalversions"
@@ -67,6 +69,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
+	"github.com/gke-labs/auto-optimizer/pkg/portal"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
@@ -7249,6 +7252,491 @@ func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T)
 	for _, e := range events {
 		if e.Kind == "deadline_exceeded" {
 			t.Errorf("did not expect deadline_exceeded event when turn outcome was waiting")
+		}
+	}
+}
+
+type fakePortalBinder struct {
+	mu       sync.Mutex
+	calls    []portalBindCall
+	bindFunc func(ctx context.Context, podUID types.UID, policy *portalsv1.EgressPolicy) error
+}
+
+type portalBindCall struct {
+	PodUID types.UID
+	Policy *portalsv1.EgressPolicy
+}
+
+func (f *fakePortalBinder) Bind(ctx context.Context, podUID types.UID, policy *portalsv1.EgressPolicy) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, portalBindCall{PodUID: podUID, Policy: policy})
+	if f.bindFunc != nil {
+		return f.bindFunc(ctx, podUID, policy)
+	}
+	return nil
+}
+
+func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-bind1"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "test-goal",
+		BaseCommit: "abc1234",
+		Phase:      state.PhasePending,
+		Goal: &goals.Goal{
+			Name: "test-goal",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &mockProcessServer{
+		exitCode: 0,
+		stdout:   "success",
+	}
+	harness, agentsCS, coreCS := setupTestHarness(t, procSrv)
+
+	binder := &fakePortalBinder{}
+	binder.bindFunc = func(ctx context.Context, podUID types.UID, policy *portalsv1.EgressPolicy) error {
+		procSrv.mu.Lock()
+		defer procSrv.mu.Unlock()
+		if len(procSrv.commands) > 0 {
+			t.Errorf("expected 0 commands executed before bind, got %d", len(procSrv.commands))
+		}
+		return nil
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	egressHosts := []string{"github.com", "golang.org"}
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		PortalBinder: binder,
+		EgressHosts:  egressHosts,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Step 1: Reconcile Pending -> Preparing
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("Reconcile step 1: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhasePreparing {
+		t.Fatalf("expected phase %s, got %s", state.PhasePreparing, gotRun.Phase)
+	}
+
+	// Verify sandbox pod template has the interception label
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	podLabels := sb.Spec.SandboxBlueprint.PodTemplate.ObjectMeta.Labels
+	if podLabels[session.PortalInterceptLabel] != "true" {
+		t.Errorf("expected sandbox template label %s=true, got %+v", session.PortalInterceptLabel, podLabels)
+	}
+
+	// Ensure no bind was called yet
+	binder.mu.Lock()
+	callsBeforeReady := len(binder.calls)
+	binder.mu.Unlock()
+	if callsBeforeReady != 0 {
+		t.Fatalf("expected 0 bind calls before ready, got %d", callsBeforeReady)
+	}
+
+	// Create backing pod in fake k8s
+	podUID := types.UID("pod-uid-test-12345")
+	_, err = coreCS.CoreV1().Pods("ao-sandboxes").Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gotRun.SandboxName,
+			Namespace: "ao-sandboxes",
+			UID:       podUID,
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating backing pod: %v", err)
+	}
+
+	// Mark sandbox Ready
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating sandbox to Ready: %v", err)
+	}
+
+	// Step 2: Reconcile Preparing -> Working (binds, then clones and checkouts)
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("Reconcile step 2: %v", err)
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun after step 2: %v", err)
+	}
+	if gotRun.Phase != state.PhaseWorking {
+		t.Errorf("expected phase %s, got %s", state.PhaseWorking, gotRun.Phase)
+	}
+	if gotRun.PortalBoundAt == nil {
+		t.Errorf("expected PortalBoundAt to be set on run")
+	}
+
+	binder.mu.Lock()
+	numCalls := len(binder.calls)
+	var call portalBindCall
+	if numCalls > 0 {
+		call = binder.calls[0]
+	}
+	binder.mu.Unlock()
+
+	if numCalls != 1 {
+		t.Fatalf("expected exactly 1 bind call, got %d", numCalls)
+	}
+	if call.PodUID != podUID {
+		t.Errorf("expected pod UID %q, got %q", podUID, call.PodUID)
+	}
+	wantPolicy := portal.PolicyForHosts(egressHosts)
+	if call.Policy == nil || len(call.Policy.Rules) != len(wantPolicy.Rules) || call.Policy.Rules[0].Https == nil {
+		t.Fatalf("expected policy matching %+v, got %+v", wantPolicy, call.Policy)
+	}
+	if !slices.Equal(call.Policy.Rules[0].Https.Hostnames, wantPolicy.Rules[0].Https.Hostnames) {
+		t.Errorf("hostnames = %v, want %v", call.Policy.Rules[0].Https.Hostnames, wantPolicy.Rules[0].Https.Hostnames)
+	}
+
+	procSrv.mu.Lock()
+	cmds := len(procSrv.commands)
+	procSrv.mu.Unlock()
+	if cmds != 2 {
+		t.Errorf("expected 2 commands executed after bind, got %d", cmds)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundPortalBound bool
+	for _, e := range events {
+		if e.Kind == "portal_bound" {
+			foundPortalBound = true
+			if m, ok := e.Data.(map[string]any); ok {
+				if hosts, ok := m["hosts"].([]any); ok {
+					var gotHosts []string
+					for _, h := range hosts {
+						if s, ok := h.(string); ok {
+							gotHosts = append(gotHosts, s)
+						}
+					}
+					if !slices.Equal(gotHosts, egressHosts) {
+						t.Errorf("portal_bound hosts = %v, want %v", gotHosts, egressHosts)
+					}
+				} else if gotHosts, ok := m["hosts"].([]string); ok {
+					if !slices.Equal(gotHosts, egressHosts) {
+						t.Errorf("portal_bound hosts = %v, want %v", gotHosts, egressHosts)
+					}
+				}
+			}
+		}
+	}
+	if !foundPortalBound {
+		t.Errorf("expected portal_bound event, got events: %+v", events)
+	}
+}
+
+func TestOrchestrator_PortalBinder_FailsAfterDeadline(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-bindfail"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "test-goal",
+		BaseCommit: "abc1234",
+		Phase:      state.PhasePending,
+		Goal: &goals.Goal{
+			Name: "test-goal",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &mockProcessServer{}
+	harness, agentsCS, coreCS := setupTestHarness(t, procSrv)
+
+	bindErr := errors.New("portal controller unreachable")
+	binder := &fakePortalBinder{
+		bindFunc: func(ctx context.Context, podUID types.UID, policy *portalsv1.EgressPolicy) error {
+			return bindErr
+		},
+	}
+
+	clockMu := sync.Mutex{}
+	currentTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	getClock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return currentTime
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		Harness:      harness,
+		Clock:        getClock,
+		PortalBinder: binder,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Step 1: Pending -> Preparing (sets ReadyDeadline)
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("Reconcile step 1: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.ReadyDeadline == nil {
+		t.Fatal("expected ReadyDeadline set")
+	}
+
+	// Create backing pod in fake k8s
+	_, err = coreCS.CoreV1().Pods("ao-sandboxes").Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gotRun.SandboxName,
+			Namespace: "ao-sandboxes",
+			UID:       types.UID("pod-uid-fail"),
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating backing pod: %v", err)
+	}
+
+	// Mark sandbox Ready
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating sandbox to Ready: %v", err)
+	}
+
+	// Reconcile pass 1: before deadline, bind fails -> should requeue for retry
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
+	if err != nil {
+		t.Fatalf("expected Reconcile to handle retry cleanly, got err: %v", err)
+	}
+	if res.RequeueAfter != portalBindRetryInterval {
+		t.Errorf("expected RequeueAfter == %v for retry, got %v", portalBindRetryInterval, res.RequeueAfter)
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhasePreparing {
+		t.Errorf("expected phase %s on retry, got %s", state.PhasePreparing, gotRun.Phase)
+	}
+
+	// Advance clock past ReadyDeadline
+	clockMu.Lock()
+	currentTime = gotRun.ReadyDeadline.Add(time.Minute)
+	clockMu.Unlock()
+
+	// Reconcile pass 2: after deadline, bind fails -> should fail the run with portal_bind_failed
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err == nil {
+		t.Logf("Reconcile returned nil error (as terminal failures are logged)")
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Errorf("expected phase %s after deadline, got %s", state.PhaseFailed, gotRun.Phase)
+	}
+	if !strings.Contains(gotRun.Error, "portal controller unreachable") {
+		t.Errorf("expected error to mention 'portal controller unreachable', got %q", gotRun.Error)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundBindFailed bool
+	for _, e := range events {
+		if e.Kind == "portal_bind_failed" {
+			foundBindFailed = true
+			if !strings.Contains(e.Error, "portal controller unreachable") {
+				t.Errorf("expected portal_bind_failed error %q to contain 'portal controller unreachable'", e.Error)
+			}
+		}
+	}
+	if !foundBindFailed {
+		t.Errorf("expected portal_bind_failed event, got events: %+v", events)
+	}
+
+	// Verify sandbox was deleted
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox to be deleted, got err: %v", err)
+	}
+}
+
+func TestOrchestrator_PortalBinder_DisabledWithoutBinder(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-nobinder"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "test-goal",
+		BaseCommit: "abc1234",
+		Phase:      state.PhasePending,
+		Goal: &goals.Goal{
+			Name: "test-goal",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &mockProcessServer{
+		exitCode: 0,
+		stdout:   "success",
+	}
+	harness, agentsCS, coreCS := setupTestHarness(t, procSrv)
+
+	fixedTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		PortalBinder: nil, // disabled
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Step 1: Reconcile Pending -> Preparing
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("Reconcile step 1: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+
+	// Verify sandbox does NOT have the interception label
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	podLabels := sb.Spec.SandboxBlueprint.PodTemplate.ObjectMeta.Labels
+	if podLabels != nil && podLabels[session.PortalInterceptLabel] != "" {
+		t.Errorf("expected no interception label, got %q", podLabels[session.PortalInterceptLabel])
+	}
+
+	// Create backing pod in fake k8s
+	_, err = coreCS.CoreV1().Pods("ao-sandboxes").Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gotRun.SandboxName,
+			Namespace: "ao-sandboxes",
+			UID:       types.UID("pod-uid-nobinder"),
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating backing pod: %v", err)
+	}
+
+	// Mark sandbox Ready
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating sandbox to Ready: %v", err)
+	}
+
+	// Step 2: Reconcile Preparing -> Working
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("Reconcile step 2: %v", err)
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun after step 2: %v", err)
+	}
+	if gotRun.Phase != state.PhaseWorking {
+		t.Errorf("expected phase %s, got %s", state.PhaseWorking, gotRun.Phase)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	for _, e := range events {
+		if e.Kind == "portal_bound" || e.Kind == "portal_bind_failed" {
+			t.Errorf("unexpected portal event %q when binder is nil", e.Kind)
 		}
 	}
 }
