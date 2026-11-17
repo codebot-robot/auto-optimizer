@@ -336,7 +336,7 @@ func runServe(ctx context.Context, opts serveOptions) error {
 			}
 		}()
 		orchOpts.PortalBinder = portalClient
-		orchOpts.EgressHosts = opts.portal.EgressHosts
+		orchOpts.PolicyFactory = portal.HostListPolicyFactory(opts.portal.EgressHosts)
 	}
 	orchestrator, err := run.NewOrchestrator(orchOpts)
 	if err != nil {

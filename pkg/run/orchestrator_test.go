@@ -6880,6 +6880,14 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 			},
 			wantErrSubstr: "DefaultMaxDuration",
 		},
+		{
+			name: "portal binder without policy factory",
+			mutate: func(o *OrchestratorOptions) {
+				o.PortalBinder = &fakePortalBinder{}
+				o.PolicyFactory = nil
+			},
+			wantErrSubstr: "policy factory",
+		},
 	}
 
 	for _, tc := range tests {
@@ -6904,6 +6912,15 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 		})
 		if err == nil || !strings.Contains(err.Error(), "ReadyTimeout") {
 			t.Fatalf("expected ReadyTimeout error from NewOrchestrator, got: %v", err)
+		}
+	})
+
+	t.Run("valid with portal binder and policy factory", func(t *testing.T) {
+		opts := baseValid()
+		opts.PortalBinder = &fakePortalBinder{}
+		opts.PolicyFactory = portal.HostListPolicyFactory(nil)
+		if err := opts.Validate(); err != nil {
+			t.Fatalf("expected valid options to pass, got: %v", err)
 		}
 	})
 }
@@ -7325,12 +7342,17 @@ func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
 
 	fixedTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
 	egressHosts := []string{"github.com", "golang.org"}
+	var factoryCalls []portal.PolicyRequest
+	policyFactory := func(ctx context.Context, req portal.PolicyRequest) (*portalsv1.EgressPolicy, error) {
+		factoryCalls = append(factoryCalls, req)
+		return portal.HostListPolicyFactory(egressHosts)(ctx, req)
+	}
 	orch, err := NewOrchestrator(OrchestratorOptions{
-		Store:        store,
-		Harness:      harness,
-		Clock:        func() time.Time { return fixedTime },
-		PortalBinder: binder,
-		EgressHosts:  egressHosts,
+		Store:         store,
+		Harness:       harness,
+		Clock:         func() time.Time { return fixedTime },
+		PortalBinder:  binder,
+		PolicyFactory: policyFactory,
 	})
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -7405,6 +7427,22 @@ func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
 	}
 	if gotRun.PortalBoundAt == nil {
 		t.Errorf("expected PortalBoundAt to be set on run")
+	}
+
+	if len(factoryCalls) != 1 {
+		t.Fatalf("expected 1 factory call, got %d", len(factoryCalls))
+	}
+	if factoryCalls[0].RepoURL != repo.URL {
+		t.Errorf("factory req RepoURL = %q, want %q", factoryCalls[0].RepoURL, repo.URL)
+	}
+	if factoryCalls[0].GoalName != run.GoalName {
+		t.Errorf("factory req GoalName = %q, want %q", factoryCalls[0].GoalName, run.GoalName)
+	}
+	if factoryCalls[0].RunID != run.ID {
+		t.Errorf("factory req RunID = %q, want %q", factoryCalls[0].RunID, run.ID)
+	}
+	if factoryCalls[0].SandboxName != gotRun.SandboxName {
+		t.Errorf("factory req SandboxName = %q, want %q", factoryCalls[0].SandboxName, gotRun.SandboxName)
 	}
 
 	binder.mu.Lock()
@@ -7517,10 +7555,11 @@ func TestOrchestrator_PortalBinder_FailsAfterDeadline(t *testing.T) {
 	}
 
 	orch, err := NewOrchestrator(OrchestratorOptions{
-		Store:        store,
-		Harness:      harness,
-		Clock:        getClock,
-		PortalBinder: binder,
+		Store:         store,
+		Harness:       harness,
+		Clock:         getClock,
+		PortalBinder:  binder,
+		PolicyFactory: portal.HostListPolicyFactory(nil),
 	})
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -7614,6 +7653,171 @@ func TestOrchestrator_PortalBinder_FailsAfterDeadline(t *testing.T) {
 			foundBindFailed = true
 			if !strings.Contains(e.Error, "portal controller unreachable") {
 				t.Errorf("expected portal_bind_failed error %q to contain 'portal controller unreachable'", e.Error)
+			}
+		}
+	}
+	if !foundBindFailed {
+		t.Errorf("expected portal_bind_failed event, got events: %+v", events)
+	}
+
+	// Verify sandbox was deleted
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox to be deleted, got err: %v", err)
+	}
+}
+
+func TestOrchestrator_PortalBinder_FactoryErrorFailsAfterDeadline(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-factoryfail"
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "test-goal",
+		BaseCommit: "abc1234",
+		Phase:      state.PhasePending,
+		Goal: &goals.Goal{
+			Name: "test-goal",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &mockProcessServer{}
+	harness, agentsCS, coreCS := setupTestHarness(t, procSrv)
+
+	binder := &fakePortalBinder{}
+	factoryErr := errors.New("egress policy generation failed")
+	policyFactory := func(ctx context.Context, req portal.PolicyRequest) (*portalsv1.EgressPolicy, error) {
+		return nil, factoryErr
+	}
+
+	clockMu := sync.Mutex{}
+	currentTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	getClock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return currentTime
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:         store,
+		Harness:       harness,
+		Clock:         getClock,
+		PortalBinder:  binder,
+		PolicyFactory: policyFactory,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Step 1: Pending -> Preparing (sets ReadyDeadline)
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("Reconcile step 1: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.ReadyDeadline == nil {
+		t.Fatal("expected ReadyDeadline set")
+	}
+
+	// Create backing pod in fake k8s
+	_, err = coreCS.CoreV1().Pods("ao-sandboxes").Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gotRun.SandboxName,
+			Namespace: "ao-sandboxes",
+			UID:       types.UID("pod-uid-factoryfail"),
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating backing pod: %v", err)
+	}
+
+	// Mark sandbox Ready
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting sandbox: %v", err)
+	}
+	sb.Status.Conditions = []metav1.Condition{
+		{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		},
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating sandbox to Ready: %v", err)
+	}
+
+	// Reconcile pass 1: before deadline, factory fails -> should requeue for retry
+	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
+	if err != nil {
+		t.Fatalf("expected Reconcile to handle retry cleanly, got err: %v", err)
+	}
+	if res.RequeueAfter != portalBindRetryInterval {
+		t.Errorf("expected RequeueAfter == %v for retry, got %v", portalBindRetryInterval, res.RequeueAfter)
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhasePreparing {
+		t.Errorf("expected phase %s on retry, got %s", state.PhasePreparing, gotRun.Phase)
+	}
+	binder.mu.Lock()
+	bindCalls := len(binder.calls)
+	binder.mu.Unlock()
+	if bindCalls != 0 {
+		t.Errorf("expected 0 bind calls when factory fails, got %d", bindCalls)
+	}
+
+	// Advance clock past ReadyDeadline
+	clockMu.Lock()
+	currentTime = gotRun.ReadyDeadline.Add(time.Minute)
+	clockMu.Unlock()
+
+	// Reconcile pass 2: after deadline, factory fails -> should fail the run with portal_bind_failed
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err == nil {
+		t.Logf("Reconcile returned nil error (as terminal failures are logged)")
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Errorf("expected phase %s after deadline, got %s", state.PhaseFailed, gotRun.Phase)
+	}
+	if !strings.Contains(gotRun.Error, "egress policy generation failed") {
+		t.Errorf("expected error to mention 'egress policy generation failed', got %q", gotRun.Error)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundBindFailed bool
+	for _, e := range events {
+		if e.Kind == "portal_bind_failed" {
+			foundBindFailed = true
+			if !strings.Contains(e.Error, "egress policy generation failed") {
+				t.Errorf("expected portal_bind_failed error %q to contain 'egress policy generation failed'", e.Error)
 			}
 		}
 	}
