@@ -70,6 +70,9 @@ var (
 
 	// ErrSessionFinished is returned when a tool signals that the session should end.
 	ErrSessionFinished = errors.New("session finished")
+
+	// ErrPodNotFound is returned when a sandbox pod does not exist yet.
+	ErrPodNotFound = errors.New("sandbox pod not found")
 )
 
 // SandboxInactivityTimeout is how long we keep sandboxes around after we last used them.
@@ -83,6 +86,13 @@ const DefaultToolTimeout = 2 * time.Minute
 // DefaultSandboxdImage is the default container image containing the sandboxd binary.
 // It matches the image built and loaded into kind by dev/tasks/deploy-to-kube.
 const DefaultSandboxdImage = "auto-optimizer.local/sandboxd:dev"
+
+// PortalInterceptLabel is the pod template label key that opts a sandbox pod into
+// service-portals transparent network interception.
+const PortalInterceptLabel = "service-portal.gke.io/intercept"
+
+// ServicePortalInterceptLabel is an alias for PortalInterceptLabel.
+const ServicePortalInterceptLabel = PortalInterceptLabel
 
 // ProcessClientFactory is a function that creates a processv1.ProcessServiceClient for a sandbox.
 // Used in tests to connect to mock/fake sandboxd servers without network port-forwarding.
@@ -277,6 +287,39 @@ func (s *Sandbox) PodNamespacedName() types.NamespacedName {
 		Namespace: s.id.Namespace,
 		Name:      s.podName,
 	}
+}
+
+// PodUID reads the Sandbox's pod through the core client the Sandbox already holds
+// and returns its UID, or an error if the pod does not exist yet.
+func (s *Sandbox) PodUID(ctx context.Context) (types.UID, error) {
+	if s == nil {
+		return "", errors.New("sandbox is nil")
+	}
+
+	coreClient := s.coreClient()
+	if coreClient == nil {
+		return "", errors.New("kubernetes core client not available")
+	}
+
+	podName := s.PodNamespacedName().Name
+	if podName == "" {
+		podName = s.id.Name
+	}
+	if podName == "" {
+		return "", fmt.Errorf("%w: sandbox pod name is empty", ErrPodNotFound)
+	}
+
+	pod, err := coreClient.Pods(s.id.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return "", fmt.Errorf("%w: pod %s/%s does not exist yet: %w", ErrPodNotFound, s.id.Namespace, podName, err)
+		}
+		return "", fmt.Errorf("getting pod %s/%s: %w", s.id.Namespace, podName, err)
+	}
+	if pod.UID == "" {
+		return "", fmt.Errorf("pod %s/%s has no UID", s.id.Namespace, podName)
+	}
+	return pod.UID, nil
 }
 
 // Close closes any active gRPC connection and stops any port-forward associated with the sandbox.
@@ -1184,6 +1227,7 @@ type CreateSandboxOptions struct {
 	OwnerReferences    []metav1.OwnerReference
 	ShutdownTime       time.Time
 	WorkspaceClaimName string
+	PortalIntercept    bool
 }
 
 // CreateSandboxWithOptions creates a Sandbox resource with the specified options using topology B.
@@ -1292,6 +1336,13 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 		}
 	}
 
+	var podMeta sandboxv1beta1.PodMetadata
+	if opts.PortalIntercept {
+		podMeta.Labels = map[string]string{
+			PortalInterceptLabel: "true",
+		}
+	}
+
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	sb := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1305,6 +1356,7 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
 				Service: new(true),
 				PodTemplate: sandboxv1beta1.PodTemplate{
+					ObjectMeta: podMeta,
 					Spec: corev1.PodSpec{
 						AutomountServiceAccountToken: new(false),
 						SecurityContext: &corev1.PodSecurityContext{
