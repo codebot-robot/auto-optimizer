@@ -1426,3 +1426,168 @@ func TestCreateSandboxWithOptions_WorkspaceClaim(t *testing.T) {
 		})
 	}
 }
+
+func TestCreateSandboxWithOptions_PortalIntercept(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+	cpNamespace := "ao-system"
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	client := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	harness := NewHarness(nil, client, nil, RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: cpNamespace,
+		SigningKey:            privKey,
+	})
+
+	tests := []struct {
+		name            string
+		sandboxName     string
+		portalIntercept bool
+		wantLabel       bool
+	}{
+		{
+			name:            "portal intercept enabled labels pod template",
+			sandboxName:     "test-sb-intercept-enabled",
+			portalIntercept: true,
+			wantLabel:       true,
+		},
+		{
+			name:            "portal intercept disabled leaves pod template unchanged",
+			sandboxName:     "test-sb-intercept-disabled",
+			portalIntercept: false,
+			wantLabel:       false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sb, err := harness.CreateSandboxWithOptions(ctx, CreateSandboxOptions{
+				Name:            tc.sandboxName,
+				PortalIntercept: tc.portalIntercept,
+			})
+			if err != nil {
+				t.Fatalf("CreateSandboxWithOptions failed: %v", err)
+			}
+			defer func() { _ = client.DeleteSandbox(ctx, sb) }()
+
+			created, err := client.GetSandboxResource(ctx, ns, tc.sandboxName)
+			if err != nil {
+				t.Fatalf("GetSandboxResource failed: %v", err)
+			}
+
+			podLabels := created.Spec.SandboxBlueprint.PodTemplate.ObjectMeta.Labels
+			if tc.wantLabel {
+				if podLabels == nil || podLabels[PortalInterceptLabel] != "true" {
+					t.Errorf("expected pod template label %s=%q, got %+v", PortalInterceptLabel, "true", podLabels)
+				}
+			} else {
+				if podLabels != nil && podLabels[PortalInterceptLabel] != "" {
+					t.Errorf("expected pod template label %s to not be set, got %q", PortalInterceptLabel, podLabels[PortalInterceptLabel])
+				}
+			}
+
+			// Verify no extra containers, volumes, capabilities, or environment variables are added
+			podSpec := created.Spec.SandboxBlueprint.PodTemplate.Spec
+			if len(podSpec.InitContainers) != 1 || podSpec.InitContainers[0].Name != "install-sandboxd" {
+				t.Errorf("unexpected init containers: %+v", podSpec.InitContainers)
+			}
+			if len(podSpec.Containers) != 1 || podSpec.Containers[0].Name != "sandbox" {
+				t.Errorf("unexpected containers: %+v", podSpec.Containers)
+			}
+			if len(podSpec.Containers[0].Env) != 1 || podSpec.Containers[0].Env[0].Name != "HOME" {
+				t.Errorf("unexpected env: %+v", podSpec.Containers[0].Env)
+			}
+		})
+	}
+}
+
+func TestSandbox_PodUID(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+	sbName := "test-sb-poduid"
+	cpNamespace := "ao-system"
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	client := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	harness := NewHarness(nil, client, nil, RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: cpNamespace,
+		SigningKey:            privKey,
+	})
+
+	sb, err := harness.CreateSandboxWithOptions(ctx, CreateSandboxOptions{
+		Name: sbName,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandboxWithOptions failed: %v", err)
+	}
+	defer func() { _ = client.DeleteSandbox(ctx, sb) }()
+
+	// 1. Pod does not exist yet: PodUID fails clearly
+	uid, err := sb.PodUID(ctx)
+	if err == nil {
+		t.Fatalf("expected error when pod does not exist, got uid %q", uid)
+	}
+	if !errors.Is(err, ErrPodNotFound) {
+		t.Errorf("expected ErrPodNotFound, got: %v", err)
+	}
+
+	// 2. Pod exists: PodUID returns the pod's UID
+	expectedUID := types.UID("uid-sandbox-pod-1234")
+	_, err = coreCS.CoreV1().Pods(ns).Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sbName,
+			Namespace: ns,
+			UID:       expectedUID,
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create fake pod: %v", err)
+	}
+
+	gotUID, err := sb.PodUID(ctx)
+	if err != nil {
+		t.Fatalf("PodUID failed: %v", err)
+	}
+	if gotUID != expectedUID {
+		t.Errorf("PodUID = %q, want %q", gotUID, expectedUID)
+	}
+
+	// 3. With explicit pod name via SetPodInfo
+	otherPodName := "custom-pod-name"
+	otherUID := types.UID("uid-custom-5678")
+	_, err = coreCS.CoreV1().Pods(ns).Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      otherPodName,
+			Namespace: ns,
+			UID:       otherUID,
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create fake pod: %v", err)
+	}
+
+	sb.SetPodInfo(otherPodName, "10.0.0.42")
+	gotOtherUID, err := sb.PodUID(ctx)
+	if err != nil {
+		t.Fatalf("PodUID with custom pod name failed: %v", err)
+	}
+	if gotOtherUID != otherUID {
+		t.Errorf("PodUID with custom pod name = %q, want %q", gotOtherUID, otherUID)
+	}
+}
