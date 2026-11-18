@@ -98,9 +98,20 @@ func TestSandboxOptions_Validate(t *testing.T) {
 		t.Error("expected error for empty HomeDir, got nil")
 	}
 
-	valid := SandboxOptions{HomeDir: "/home/clawtainer"}
+	valid := SandboxOptions{HomeDir: "/home/auto-optimizer"}
 	if err := valid.Validate(); err != nil {
 		t.Errorf("unexpected error for valid SandboxOptions: %v", err)
+	}
+}
+
+func TestRunOptions_Defaults(t *testing.T) {
+	t.Setenv("SANDBOX_HOME_DIR", "")
+
+	var opts RunOptions
+	opts.InitDefaults()
+
+	if opts.HomeDir != DefaultHomeDir {
+		t.Errorf("HomeDir = %q, want %q", opts.HomeDir, DefaultHomeDir)
 	}
 }
 

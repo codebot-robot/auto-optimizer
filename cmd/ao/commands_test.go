@@ -759,3 +759,16 @@ func TestServeSandboxEnvironmentOverrides(t *testing.T) {
 		t.Errorf("sandbox.HomeDir = %q, want '/env/home'", opts.sandbox.HomeDir)
 	}
 }
+
+func TestSessionRunCommand_DefaultHomeDir(t *testing.T) {
+	t.Setenv("SANDBOX_HOME_DIR", "")
+
+	cmd := newSessionRunCommand()
+	f := cmd.Flag("homedir")
+	if f == nil {
+		t.Fatal("expected --homedir flag on session run command")
+	}
+	if f.DefValue != session.DefaultHomeDir {
+		t.Errorf("homedir default = %q, want %q", f.DefValue, session.DefaultHomeDir)
+	}
+}

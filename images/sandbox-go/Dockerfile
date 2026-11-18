@@ -35,15 +35,15 @@ RUN apt-get update \
 COPY --from=build /geminicli-toolbox /usr/local/bin/geminicli-toolbox
 COPY --from=go-dist /usr/local/go /usr/local/go
 
-RUN useradd -u 1000 -m -d /home/clawtainer -s /bin/bash clawtainer
+RUN useradd -u 1000 -m -d /home/auto-optimizer -s /bin/bash auto-optimizer
 
-ENV HOME=/home/clawtainer \
-    GOPATH=/home/clawtainer/go \
-    GOCACHE=/home/clawtainer/.cache/go-build \
-    GOMODCACHE=/home/clawtainer/go/pkg/mod \
-    PATH=/usr/local/go/bin:/home/clawtainer/go/bin:${PATH}
+ENV HOME=/home/auto-optimizer \
+    GOPATH=/home/auto-optimizer/go \
+    GOCACHE=/home/auto-optimizer/.cache/go-build \
+    GOMODCACHE=/home/auto-optimizer/go/pkg/mod \
+    PATH=/usr/local/go/bin:/home/auto-optimizer/go/bin:${PATH}
 
 USER 1000
-WORKDIR /home/clawtainer
+WORKDIR /home/auto-optimizer
 
 CMD ["sleep", "infinity"]

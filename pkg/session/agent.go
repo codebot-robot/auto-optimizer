@@ -1665,7 +1665,7 @@ func (o *RunOptions) InitDefaults() {
 
 	o.HomeDir = os.Getenv("SANDBOX_HOME_DIR")
 	if o.HomeDir == "" {
-		o.HomeDir = "/home/clawtainer"
+		o.HomeDir = DefaultHomeDir
 	}
 
 	modelName := os.Getenv("OPENAI_MODEL")
