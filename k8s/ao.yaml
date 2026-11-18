@@ -104,6 +104,8 @@ data:
   AO_REPOS: ""
   # The base URL used in pull request bodies.
   AO_PUBLIC_URL: ""
+  # Comma-separated list of GitHub logins allowed to sign in.
+  AO_GITHUB_ALLOWED_USERS: ""
   PORTAL_CONTROLLER_ADDR: ""
   PORTAL_CONTROLLER_CA_FILE: "/etc/portal/tls.crt"
   PORTAL_TOKEN_FILE: "/var/run/secrets/portal/token"
@@ -181,6 +183,9 @@ spec:
                 optional: true
             - secretRef:
                 name: ao-forge
+                optional: true
+            - secretRef:
+                name: ao-web-auth
                 optional: true
           volumeMounts:
             - name: state
