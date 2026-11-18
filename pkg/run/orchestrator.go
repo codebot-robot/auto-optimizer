@@ -27,7 +27,9 @@ import (
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -82,6 +84,9 @@ const (
 
 	// DefaultMaxDuration is the default maximum duration for a run when the goal does not specify budget.maxDuration.
 	DefaultMaxDuration = 1 * time.Hour
+
+	// DefaultWorkspaceSize is the default storage request size for run workspace claims.
+	DefaultWorkspaceSize = "10Gi"
 
 	// SandboxShutdownGrace is the grace period added to a run's deadline when computing its Sandbox shutdown time.
 	SandboxShutdownGrace = 15 * time.Minute
@@ -142,6 +147,14 @@ type OrchestratorOptions struct {
 	// PolicyFactory generates the egress policy for a sandbox.
 	// Required when PortalBinder is configured.
 	PolicyFactory portal.PolicyFactory
+
+	// WorkspaceStorageClass is the StorageClass used for run workspace claims.
+	// When empty, sandboxes use an emptyDir volume for the workspace.
+	WorkspaceStorageClass string
+
+	// WorkspaceSize is the storage request size for run workspace claims.
+	// When unset, defaults to DefaultWorkspaceSize ("10Gi").
+	WorkspaceSize string
 }
 
 // InitDefaults fills every zero-valued field that has a default with its Default* constant.
@@ -170,6 +183,9 @@ func (o *OrchestratorOptions) InitDefaults() {
 	if o.DefaultMaxDuration == 0 {
 		o.DefaultMaxDuration = DefaultMaxDuration
 	}
+	if o.WorkspaceSize == "" {
+		o.WorkspaceSize = DefaultWorkspaceSize
+	}
 }
 
 // AddFlags binds orchestrator configuration flags to fs.
@@ -181,6 +197,8 @@ func (o *OrchestratorOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.DurationVar(&o.ReadyTimeout, "ready-timeout", o.ReadyTimeout, "Maximum duration to wait for a sandbox to become ready")
 	fs.DurationVar(&o.VerifyTimeout, "verify-timeout", o.VerifyTimeout, "Maximum duration for running a goal's verify command")
 	fs.DurationVar(&o.DefaultMaxDuration, "max-run-duration", o.DefaultMaxDuration, "Default maximum duration for a run when the goal does not specify budget.maxDuration")
+	fs.StringVar(&o.WorkspaceStorageClass, "workspace-storage-class", o.WorkspaceStorageClass, "StorageClass for run workspace claims (empty to use emptyDir)")
+	fs.StringVar(&o.WorkspaceSize, "workspace-size", o.WorkspaceSize, "Storage request size for run workspace claims")
 }
 
 // Validate reports any missing required dependencies or invalid option values.
@@ -215,6 +233,11 @@ func (o *OrchestratorOptions) Validate() error {
 	if o.PortalBinder != nil && o.PolicyFactory == nil {
 		return errors.New("policy factory is required when portal binder is set")
 	}
+	if o.WorkspaceSize != "" {
+		if _, err := resource.ParseQuantity(o.WorkspaceSize); err != nil {
+			return fmt.Errorf("invalid WorkspaceSize: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -245,6 +268,9 @@ type Orchestrator struct {
 	forgeFor           func(repoURL string) (forge.Forge, error)
 	portalBinder       portal.Binder
 	policyFactory      portal.PolicyFactory
+
+	workspaceStorageClass string
+	workspaceSize         string
 
 	runIndexMu sync.RWMutex
 	runIndex   map[string]runIndexEntry
@@ -314,26 +340,28 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 	}
 
 	orch := &Orchestrator{
-		store:              opts.Store,
-		sessionStore:       opts.SessionStore,
-		harness:            opts.Harness,
-		clock:              opts.Clock,
-		maxTurns:           opts.MaxTurns,
-		maxConcurrentRuns:  opts.MaxConcurrentRuns,
-		gitAuthor:          opts.GitAuthor,
-		publicURL:          strings.TrimRight(opts.PublicURL, "/"),
-		readyTimeout:       opts.ReadyTimeout,
-		kubeClient:         opts.KubeClient,
-		verifyTimeout:      opts.VerifyTimeout,
-		defaultMaxDuration: opts.DefaultMaxDuration,
-		forgeFor:           opts.ForgeFor,
-		portalBinder:       opts.PortalBinder,
-		policyFactory:      opts.PolicyFactory,
-		runIndex:           make(map[string]runIndexEntry),
-		notifyCh:           make(chan event.TypedGenericEvent[reconcile.Request], 1024),
-		activeRuns:         make(map[string]bool),
-		workerCancels:      make(map[string]context.CancelFunc),
-		turnOutcomes:       make(map[string]turnOutcome),
+		store:                 opts.Store,
+		sessionStore:          opts.SessionStore,
+		harness:               opts.Harness,
+		clock:                 opts.Clock,
+		maxTurns:              opts.MaxTurns,
+		maxConcurrentRuns:     opts.MaxConcurrentRuns,
+		gitAuthor:             opts.GitAuthor,
+		publicURL:             strings.TrimRight(opts.PublicURL, "/"),
+		readyTimeout:          opts.ReadyTimeout,
+		kubeClient:            opts.KubeClient,
+		verifyTimeout:         opts.VerifyTimeout,
+		defaultMaxDuration:    opts.DefaultMaxDuration,
+		forgeFor:              opts.ForgeFor,
+		portalBinder:          opts.PortalBinder,
+		policyFactory:         opts.PolicyFactory,
+		workspaceStorageClass: opts.WorkspaceStorageClass,
+		workspaceSize:         opts.WorkspaceSize,
+		runIndex:              make(map[string]runIndexEntry),
+		notifyCh:              make(chan event.TypedGenericEvent[reconcile.Request], 1024),
+		activeRuns:            make(map[string]bool),
+		workerCancels:         make(map[string]context.CancelFunc),
+		turnOutcomes:          make(map[string]turnOutcome),
 	}
 	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, opts.Clock, opts.HeroRunStatusInterval, opts.Harness.Namespace(), orch.publishHeroRun)
 	return orch, nil
@@ -659,6 +687,32 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		log.Info("creating unowned sandbox: no HeroRun available", "run", run.ID, "sandbox", sandboxName)
 	}
 
+	var workspaceClaimName string
+	if o.workspaceStorageClass != "" {
+		if heroRun == nil {
+			msg := "cannot create workspace claim: HeroRun owner is required"
+			run.ReadyDeadline = nil
+			o.finishRun(ctx, repo, run, runEnd{
+				Phase:   state.PhaseFailed,
+				Kind:    "failed",
+				Message: msg,
+			})
+			return errors.New(msg)
+		}
+		claimName := sandboxNameForRun(run.ID)
+		if err := o.ensureWorkspaceClaim(ctx, claimName, ownerRefs); err != nil {
+			run.ReadyDeadline = nil
+			msg := fmt.Sprintf("creating workspace claim: %v", err)
+			o.finishRun(ctx, repo, run, runEnd{
+				Phase:   state.PhaseFailed,
+				Kind:    "failed",
+				Message: msg,
+			})
+			return errors.New(msg)
+		}
+		workspaceClaimName = claimName
+	}
+
 	// 4. Create sandbox with a label naming the run, annotation naming the repository, owner reference, and shutdown time
 	labels := map[string]string{
 		LabelRun: run.ID,
@@ -668,12 +722,13 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 	}
 	sbShutdown := runDeadline.Add(SandboxShutdownGrace)
 	sbOpts := session.CreateSandboxOptions{
-		Name:            sandboxName,
-		Labels:          labels,
-		Annotations:     annotations,
-		OwnerReferences: ownerRefs,
-		ShutdownTime:    sbShutdown,
-		PortalIntercept: o.portalBinder != nil,
+		Name:               sandboxName,
+		Labels:             labels,
+		Annotations:        annotations,
+		OwnerReferences:    ownerRefs,
+		ShutdownTime:       sbShutdown,
+		WorkspaceClaimName: workspaceClaimName,
+		PortalIntercept:    o.portalBinder != nil,
 	}
 	if _, err := o.harness.CreateSandboxWithOptions(ctx, sbOpts); err != nil {
 		prev := run.Phase
@@ -720,6 +775,46 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 // sandboxNameForRun returns the canonical name for a run's Sandbox and HeroRun objects.
 func sandboxNameForRun(runID string) string {
 	return fmt.Sprintf("run-%s", strings.ToLower(runID))
+}
+
+// ensureWorkspaceClaim creates a PersistentVolumeClaim for the run's workspace if it does not already exist.
+func (o *Orchestrator) ensureWorkspaceClaim(ctx context.Context, name string, ownerRefs []metav1.OwnerReference) error {
+	if o.kubeClient == nil {
+		return errors.New("cannot create workspace claim: no Kubernetes client configured")
+	}
+	namespace := ""
+	if o.harness != nil {
+		namespace = o.harness.Namespace()
+	}
+
+	storageQty, err := resource.ParseQuantity(o.workspaceSize)
+	if err != nil {
+		return fmt.Errorf("parsing workspace size %q: %w", o.workspaceSize, err)
+	}
+
+	claim := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			OwnerReferences: ownerRefs,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOncePod,
+			},
+			StorageClassName: &o.workspaceStorageClass,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: storageQty,
+				},
+			},
+		},
+	}
+
+	if err := o.kubeClient.Create(ctx, claim); err != nil && !k8serrors.IsAlreadyExists(err) {
+		return fmt.Errorf("creating workspace claim %s: %w", name, err)
+	}
+	return nil
 }
 
 // publishHeroRun publishes a thin HeroRun custom resource for run in the sandbox namespace.

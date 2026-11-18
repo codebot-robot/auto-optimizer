@@ -52,6 +52,13 @@ rules:
       - get
       - list
   - apiGroups:
+      - ""
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - create
+      - delete
+  - apiGroups:
       - auto-optimizer.labs.gke.io
     resources:
       - heroruns

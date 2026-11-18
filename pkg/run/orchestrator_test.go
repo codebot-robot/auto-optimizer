@@ -46,6 +46,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
@@ -6918,6 +6919,12 @@ func TestOrchestratorOptions_Defaults(t *testing.T) {
 	if opts.DefaultMaxDuration != DefaultMaxDuration {
 		t.Errorf("DefaultMaxDuration = %v, want %v", opts.DefaultMaxDuration, DefaultMaxDuration)
 	}
+	if opts.WorkspaceSize != DefaultWorkspaceSize {
+		t.Errorf("WorkspaceSize = %q, want %q", opts.WorkspaceSize, DefaultWorkspaceSize)
+	}
+	if opts.WorkspaceStorageClass != "" {
+		t.Errorf("WorkspaceStorageClass = %q, want empty", opts.WorkspaceStorageClass)
+	}
 
 	// Verify custom non-zero fields are not overwritten
 	customTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -6929,6 +6936,8 @@ func TestOrchestratorOptions_Defaults(t *testing.T) {
 		HeroRunStatusInterval: 5 * time.Second,
 		VerifyTimeout:         2 * time.Minute,
 		DefaultMaxDuration:    20 * time.Minute,
+		WorkspaceStorageClass: "custom-sc",
+		WorkspaceSize:         "25Gi",
 	}
 	customOpts.InitDefaults()
 	if !customOpts.Clock().Equal(customTime) {
@@ -6952,6 +6961,12 @@ func TestOrchestratorOptions_Defaults(t *testing.T) {
 	if customOpts.DefaultMaxDuration != 20*time.Minute {
 		t.Errorf("custom DefaultMaxDuration was overwritten: %v", customOpts.DefaultMaxDuration)
 	}
+	if customOpts.WorkspaceStorageClass != "custom-sc" {
+		t.Errorf("custom WorkspaceStorageClass was overwritten: %q", customOpts.WorkspaceStorageClass)
+	}
+	if customOpts.WorkspaceSize != "25Gi" {
+		t.Errorf("custom WorkspaceSize was overwritten: %q", customOpts.WorkspaceSize)
+	}
 }
 
 func TestOrchestratorOptions_AddFlags(t *testing.T) {
@@ -6966,6 +6981,8 @@ func TestOrchestratorOptions_AddFlags(t *testing.T) {
 		"--ready-timeout", "2m",
 		"--verify-timeout", "5m",
 		"--max-run-duration", "30m",
+		"--workspace-storage-class", "fast-ssd",
+		"--workspace-size", "50Gi",
 	}); err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -6987,6 +7004,12 @@ func TestOrchestratorOptions_AddFlags(t *testing.T) {
 	}
 	if opts.DefaultMaxDuration != 30*time.Minute {
 		t.Errorf("DefaultMaxDuration = %v, want 30m", opts.DefaultMaxDuration)
+	}
+	if opts.WorkspaceStorageClass != "fast-ssd" {
+		t.Errorf("WorkspaceStorageClass = %q, want 'fast-ssd'", opts.WorkspaceStorageClass)
+	}
+	if opts.WorkspaceSize != "50Gi" {
+		t.Errorf("WorkspaceSize = %q, want '50Gi'", opts.WorkspaceSize)
 	}
 }
 
@@ -7090,6 +7113,13 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 				o.PolicyFactory = nil
 			},
 			wantErrSubstr: "policy factory",
+		},
+		{
+			name: "invalid WorkspaceSize",
+			mutate: func(o *OrchestratorOptions) {
+				o.WorkspaceSize = "not-a-valid-size"
+			},
+			wantErrSubstr: "WorkspaceSize",
 		},
 	}
 
@@ -8146,4 +8176,206 @@ func TestOrchestrator_PortalBinder_DisabledWithoutBinder(t *testing.T) {
 			t.Errorf("unexpected portal event %q when binder is nil", e.Kind)
 		}
 	}
+}
+
+func TestOrchestrator_WorkspaceClaim(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	getWorkspaceVol := func(t *testing.T, sbName string) *corev1.Volume {
+		t.Helper()
+		sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sbName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
+		}
+		for i := range sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes {
+			if sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes[i].Name == "workspace" {
+				return &sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes[i]
+			}
+		}
+		t.Fatal("expected workspace volume on sandbox")
+		return nil
+	}
+
+	t.Run("with StorageClass set claim exists and sandbox mounts it", func(t *testing.T) {
+		runID := "20261030T120000Z-scset"
+		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
+			t.Fatalf("PutRun: %v", err)
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		orch, err := NewOrchestrator(OrchestratorOptions{
+			Store: store, Harness: harness, KubeClient: fakeClient,
+			WorkspaceStorageClass: "standard", WorkspaceSize: "20Gi",
+		})
+		if err != nil {
+			t.Fatalf("NewOrchestrator: %v", err)
+		}
+		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+			t.Fatalf("orch.Reconcile: %v", err)
+		}
+
+		name := sandboxNameForRun(runID)
+		var claim corev1.PersistentVolumeClaim
+		if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: name}, &claim); err != nil {
+			t.Fatalf("fakeClient.Get claim %s: %v", name, err)
+		}
+		if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != "standard" {
+			t.Errorf("expected StorageClassName 'standard', got %v", claim.Spec.StorageClassName)
+		}
+		if len(claim.Spec.AccessModes) != 1 || claim.Spec.AccessModes[0] != corev1.ReadWriteOncePod {
+			t.Errorf("expected AccessModes [ReadWriteOncePod], got %v", claim.Spec.AccessModes)
+		}
+		storageQty := claim.Spec.Resources.Requests[corev1.ResourceStorage]
+		if !storageQty.Equal(resource.MustParse("20Gi")) {
+			t.Errorf("expected storage size '20Gi', got %s", storageQty.String())
+		}
+
+		var hr herorunv1alpha1.HeroRun
+		if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: name}, &hr); err != nil {
+			t.Fatalf("fakeClient.Get herorun %s: %v", name, err)
+		}
+		if len(claim.OwnerReferences) != 1 {
+			t.Fatalf("expected 1 owner reference on claim, got %d", len(claim.OwnerReferences))
+		}
+		owner := claim.OwnerReferences[0]
+		if owner.Kind != "HeroRun" || owner.Name != hr.Name || owner.UID != hr.UID || owner.Controller == nil || !*owner.Controller {
+			t.Errorf("unexpected claim owner reference: %+v", owner)
+		}
+
+		vol := getWorkspaceVol(t, name)
+		if vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != name || vol.EmptyDir != nil {
+			t.Errorf("expected workspace volume to mount claim %s, got %+v", name, vol)
+		}
+	})
+
+	t.Run("second pass reuses existing claim", func(t *testing.T) {
+		runID := "20261030T120000Z-reuse"
+		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
+			t.Fatalf("PutRun: %v", err)
+		}
+		name := sandboxNameForRun(runID)
+		const existingUID = types.UID("existing-claim-uid-123")
+		scName := "standard"
+		existingClaim := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ao-sandboxes", UID: existingUID},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				StorageClassName: &scName,
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingClaim).Build()
+		orch, err := NewOrchestrator(OrchestratorOptions{
+			Store: store, Harness: harness, KubeClient: fakeClient,
+			WorkspaceStorageClass: "standard",
+		})
+		if err != nil {
+			t.Fatalf("NewOrchestrator: %v", err)
+		}
+		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+			t.Fatalf("orch.Reconcile: %v", err)
+		}
+
+		var claim corev1.PersistentVolumeClaim
+		if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: name}, &claim); err != nil {
+			t.Fatalf("fakeClient.Get: %v", err)
+		}
+		if claim.UID != existingUID {
+			t.Errorf("expected existing claim UID %q, got %q", existingUID, claim.UID)
+		}
+
+		vol := getWorkspaceVol(t, name)
+		if vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != name {
+			t.Errorf("expected workspace volume to mount claim %s, got %+v", name, vol)
+		}
+	})
+
+	t.Run("with no StorageClass no claim is created and sandbox uses emptyDir", func(t *testing.T) {
+		runID := "20261030T120000Z-noclaim"
+		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
+			t.Fatalf("PutRun: %v", err)
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		orch, err := NewOrchestrator(OrchestratorOptions{
+			Store: store, Harness: harness, KubeClient: fakeClient,
+		})
+		if err != nil {
+			t.Fatalf("NewOrchestrator: %v", err)
+		}
+		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+			t.Fatalf("orch.Reconcile: %v", err)
+		}
+
+		var claimList corev1.PersistentVolumeClaimList
+		if err := fakeClient.List(ctx, &claimList, client.InNamespace("ao-sandboxes")); err != nil {
+			t.Fatalf("fakeClient.List: %v", err)
+		}
+		if len(claimList.Items) != 0 {
+			t.Errorf("expected 0 claims, got %d", len(claimList.Items))
+		}
+
+		name := sandboxNameForRun(runID)
+		vol := getWorkspaceVol(t, name)
+		if vol.EmptyDir == nil || vol.PersistentVolumeClaim != nil {
+			t.Errorf("expected emptyDir volume for workspace, got %+v", vol)
+		}
+	})
+
+	t.Run("with StorageClass set fails when HeroRun owner is unavailable", func(t *testing.T) {
+		runID := "20261030T120000Z-noowner"
+		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
+			t.Fatalf("PutRun: %v", err)
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*herorunv1alpha1.HeroRun); ok {
+					return errors.New("simulated HeroRun creation failure")
+				}
+				return client.Create(ctx, obj, opts...)
+			},
+		}).Build()
+		orch, err := NewOrchestrator(OrchestratorOptions{
+			Store:                 store,
+			Harness:               harness,
+			KubeClient:            fakeClient,
+			WorkspaceStorageClass: "standard",
+		})
+		if err != nil {
+			t.Fatalf("NewOrchestrator: %v", err)
+		}
+		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+			t.Fatalf("orch.Reconcile: %v", err)
+		}
+
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseFailed {
+			t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
+		}
+		if !strings.Contains(gotRun.Error, "HeroRun owner") {
+			t.Errorf("expected run.Error containing 'HeroRun owner', got %q", gotRun.Error)
+		}
+
+		name := sandboxNameForRun(runID)
+		var claim corev1.PersistentVolumeClaim
+		if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: name}, &claim); !k8serrors.IsNotFound(err) {
+			t.Errorf("expected claim not found, got %v", err)
+		}
+	})
 }
