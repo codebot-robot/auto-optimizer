@@ -987,100 +987,137 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 		}
 	}
 
-	commands := []struct {
-		desc string
-		args []string
-	}{
-		{
-			desc: fmt.Sprintf("git clone -- %s /workspace/repo", repo.URL),
-			args: []string{"git", "clone", "--", repo.URL, "/workspace/repo"},
-		},
-		{
-			desc: fmt.Sprintf("git -C /workspace/repo checkout %s", run.BaseCommit),
-			args: []string{"git", "-C", "/workspace/repo", "checkout", run.BaseCommit},
-		},
-	}
+	failCommand := func(desc string, args []string, errMsg string, cmdTime time.Time, res *tools.ExecCommandResult) (reconcile.Result, error) {
+		log.Error(errors.New(errMsg), "command failed; deleting sandbox", "run", run.ID, "sandbox", run.SandboxName)
 
-	for _, cmd := range commands {
-		log.Info("executing command inside sandbox", "run", run.ID, "cmd", cmd.desc)
-
-		res, execErr := sb.ExecCommand(ctx, tools.ExecCommandOptions{
-			Command: cmd.args,
-		})
-
-		cmdTime := o.clock().UTC()
-		var cmdFailed bool
-		var cmdErrMsg string
-
-		if execErr != nil {
-			cmdFailed = true
-			cmdErrMsg = fmt.Sprintf("command error: %v", execErr)
-		} else if res != nil && res.ExitCode != 0 {
-			cmdFailed = true
-			stderr := strings.TrimSpace(res.Stderr)
-			if stderr != "" {
-				cmdErrMsg = fmt.Sprintf("command failed with exit code %d: %s", res.ExitCode, stderr)
-			} else {
-				cmdErrMsg = fmt.Sprintf("command failed with exit code %d", res.ExitCode)
-			}
-		} else if res == nil {
-			cmdFailed = true
-			cmdErrMsg = "command returned nil result"
+		var exitCode int
+		var stdout, stderr string
+		if res != nil {
+			exitCode = res.ExitCode
+			stdout = res.Stdout
+			stderr = res.Stderr
 		}
 
-		if cmdFailed {
-			log.Error(errors.New(cmdErrMsg), "command failed; deleting sandbox", "run", run.ID, "sandbox", run.SandboxName)
-
-			var exitCode int
-			var stdout, stderr string
-			if res != nil {
-				exitCode = res.ExitCode
-				stdout = res.Stdout
-				stderr = res.Stderr
-			}
-
-			// Record command failure event
-			if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-				Time:    cmdTime,
-				Phase:   state.PhasePreparing,
-				Kind:    "command",
-				Message: cmdErrMsg,
-				Error:   cmdErrMsg,
-				Data: map[string]any{
-					"command":   cmd.desc,
-					"args":      cmd.args,
-					"exit_code": exitCode,
-					"stdout":    stdout,
-					"stderr":    stderr,
-				},
-			}); err != nil {
-				log.Error(err, "failed to append command failure event", "run", run.ID)
-			}
-
-			// Delete sandbox
-			if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-				log.Error(delErr, "failed to delete sandbox after command failure", "sandbox", run.SandboxName)
-			}
-
-			run.ReadyDeadline = nil
-			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, cmdErrMsg)
-		}
-
-		// Command succeeded! Record command result event
+		// Record command failure event
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    cmdTime,
 			Phase:   state.PhasePreparing,
 			Kind:    "command",
-			Message: fmt.Sprintf("Executed %s", cmd.desc),
+			Message: errMsg,
+			Error:   errMsg,
 			Data: map[string]any{
-				"command":   cmd.desc,
-				"args":      cmd.args,
-				"exit_code": 0,
-				"stdout":    res.Stdout,
-				"stderr":    res.Stderr,
+				"command":   desc,
+				"args":      args,
+				"exit_code": exitCode,
+				"stdout":    stdout,
+				"stderr":    stderr,
 			},
 		}); err != nil {
-			log.Error(err, "failed to append command success event", "run", run.ID)
+			log.Error(err, "failed to append command failure event", "run", run.ID)
+		}
+
+		// Delete sandbox
+		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+			log.Error(delErr, "failed to delete sandbox after command failure", "sandbox", run.SandboxName)
+		}
+
+		run.ReadyDeadline = nil
+		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, errMsg)
+	}
+
+	checkDesc := "git -C /workspace/repo rev-parse --git-dir"
+	checkArgs := []string{"git", "-C", "/workspace/repo", "rev-parse", "--git-dir"}
+	checkRes, checkErr := sb.ExecCommand(ctx, tools.ExecCommandOptions{
+		Command: checkArgs,
+	})
+	checkTime := o.clock().UTC()
+
+	var workspaceReused bool
+	if checkErr != nil {
+		return failCommand(checkDesc, checkArgs, fmt.Sprintf("command error: %v", checkErr), checkTime, checkRes)
+	} else if checkRes == nil {
+		return failCommand(checkDesc, checkArgs, "command returned nil result", checkTime, checkRes)
+	} else if checkRes.ExitCode == 0 {
+		workspaceReused = true
+	} else if checkRes.ExitCode != 128 {
+		stderr := strings.TrimSpace(checkRes.Stderr)
+		var errMsg string
+		if stderr != "" {
+			errMsg = fmt.Sprintf("command failed with exit code %d: %s", checkRes.ExitCode, stderr)
+		} else {
+			errMsg = fmt.Sprintf("command failed with exit code %d", checkRes.ExitCode)
+		}
+		return failCommand(checkDesc, checkArgs, errMsg, checkTime, checkRes)
+	}
+
+	if workspaceReused {
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    checkTime,
+			Phase:   state.PhasePreparing,
+			Kind:    "workspace_reused",
+			Message: fmt.Sprintf("Workspace reused in sandbox %s", run.SandboxName),
+			Data:    map[string]any{"sandbox": run.SandboxName},
+		}); err != nil {
+			log.Error(err, "failed to append workspace_reused event", "run", run.ID)
+		}
+	} else {
+		commands := []struct {
+			desc string
+			args []string
+		}{
+			{
+				desc: fmt.Sprintf("git clone -- %s /workspace/repo", repo.URL),
+				args: []string{"git", "clone", "--", repo.URL, "/workspace/repo"},
+			},
+			{
+				desc: fmt.Sprintf("git -C /workspace/repo checkout %s", run.BaseCommit),
+				args: []string{"git", "-C", "/workspace/repo", "checkout", run.BaseCommit},
+			},
+		}
+
+		for _, cmd := range commands {
+			log.Info("executing command inside sandbox", "run", run.ID, "cmd", cmd.desc)
+
+			res, execErr := sb.ExecCommand(ctx, tools.ExecCommandOptions{
+				Command: cmd.args,
+			})
+
+			cmdTime := o.clock().UTC()
+			var cmdErrMsg string
+
+			if execErr != nil {
+				cmdErrMsg = fmt.Sprintf("command error: %v", execErr)
+			} else if res == nil {
+				cmdErrMsg = "command returned nil result"
+			} else if res.ExitCode != 0 {
+				stderr := strings.TrimSpace(res.Stderr)
+				if stderr != "" {
+					cmdErrMsg = fmt.Sprintf("command failed with exit code %d: %s", res.ExitCode, stderr)
+				} else {
+					cmdErrMsg = fmt.Sprintf("command failed with exit code %d", res.ExitCode)
+				}
+			}
+
+			if cmdErrMsg != "" {
+				return failCommand(cmd.desc, cmd.args, cmdErrMsg, cmdTime, res)
+			}
+
+			// Command succeeded! Record command result event
+			if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+				Time:    cmdTime,
+				Phase:   state.PhasePreparing,
+				Kind:    "command",
+				Message: fmt.Sprintf("Executed %s", cmd.desc),
+				Data: map[string]any{
+					"command":   cmd.desc,
+					"args":      cmd.args,
+					"exit_code": 0,
+					"stdout":    res.Stdout,
+					"stderr":    res.Stderr,
+				},
+			}); err != nil {
+				log.Error(err, "failed to append command success event", "run", run.ID)
+			}
 		}
 	}
 
