@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -95,6 +96,17 @@ func (o Options) Enabled() bool {
 type Binder interface {
 	Bind(ctx context.Context, podUID types.UID, policy *portalsv1.EgressPolicy) error
 }
+
+// PolicyRequest identifies the sandbox and its session for which an egress policy is requested.
+type PolicyRequest struct {
+	RepoURL     string
+	GoalName    string
+	RunID       string
+	SandboxName string
+}
+
+// PolicyFactory generates an EgressPolicy for a given sandbox and session.
+type PolicyFactory func(ctx context.Context, req PolicyRequest) (*portalsv1.EgressPolicy, error)
 
 // Client is a gRPC client that binds egress policies via the Service Portal Controller.
 type Client struct {
@@ -191,4 +203,83 @@ func PolicyForHosts(hosts []string) *portalsv1.EgressPolicy {
 			},
 		},
 	}
+}
+
+func repoHost(repoURL string) string {
+	raw := strings.TrimSpace(repoURL)
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "@") && strings.Contains(raw, ":") && !strings.Contains(raw, "://") {
+		at := strings.Index(raw, "@")
+		colon := strings.Index(raw, ":")
+		if colon > at {
+			return raw[at+1 : colon]
+		}
+	}
+	if !strings.Contains(raw, "://") {
+		if strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, ".") {
+			return ""
+		}
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if u.Scheme == "file" {
+		return ""
+	}
+	h := u.Hostname()
+	if h != "" {
+		return h
+	}
+	return u.Host
+}
+
+// HostListPolicyFactory returns a PolicyFactory that creates an EgressPolicy with a
+// single HTTPS rule containing the configured hosts plus the host from the request's
+// repository URL, without duplicates.
+func HostListPolicyFactory(hosts []string) PolicyFactory {
+	return func(ctx context.Context, req PolicyRequest) (*portalsv1.EgressPolicy, error) {
+		var combined []string
+		seen := make(map[string]bool)
+		for _, h := range hosts {
+			if h != "" && !seen[h] {
+				seen[h] = true
+				combined = append(combined, h)
+			}
+		}
+		if h := repoHost(req.RepoURL); h != "" && !seen[h] {
+			seen[h] = true
+			combined = append(combined, h)
+		}
+		return PolicyForHosts(combined), nil
+	}
+}
+
+// PolicyHostnames returns all distinct hostnames referenced across rules in policy.
+func PolicyHostnames(policy *portalsv1.EgressPolicy) []string {
+	if policy == nil {
+		return nil
+	}
+	var hosts []string
+	seen := make(map[string]bool)
+	for _, r := range policy.GetRules() {
+		var list []string
+		if r.GetHttps() != nil {
+			list = r.GetHttps().GetHostnames()
+		} else if r.GetHttp() != nil {
+			list = r.GetHttp().GetHostnames()
+		} else if r.GetTlsPassthrough() != nil {
+			list = r.GetTlsPassthrough().GetHostnames()
+		}
+		for _, h := range list {
+			if !seen[h] {
+				seen[h] = true
+				hosts = append(hosts, h)
+			}
+		}
+	}
+	return hosts
 }

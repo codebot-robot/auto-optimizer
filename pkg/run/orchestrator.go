@@ -139,9 +139,9 @@ type OrchestratorOptions struct {
 	// Optional: when nil, portal egress policy binding is disabled.
 	PortalBinder portal.Binder
 
-	// EgressHosts is the list of allowed egress hosts when PortalBinder is configured.
-	// When unset or empty, defaults to portal.DefaultEgressHosts.
-	EgressHosts []string
+	// PolicyFactory generates the egress policy for a sandbox.
+	// Required when PortalBinder is configured.
+	PolicyFactory portal.PolicyFactory
 }
 
 // InitDefaults fills every zero-valued field that has a default with its Default* constant.
@@ -169,9 +169,6 @@ func (o *OrchestratorOptions) InitDefaults() {
 	}
 	if o.DefaultMaxDuration == 0 {
 		o.DefaultMaxDuration = DefaultMaxDuration
-	}
-	if len(o.EgressHosts) == 0 {
-		o.EgressHosts = append([]string(nil), portal.DefaultEgressHosts...)
 	}
 }
 
@@ -215,6 +212,9 @@ func (o *OrchestratorOptions) Validate() error {
 	if o.DefaultMaxDuration <= 0 {
 		return errors.New("DefaultMaxDuration must be positive")
 	}
+	if o.PortalBinder != nil && o.PolicyFactory == nil {
+		return errors.New("policy factory is required when portal binder is set")
+	}
 	return nil
 }
 
@@ -244,7 +244,7 @@ type Orchestrator struct {
 	defaultMaxDuration time.Duration
 	forgeFor           func(repoURL string) (forge.Forge, error)
 	portalBinder       portal.Binder
-	egressHosts        []string
+	policyFactory      portal.PolicyFactory
 
 	runIndexMu sync.RWMutex
 	runIndex   map[string]runIndexEntry
@@ -313,11 +313,6 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		return nil, err
 	}
 
-	egressHosts := opts.EgressHosts
-	if len(egressHosts) == 0 {
-		egressHosts = append([]string(nil), portal.DefaultEgressHosts...)
-	}
-
 	orch := &Orchestrator{
 		store:              opts.Store,
 		sessionStore:       opts.SessionStore,
@@ -333,7 +328,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		defaultMaxDuration: opts.DefaultMaxDuration,
 		forgeFor:           opts.ForgeFor,
 		portalBinder:       opts.PortalBinder,
-		egressHosts:        append([]string(nil), egressHosts...),
+		policyFactory:      opts.PolicyFactory,
 		runIndex:           make(map[string]runIndexEntry),
 		notifyCh:           make(chan event.TypedGenericEvent[reconcile.Request], 1024),
 		activeRuns:         make(map[string]bool),
@@ -930,9 +925,18 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 	sb.SetPodInfo(sbObj.Name, podIP)
 
 	if o.portalBinder != nil && run.PortalBoundAt == nil {
-		podUID, err := sb.PodUID(ctx)
+		policy, err := o.policyFactory(ctx, portal.PolicyRequest{
+			RepoURL:     repo.URL,
+			GoalName:    run.GoalName,
+			RunID:       run.ID,
+			SandboxName: run.SandboxName,
+		})
 		if err == nil {
-			err = o.portalBinder.Bind(ctx, podUID, portal.PolicyForHosts(o.egressHosts))
+			var podUID types.UID
+			podUID, err = sb.PodUID(ctx)
+			if err == nil {
+				err = o.portalBinder.Bind(ctx, podUID, policy)
+			}
 		}
 		if err != nil {
 			log.Error(err, "failed to bind portal egress policy", "run", run.ID, "sandbox", run.SandboxName)
@@ -966,13 +970,17 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 			log.Error(err, "failed to update run with PortalBoundAt", "run", run.ID)
 		}
 
+		hosts := portal.PolicyHostnames(policy)
+		if hosts == nil {
+			hosts = []string{}
+		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    nowBound,
 			Phase:   state.PhasePreparing,
 			Kind:    "portal_bound",
-			Message: fmt.Sprintf("portal egress policy bound for hosts: %s", strings.Join(o.egressHosts, ", ")),
+			Message: fmt.Sprintf("portal egress policy bound for hosts: %s", strings.Join(hosts, ", ")),
 			Data: map[string]any{
-				"hosts": append([]string(nil), o.egressHosts...),
+				"hosts": append([]string(nil), hosts...),
 			},
 		}); err != nil {
 			log.Error(err, "failed to append portal_bound event", "run", run.ID)

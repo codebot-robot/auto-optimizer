@@ -212,6 +212,113 @@ func TestPolicyForHosts(t *testing.T) {
 	}
 }
 
+func TestHostListPolicyFactory(t *testing.T) {
+	tests := []struct {
+		name      string
+		hosts     []string
+		repoURL   string
+		wantHosts []string
+	}{
+		{
+			name:      "repo host already in hosts",
+			hosts:     []string{"github.com", "proxy.golang.org"},
+			repoURL:   "https://github.com/gke-labs/test-repo",
+			wantHosts: []string{"github.com", "proxy.golang.org"},
+		},
+		{
+			name:      "repo host added to configured hosts",
+			hosts:     []string{"proxy.golang.org", "pypi.org"},
+			repoURL:   "https://github.com/gke-labs/test-repo",
+			wantHosts: []string{"proxy.golang.org", "pypi.org", "github.com"},
+		},
+		{
+			name:      "duplicates in configured hosts are removed",
+			hosts:     []string{"github.com", "proxy.golang.org", "github.com", "pypi.org", "pypi.org"},
+			repoURL:   "https://github.com/gke-labs/test-repo",
+			wantHosts: []string{"github.com", "proxy.golang.org", "pypi.org"},
+		},
+		{
+			name:      "scp-like repo URL extracts host",
+			hosts:     []string{"proxy.golang.org"},
+			repoURL:   "git@gitlab.com:gke-labs/test-repo.git",
+			wantHosts: []string{"proxy.golang.org", "gitlab.com"},
+		},
+		{
+			name:      "url with port extracts hostname",
+			hosts:     []string{"proxy.golang.org"},
+			repoURL:   "http://custom-forge.internal:8080/gke-labs/test-repo",
+			wantHosts: []string{"proxy.golang.org", "custom-forge.internal"},
+		},
+		{
+			name:      "empty repo URL leaves hosts unchanged",
+			hosts:     []string{"github.com"},
+			repoURL:   "",
+			wantHosts: []string{"github.com"},
+		},
+		{
+			name:      "local repo path leaves hosts unchanged",
+			hosts:     []string{"github.com"},
+			repoURL:   "/workspace/test-repo",
+			wantHosts: []string{"github.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			factory := HostListPolicyFactory(tt.hosts)
+			req := PolicyRequest{
+				RepoURL:     tt.repoURL,
+				GoalName:    "test-goal",
+				RunID:       "run-123",
+				SandboxName: "sandbox-123",
+			}
+			policy, err := factory(t.Context(), req)
+			if err != nil {
+				t.Fatalf("unexpected factory error: %v", err)
+			}
+			if len(policy.Rules) != 1 || policy.Rules[0].Https == nil {
+				t.Fatalf("expected 1 Https rule, got: %+v", policy.Rules)
+			}
+			gotHosts := policy.Rules[0].Https.Hostnames
+			if diff := cmp.Diff(tt.wantHosts, gotHosts); diff != "" {
+				t.Errorf("hostnames mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestPolicyHostnames(t *testing.T) {
+	if got := PolicyHostnames(nil); got != nil {
+		t.Errorf("PolicyHostnames(nil) = %v, want nil", got)
+	}
+
+	policy := &portalsv1.EgressPolicy{
+		Rules: []*portalsv1.EgressRule{
+			{
+				Https: &portalsv1.HttpsRule{
+					Hostnames: []string{"github.com", "proxy.golang.org"},
+				},
+			},
+			{
+				Http: &portalsv1.HttpRule{
+					Hostnames: []string{"proxy.golang.org", "insecure.org"},
+				},
+			},
+			{
+				TlsPassthrough: &portalsv1.TlsPassthroughRule{
+					Hostnames: []string{"custom.org", "github.com"},
+				},
+			},
+		},
+	}
+
+	want := []string{"github.com", "proxy.golang.org", "insecure.org", "custom.org"}
+	got := PolicyHostnames(policy)
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("PolicyHostnames mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestBinder_GRPC(t *testing.T) {
 	ip := net.ParseIP("127.0.0.1")
 	certPEM, keyPEM := generateTestCertificate(t, ip)
