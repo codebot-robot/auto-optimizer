@@ -15,11 +15,13 @@
 package web
 
 import (
+	"context"
 	_ "embed"
 	"html/template"
 	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
+	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
 
 //go:embed layout.html
@@ -32,6 +34,14 @@ var templateFuncs = template.FuncMap{
 	"truncate":    truncate,
 	"canTruncate": canTruncate,
 	"isTool":      isTool,
+}
+
+func populateUser(ctx context.Context, user *string) {
+	if *user == "" {
+		if u, ok := auth.UserFromContext(ctx); ok {
+			*user = u
+		}
+	}
 }
 
 func parsePageTemplate(pageHTML string) *template.Template {

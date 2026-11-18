@@ -29,6 +29,7 @@ type RunPageData struct {
 	Run         *state.Run
 	Events      []state.Event
 	ActionError string
+	User        string
 }
 
 // Title returns the page title for the layout header.
@@ -61,6 +62,7 @@ func RenderRunPage(ctx context.Context, w http.ResponseWriter, data RunPageData)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	return runPageTmpl().Execute(w, data)
 }

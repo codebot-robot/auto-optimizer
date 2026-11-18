@@ -27,6 +27,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
+	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
 
 var update = flag.Bool("update", false, "update golden files")
@@ -472,4 +473,22 @@ func TestGoldenFiles(t *testing.T) {
 		}
 		assertGolden(t, "run_terminal.golden.html", rec.Body.String())
 	})
+}
+
+func TestHeaderUser(t *testing.T) {
+	ctx := auth.WithUser(t.Context(), "octocat")
+	rec := httptest.NewRecorder()
+	if err := RenderSessionListPage(ctx, rec, SessionListPageData{}); err != nil {
+		t.Fatalf("RenderSessionListPage: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `<span class="user-login">octocat</span>`) {
+		t.Errorf("body does not contain user login: %s", body)
+	}
+	if !strings.Contains(body, `<form method="POST" action="/logout">`) {
+		t.Errorf("body does not contain logout form: %s", body)
+	}
+	if !strings.Contains(body, `Sign out</button>`) {
+		t.Errorf("body does not contain Sign out button: %s", body)
+	}
 }

@@ -18,15 +18,24 @@ package auth
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/spf13/pflag"
+
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
 // CookieName is the name of the session cookie used by ao.
@@ -197,7 +206,7 @@ func acceptsHTML(r *http.Request) bool {
 
 // SetSessionCookie writes the session cookie with HttpOnly, SameSite=Lax, Path=/,
 // and Secure set unconditionally.
-func SetSessionCookie(w http.ResponseWriter, _ *http.Request, value string) {
+func SetSessionCookie(w http.ResponseWriter, value string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    value,
@@ -210,7 +219,7 @@ func SetSessionCookie(w http.ResponseWriter, _ *http.Request, value string) {
 
 // ClearSessionCookie clears the session cookie with HttpOnly, SameSite=Lax, Path=/,
 // and Secure set unconditionally.
-func ClearSessionCookie(w http.ResponseWriter, _ *http.Request) {
+func ClearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    "",
@@ -221,4 +230,354 @@ func ClearSessionCookie(w http.ResponseWriter, _ *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		Secure:   true,
 	})
+}
+
+// SessionDuration is the lifetime of an authenticated web session.
+const SessionDuration = 24 * time.Hour
+
+// OAuth cookie names.
+const (
+	// OAuthStateCookieName is the cookie name for the OAuth CSRF state parameter.
+	OAuthStateCookieName = "ao_oauth_state"
+	// OAuthNextCookieName is the cookie name for preserving the post-login destination path.
+	OAuthNextCookieName = "ao_oauth_next"
+)
+
+// GitHubOptions configures GitHub OAuth authentication for the web UI.
+type GitHubOptions struct {
+	ClientID     string
+	ClientSecret string
+	PublicURL    string
+	AllowedUsers []string
+	BaseURL      string
+	APIURL       string
+}
+
+// InitDefaults fills zero-valued fields with defaults and environment variables.
+func (o *GitHubOptions) InitDefaults() {
+	if o == nil {
+		return
+	}
+	if o.BaseURL == "" {
+		if env := os.Getenv("AO_GITHUB_BASE_URL"); env != "" {
+			o.BaseURL = env
+		} else {
+			o.BaseURL = "https://github.com"
+		}
+	}
+	if o.APIURL == "" {
+		if env := os.Getenv("AO_GITHUB_API_URL"); env != "" {
+			o.APIURL = env
+		} else {
+			o.APIURL = "https://api.github.com"
+		}
+	}
+	if o.ClientID == "" {
+		o.ClientID = os.Getenv("AO_GITHUB_CLIENT_ID")
+	}
+	if o.ClientSecret == "" {
+		o.ClientSecret = os.Getenv("AO_GITHUB_CLIENT_SECRET")
+	}
+	if len(o.AllowedUsers) == 0 {
+		if env := os.Getenv("AO_GITHUB_ALLOWED_USERS"); env != "" {
+			for _, u := range strings.Split(env, ",") {
+				if u = strings.TrimSpace(u); u != "" {
+					o.AllowedUsers = append(o.AllowedUsers, u)
+				}
+			}
+		}
+	}
+}
+
+// AddFlags binds GitHub OAuth configuration flags to fs.
+func (o *GitHubOptions) AddFlags(fs *pflag.FlagSet) {
+	o.InitDefaults()
+	fs.StringVar(&o.ClientID, "github-client-id", o.ClientID, "GitHub OAuth client ID")
+	fs.StringSliceVar(&o.AllowedUsers, "github-allowed-user", o.AllowedUsers, "GitHub user login allowed to access the web UI (repeatable, comma-separated)")
+	fs.StringVar(&o.BaseURL, "github-base-url", o.BaseURL, "GitHub base URL for OAuth")
+	fs.StringVar(&o.APIURL, "github-api-url", o.APIURL, "GitHub API base URL")
+}
+
+// Validate reports any invalid or missing configuration in o.
+func (o *GitHubOptions) Validate() error {
+	if o == nil {
+		return errors.New("github options are required")
+	}
+	if o.ClientID == "" {
+		return errors.New("github client ID is required")
+	}
+	if o.ClientSecret == "" {
+		return errors.New("github client secret is required (AO_GITHUB_CLIENT_SECRET)")
+	}
+	if len(o.AllowedUsers) == 0 {
+		return errors.New("at least one allowed user is required (--github-allowed-user)")
+	}
+	if o.PublicURL == "" {
+		return errors.New("public URL is required")
+	}
+	u, err := url.Parse(o.PublicURL)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("invalid public URL %q", o.PublicURL)
+	}
+	host := u.Hostname()
+	isLocal := host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if u.Scheme == "http" {
+		if !isLocal {
+			return fmt.Errorf("invalid public URL %q: scheme must be https (http is only permitted for localhost/127.0.0.1/[::1])", o.PublicURL)
+		}
+	} else if u.Scheme != "https" {
+		return fmt.Errorf("invalid public URL %q: scheme must be https", o.PublicURL)
+	}
+	if o.BaseURL == "" {
+		return errors.New("github base URL is required")
+	}
+	if _, err := url.Parse(o.BaseURL); err != nil {
+		return fmt.Errorf("invalid base URL %q: %w", o.BaseURL, err)
+	}
+	if o.APIURL == "" {
+		return errors.New("github API URL is required")
+	}
+	if _, err := url.Parse(o.APIURL); err != nil {
+		return fmt.Errorf("invalid API URL %q: %w", o.APIURL, err)
+	}
+	return nil
+}
+
+// NewGitHubHandler returns an HTTP handler that serves GitHub OAuth routes (/login, /auth/github/callback, and /logout)
+// and delegates all other requests to next wrapped in NewMiddleware.
+func NewGitHubHandler(opts GitHubOptions, key []byte, now func() time.Time, next http.Handler) (http.Handler, error) {
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
+	authed, err := NewMiddleware(key, now, next)
+	if err != nil {
+		return nil, err
+	}
+	if now == nil {
+		now = time.Now
+	}
+
+	return &gitHubHandler{
+		opts:   opts,
+		key:    key,
+		now:    now,
+		authed: authed,
+		client: &http.Client{Timeout: 10 * time.Second},
+	}, nil
+}
+
+type gitHubHandler struct {
+	opts   GitHubOptions
+	key    []byte
+	now    func() time.Time
+	authed http.Handler
+	client *http.Client
+}
+
+func (h *gitHubHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case (r.URL.Path == "/login" || r.URL.Path == "/login/") && r.Method == http.MethodGet:
+		h.handleLogin(w, r)
+	case r.URL.Path == "/auth/github/callback" && r.Method == http.MethodGet:
+		h.handleCallback(w, r)
+	case (r.URL.Path == "/logout" || r.URL.Path == "/logout/") && r.Method == http.MethodPost:
+		ClearSessionCookie(w)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	default:
+		h.authed.ServeHTTP(w, r)
+	}
+}
+
+func (h *gitHubHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
+	next := r.URL.Query().Get("next")
+	if !isLocalPath(next) {
+		next = "/"
+	}
+
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		http.Error(w, "Failed to generate state", http.StatusInternalServerError)
+		return
+	}
+	state := hex.EncodeToString(b)
+
+	setOAuthCookie(w, OAuthStateCookieName, state, h.now)
+	setOAuthCookie(w, OAuthNextCookieName, next, h.now)
+
+	redirectURI := strings.TrimRight(h.opts.PublicURL, "/") + "/auth/github/callback"
+	q := url.Values{
+		"client_id":    {h.opts.ClientID},
+		"redirect_uri": {redirectURI},
+		"state":        {state},
+	}
+	authURL := strings.TrimRight(h.opts.BaseURL, "/") + "/login/oauth/authorize?" + q.Encode()
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+func (h *gitHubHandler) handleCallback(w http.ResponseWriter, r *http.Request) {
+	stateCookie, err := r.Cookie(OAuthStateCookieName)
+	if err != nil || stateCookie.Value == "" {
+		http.Error(w, "Missing state cookie", http.StatusBadRequest)
+		return
+	}
+
+	queryState := r.URL.Query().Get("state")
+	if queryState == "" || subtle.ConstantTimeCompare([]byte(stateCookie.Value), []byte(queryState)) != 1 {
+		http.Error(w, "Invalid state parameter", http.StatusBadRequest)
+		return
+	}
+
+	clearOAuthCookie(w, OAuthStateCookieName)
+
+	next := "/"
+	if c, err := r.Cookie(OAuthNextCookieName); err == nil && isLocalPath(c.Value) {
+		next = c.Value
+	}
+	clearOAuthCookie(w, OAuthNextCookieName)
+
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "Missing code parameter", http.StatusBadRequest)
+		return
+	}
+
+	tokenEndpoint := strings.TrimRight(h.opts.BaseURL, "/") + "/login/oauth/access_token"
+	redirectURI := strings.TrimRight(h.opts.PublicURL, "/") + "/auth/github/callback"
+	form := url.Values{
+		"client_id":     {h.opts.ClientID},
+		"client_secret": {h.opts.ClientSecret},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+	}
+	tokenReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, tokenEndpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		http.Error(w, "Failed to create token request", http.StatusInternalServerError)
+		return
+	}
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenReq.Header.Set("Accept", "application/json")
+
+	tokenResp, err := h.client.Do(tokenReq)
+	if err != nil {
+		http.Error(w, "Token exchange failed", http.StatusBadGateway)
+		return
+	}
+	defer func() {
+		if closeErr := tokenResp.Body.Close(); closeErr != nil {
+			scoped.Log(r.Context()).V(2).Info("failed to close response body", "error", closeErr)
+		}
+	}()
+
+	if tokenResp.StatusCode != http.StatusOK {
+		http.Error(w, "Token exchange failed", http.StatusBadGateway)
+		return
+	}
+
+	var tokenData struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+	}
+	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenData); err != nil || tokenData.AccessToken == "" {
+		http.Error(w, "Invalid token response", http.StatusBadGateway)
+		return
+	}
+
+	userEndpoint := strings.TrimRight(h.opts.APIURL, "/") + "/user"
+	userReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, userEndpoint, nil)
+	if err != nil {
+		http.Error(w, "Failed to create user request", http.StatusInternalServerError)
+		return
+	}
+	userReq.Header.Set("Authorization", "Bearer "+tokenData.AccessToken)
+	userReq.Header.Set("Accept", "application/json")
+
+	userResp, err := h.client.Do(userReq)
+	if err != nil {
+		http.Error(w, "Failed to fetch user", http.StatusBadGateway)
+		return
+	}
+	defer func() {
+		if closeErr := userResp.Body.Close(); closeErr != nil {
+			scoped.Log(r.Context()).V(2).Info("failed to close response body", "error", closeErr)
+		}
+	}()
+
+	if userResp.StatusCode != http.StatusOK {
+		http.Error(w, "Failed to fetch user", http.StatusBadGateway)
+		return
+	}
+
+	var userData struct {
+		Login string `json:"login"`
+	}
+	if err := json.NewDecoder(userResp.Body).Decode(&userData); err != nil || userData.Login == "" {
+		http.Error(w, "Invalid user response", http.StatusBadGateway)
+		return
+	}
+
+	allowed := false
+	for _, u := range h.opts.AllowedUsers {
+		if strings.EqualFold(u, userData.Login) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		body := fmt.Sprintf("<!doctype html><html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1><p>User %q is not authorized.</p></body></html>\n", html.EscapeString(userData.Login))
+		if _, err := w.Write([]byte(body)); err != nil {
+			return
+		}
+		return
+	}
+
+	sess := Session{
+		Login:   userData.Login,
+		Expires: h.now().Add(SessionDuration),
+	}
+	encoded, err := sess.Encode(h.key)
+	if err != nil {
+		http.Error(w, "Failed to encode session", http.StatusInternalServerError)
+		return
+	}
+	SetSessionCookie(w, encoded)
+	http.Redirect(w, r, next, http.StatusSeeOther)
+}
+
+func setOAuthCookie(w http.ResponseWriter, name, value string, now func() time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		MaxAge:   300,
+		Expires:  now().Add(5 * time.Minute),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   true,
+	})
+}
+
+func clearOAuthCookie(w http.ResponseWriter, name string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   true,
+	})
+}
+
+func isLocalPath(p string) bool {
+	if p == "" || !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") || strings.Contains(p, "\\") {
+		return false
+	}
+	u, err := url.Parse(p)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "" && u.Host == "" && strings.HasPrefix(u.Path, "/") && !strings.HasPrefix(u.Path, "//")
 }

@@ -28,6 +28,7 @@ import (
 type TranscriptPageData struct {
 	Detail sessionapi.SessionDetail
 	Full   bool
+	User   string
 }
 
 // Summary returns the session summary.
@@ -62,6 +63,7 @@ func RenderTranscriptPage(ctx context.Context, w http.ResponseWriter, data Trans
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	return transcriptPageTmpl().Execute(w, data)
 }

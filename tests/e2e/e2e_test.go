@@ -589,6 +589,7 @@ func TestSessionAPI(t *testing.T) {
 	serveCmd := exec.Command(aoBin, "serve",
 		"--listen", serverAddr,
 		"--state-dir", stateDir,
+		"--insecure-no-auth",
 	)
 	serveCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
 
@@ -1023,6 +1024,7 @@ func startAOServe(t *testing.T, aoBin, repoURL string, env ...string) (serverAdd
 		"--http", httpAddr,
 		"--state-dir", stateDir,
 		"--repo", repoURL,
+		"--insecure-no-auth",
 	)
 	serveCmd.Env = append(os.Environ(), env...)
 

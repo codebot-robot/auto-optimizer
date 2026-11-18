@@ -33,6 +33,7 @@ type RepoEntry struct {
 // ReposPageData contains data for rendering the repositories page.
 type ReposPageData struct {
 	Repos []RepoEntry
+	User  string
 }
 
 // Title returns the page title for the layout header.
@@ -57,6 +58,7 @@ func RenderReposPage(ctx context.Context, w http.ResponseWriter, data ReposPageD
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	return reposPageTmpl().Execute(w, data)
 }

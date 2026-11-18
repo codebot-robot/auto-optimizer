@@ -29,6 +29,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
+	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
 
 func TestCommandHierarchy(t *testing.T) {
@@ -147,6 +148,78 @@ func TestServeFlags(t *testing.T) {
 	} else if publicURLFlag.DefValue != "" {
 		t.Errorf("expected default public-url to be empty, got %s", publicURLFlag.DefValue)
 	}
+	if cmd.Flag("insecure-no-auth") == nil {
+		t.Error("expected --insecure-no-auth flag on ao serve")
+	}
+	if cmd.Flag("github-client-id") == nil {
+		t.Error("expected --github-client-id flag on ao serve")
+	}
+	if cmd.Flag("github-allowed-user") == nil {
+		t.Error("expected --github-allowed-user flag on ao serve")
+	}
+}
+
+func TestServeAuthValidation(t *testing.T) {
+	t.Run("refuses to start with neither client ID nor insecure-no-auth", func(t *testing.T) {
+		var opts serveOptions
+		opts.InitDefaults()
+		if err := opts.Validate(); err == nil {
+			t.Error("expected error with neither client ID nor --insecure-no-auth, got nil")
+		}
+	})
+
+	t.Run("succeeds with insecure-no-auth", func(t *testing.T) {
+		var opts serveOptions
+		opts.InitDefaults()
+		opts.insecureNoAuth = true
+		if err := opts.Validate(); err != nil {
+			t.Errorf("expected nil error with --insecure-no-auth, got %v", err)
+		}
+	})
+
+	t.Run("refuses to start with client ID but missing AO_SESSION_KEY", func(t *testing.T) {
+		t.Setenv("AO_SESSION_KEY", "")
+		var opts serveOptions
+		opts.InitDefaults()
+		opts.github = auth.GitHubOptions{
+			ClientID:     "id",
+			ClientSecret: "secret",
+			PublicURL:    "https://example.com",
+		}
+		if err := opts.Validate(); err == nil {
+			t.Error("expected error for missing AO_SESSION_KEY, got nil")
+		}
+	})
+
+	t.Run("refuses to start with client ID and short AO_SESSION_KEY", func(t *testing.T) {
+		t.Setenv("AO_SESSION_KEY", "too-short")
+		var opts serveOptions
+		opts.InitDefaults()
+		opts.github = auth.GitHubOptions{
+			ClientID:     "id",
+			ClientSecret: "secret",
+			PublicURL:    "https://example.com",
+		}
+		if err := opts.Validate(); err == nil {
+			t.Error("expected error for short AO_SESSION_KEY, got nil")
+		}
+	})
+
+	t.Run("succeeds with client ID, valid key, and valid github options", func(t *testing.T) {
+		t.Setenv("AO_SESSION_KEY", "session-signing-key-32-bytes-long!")
+		var opts serveOptions
+		opts.InitDefaults()
+		opts.github = auth.GitHubOptions{
+			ClientID:     "id",
+			ClientSecret: "secret",
+			PublicURL:    "https://example.com",
+			AllowedUsers: []string{"octocat"},
+		}
+		opts.github.InitDefaults()
+		if err := opts.Validate(); err != nil {
+			t.Errorf("expected valid, got %v", err)
+		}
+	})
 }
 
 func TestServeGitAuthorValidation(t *testing.T) {

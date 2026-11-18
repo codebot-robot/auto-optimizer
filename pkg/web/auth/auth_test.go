@@ -18,6 +18,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -226,8 +227,7 @@ func TestMiddleware(t *testing.T) {
 func TestCookieHelpers(t *testing.T) {
 	t.Run("SetSessionCookie sets Secure unconditionally", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/test", nil)
-		SetSessionCookie(rec, req, "token123")
+		SetSessionCookie(rec, "token123")
 		c := rec.Result().Cookies()[0]
 		if c.Name != CookieName || c.Value != "token123" || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" || !c.Secure {
 			t.Fatalf("unexpected cookie: %+v", c)
@@ -236,11 +236,322 @@ func TestCookieHelpers(t *testing.T) {
 
 	t.Run("ClearSessionCookie sets Secure unconditionally", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "http://localhost:8080/logout", nil)
-		ClearSessionCookie(rec, req)
+		ClearSessionCookie(rec)
 		c := rec.Result().Cookies()[0]
 		if c.Name != CookieName || c.Value != "" || c.MaxAge >= 0 || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || !c.Secure {
 			t.Fatalf("unexpected clear cookie: %+v", c)
+		}
+	})
+}
+
+func TestGitHubOAuth(t *testing.T) {
+	mockGitHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/oauth/access_token":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			code := r.FormValue("code")
+			w.Header().Set("Content-Type", "application/json")
+			switch code {
+			case "valid-code":
+				_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "token-allowed"})
+			case "unallowed-code":
+				_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "token-denied"})
+			default:
+				http.Error(w, "invalid code", http.StatusBadRequest)
+			}
+		case "/user":
+			authHeader := r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			switch authHeader {
+			case "Bearer token-allowed":
+				_ = json.NewEncoder(w).Encode(map[string]string{"login": "OctoCat"})
+			case "Bearer token-denied":
+				_ = json.NewEncoder(w).Encode(map[string]string{"login": "EvilHacker"})
+			default:
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockGitHub.Close()
+
+	key := []byte("session-signing-key-32-bytes-long!")
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+
+	opts := GitHubOptions{
+		ClientID:     "client-123",
+		ClientSecret: "secret-abc",
+		PublicURL:    "https://ao.example.com",
+		AllowedUsers: []string{"octocat"},
+		BaseURL:      mockGitHub.URL,
+		APIURL:       mockGitHub.URL,
+	}
+
+	handler, err := NewGitHubHandler(opts, key, func() time.Time { return now }, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	if err != nil {
+		t.Fatalf("NewGitHubHandler failed: %v", err)
+	}
+
+	t.Run("full sign-in sets session for allowed user", func(t *testing.T) {
+		loginReq := httptest.NewRequest(http.MethodGet, "/login?next=/repos", nil)
+		loginRec := httptest.NewRecorder()
+		handler.ServeHTTP(loginRec, loginReq)
+
+		if loginRec.Code != http.StatusFound {
+			t.Fatalf("login code = %d, want %d", loginRec.Code, http.StatusFound)
+		}
+		loc := loginRec.Header().Get("Location")
+		u, err := url.Parse(loc)
+		if err != nil {
+			t.Fatalf("failed to parse redirect: %v", err)
+		}
+		state := u.Query().Get("state")
+		if state == "" {
+			t.Fatal("expected state parameter in redirect URL")
+		}
+
+		cookies := loginRec.Result().Cookies()
+		var stateCookie, nextCookie *http.Cookie
+		for _, c := range cookies {
+			if c.Name == OAuthStateCookieName {
+				stateCookie = c
+			}
+			if c.Name == OAuthNextCookieName {
+				nextCookie = c
+			}
+		}
+		if stateCookie == nil || stateCookie.Value != state {
+			t.Fatalf("state cookie = %v, want %s", stateCookie, state)
+		}
+		if nextCookie == nil || nextCookie.Value != "/repos" {
+			t.Fatalf("next cookie = %v, want /repos", nextCookie)
+		}
+
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=valid-code&state="+state, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(nextCookie)
+		cbRec := httptest.NewRecorder()
+		handler.ServeHTTP(cbRec, cbReq)
+
+		if cbRec.Code != http.StatusSeeOther {
+			t.Fatalf("callback code = %d, want %d", cbRec.Code, http.StatusSeeOther)
+		}
+		if cbLoc := cbRec.Header().Get("Location"); cbLoc != "/repos" {
+			t.Errorf("callback Location = %q, want /repos", cbLoc)
+		}
+
+		var sessionCookie *http.Cookie
+		for _, c := range cbRec.Result().Cookies() {
+			if c.Name == CookieName && c.Value != "" {
+				sessionCookie = c
+			}
+		}
+		if sessionCookie == nil {
+			t.Fatal("expected session cookie to be set")
+		}
+		sess, err := Decode(key, sessionCookie.Value, now)
+		if err != nil {
+			t.Fatalf("failed to decode session: %v", err)
+		}
+		if sess.Login != "OctoCat" {
+			t.Errorf("session login = %q, want OctoCat", sess.Login)
+		}
+	})
+
+	t.Run("user who is not allowed gets 403 and no cookie", func(t *testing.T) {
+		loginReq := httptest.NewRequest(http.MethodGet, "/login", nil)
+		loginRec := httptest.NewRecorder()
+		handler.ServeHTTP(loginRec, loginReq)
+
+		u, _ := url.Parse(loginRec.Header().Get("Location"))
+		state := u.Query().Get("state")
+		var stateCookie *http.Cookie
+		for _, c := range loginRec.Result().Cookies() {
+			if c.Name == OAuthStateCookieName {
+				stateCookie = c
+			}
+		}
+
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=unallowed-code&state="+state, nil)
+		cbReq.AddCookie(stateCookie)
+		cbRec := httptest.NewRecorder()
+		handler.ServeHTTP(cbRec, cbReq)
+
+		if cbRec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", cbRec.Code)
+		}
+		if !strings.Contains(cbRec.Body.String(), "EvilHacker") {
+			t.Errorf("body %q does not contain EvilHacker", cbRec.Body.String())
+		}
+		for _, c := range cbRec.Result().Cookies() {
+			if c.Name == CookieName && c.Value != "" && c.MaxAge >= 0 {
+				t.Fatalf("unexpected session cookie: %+v", c)
+			}
+		}
+	})
+
+	t.Run("wrong state is rejected", func(t *testing.T) {
+		loginReq := httptest.NewRequest(http.MethodGet, "/login", nil)
+		loginRec := httptest.NewRecorder()
+		handler.ServeHTTP(loginRec, loginReq)
+
+		var stateCookie *http.Cookie
+		for _, c := range loginRec.Result().Cookies() {
+			if c.Name == OAuthStateCookieName {
+				stateCookie = c
+			}
+		}
+
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=valid-code&state=wrong-state-value", nil)
+		cbReq.AddCookie(stateCookie)
+		cbRec := httptest.NewRecorder()
+		handler.ServeHTTP(cbRec, cbReq)
+
+		if cbRec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", cbRec.Code)
+		}
+	})
+
+	t.Run("absolute next URL is ignored", func(t *testing.T) {
+		loginReq := httptest.NewRequest(http.MethodGet, "/login?next=https://attacker.com/phish", nil)
+		loginRec := httptest.NewRecorder()
+		handler.ServeHTTP(loginRec, loginReq)
+
+		u, _ := url.Parse(loginRec.Header().Get("Location"))
+		state := u.Query().Get("state")
+		var stateCookie, nextCookie *http.Cookie
+		for _, c := range loginRec.Result().Cookies() {
+			if c.Name == OAuthStateCookieName {
+				stateCookie = c
+			}
+			if c.Name == OAuthNextCookieName {
+				nextCookie = c
+			}
+		}
+		if nextCookie != nil && nextCookie.Value != "/" {
+			t.Errorf("next cookie = %q, want /", nextCookie.Value)
+		}
+
+		// Verify callback ignores any attempt to inject next via query parameter and relies solely on the cookie.
+		cbReq := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=valid-code&state="+state+"&next=/evil-query", nil)
+		cbReq.AddCookie(stateCookie)
+		if nextCookie != nil {
+			cbReq.AddCookie(nextCookie)
+		}
+		cbRec := httptest.NewRecorder()
+		handler.ServeHTTP(cbRec, cbReq)
+
+		if cbRec.Code != http.StatusSeeOther {
+			t.Fatalf("code = %d, want 303", cbRec.Code)
+		}
+		if loc := cbRec.Header().Get("Location"); loc != "/" {
+			t.Errorf("Location = %q, want /", loc)
+		}
+	})
+
+	t.Run("POST logout clears session cookie", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("logout code = %d, want 303", rec.Code)
+		}
+		var clearCookie *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == CookieName {
+				clearCookie = c
+			}
+		}
+		if clearCookie == nil || clearCookie.Value != "" || clearCookie.MaxAge >= 0 {
+			t.Fatalf("expected cleared session cookie, got %+v", clearCookie)
+		}
+	})
+}
+
+func TestGitHubOptionsValidation(t *testing.T) {
+	valid := GitHubOptions{
+		ClientID:     "id",
+		ClientSecret: "secret",
+		PublicURL:    "https://example.com",
+		AllowedUsers: []string{"octocat"},
+		BaseURL:      "https://github.com",
+		APIURL:       "https://api.github.com",
+	}
+
+	t.Run("valid options", func(t *testing.T) {
+		if err := valid.Validate(); err != nil {
+			t.Errorf("expected valid, got: %v", err)
+		}
+	})
+
+	t.Run("missing client ID", func(t *testing.T) {
+		o := valid
+		o.ClientID = ""
+		if err := o.Validate(); err == nil {
+			t.Error("expected error for missing client ID")
+		}
+	})
+
+	t.Run("missing client secret", func(t *testing.T) {
+		o := valid
+		o.ClientSecret = ""
+		if err := o.Validate(); err == nil {
+			t.Error("expected error for missing client secret")
+		}
+	})
+
+	t.Run("missing allowed users", func(t *testing.T) {
+		o := valid
+		o.AllowedUsers = nil
+		err := o.Validate()
+		if err == nil {
+			t.Fatal("expected error for missing allowed users")
+		}
+		if !strings.Contains(err.Error(), "--github-allowed-user") {
+			t.Errorf("expected error to mention --github-allowed-user, got %v", err)
+		}
+	})
+
+	t.Run("public URL validation", func(t *testing.T) {
+		validURLs := []string{
+			"https://ao.example.com",
+			"https://ao.example.com:8443",
+			"http://localhost",
+			"http://localhost:8080",
+			"http://127.0.0.1",
+			"http://127.0.0.1:8080",
+			"http://[::1]",
+			"http://[::1]:8080",
+		}
+		for _, u := range validURLs {
+			o := valid
+			o.PublicURL = u
+			if err := o.Validate(); err != nil {
+				t.Errorf("expected %q to be valid, got: %v", u, err)
+			}
+		}
+
+		invalidURLs := []string{
+			"",
+			"ftp://foo",
+			"invalid",
+			"http://",
+			"http://ao.example.com",
+			"http://example.com:8080",
+		}
+		for _, u := range invalidURLs {
+			o := valid
+			o.PublicURL = u
+			if err := o.Validate(); err == nil {
+				t.Errorf("expected error for public URL %q", u)
+			}
 		}
 	})
 }
