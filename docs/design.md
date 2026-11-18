@@ -322,9 +322,10 @@ Node, Python, build essentials, the agent CLIs, and `geminicli-toolbox`. An
 init container copies sandboxd into the pod, which is topology B in the
 sandboxd user guide, so commands run in the tool-rich root filesystem. The
 image ships `tini`, so sandboxd is not PID 1 in a long-lived sandbox.
-`/workspace` is the sandboxd root. It is an ObjectFS volume declared in
-`volumeClaimTemplates` with the `objectfs-exclusive-local` StorageClass,
-`ReadWriteOncePod` access, and a periodic checkpoint. sandboxd runs with
+`/workspace` is the sandboxd root. It is an ObjectFS volume: the orchestrator
+creates the claim directly with the `objectfs-exclusive-local` StorageClass,
+`ReadWriteOncePod` access, and a periodic checkpoint, and the run's `HeroRun`
+owns it. sandboxd runs with
 `--auth-public-key` and `--auth-audience`. The control plane signs short-lived
 tokens per call with its ed25519 key, and no Secrets are created for sandbox
 authentication.
@@ -386,7 +387,9 @@ Runs are reconciled in response to events:
    changed, or someone asked. The scheduler allows one active run per goal
    and enforces the repository's budget cap.
 2. **Preparing.** Split into two reconcile steps without blocking a worker:
-   - *Step 1 (creation):* The orchestrator creates the workspace PVC and the
+   - *Step 1 (creation):* When a workspace StorageClass is configured, the
+     orchestrator creates the claim directly and the run's `HeroRun` owns it
+     (otherwise the workspace uses an `emptyDir`). The orchestrator creates the
      Sandbox with a label naming the run (and with `service-portal.gke.io/intercept`
      label when a portal binder is configured), records `SandboxName` and a
      `ReadyDeadline` on the run, appends an event, and returns with `RequeueAfter`.
