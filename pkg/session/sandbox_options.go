@@ -25,7 +25,7 @@ import (
 const DefaultNamespace = "ao-sandboxes"
 
 // DefaultHomeDir is the default home directory inside the sandbox persisted via snapshot/restore.
-const DefaultHomeDir = "/home/clawtainer"
+const DefaultHomeDir = "/home/auto-optimizer"
 
 // SandboxOptions configures a sandbox container environment.
 type SandboxOptions struct {

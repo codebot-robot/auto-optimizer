@@ -117,7 +117,7 @@ func newSessionRunCommand() *cobra.Command {
 
 	defaultHomeDir := os.Getenv("SANDBOX_HOME_DIR")
 	if defaultHomeDir == "" {
-		defaultHomeDir = "/home/clawtainer"
+		defaultHomeDir = session.DefaultHomeDir
 	}
 
 	defaultImage := os.Getenv("SANDBOX_IMAGE")
