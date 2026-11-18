@@ -78,12 +78,13 @@ import (
 type mockProcessServer struct {
 	processv1.UnimplementedProcessServiceServer
 
-	mu       sync.Mutex
-	commands [][]string
-	exitCode int32
-	stderr   string
-	stdout   string
-	err      error
+	mu              sync.Mutex
+	commands        [][]string
+	exitCode        int32
+	stderr          string
+	stdout          string
+	err             error
+	workspaceReused bool
 }
 
 func (m *mockProcessServer) Execute(ctx context.Context, req *processv1.ExecuteRequest) (*processv1.ExecuteResponse, error) {
@@ -95,6 +96,26 @@ func (m *mockProcessServer) Execute(ctx context.Context, req *processv1.ExecuteR
 	}
 	if m.err != nil {
 		return nil, m.err
+	}
+
+	cmd := req.GetConfig().GetCommand()
+	if len(cmd) >= 4 && cmd[0] == "git" && cmd[1] == "-C" && cmd[2] == "/workspace/repo" && cmd[3] == "rev-parse" {
+		if m.workspaceReused {
+			return &processv1.ExecuteResponse{
+				ExitCode: 0,
+				Stdout:   []byte(".git\n"),
+			}, nil
+		}
+		if m.exitCode != 0 && m.exitCode != 128 {
+			return &processv1.ExecuteResponse{
+				ExitCode: m.exitCode,
+				Stderr:   []byte(m.stderr),
+			}, nil
+		}
+		return &processv1.ExecuteResponse{
+			ExitCode: 128,
+			Stderr:   []byte("fatal: not a git repository (or any of the parent directories): .git\n"),
+		}, nil
 	}
 
 	return &processv1.ExecuteResponse{
@@ -327,31 +348,36 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 		t.Errorf("expected sandbox name %s, got %s", gotRun.SandboxName, sb.Name)
 	}
 
-	// 6. Verify clone, checkout, and git config commands were issued directly without shell
+	// 6. Verify rev-parse, clone, checkout, and git config commands were issued directly without shell
 	procSrv.mu.Lock()
 	cmds = procSrv.commands
 	procSrv.mu.Unlock()
 
-	if len(cmds) != 4 {
-		t.Fatalf("expected exactly 4 commands executed in sandbox (clone, checkout, 2 git config), got %d: %+v", len(cmds), cmds)
+	if len(cmds) != 5 {
+		t.Fatalf("expected exactly 5 commands executed in sandbox (rev-parse, clone, checkout, 2 git config), got %d: %+v", len(cmds), cmds)
 	}
 
-	cloneCmdStr := strings.Join(cmds[0], " ")
+	revParseCmdStr := strings.Join(cmds[0], " ")
+	if revParseCmdStr != "git -C /workspace/repo rev-parse --git-dir" {
+		t.Errorf("expected rev-parse command 'git -C /workspace/repo rev-parse --git-dir', got: %s", revParseCmdStr)
+	}
+
+	cloneCmdStr := strings.Join(cmds[1], " ")
 	if cloneCmdStr != "git clone -- "+repo.URL+" /workspace/repo" {
 		t.Errorf("expected clone command 'git clone -- %s /workspace/repo', got: %s", repo.URL, cloneCmdStr)
 	}
 
-	checkoutCmdStr := strings.Join(cmds[1], " ")
+	checkoutCmdStr := strings.Join(cmds[2], " ")
 	if checkoutCmdStr != "git -C /workspace/repo checkout commit-base123" {
 		t.Errorf("expected checkout command 'git -C /workspace/repo checkout commit-base123', got: %s", checkoutCmdStr)
 	}
 
-	configNameCmdStr := strings.Join(cmds[2], " ")
+	configNameCmdStr := strings.Join(cmds[3], " ")
 	if configNameCmdStr != "git -C /workspace/repo config user.name auto-optimizer" {
 		t.Errorf("expected config user.name command 'git -C /workspace/repo config user.name auto-optimizer', got: %s", configNameCmdStr)
 	}
 
-	configEmailCmdStr := strings.Join(cmds[3], " ")
+	configEmailCmdStr := strings.Join(cmds[4], " ")
 	if configEmailCmdStr != "git -C /workspace/repo config user.email auto-optimizer@users.noreply.github.com" {
 		t.Errorf("expected config user.email command 'git -C /workspace/repo config user.email auto-optimizer@users.noreply.github.com', got: %s", configEmailCmdStr)
 	}
@@ -603,6 +629,183 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 	if !hasFailureEvent {
 		t.Errorf("expected a PhaseFailed event in events.jsonl, got: %+v", events)
 	}
+}
+
+func TestOrchestrator_WorkspaceReuse(t *testing.T) {
+	setupReadyRun := func(t *testing.T, runID string, procSrv processv1.ProcessServiceServer) (*Orchestrator, state.Store, *fakeagents.Clientset, *state.Repo, *state.Run) {
+		t.Helper()
+		ctx := t.Context()
+		store := state.NewFileStore(t.TempDir())
+		repo := &state.Repo{
+			URL:           "https://github.com/gke-labs/test-repo",
+			Host:          "github.com",
+			Owner:         "gke-labs",
+			Name:          "test-repo",
+			DefaultBranch: "main",
+		}
+		if err := store.PutRepo(ctx, repo); err != nil {
+			t.Fatalf("PutRepo: %v", err)
+		}
+		run := &state.Run{
+			ID:         runID,
+			Repo:       repo.Key(),
+			GoalName:   "optimize",
+			Phase:      state.PhasePending,
+			BaseCommit: "base123",
+		}
+		if err := store.PutRun(ctx, run); err != nil {
+			t.Fatalf("PutRun: %v", err)
+		}
+		harness, agentsCS, _ := setupTestHarness(t, procSrv)
+		orch, err := NewOrchestrator(OrchestratorOptions{
+			Store:     store,
+			Harness:   harness,
+			Clock:     func() time.Time { return time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC) },
+			GitAuthor: "bot <bot@test.com>",
+		})
+		if err != nil {
+			t.Fatalf("NewOrchestrator: %v", err)
+		}
+		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+			t.Fatalf("Reconcile step 1: %v", err)
+		}
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("getting sandbox: %v", err)
+		}
+		sb.Status.Conditions = []metav1.Condition{{Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue}}
+		if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("updating sandbox to Ready: %v", err)
+		}
+		return orch, store, agentsCS, repo, gotRun
+	}
+
+	t.Run("empty workspace clones and checks out", func(t *testing.T) {
+		procSrv := &mockProcessServer{}
+		orch, store, _, repo, run := setupReadyRun(t, "run-empty", procSrv)
+		if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err != nil {
+			t.Fatalf("Reconcile step 2: %v", err)
+		}
+		gotRun, err := store.GetRun(t.Context(), repo.Key(), run.ID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseWorking {
+			t.Errorf("phase = %s, want %s", gotRun.Phase, state.PhaseWorking)
+		}
+		procSrv.mu.Lock()
+		cmds := procSrv.commands
+		procSrv.mu.Unlock()
+		if len(cmds) != 5 {
+			t.Fatalf("expected 5 commands (rev-parse, clone, checkout, 2 git config), got %d: %+v", len(cmds), cmds)
+		}
+		if !strings.Contains(cmds[0][4], "--git-dir") || cmds[1][1] != "clone" || cmds[2][3] != "checkout" {
+			t.Errorf("unexpected commands: %+v", cmds)
+		}
+		events, err := store.ReadEvents(t.Context(), repo.Key(), run.ID)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		for _, e := range events {
+			if e.Kind == "workspace_reused" {
+				t.Errorf("unexpected workspace_reused event in empty workspace")
+			}
+		}
+	})
+
+	t.Run("existing workspace skips clone and checkout", func(t *testing.T) {
+		procSrv := &mockProcessServer{workspaceReused: true}
+		orch, store, _, repo, run := setupReadyRun(t, "run-reused", procSrv)
+		if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err != nil {
+			t.Fatalf("Reconcile step 2: %v", err)
+		}
+		gotRun, err := store.GetRun(t.Context(), repo.Key(), run.ID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseWorking {
+			t.Errorf("phase = %s, want %s", gotRun.Phase, state.PhaseWorking)
+		}
+		procSrv.mu.Lock()
+		cmds := procSrv.commands
+		procSrv.mu.Unlock()
+		if len(cmds) != 3 {
+			t.Fatalf("expected 3 commands (rev-parse, 2 git config), got %d: %+v", len(cmds), cmds)
+		}
+		if !strings.Contains(cmds[0][4], "--git-dir") {
+			t.Errorf("expected rev-parse check, got: %+v", cmds[0])
+		}
+		for _, cmd := range cmds[1:] {
+			cmdStr := strings.Join(cmd, " ")
+			if strings.Contains(cmdStr, "clone") || strings.Contains(cmdStr, "checkout") {
+				t.Errorf("clone or checkout should have been skipped, got command: %s", cmdStr)
+			}
+		}
+		events, err := store.ReadEvents(t.Context(), repo.Key(), run.ID)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		var foundReused bool
+		for _, e := range events {
+			if e.Kind == "workspace_reused" {
+				foundReused = true
+				if m, ok := e.Data.(map[string]any); !ok || m["sandbox"] != run.SandboxName {
+					t.Errorf("expected sandbox name in event data, got: %+v", e.Data)
+				}
+			}
+		}
+		if !foundReused {
+			t.Errorf("expected workspace_reused event, found none")
+		}
+	})
+
+	t.Run("check failure fails step", func(t *testing.T) {
+		procSrv := &mockProcessServer{err: errors.New("sandbox process error")}
+		orch, store, agentsCS, repo, run := setupReadyRun(t, "run-checkfail", procSrv)
+		if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err == nil {
+			t.Logf("Reconcile completed")
+		}
+		gotRun, err := store.GetRun(t.Context(), repo.Key(), run.ID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseFailed {
+			t.Errorf("phase = %s, want %s", gotRun.Phase, state.PhaseFailed)
+		}
+		if !strings.Contains(gotRun.Error, "sandbox process error") {
+			t.Errorf("expected error to mention failure, got: %s", gotRun.Error)
+		}
+		_, err = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(t.Context(), run.SandboxName, metav1.GetOptions{})
+		if err == nil || !k8serrors.IsNotFound(err) {
+			t.Errorf("expected sandbox to be deleted, got err: %v", err)
+		}
+	})
+
+	t.Run("check exit code failure fails step", func(t *testing.T) {
+		procSrv := &mockProcessServer{exitCode: 1, stderr: "fatal: git check failure\n"}
+		orch, store, agentsCS, repo, run := setupReadyRun(t, "run-checkexitfail", procSrv)
+		if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err == nil {
+			t.Logf("Reconcile completed")
+		}
+		gotRun, err := store.GetRun(t.Context(), repo.Key(), run.ID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseFailed {
+			t.Errorf("phase = %s, want %s", gotRun.Phase, state.PhaseFailed)
+		}
+		if !strings.Contains(gotRun.Error, "exit code 1") {
+			t.Errorf("expected error to mention exit code 1, got: %s", gotRun.Error)
+		}
+		_, err = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(t.Context(), run.SandboxName, metav1.GetOptions{})
+		if err == nil || !k8serrors.IsNotFound(err) {
+			t.Errorf("expected sandbox to be deleted, got err: %v", err)
+		}
+	})
 }
 
 func TestOrchestrator_Preparing_DeleteSandboxFailsRun(t *testing.T) {
@@ -2980,8 +3183,8 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	procSrv.mu.Lock()
 	finalCmds := len(procSrv.commands)
 	procSrv.mu.Unlock()
-	if finalCmds != 2 {
-		t.Fatalf("expected 2 commands executed after Ready, got %d", finalCmds)
+	if finalCmds != 3 {
+		t.Fatalf("expected 3 commands executed after Ready, got %d", finalCmds)
 	}
 }
 
@@ -7470,8 +7673,8 @@ func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
 	procSrv.mu.Lock()
 	cmds := len(procSrv.commands)
 	procSrv.mu.Unlock()
-	if cmds != 2 {
-		t.Errorf("expected 2 commands executed after bind, got %d", cmds)
+	if cmds != 3 {
+		t.Errorf("expected 3 commands executed after bind, got %d", cmds)
 	}
 
 	events, err := store.ReadEvents(ctx, repo.Key(), runID)
