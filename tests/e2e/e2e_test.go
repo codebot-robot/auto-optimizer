@@ -349,6 +349,52 @@ spec:
 		}
 		t.Logf("PASS: service-portals init-service-portals ran --help and exited 0.")
 	})
+
+	t.Run("SandboxGoImage", func(t *testing.T) {
+		subH := h.WithT(t)
+		podName := "smoke-test-sandbox-go"
+		subH.DeleteWithCleanup("default", "pod", podName)
+
+		imagePrefix := os.Getenv("IMAGE_PREFIX")
+		if imagePrefix == "" {
+			imagePrefix = "auto-optimizer.local"
+		}
+		imageTag := os.Getenv("IMAGE_TAG")
+		if imageTag == "" {
+			imageTag = "dev"
+		}
+		image := fmt.Sprintf("%s/sandbox-go:%s", imagePrefix, imageTag)
+
+		manifest := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: default
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    runAsNonRoot: true
+  containers:
+    - name: sandbox-go
+      image: %s
+      command: ["sh", "-c", "go version && cd $(mktemp -d) && printf 'package main\nfunc main() {}\n' > main.go && go build main.go"]
+`, podName, image)
+
+		subH.ApplyManifest(manifest)
+
+		// Wait for pod to complete
+		subH.WaitForPodSuccess("default", podName, 60*time.Second)
+
+		// Verify pod logs
+		logs := subH.GetPodLogs("default", podName)
+		if !strings.Contains(logs, "go version") {
+			t.Fatalf("Unexpected pod logs from %s: %s", podName, logs)
+		}
+		t.Logf("PASS: sandbox-go ran go version and go build as UID 1000 and exited 0.")
+	})
 }
 
 func TestSession(t *testing.T) {

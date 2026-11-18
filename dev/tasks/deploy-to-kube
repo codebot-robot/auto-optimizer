@@ -426,6 +426,7 @@ if has_component "ao"; then
     echo "Loading auto-optimizer images into kind cluster ${KIND_CLUSTER_NAME}..."
     kind load docker-image \
       "${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}" \
+      "${IMAGE_PREFIX}/sandbox-go:${IMAGE_TAG}" \
       "${IMAGE_PREFIX}/ao:${IMAGE_TAG}" \
       "${IMAGE_PREFIX}/sandboxd:${IMAGE_TAG}" \
       --name "${KIND_CLUSTER_NAME}"

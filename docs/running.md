@@ -110,8 +110,7 @@ Commit this file and push it to the default branch of your fork.
 Ensure the sandbox container image contains all tools required by your verify command.
 The default toolbox image in `SANDBOX_IMAGE` provides Debian with git, curl, bash, and process tools.
 It does not provide language compilers or build runtimes.
-Build a custom sandbox image when your verify command requires tools such as Go, Python, or Node.js.
-Install your build toolchain into an image that includes the `geminicli-toolbox` binary.
+Use `sandbox-go` for Go repositories, and build your own for other toolchains.
 Update `SANDBOX_IMAGE` in the `ao-config` ConfigMap with your image reference:
 
 ```bash
