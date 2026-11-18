@@ -36,6 +36,7 @@ type RepoPageData struct {
 	Goals      []GoalEntry
 	RecentRuns []*state.Run
 	User       string
+	CSRFToken  string
 }
 
 // Title returns the page title for the layout header.
@@ -63,7 +64,7 @@ func RenderRepoPage(ctx context.Context, w http.ResponseWriter, data RepoPageDat
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	populateUser(ctx, &data.User)
+	populatePage(ctx, &data.User, &data.CSRFToken)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	return repoPageTmpl().Execute(w, data)
 }

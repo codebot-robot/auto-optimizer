@@ -435,14 +435,22 @@ func runServe(ctx context.Context, opts serveOptions) error {
 	var httpListener net.Listener
 	var httpServer *http.Server
 	if opts.http != "" {
-		webHandler, err := web.NewServer(srv, stateStore, scheduler)
+		var sessionKey []byte
+		if opts.github.ClientID != "" {
+			sessionKey = []byte(os.Getenv("AO_SESSION_KEY"))
+		}
+		webHandler, err := web.NewServer(web.ServerOptions{
+			Service:    srv,
+			StateStore: stateStore,
+			Starter:    scheduler,
+			SessionKey: sessionKey,
+		})
 		if err != nil {
 			return fmt.Errorf("initializing web server: %w", err)
 		}
 		var handler http.Handler = webHandler
 		if opts.github.ClientID != "" {
-			sessionKey := os.Getenv("AO_SESSION_KEY")
-			h, err := auth.NewGitHubHandler(opts.github, []byte(sessionKey), time.Now, webHandler)
+			h, err := auth.NewGitHubHandler(opts.github, sessionKey, time.Now, webHandler)
 			if err != nil {
 				return fmt.Errorf("initializing auth handler: %w", err)
 			}

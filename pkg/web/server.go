@@ -17,6 +17,7 @@ package web
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -26,18 +27,20 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
+	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
 
 //go:embed static/*
 var staticFS embed.FS
 
-const csrfCookieName = "ao_session"
+const csrfCookieName = "csrf_token"
 
 // SessionService is the interface web requires from the session backend.
 type SessionService interface {
@@ -49,7 +52,15 @@ type SessionService interface {
 
 // RunStarter can start a new run for a goal in a repository.
 type RunStarter interface {
-	StartRun(ctx context.Context, repo *state.Repo, goalName string, reason string) (*state.Run, error)
+	StartRun(ctx context.Context, repo *state.Repo, goalName string, opts run.StartOptions) (*state.Run, error)
+}
+
+// ServerOptions configures a web Server.
+type ServerOptions struct {
+	Service    SessionService
+	StateStore state.Store
+	Starter    RunStarter
+	SessionKey []byte
 }
 
 // Server handles HTTP requests for the web UI.
@@ -57,18 +68,20 @@ type Server struct {
 	service    SessionService
 	stateStore state.Store
 	starter    RunStarter
+	sessionKey []byte
 }
 
-// NewServer creates a new web Server backed by the given SessionService, state.Store, and RunStarter.
-func NewServer(service SessionService, stateStore state.Store, starter RunStarter) (*Server, error) {
-	if service == nil {
+// NewServer creates a new web Server backed by the given ServerOptions.
+func NewServer(opts ServerOptions) (*Server, error) {
+	if opts.Service == nil {
 		return nil, errors.New("service is required")
 	}
 
 	return &Server{
-		service:    service,
-		stateStore: stateStore,
-		starter:    starter,
+		service:    opts.Service,
+		stateStore: opts.StateStore,
+		starter:    opts.Starter,
+		sessionKey: opts.SessionKey,
 	}, nil
 }
 
@@ -92,10 +105,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ensure SameSite=Strict cookie on GET requests
-	if r.Method == http.MethodGet {
-		s.ensureCSRFCookie(w, r)
-	}
+	// Inject anti-forgery token into request context for template rendering
+	token := s.csrfToken(w, r)
+	r = r.WithContext(WithCSRFToken(r.Context(), token))
 
 	// Validate CSRF on POST requests
 	if r.Method == http.MethodPost {
@@ -149,9 +161,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) string {
 	if c, err := r.Cookie(csrfCookieName); err == nil && c.Value != "" {
-		return
+		return c.Value
 	}
 	tokenBytes := make([]byte, 16)
 	_, _ = rand.Read(tokenBytes)
@@ -164,11 +176,43 @@ func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteStrictMode,
 		HttpOnly: true,
 	})
+	return token
+}
+
+func (s *Server) authEnabled() bool {
+	return len(s.sessionKey) >= auth.MinKeyLength
+}
+
+func (s *Server) csrfToken(w http.ResponseWriter, r *http.Request) string {
+	if s.authEnabled() {
+		if c, err := r.Cookie(auth.CookieName); err == nil && c.Value != "" {
+			return auth.CSRFToken(c.Value, s.sessionKey)
+		}
+		return ""
+	}
+	return s.ensureCSRFCookie(w, r)
 }
 
 func (s *Server) validateCSRF(r *http.Request) bool {
+	formToken := strings.TrimSpace(r.PostFormValue("csrf"))
+	if formToken == "" {
+		return false
+	}
+
+	if s.authEnabled() {
+		c, err := r.Cookie(auth.CookieName)
+		if err != nil || c.Value == "" {
+			return false
+		}
+		expected := auth.CSRFToken(c.Value, s.sessionKey)
+		return hmac.Equal([]byte(formToken), []byte(expected))
+	}
+
 	cookie, err := r.Cookie(csrfCookieName)
-	return err == nil && cookie.Value != ""
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	return hmac.Equal([]byte(formToken), []byte(cookie.Value))
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -365,7 +409,15 @@ func (s *Server) handlePostRun(w http.ResponseWriter, r *http.Request, runID str
 		return
 	}
 
-	newRun, err := s.starter.StartRun(r.Context(), repo, runRec.GoalName, "manual")
+	actor := "anonymous"
+	if u, ok := auth.UserFromContext(r.Context()); ok && u != "" {
+		actor = u
+	}
+
+	newRun, err := s.starter.StartRun(r.Context(), repo, runRec.GoalName, run.StartOptions{
+		Reason: "manual",
+		By:     actor,
+	})
 	if err != nil {
 		if isConflict(err) {
 			events, readErr := s.stateStore.ReadEvents(r.Context(), runRec.Repo, runRec.ID)
@@ -443,6 +495,25 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, name 
 	if text == "" {
 		http.Error(w, "message text is required", http.StatusBadRequest)
 		return
+	}
+
+	actor := "anonymous"
+	if u, ok := auth.UserFromContext(r.Context()); ok && u != "" {
+		actor = u
+	}
+
+	if s.stateStore != nil {
+		if run, err := s.stateStore.FindRunBySession(r.Context(), name); err == nil && run != nil {
+			event := state.Event{
+				Time:  time.Now().UTC(),
+				Phase: run.Phase,
+				Kind:  "message_posted",
+				Data:  map[string]any{"by": actor},
+			}
+			if appendErr := s.stateStore.AppendEvent(r.Context(), run.Repo, run.ID, event); appendErr != nil {
+				scoped.Log(r.Context()).Error(appendErr, "appending message event for run", "run", run.ID, "session", name)
+			}
+		}
 	}
 
 	if err := s.service.StartTurn(r.Context(), name, text); err != nil {

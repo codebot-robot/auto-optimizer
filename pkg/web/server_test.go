@@ -37,6 +37,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
+	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
 
 type recordingSandbox struct {
@@ -111,7 +112,7 @@ func setupTestWebServer(t *testing.T, sb tools.Sandbox) (*httptest.Server, *sess
 		t.Fatalf("sessionapi.NewServer: %v", err)
 	}
 
-	webServer, err := NewServer(srv, nil, nil)
+	webServer, err := NewServer(ServerOptions{Service: srv})
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -120,6 +121,21 @@ func setupTestWebServer(t *testing.T, sb tools.Sandbox) (*httptest.Server, *sess
 	t.Cleanup(ts.Close)
 
 	return ts, srv
+}
+
+func csrfFromJar(t *testing.T, jar http.CookieJar, serverURL string) string {
+	t.Helper()
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	for _, c := range jar.Cookies(u) {
+		if c.Name == csrfCookieName {
+			return c.Value
+		}
+	}
+	t.Fatalf("csrf cookie %q not found in jar for %s", csrfCookieName, serverURL)
+	return ""
 }
 
 func TestAcceptance_SendMessageAndPoll(t *testing.T) {
@@ -146,6 +162,7 @@ func TestAcceptance_SendMessageAndPoll(t *testing.T) {
 	prompt := "What is the capital of France?"
 	postResp, err := client.PostForm(ts.URL+"/sessions/test/messages", url.Values{
 		"text": {prompt},
+		"csrf": {csrfFromJar(t, jar, ts.URL)},
 	})
 	if err != nil {
 		t.Fatalf("POST /sessions/test/messages: %v", err)
@@ -211,6 +228,7 @@ func TestSendMessage_ToolCallExecution(t *testing.T) {
 	// Post message triggering run_command tool call
 	postResp, err := client.PostForm(ts.URL+"/sessions/toolcall/messages", url.Values{
 		"text": {"run: uname -a"},
+		"csrf": {csrfFromJar(t, jar, ts.URL)},
 	})
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -277,8 +295,10 @@ func TestSendMessage_BusySessionReturns409(t *testing.T) {
 	_ = resp.Body.Close()
 
 	// First message starts a blocking turn
+	csrf := csrfFromJar(t, jar, ts.URL)
 	postResp1, err := client.PostForm(ts.URL+"/sessions/busysess/messages", url.Values{
 		"text": {"run: sleep 10"},
+		"csrf": {csrf},
 	})
 	if err != nil {
 		t.Fatalf("first POST: %v", err)
@@ -298,6 +318,7 @@ func TestSendMessage_BusySessionReturns409(t *testing.T) {
 	// Second POST to the busy session must return 409 Conflict
 	postResp2, err := client.PostForm(ts.URL+"/sessions/busysess/messages", url.Values{
 		"text": {"second message"},
+		"csrf": {csrf},
 	})
 	if err != nil {
 		t.Fatalf("second POST: %v", err)
@@ -371,6 +392,60 @@ func TestCSRFProtection_RejectsCrossSitePost(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("POST /sessions without cookie status = %d, want 403 Forbidden", resp.StatusCode)
 	}
+
+	// Client with cookiejar (cookie present)
+	jar, _ := cookiejar.New(nil)
+	jarClient := &http.Client{Jar: jar}
+	getResp, err := jarClient.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	_ = getResp.Body.Close()
+	csrf := csrfFromJar(t, jar, ts.URL)
+
+	// POST with cookie but without csrf field -> 403
+	resp, err = jarClient.PostForm(ts.URL+"/sessions", url.Values{
+		"name":    {"newsess"},
+		"toolset": {"basic"},
+	})
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST without csrf field status = %d, want 403 Forbidden", resp.StatusCode)
+	}
+
+	// POST with cookie and wrong csrf field -> 403
+	resp, err = jarClient.PostForm(ts.URL+"/sessions", url.Values{
+		"name":    {"newsess"},
+		"toolset": {"basic"},
+		"csrf":    {"wrong-token"},
+	})
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST with wrong csrf field status = %d, want 403 Forbidden", resp.StatusCode)
+	}
+
+	// POST with cookie and correct csrf field -> 303
+	jarClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err = jarClient.PostForm(ts.URL+"/sessions", url.Values{
+		"name":    {"newsess"},
+		"toolset": {"basic"},
+		"csrf":    {csrf},
+	})
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST with right csrf field status = %d, want 303 See Other", resp.StatusCode)
+	}
 }
 
 func TestCreateSessionForm(t *testing.T) {
@@ -398,6 +473,7 @@ func TestCreateSessionForm(t *testing.T) {
 	postResp, err := client.PostForm(ts.URL+"/sessions", url.Values{
 		"name":    {"createdsess"},
 		"toolset": {"basic"},
+		"csrf":    {csrfFromJar(t, jar, ts.URL)},
 	})
 	if err != nil {
 		t.Fatalf("POST /sessions: %v", err)
@@ -566,7 +642,7 @@ func TestTranscriptTruncation_UTF8(t *testing.T) {
 		},
 	}
 
-	webServer, err := NewServer(fakeSvc, nil, nil)
+	webServer, err := NewServer(ServerOptions{Service: fakeSvc})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -657,7 +733,10 @@ func TestServer_ReposAndRuns(t *testing.T) {
 		t.Fatalf("sessionapi.NewServer: %v", err)
 	}
 
-	webServer, err := NewServer(srv, stateStore, nil)
+	webServer, err := NewServer(ServerOptions{
+		Service:    srv,
+		StateStore: stateStore,
+	})
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -869,7 +948,11 @@ func TestRunAgain(t *testing.T) {
 		t.Fatalf("run.NewScheduler: %v", err)
 	}
 
-	webServer, err := NewServer(&fakeSessionService{}, stateStore, scheduler)
+	webServer, err := NewServer(ServerOptions{
+		Service:    &fakeSessionService{},
+		StateStore: stateStore,
+		Starter:    scheduler,
+	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -930,9 +1013,13 @@ func TestRunAgain(t *testing.T) {
 		},
 	}
 
-	post := func(c *http.Client, path string) (*http.Response, string) {
+	post := func(c *http.Client, path string, extraValues ...url.Values) (*http.Response, string) {
 		t.Helper()
-		resp, err := c.Post(ts.URL+path, "application/x-www-form-urlencoded", nil)
+		form := url.Values{}
+		if len(extraValues) > 0 {
+			form = extraValues[0]
+		}
+		resp, err := c.PostForm(ts.URL+path, form)
 		if err != nil {
 			t.Fatalf("POST %s: %v", path, err)
 		}
@@ -963,13 +1050,26 @@ func TestRunAgain(t *testing.T) {
 		t.Errorf("expected finished run page to contain 'Run again' button, got:\n%s", string(getBody))
 	}
 
+	csrf := csrfFromJar(t, jar, ts.URL)
+	postWithCSRF := func(c *http.Client, path string) (*http.Response, string) {
+		return post(c, path, url.Values{"csrf": {csrf}})
+	}
+
+	// 2b. Refuses when cookie is present but csrf field is missing or wrong
+	if resp, _ := post(client, "/runs/"+failedRunID+"/rerun"); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST without csrf field status = %d, want 403 Forbidden", resp.StatusCode)
+	}
+	if resp, _ := post(client, "/runs/"+failedRunID+"/rerun", url.Values{"csrf": {"invalid-token"}}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST with wrong csrf field status = %d, want 403 Forbidden", resp.StatusCode)
+	}
+
 	// 3. POST to the run's own URL /runs/<id> is not accepted (returns 404)
-	if resp, _ := post(client, "/runs/"+failedRunID); resp.StatusCode != http.StatusNotFound {
+	if resp, _ := postWithCSRF(client, "/runs/"+failedRunID); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("POST /runs/<id> status = %d, want 404 Not Found", resp.StatusCode)
 	}
 
 	// 4. Successfully starts a run for the failed goal
-	postResp, _ := post(client, "/runs/"+failedRunID+"/rerun")
+	postResp, _ := postWithCSRF(client, "/runs/"+failedRunID+"/rerun")
 	if postResp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("POST /runs/<id>/rerun status = %d, want 303 See Other", postResp.StatusCode)
 	}
@@ -994,9 +1094,12 @@ func TestRunAgain(t *testing.T) {
 	if events[0].Data.(map[string]any)["reason"] != "manual" {
 		t.Errorf("event reason = %v, want manual", events[0].Data)
 	}
+	if events[0].Data.(map[string]any)["by"] != "anonymous" {
+		t.Errorf("event by = %v, want anonymous", events[0].Data)
+	}
 
 	// 5. Refuses while run is in progress
-	activeResp, activeBody := post(client, "/runs/"+newRunID+"/rerun")
+	activeResp, activeBody := postWithCSRF(client, "/runs/"+newRunID+"/rerun")
 	if activeResp.StatusCode != http.StatusConflict {
 		t.Fatalf("POST active run status = %d, want 409 Conflict", activeResp.StatusCode)
 	}
@@ -1029,7 +1132,7 @@ func TestRunAgain(t *testing.T) {
 	if err := stateStore.PutRun(ctx, missingRun); err != nil {
 		t.Fatalf("PutRun: %v", err)
 	}
-	missingResp, missingBody := post(client, "/runs/"+missingGoalRunID+"/rerun")
+	missingResp, missingBody := postWithCSRF(client, "/runs/"+missingGoalRunID+"/rerun")
 	if missingResp.StatusCode != http.StatusConflict {
 		t.Fatalf("POST missing goal status = %d, want 409 Conflict", missingResp.StatusCode)
 	}
@@ -1038,15 +1141,26 @@ func TestRunAgain(t *testing.T) {
 	}
 
 	// 7. Store / server error produces 500 Internal Server Error
-	errServer, err := NewServer(&fakeSessionService{}, stateStore, &failRunStarter{err: errors.New("simulated internal store failure")})
+	errServer, err := NewServer(ServerOptions{
+		Service:    &fakeSessionService{},
+		StateStore: stateStore,
+		Starter:    &failRunStarter{err: errors.New("simulated internal store failure")},
+	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 	tsErr := httptest.NewServer(errServer)
 	t.Cleanup(tsErr.Close)
+	errJar, _ := cookiejar.New(nil)
 	errClient := tsErr.Client()
-	errClient.Jar = jar
-	errResp, err := errClient.Post(tsErr.URL+"/runs/"+failedRunID+"/rerun", "application/x-www-form-urlencoded", nil)
+	errClient.Jar = errJar
+	getErrResp, err := errClient.Get(tsErr.URL + "/runs/" + failedRunID)
+	if err != nil {
+		t.Fatalf("GET tsErr: %v", err)
+	}
+	_ = getErrResp.Body.Close()
+	errCSRF := csrfFromJar(t, errJar, tsErr.URL)
+	errResp, err := errClient.PostForm(tsErr.URL+"/runs/"+failedRunID+"/rerun", url.Values{"csrf": {errCSRF}})
 	if err != nil {
 		t.Fatalf("POST with error starter: %v", err)
 	}
@@ -1056,10 +1170,389 @@ func TestRunAgain(t *testing.T) {
 	}
 }
 
+func TestCSRF_AuthSessionHMAC(t *testing.T) {
+	key := []byte("secret-key-32-bytes-length-long!")
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	fakeSvc := &fakeSessionService{}
+	webServer, err := NewServer(ServerOptions{
+		Service:    fakeSvc,
+		SessionKey: key,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	handler, err := auth.NewMiddleware(key, func() time.Time { return now }, webServer)
+	if err != nil {
+		t.Fatalf("NewMiddleware: %v", err)
+	}
+
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	sessionVal, err := (auth.Session{Login: "octocat", Expires: now.Add(time.Hour)}).Encode(key)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	jar, _ := cookiejar.New(nil)
+	client := ts.Client()
+	client.Jar = jar
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	u, _ := url.Parse(ts.URL)
+	jar.SetCookies(u, []*http.Cookie{
+		{
+			Name:  auth.CookieName,
+			Value: sessionVal,
+			Path:  "/",
+		},
+	})
+
+	// GET / to render the page with CSRF token
+	getResp, err := client.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	bodyBytes, _ := io.ReadAll(getResp.Body)
+	_ = getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200", getResp.StatusCode)
+	}
+
+	expectedHMAC := auth.CSRFToken(sessionVal, key)
+	wantField := `<input type="hidden" name="csrf" value="` + expectedHMAC + `">`
+	if !strings.Contains(string(bodyBytes), wantField) {
+		t.Fatalf("expected rendered form to contain %s, got:\n%s", wantField, string(bodyBytes))
+	}
+
+	// 1. POST without csrf field -> 403
+	postResp, err := client.PostForm(ts.URL+"/sessions", url.Values{
+		"name":    {"sess1"},
+		"toolset": {"basic"},
+	})
+	if err != nil {
+		t.Fatalf("POST without csrf: %v", err)
+	}
+	_ = postResp.Body.Close()
+	if postResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST without csrf status = %d, want 403 Forbidden", postResp.StatusCode)
+	}
+
+	// 2. POST with wrong csrf field -> 403
+	postResp, err = client.PostForm(ts.URL+"/sessions", url.Values{
+		"name":    {"sess1"},
+		"toolset": {"basic"},
+		"csrf":    {"wrong-csrf-token"},
+	})
+	if err != nil {
+		t.Fatalf("POST with wrong csrf: %v", err)
+	}
+	_ = postResp.Body.Close()
+	if postResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST with wrong csrf status = %d, want 403 Forbidden", postResp.StatusCode)
+	}
+
+	// 3. POST with right HMAC csrf field -> passes (303)
+	postResp, err = client.PostForm(ts.URL+"/sessions", url.Values{
+		"name":    {"sess1"},
+		"toolset": {"basic"},
+		"csrf":    {expectedHMAC},
+	})
+	if err != nil {
+		t.Fatalf("POST with right csrf: %v", err)
+	}
+	_ = postResp.Body.Close()
+	if postResp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST with right csrf status = %d, want 303 See Other", postResp.StatusCode)
+	}
+}
+
+func TestRunAgain_CarriesLogin(t *testing.T) {
+	ctx := t.Context()
+	key := []byte("secret-key-32-bytes-length-long!")
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	stateStore := state.NewFileStore(t.TempDir())
+
+	scheduler, err := run.NewScheduler(run.SchedulerOptions{
+		Store: stateStore,
+	})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	webServer, err := NewServer(ServerOptions{
+		Service:    &fakeSessionService{},
+		StateStore: stateStore,
+		Starter:    scheduler,
+		SessionKey: key,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	handler, err := auth.NewMiddleware(key, func() time.Time { return now }, webServer)
+	if err != nil {
+		t.Fatalf("NewMiddleware: %v", err)
+	}
+
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/auto-optimizer",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "auto-optimizer",
+		DefaultBranch: "main",
+	}
+	if err := stateStore.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	goalRec := &state.GoalRecord{
+		Goal: &goals.Goal{
+			Name: "test-goal",
+			Body: "Test goal description",
+		},
+		BaseCommit: "commit-base-123",
+	}
+	if err := stateStore.PutGoal(ctx, repoKey, goalRec); err != nil {
+		t.Fatalf("PutGoal: %v", err)
+	}
+
+	failedRunID, err := state.NewRunIDAt(now)
+	if err != nil {
+		t.Fatalf("NewRunIDAt: %v", err)
+	}
+	failedRun := &state.Run{
+		ID:         failedRunID,
+		Repo:       repoKey,
+		GoalName:   "test-goal",
+		Phase:      state.PhaseFailed,
+		BaseCommit: "commit-base-123",
+		Goal:       goalRec.Goal,
+	}
+	if err := stateStore.PutRun(ctx, failedRun); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	sessionVal, err := (auth.Session{Login: "monalisa", Expires: now.Add(time.Hour)}).Encode(key)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	jar, _ := cookiejar.New(nil)
+	client := ts.Client()
+	client.Jar = jar
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	u, _ := url.Parse(ts.URL)
+	jar.SetCookies(u, []*http.Cookie{
+		{
+			Name:  auth.CookieName,
+			Value: sessionVal,
+			Path:  "/",
+		},
+	})
+
+	csrfToken := auth.CSRFToken(sessionVal, key)
+
+	// Post rerun with csrf
+	postResp, err := client.PostForm(ts.URL+"/runs/"+failedRunID+"/rerun", url.Values{
+		"csrf": {csrfToken},
+	})
+	if err != nil {
+		t.Fatalf("POST rerun: %v", err)
+	}
+	_ = postResp.Body.Close()
+	if postResp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303 See Other", postResp.StatusCode)
+	}
+
+	newRunID := strings.TrimPrefix(postResp.Header.Get("Location"), "/runs/")
+	events, err := stateStore.ReadEvents(ctx, repoKey, newRunID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d (err: %v)", len(events), err)
+	}
+	data, ok := events[0].Data.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map[string]any in event data, got %T", events[0].Data)
+	}
+	if data["reason"] != "manual" {
+		t.Errorf("reason = %v, want manual", data["reason"])
+	}
+	if data["by"] != "monalisa" {
+		t.Errorf("by = %v, want monalisa", data["by"])
+	}
+}
+
+func TestPostMessage_RecordsActor(t *testing.T) {
+	ctx := t.Context()
+	key := []byte("secret-key-32-bytes-length-long!")
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	stateStore := state.NewFileStore(t.TempDir())
+
+	fakeSvc := &fakeSessionService{}
+	webServer, err := NewServer(ServerOptions{
+		Service:    fakeSvc,
+		StateStore: stateStore,
+		SessionKey: key,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	handler, err := auth.NewMiddleware(key, func() time.Time { return now }, webServer)
+	if err != nil {
+		t.Fatalf("NewMiddleware: %v", err)
+	}
+
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/auto-optimizer",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "auto-optimizer",
+		DefaultBranch: "main",
+	}
+	if err := stateStore.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID, err := state.NewRunIDAt(now)
+	if err != nil {
+		t.Fatalf("NewRunIDAt: %v", err)
+	}
+	run := &state.Run{
+		ID:        runID,
+		Repo:      repoKey,
+		GoalName:  "test-goal",
+		Phase:     state.PhaseWorking,
+		SessionID: "sess-user-1",
+	}
+	if err := stateStore.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	sessionVal, err := (auth.Session{Login: "octocat", Expires: now.Add(time.Hour)}).Encode(key)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	jar, _ := cookiejar.New(nil)
+	client := ts.Client()
+	client.Jar = jar
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	u, _ := url.Parse(ts.URL)
+	jar.SetCookies(u, []*http.Cookie{
+		{
+			Name:  auth.CookieName,
+			Value: sessionVal,
+			Path:  "/",
+		},
+	})
+
+	csrfToken := auth.CSRFToken(sessionVal, key)
+
+	// Post message as octocat
+	postResp, err := client.PostForm(ts.URL+"/sessions/sess-user-1/messages", url.Values{
+		"text": {"please check logs"},
+		"csrf": {csrfToken},
+	})
+	if err != nil {
+		t.Fatalf("POST message: %v", err)
+	}
+	_ = postResp.Body.Close()
+	if postResp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303 See Other", postResp.StatusCode)
+	}
+
+	events, err := stateStore.ReadEvents(ctx, repoKey, runID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d (err: %v)", len(events), err)
+	}
+	if events[0].Kind != "message_posted" {
+		t.Errorf("event kind = %v, want message_posted", events[0].Kind)
+	}
+	if events[0].Message != "" {
+		t.Errorf("event message = %q, want empty", events[0].Message)
+	}
+	data, ok := events[0].Data.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map[string]any in event data, got %T", events[0].Data)
+	}
+	if data["by"] != "octocat" {
+		t.Errorf("event by = %v, want octocat", data["by"])
+	}
+}
+
+func TestCSRF_KeySetAuthenticationOff(t *testing.T) {
+	// In --insecure-no-auth mode, SessionKey is nil even if AO_SESSION_KEY is present in the environment.
+	// Verify that the server uses double-submit cookie mode and successfully processes POST requests.
+	t.Setenv("AO_SESSION_KEY", "some-key-set-in-env-32-bytes-long!")
+	ts, _ := setupTestWebServer(t, nil)
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar.New: %v", err)
+	}
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// GET establishes the per-browser double-submit csrf_token cookie and renders it into the form
+	resp, err := client.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200", resp.StatusCode)
+	}
+
+	csrf := csrfFromJar(t, jar, ts.URL)
+	if csrf == "" {
+		t.Fatal("expected non-empty csrf cookie")
+	}
+	if !strings.Contains(string(bodyBytes), `<input type="hidden" name="csrf" value="`+csrf+`">`) {
+		t.Fatalf("expected rendered form to contain csrf token from cookie, got:\n%s", string(bodyBytes))
+	}
+
+	// POST with the form token succeeds (303 See Other)
+	postResp, err := client.PostForm(ts.URL+"/sessions", url.Values{
+		"name":    {"insecuresess"},
+		"toolset": {"basic"},
+		"csrf":    {csrf},
+	})
+	if err != nil {
+		t.Fatalf("POST /sessions: %v", err)
+	}
+	_ = postResp.Body.Close()
+	if postResp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST status = %d, want 303 See Other", postResp.StatusCode)
+	}
+}
+
 type failRunStarter struct {
 	err error
 }
 
-func (f *failRunStarter) StartRun(_ context.Context, _ *state.Repo, _ string, _ string) (*state.Run, error) {
+func (f *failRunStarter) StartRun(_ context.Context, _ *state.Repo, _ string, _ run.StartOptions) (*state.Run, error) {
 	return nil, f.err
 }

@@ -135,6 +135,27 @@ func TestDecodeRejections(t *testing.T) {
 	})
 }
 
+func TestCSRFToken(t *testing.T) {
+	key := []byte("secret-session-key-for-test-32b!")
+	token1 := CSRFToken("session-value-1", key)
+	token2 := CSRFToken("session-value-1", key)
+	token3 := CSRFToken("session-value-2", key)
+	diffKeyToken := CSRFToken("session-value-1", []byte("another-different-key-32-bytes!"))
+
+	if token1 == "" {
+		t.Fatal("expected non-empty CSRF token")
+	}
+	if token1 != token2 {
+		t.Errorf("expected deterministic token for same input: %s != %s", token1, token2)
+	}
+	if token1 == token3 {
+		t.Errorf("expected different token for different session value: %s == %s", token1, token3)
+	}
+	if token1 == diffKeyToken {
+		t.Errorf("expected different token for different key: %s == %s", token1, diffKeyToken)
+	}
+}
+
 func TestMiddleware(t *testing.T) {
 	key := []byte("test-signing-key-32-bytes-length")
 	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)

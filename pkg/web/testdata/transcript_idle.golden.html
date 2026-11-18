@@ -72,6 +72,7 @@
 <div class="card message-form-section">
   <h3>Send Message</h3>
   <form action="/sessions/idle-session/messages" method="POST" class="message-form">
+    <input type="hidden" name="csrf" value="">
     <div class="form-group">
       <textarea name="text" rows="3" required placeholder="Type a message to the agent..."></textarea>
     </div>

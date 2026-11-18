@@ -965,7 +965,7 @@ func TestScheduler_StartRun(t *testing.T) {
 	}
 
 	// 1. Successful manual start
-	run, err := scheduler.StartRun(ctx, repo, goalRec.Goal.Name, "manual")
+	run, err := scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{Reason: "manual", By: "octocat"})
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
@@ -979,9 +979,12 @@ func TestScheduler_StartRun(t *testing.T) {
 	if events[0].Data.(map[string]any)["reason"] != "manual" {
 		t.Errorf("expected reason 'manual', got %v", events[0].Data)
 	}
+	if events[0].Data.(map[string]any)["by"] != "octocat" {
+		t.Errorf("expected by 'octocat', got %v", events[0].Data)
+	}
 
 	// 2. Refuses when goal has an active run
-	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, "manual")
+	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{Reason: "manual"})
 	if !errors.Is(err, ErrActiveRun) {
 		t.Fatalf("expected ErrActiveRun, got: %v", err)
 	}
@@ -995,13 +998,13 @@ func TestScheduler_StartRun(t *testing.T) {
 	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
 		{Number: 1, Head: "ao/optimize-latency/run-1", State: "open", URL: repo.URL + "/pull/1"},
 	})
-	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, "manual")
+	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{Reason: "manual"})
 	if !errors.Is(err, ErrOpenPullRequest) {
 		t.Fatalf("expected ErrOpenPullRequest, got: %v", err)
 	}
 
 	// 4. Refuses when goal record is missing from repository
-	_, err = scheduler.StartRun(ctx, repo, "missing-goal", "manual")
+	_, err = scheduler.StartRun(ctx, repo, "missing-goal", StartOptions{Reason: "manual"})
 	if !errors.Is(err, ErrGoalNotFound) {
 		t.Fatalf("expected ErrGoalNotFound, got: %v", err)
 	}

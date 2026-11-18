@@ -419,6 +419,60 @@ func TestRun_FindRun(t *testing.T) {
 	}
 }
 
+func TestRun_FindRunBySession(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := NewFileStore(storeDir)
+
+	// Empty session ID returns error
+	if _, err := store.FindRunBySession(ctx, ""); err == nil {
+		t.Error("expected error for empty session ID")
+	}
+
+	// Missing session in empty store
+	if _, err := store.FindRunBySession(ctx, "missing-sess"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound for missing session, got %v", err)
+	}
+
+	repo := &Repo{
+		URL:            "https://github.com/gke-labs/repo-c",
+		Host:           "github.com",
+		Owner:          "gke-labs",
+		Name:           "repo-c",
+		DefaultBranch:  "main",
+		ForgeKind:      "github",
+		RegisteredTime: time.Now(),
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	run := &Run{
+		ID:        "20261023T160000Z-0001",
+		Repo:      repo.Key(),
+		GoalName:  "optimize",
+		Phase:     PhaseWorking,
+		SessionID: "sess-12345",
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	// Direct lookup by session
+	found, err := store.FindRunBySession(ctx, "sess-12345")
+	if err != nil {
+		t.Fatalf("FindRunBySession failed: %v", err)
+	}
+	if diff := cmp.Diff(run, found); diff != "" {
+		t.Errorf("FindRunBySession mismatch (-want +got):\n%s", diff)
+	}
+
+	// Non-existent session ID
+	if _, err := store.FindRunBySession(ctx, "sess-nonexistent"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got %v", err)
+	}
+}
+
 func TestEvents_AppendAndRead(t *testing.T) {
 	ctx := t.Context()
 	storeDir := t.TempDir()

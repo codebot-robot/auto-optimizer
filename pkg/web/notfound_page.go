@@ -24,8 +24,9 @@ import (
 
 // NotFoundPageData contains data for rendering the 404 Not Found page.
 type NotFoundPageData struct {
-	Message string
-	User    string
+	Message   string
+	User      string
+	CSRFToken string
 }
 
 // Title returns the page title for the layout header.
@@ -50,7 +51,7 @@ func RenderNotFoundPage(ctx context.Context, w http.ResponseWriter, data NotFoun
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	populateUser(ctx, &data.User)
+	populatePage(ctx, &data.User, &data.CSRFToken)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)
 	return notFoundPageTmpl().Execute(w, data)

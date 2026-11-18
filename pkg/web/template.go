@@ -36,12 +36,39 @@ var templateFuncs = template.FuncMap{
 	"isTool":      isTool,
 }
 
+type csrfContextKey struct{}
+
+// WithCSRFToken returns a copy of parent context with the CSRF token stored.
+func WithCSRFToken(parent context.Context, token string) context.Context {
+	return context.WithValue(parent, csrfContextKey{}, token)
+}
+
+// CSRFTokenFromContext returns the CSRF token from ctx, if present.
+func CSRFTokenFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	t, _ := ctx.Value(csrfContextKey{}).(string)
+	return t
+}
+
 func populateUser(ctx context.Context, user *string) {
 	if *user == "" {
 		if u, ok := auth.UserFromContext(ctx); ok {
 			*user = u
 		}
 	}
+}
+
+func populateCSRF(ctx context.Context, csrf *string) {
+	if *csrf == "" {
+		*csrf = CSRFTokenFromContext(ctx)
+	}
+}
+
+func populatePage(ctx context.Context, user *string, csrf *string) {
+	populateUser(ctx, user)
+	populateCSRF(ctx, csrf)
 }
 
 func parsePageTemplate(pageHTML string) *template.Template {

@@ -26,8 +26,9 @@ import (
 
 // SessionListPageData contains data for rendering the session list page.
 type SessionListPageData struct {
-	Sessions []sessionapi.SessionSummary
-	User     string
+	Sessions  []sessionapi.SessionSummary
+	User      string
+	CSRFToken string
 }
 
 // Title returns the page title for the layout header.
@@ -52,7 +53,7 @@ func RenderSessionListPage(ctx context.Context, w http.ResponseWriter, data Sess
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	populateUser(ctx, &data.User)
+	populatePage(ctx, &data.User, &data.CSRFToken)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	return sessionListPageTmpl().Execute(w, data)
 }

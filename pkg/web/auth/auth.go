@@ -138,6 +138,13 @@ func WithUser(parent context.Context, login string) context.Context {
 	return context.WithValue(parent, userContextKey{}, login)
 }
 
+// CSRFToken derives an anti-forgery token from a session cookie value and session signing key.
+func CSRFToken(sessionValue string, key []byte) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(sessionValue))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // NewMiddleware returns an HTTP handler that enforces valid session cookies.
 // It returns an error if key is shorter than MinKeyLength.
 // With a valid session, the user login is injected into the request context.

@@ -74,6 +74,9 @@ type Store interface {
 	// FindRun searches across all registered repositories for a run by its ID.
 	FindRun(ctx context.Context, runID string) (*Run, error)
 
+	// FindRunBySession retrieves the run associated with a session ID, or returns ErrNotFound.
+	FindRunBySession(ctx context.Context, sessionID string) (*Run, error)
+
 	// ListRuns returns all runs for a repository sorted chronologically by run ID.
 	ListRuns(ctx context.Context, key RepoKey) ([]*Run, error)
 
@@ -118,6 +121,15 @@ func (s *FileStore) runPath(key RepoKey, runID string) string {
 
 func (s *FileStore) eventsPath(key RepoKey, runID string) string {
 	return filepath.Join(s.repoDir(key), "runs", runID, "events.jsonl")
+}
+
+type sessionRunRef struct {
+	Repo  RepoKey `json:"repo"`
+	RunID string  `json:"runId"`
+}
+
+func (s *FileStore) sessionRunPath(sessionID string) string {
+	return filepath.Join(s.rootDir, "session_runs", sessionID+".json")
 }
 
 // writeJSONAtomically writes a JSON object atomically using a temporary file in the same
@@ -450,7 +462,20 @@ func (s *FileStore) PutRun(ctx context.Context, run *Run) error {
 	log := scoped.Log(ctx)
 	p := s.runPath(run.Repo, run.ID)
 	log.V(2).Info("putting run record", "repo", run.Repo.String(), "run", run.ID, "path", p)
-	return writeJSONAtomically(ctx, p, run)
+	if err := writeJSONAtomically(ctx, p, run); err != nil {
+		return err
+	}
+
+	if run.SessionID != "" {
+		ref := sessionRunRef{
+			Repo:  run.Repo,
+			RunID: run.ID,
+		}
+		if err := writeJSONAtomically(ctx, s.sessionRunPath(run.SessionID), ref); err != nil {
+			return fmt.Errorf("writing session run index for session %s: %w", run.SessionID, err)
+		}
+	}
+	return nil
 }
 
 // GetRun reads run.json for the given run ID.
@@ -544,6 +569,29 @@ func (s *FileStore) FindRun(ctx context.Context, runID string) (*Run, error) {
 	}
 
 	return nil, fmt.Errorf("run %q: %w", runID, ErrNotFound)
+}
+
+// FindRunBySession searches for a run by its associated session ID.
+func (s *FileStore) FindRunBySession(ctx context.Context, sessionID string) (*Run, error) {
+	if sessionID == "" {
+		return nil, errors.New("session id cannot be empty")
+	}
+
+	p := s.sessionRunPath(sessionID)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("session %q: %w", sessionID, ErrNotFound)
+		}
+		return nil, fmt.Errorf("reading session run index %s: %w", p, err)
+	}
+
+	var ref sessionRunRef
+	if err := json.Unmarshal(data, &ref); err != nil {
+		return nil, fmt.Errorf("decoding session run index %s: %w", p, err)
+	}
+
+	return s.GetRun(ctx, ref.Repo, ref.RunID)
 }
 
 // AppendEvent appends one or more events to events.jsonl.
