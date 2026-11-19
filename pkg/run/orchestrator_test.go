@@ -48,9 +48,11 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apimachineryruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -232,28 +234,40 @@ func runRequest(orch *Orchestrator, repo state.RepoKey, runID string) reconcile.
 }
 
 func reconcileWorkingRun(ctx context.Context, orch *Orchestrator, req reconcile.Request) (reconcile.Result, error) {
-	_, runID, ok, err := orch.runForRequest(ctx, req)
+	repoKey, runID, ok, err := orch.runForRequest(ctx, req)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 	if !ok {
 		return reconcile.Result{}, fmt.Errorf("could not resolve request %v to run", req)
 	}
-	// First pass starts the worker
-	res, err := orch.Reconcile(ctx, req)
-	if err != nil {
-		return res, err
-	}
-	// Wait for worker to finish
-	deadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(runID) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
 		if time.Now().After(deadline) {
-			return res, fmt.Errorf("timed out waiting for worker on run %s", runID)
+			return reconcile.Result{}, fmt.Errorf("timed out waiting for worker on run %s", runID)
 		}
-		time.Sleep(5 * time.Millisecond)
+		res, err := orch.Reconcile(ctx, req)
+		if err != nil {
+			return res, err
+		}
+		for orch.isRunActive(runID) {
+			if time.Now().After(deadline) {
+				return res, fmt.Errorf("timed out waiting for worker on run %s", runID)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		orch.turnOutcomesMu.Lock()
+		_, hasOutcome := orch.turnOutcomes[runID]
+		orch.turnOutcomesMu.Unlock()
+		if hasOutcome {
+			continue
+		}
+		runRec, getErr := orch.store.GetRun(ctx, repoKey, runID)
+		if getErr == nil && runRec != nil && orch.isPreparingReplacement(runRec) {
+			continue
+		}
+		return res, nil
 	}
-	// Second pass consumes the outcome
-	return orch.Reconcile(ctx, req)
 }
 
 func TestOrchestrator_PendingToWorking(t *testing.T) {
@@ -8309,6 +8323,316 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		var claim corev1.PersistentVolumeClaim
 		if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: name}, &claim); !k8serrors.IsNotFound(err) {
 			t.Errorf("expected claim not found, got %v", err)
+		}
+	})
+}
+
+type sandboxLossLLM struct {
+	mu        sync.Mutex
+	agentsCS  *fakeagents.Clientset
+	sbName    string
+	losses    int
+	maxLosses int
+	callCount int
+}
+
+func (l *sandboxLossLLM) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.callCount++
+
+	if l.losses < l.maxLosses {
+		l.losses++
+		_ = l.agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, l.sbName, metav1.DeleteOptions{})
+		args, _ := json.Marshal(map[string]string{"command": "echo hello"})
+		return &llm.ChatCompletionResponse{
+			ID: fmt.Sprintf("loss-llm-%d", l.callCount),
+			Choices: []llm.Choice{
+				{
+					Message: llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:   fmt.Sprintf("call-%d", l.callCount),
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "run_command",
+									Arguments: string(args),
+								},
+							},
+						},
+					},
+					FinishReason: "tool_calls",
+				},
+			},
+		}, nil
+	}
+
+	finishArgs, _ := json.Marshal(map[string]string{"summary": "work complete"})
+	return &llm.ChatCompletionResponse{
+		ID: fmt.Sprintf("finish-llm-%d", l.callCount),
+		Choices: []llm.Choice{
+			{
+				Message: llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{
+						{
+							ID:   fmt.Sprintf("call-%d", l.callCount),
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "finish",
+								Arguments: string(finishArgs),
+							},
+						},
+					},
+				},
+				FinishReason: "tool_calls",
+			},
+		},
+	}, nil
+}
+
+func setupSandboxLossTest(t *testing.T, runID string, maxLosses int, withClaim bool) (*Orchestrator, state.Store, *state.Run, *state.Repo, *fakeagents.Clientset, func() *sandboxv1beta1.Sandbox) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	sbName := sandboxNameForRun(runID)
+	deadline := time.Now().Add(30 * time.Minute)
+	claimName := ""
+	if withClaim {
+		claimName = sbName
+	}
+
+	run := &state.Run{
+		ID:                 runID,
+		Repo:               repo.Key(),
+		GoalName:           "test-goal",
+		Phase:              state.PhaseWorking,
+		BaseCommit:         "base-sha",
+		SandboxName:        sbName,
+		WorkspaceClaimName: claimName,
+		Deadline:           &deadline,
+		Goal:               &goals.Goal{Name: "test-goal", Body: "body"},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &mockProcessServer{
+		workspaceReused: true,
+		exitCode:        0,
+		stdout:          "hello\n",
+	}
+	lossLLM := &sandboxLossLLM{sbName: sbName, maxLosses: maxLosses}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, lossLLM)
+	lossLLM.agentsCS = agentsCS
+
+	var createdSb *sandboxv1beta1.Sandbox
+	agentsCS.PrependReactor("create", "sandboxes", func(action clienttesting.Action) (bool, apimachineryruntime.Object, error) {
+		createAction := action.(clienttesting.CreateAction)
+		sb := createAction.GetObject().(*sandboxv1beta1.Sandbox)
+		createdSb = sb
+		sb.Status.Conditions = []metav1.Condition{
+			{
+				Type:   string(sandboxv1beta1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			},
+		}
+		return false, nil, nil
+	})
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: "ao-sandboxes", Labels: map[string]string{LabelRun: runID}},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: deadline.Add(SandboxShutdownGrace)}, ShutdownPolicy: &policy},
+		},
+		Status: sandboxv1beta1.SandboxStatus{Conditions: []metav1.Condition{{Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue}}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating initial sandbox: %v", err)
+	}
+
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	if withClaim {
+		sc := "standard"
+		claim := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sbName,
+				Namespace: "ao-sandboxes",
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				StorageClassName: &sc,
+			},
+		}
+		if err := fakeClient.Create(ctx, claim); err != nil {
+			t.Fatalf("creating claim: %v", err)
+		}
+		hr := &herorunv1alpha1.HeroRun{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sbName,
+				Namespace: "ao-sandboxes",
+			},
+		}
+		if err := fakeClient.Create(ctx, hr); err != nil {
+			t.Fatalf("creating herorun: %v", err)
+		}
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:                 store,
+		SessionStore:          sessionStore,
+		Harness:               harness,
+		KubeClient:            fakeClient,
+		WorkspaceStorageClass: "standard",
+		Clock:                 func() time.Time { return fixedTime },
+		MaxTurns:              30,
+	})
+
+	return orch, store, run, repo, agentsCS, func() *sandboxv1beta1.Sandbox { return createdSb }
+}
+
+func TestOrchestrator_Working_SandboxLoss(t *testing.T) {
+	t.Run("disappears during tool call and finishes on same claim", func(t *testing.T) {
+		ctx := t.Context()
+		runID := "20261030T120000Z-loss-replace"
+		orch, store, run, repo, _, getCreatedSb := setupSandboxLossTest(t, runID, 1, true)
+
+		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+			t.Fatalf("reconcileWorkingRun: %v", err)
+		}
+
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseNoImprovement {
+			t.Errorf("expected phase %s, got %s (err: %s)", state.PhaseNoImprovement, gotRun.Phase, gotRun.Error)
+		}
+		if gotRun.SandboxReplacements != 1 {
+			t.Errorf("expected SandboxReplacements = 1, got %d", gotRun.SandboxReplacements)
+		}
+
+		events, err := store.ReadEvents(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		var foundReplaced bool
+		for _, e := range events {
+			if e.Kind == "sandbox_replaced" {
+				foundReplaced = true
+				break
+			}
+		}
+		if !foundReplaced {
+			t.Errorf("expected sandbox_replaced event, got events: %+v", events)
+		}
+
+		createdSb := getCreatedSb()
+		if createdSb == nil {
+			t.Fatal("expected replacement sandbox to be created")
+		}
+		var mountedClaim string
+		for _, v := range createdSb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes {
+			if v.Name == "workspace" && v.PersistentVolumeClaim != nil {
+				mountedClaim = v.PersistentVolumeClaim.ClaimName
+			}
+		}
+		if mountedClaim != run.SandboxName {
+			t.Errorf("expected replacement sandbox to mount claim %q, got %q", run.SandboxName, mountedClaim)
+		}
+	})
+
+	t.Run("no workspace claim fails with sandbox_expired", func(t *testing.T) {
+		ctx := t.Context()
+		runID := "20261030T120000Z-loss-noclaim"
+		orch, store, _, repo, _, _ := setupSandboxLossTest(t, runID, 1, false)
+
+		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
+			t.Logf("reconcileWorkingRun completed")
+		}
+
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseFailed {
+			t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
+		}
+
+		events, err := store.ReadEvents(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		var foundExpired bool
+		for _, e := range events {
+			if e.Phase == state.PhaseFailed && e.Kind == "sandbox_expired" {
+				foundExpired = true
+			}
+			if e.Kind == "sandbox_replaced" {
+				t.Errorf("unexpected sandbox_replaced event for run with no claim")
+			}
+		}
+		if !foundExpired {
+			t.Errorf("expected sandbox_expired event, got events: %+v", events)
+		}
+	})
+
+	t.Run("fourth loss ends as Failed with sandbox_expired", func(t *testing.T) {
+		ctx := t.Context()
+		runID := "20261030T120000Z-loss-fourth"
+		orch, store, _, repo, _, _ := setupSandboxLossTest(t, runID, 4, true)
+
+		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
+			t.Logf("reconcileWorkingRun completed")
+		}
+
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseFailed {
+			t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
+		}
+		if gotRun.SandboxReplacements != 3 {
+			t.Errorf("expected SandboxReplacements = 3, got %d", gotRun.SandboxReplacements)
+		}
+
+		events, err := store.ReadEvents(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		var replacedCount int
+		var foundExpired bool
+		for _, e := range events {
+			if e.Kind == "sandbox_replaced" {
+				replacedCount++
+			}
+			if e.Phase == state.PhaseFailed && e.Kind == "sandbox_expired" {
+				foundExpired = true
+			}
+		}
+		if replacedCount != 3 {
+			t.Errorf("expected exactly 3 sandbox_replaced events, got %d", replacedCount)
+		}
+		if !foundExpired {
+			t.Errorf("expected sandbox_expired event on 4th loss, got events: %+v", events)
 		}
 	})
 }
