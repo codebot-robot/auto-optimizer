@@ -18,6 +18,7 @@ import (
 	"context"
 	_ "embed"
 	"html/template"
+	"io"
 	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
@@ -34,6 +35,37 @@ var templateFuncs = template.FuncMap{
 	"truncate":    truncate,
 	"canTruncate": canTruncate,
 	"isTool":      isTool,
+	"csrfToken":   func() string { return "" },
+}
+
+type csrfContextKey struct{}
+
+// WithCSRFToken returns a copy of parent context carrying the CSRF token.
+func WithCSRFToken(parent context.Context, token string) context.Context {
+	return context.WithValue(parent, csrfContextKey{}, token)
+}
+
+// CSRFTokenFromContext returns the CSRF token stored in ctx, if present.
+func CSRFTokenFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	token, _ := ctx.Value(csrfContextKey{}).(string)
+	return token
+}
+
+func executePageTemplate(ctx context.Context, tmpl *template.Template, w io.Writer, data any) error {
+	token := CSRFTokenFromContext(ctx)
+	t, err := tmpl.Clone()
+	if err != nil {
+		return err
+	}
+	t.Funcs(template.FuncMap{
+		"csrfToken": func() string {
+			return token
+		},
+	})
+	return t.Execute(w, data)
 }
 
 func populateUser(ctx context.Context, user *string) {

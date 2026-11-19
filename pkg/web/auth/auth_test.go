@@ -53,6 +53,43 @@ func TestSessionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCSRFToken(t *testing.T) {
+	key := []byte("secret-session-key-for-test-32b!")
+	otherKey := []byte("other-secret-session-key-32bytes")
+	sessVal := "payload.signature"
+	otherSessVal := "different-payload.signature"
+
+	tok1 := CSRFToken(sessVal, key)
+	if tok1 == "" {
+		t.Fatal("expected non-empty CSRF token")
+	}
+
+	tok2 := CSRFToken(sessVal, key)
+	if tok1 != tok2 {
+		t.Errorf("CSRFToken not deterministic: got %q and %q", tok1, tok2)
+	}
+
+	tokDiffSess := CSRFToken(otherSessVal, key)
+	if tok1 == tokDiffSess {
+		t.Error("expected different tokens for different session values")
+	}
+
+	tokDiffKey := CSRFToken(sessVal, otherKey)
+	if tok1 == tokDiffKey {
+		t.Error("expected different tokens for different keys")
+	}
+
+	if got := CSRFToken("", key); got != "" {
+		t.Errorf("CSRFToken with empty session value = %q, want empty", got)
+	}
+	if got := CSRFToken(sessVal, nil); got != "" {
+		t.Errorf("CSRFToken with nil key = %q, want empty", got)
+	}
+	if got := CSRFToken(sessVal, []byte{}); got != "" {
+		t.Errorf("CSRFToken with empty key = %q, want empty", got)
+	}
+}
+
 func TestShortKeyRejections(t *testing.T) {
 	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	sess := Session{Login: "alice", Expires: now.Add(time.Hour)}

@@ -65,5 +65,5 @@ func RenderTranscriptPage(ctx context.Context, w http.ResponseWriter, data Trans
 	}
 	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	return transcriptPageTmpl().Execute(w, data)
+	return executePageTemplate(ctx, transcriptPageTmpl(), w, data)
 }

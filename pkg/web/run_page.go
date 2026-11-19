@@ -64,5 +64,5 @@ func RenderRunPage(ctx context.Context, w http.ResponseWriter, data RunPageData)
 	}
 	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	return runPageTmpl().Execute(w, data)
+	return executePageTemplate(ctx, runPageTmpl(), w, data)
 }

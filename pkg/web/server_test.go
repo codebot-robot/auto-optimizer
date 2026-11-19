@@ -17,6 +17,7 @@ package web
 import (
 	"context"
 	"errors"
+	"fmt"
 	"html"
 	"io"
 	"net/http"
@@ -37,6 +38,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
+	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
 
 type recordingSandbox struct {
@@ -111,7 +113,7 @@ func setupTestWebServer(t *testing.T, sb tools.Sandbox) (*httptest.Server, *sess
 		t.Fatalf("sessionapi.NewServer: %v", err)
 	}
 
-	webServer, err := NewServer(srv, nil, nil)
+	webServer, err := NewServer(srv, nil, nil, ServerOptions{})
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -373,6 +375,54 @@ func TestCSRFProtection_RejectsCrossSitePost(t *testing.T) {
 	}
 }
 
+func TestCSRFToken_RenderedInPage(t *testing.T) {
+	key := []byte("secret-session-signing-key-32b!!")
+	fakeSvc := &fakeSessionService{}
+	webServer, err := NewServer(fakeSvc, nil, nil, ServerOptions{
+		SessionKey: key,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	ts := httptest.NewServer(webServer)
+	t.Cleanup(ts.Close)
+
+	sess := auth.Session{
+		Login:   "alice",
+		Expires: time.Now().Add(time.Hour),
+	}
+	sessVal, err := sess.Encode(key)
+	if err != nil {
+		t.Fatalf("Encode session: %v", err)
+	}
+	expectedCSRF := auth.CSRFToken(sessVal, key)
+	if expectedCSRF == "" {
+		t.Fatal("expected non-empty derived CSRF token")
+	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar.New: %v", err)
+	}
+	u, _ := url.Parse(ts.URL)
+	jar.SetCookies(u, []*http.Cookie{
+		{Name: auth.CookieName, Value: sessVal, Path: "/"},
+	})
+
+	client := &http.Client{Jar: jar}
+	resp, err := client.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	wantHidden := fmt.Sprintf(`<input type="hidden" name="csrf" value="%s">`, expectedCSRF)
+	if !strings.Contains(string(body), wantHidden) {
+		t.Errorf("expected rendered page to contain %q, got body:\n%s", wantHidden, string(body))
+	}
+}
+
 func TestCreateSessionForm(t *testing.T) {
 	ts, _ := setupTestWebServer(t, nil)
 
@@ -566,7 +616,7 @@ func TestTranscriptTruncation_UTF8(t *testing.T) {
 		},
 	}
 
-	webServer, err := NewServer(fakeSvc, nil, nil)
+	webServer, err := NewServer(fakeSvc, nil, nil, ServerOptions{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -657,7 +707,7 @@ func TestServer_ReposAndRuns(t *testing.T) {
 		t.Fatalf("sessionapi.NewServer: %v", err)
 	}
 
-	webServer, err := NewServer(srv, stateStore, nil)
+	webServer, err := NewServer(srv, stateStore, nil, ServerOptions{})
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -869,7 +919,7 @@ func TestRunAgain(t *testing.T) {
 		t.Fatalf("run.NewScheduler: %v", err)
 	}
 
-	webServer, err := NewServer(&fakeSessionService{}, stateStore, scheduler)
+	webServer, err := NewServer(&fakeSessionService{}, stateStore, scheduler, ServerOptions{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -1038,7 +1088,7 @@ func TestRunAgain(t *testing.T) {
 	}
 
 	// 7. Store / server error produces 500 Internal Server Error
-	errServer, err := NewServer(&fakeSessionService{}, stateStore, &failRunStarter{err: errors.New("simulated internal store failure")})
+	errServer, err := NewServer(&fakeSessionService{}, stateStore, &failRunStarter{err: errors.New("simulated internal store failure")}, ServerOptions{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
