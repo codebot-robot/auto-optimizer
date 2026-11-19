@@ -414,7 +414,14 @@ Runs are reconciled in response to events:
    commits its own work before asking for a pull request. The control plane sets
    the agent's git identity during preparation. Every tool call, its truncated
    result, and its full output go to the state directory as they happen, so the
-   UI shows progress live.
+   UI shows progress live. When a `Working` run's Sandbox is gone before the
+   deadline and the run has a workspace claim, the orchestrator replaces the
+   Sandbox on the same claim (re-waiting for readiness, re-binding the portal
+   when configured, and verifying the clone is present), records the
+   `sandbox_replaced` event, and continues the turn with `Harness.ContinueTurn`.
+   After three replacements in one run, a subsequent loss ends the run as `Failed`
+   with `sandbox_expired`. A run with no workspace claim or a Sandbox that expires
+   at its `ShutdownTime` fails immediately.
 4. **Selecting.** When the goal specifies a `verify` command, the orchestrator
    runs it in the sandbox bounded by `--verify-timeout`. A failing command ends
    the run as `NoImprovement` with the event `verify_failed`. Execution errors

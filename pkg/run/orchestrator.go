@@ -96,6 +96,9 @@ const (
 
 	// portalBindRetryInterval is the retry interval used when binding an egress policy fails.
 	portalBindRetryInterval = 5 * time.Second
+
+	// sandboxDeleteRetryInterval is the retry interval when waiting for an old sandbox to finish terminating.
+	sandboxDeleteRetryInterval = 1 * time.Second
 )
 
 type runIndexEntry struct {
@@ -567,7 +570,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 	if run.Phase.IsTerminal() {
 		o.deleteRunIndex(req.Name)
 		if outcome, ok := o.popTurnOutcome(run.ID); ok {
-			if err := o.handleTurnOutcome(ctx, repo, run, outcome); err != nil {
+			if _, err := o.handleTurnOutcome(ctx, repo, run, outcome); err != nil {
 				log.V(2).Info("error handling leftover outcome for terminal run", "run", run.ID, "error", err)
 			}
 		}
@@ -1549,11 +1552,15 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	}
 
 	if outcome, ok := o.popTurnOutcome(run.ID); ok {
-		return reconcile.Result{}, o.handleTurnOutcome(ctx, repo, run, outcome)
+		return o.handleTurnOutcome(ctx, repo, run, outcome)
 	}
 
 	if o.isManagerCanceled() {
 		return reconcile.Result{}, nil
+	}
+
+	if o.isPreparingReplacement(run) {
+		return o.replaceWorkingSandbox(ctx, repo, run)
 	}
 
 	now := o.clock().UTC()
@@ -1605,13 +1612,21 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 			if failMsg != "" {
 				o.cancelWorker(run.ID)
 				sb := o.harness.GetOrAttachSandbox(run.SandboxName)
-				o.finishRun(ctx, repo, run, runEnd{
-					Phase:   state.PhaseFailed,
-					Kind:    "sandbox_deleted",
-					Message: failMsg,
-					Sandbox: sb,
-				})
-				return reconcile.Result{}, nil
+				if !o.canReplaceSandbox(ctx, repo, run) {
+					o.finishRun(ctx, repo, run, runEnd{
+						Phase:   state.PhaseFailed,
+						Kind:    "sandbox_deleted",
+						Message: failMsg,
+						Sandbox: sb,
+					})
+					return reconcile.Result{}, nil
+				}
+				o.markReplacementInProgress(run)
+				if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
+					return reconcile.Result{}, fmt.Errorf("marking replacement in progress: %w", err)
+				}
+				requeueAfter := o.retryAfterCappedAtDeadline(sandboxDeleteRetryInterval, run.Deadline)
+				return reconcile.Result{RequeueAfter: requeueAfter}, nil
 			}
 		}
 
@@ -1768,6 +1783,12 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		turnErr = harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
 	}
 
+	if isCanceled(turnErr) {
+		if checkErr := sb.CheckAlive(ctx, o.clock().UTC()); checkErr != nil {
+			turnErr = checkErr
+		}
+	}
+
 	return turnOutcome{
 		Err:      turnErr,
 		Finished: o.clock().UTC(),
@@ -1777,11 +1798,171 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	}
 }
 
-func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, run *state.Run, outcome turnOutcome) error {
+const maxSandboxReplacements = 3
+
+func (o *Orchestrator) isSandboxExpiredAtShutdownTime(ctx context.Context, run *state.Run) bool {
+	if o.harness == nil || o.harness.SandboxClient() == nil || run.SandboxName == "" {
+		return false
+	}
+	sbObj, err := o.harness.SandboxClient().GetSandboxResource(ctx, o.harness.Namespace(), run.SandboxName)
+	if err != nil {
+		return false
+	}
+	now := o.clock().UTC()
+	if sbObj.Spec.Lifecycle.ShutdownTime != nil && !now.Before(sbObj.Spec.Lifecycle.ShutdownTime.Time) {
+		return true
+	}
+	for _, cond := range sbObj.Status.Conditions {
+		if cond.Reason == sandboxv1beta1.SandboxReasonExpired {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *Orchestrator) canReplaceSandbox(ctx context.Context, repo *state.Repo, run *state.Run) bool {
+	if run.Phase != state.PhaseWorking {
+		return false
+	}
+	if run.SandboxReplacements >= maxSandboxReplacements {
+		return false
+	}
+	now := o.clock().UTC()
+	if run.Deadline != nil && !now.Before(*run.Deadline) {
+		return false
+	}
+	if run.WorkspaceClaimName == "" {
+		return false
+	}
+	if o.isSandboxExpiredAtShutdownTime(ctx, run) {
+		return false
+	}
+	return true
+}
+
+func (o *Orchestrator) retryAfterCappedAtDeadline(interval time.Duration, deadline *time.Time) time.Duration {
+	if deadline == nil {
+		return interval
+	}
+	now := o.clock().UTC()
+	if rem := deadline.Sub(now); rem < interval {
+		return rem
+	}
+	return interval
+}
+
+// isPreparingReplacement reports whether a Working run is currently preparing
+// a replacement Sandbox following Sandbox loss.
+func (o *Orchestrator) isPreparingReplacement(run *state.Run) bool {
+	return run.Phase == state.PhaseWorking && run.ReadyDeadline != nil
+}
+
+// markReplacementInProgress sets ReadyDeadline and resets PortalBoundAt to indicate
+// that a replacement Sandbox is being prepared for a Working run.
+func (o *Orchestrator) markReplacementInProgress(run *state.Run) {
+	readyDeadline := o.clock().UTC().Add(o.readyTimeout)
+	run.ReadyDeadline = &readyDeadline
+	run.PortalBoundAt = nil
+}
+
+func (o *Orchestrator) replaceWorkingSandbox(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
+	log := scoped.Log(ctx)
+	now := o.clock().UTC()
+
+	if run.Deadline != nil && !now.Before(*run.Deadline) {
+		run.ReadyDeadline = nil
+		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "deadline exceeded while preparing replacement sandbox")
+	}
+
+	o.releaseSandbox(run.SandboxName)
+
+	var sbExists bool
+	if o.harness != nil && o.harness.SandboxClient() != nil && run.SandboxName != "" {
+		sbObj, err := o.harness.SandboxClient().GetSandboxResource(ctx, o.harness.Namespace(), run.SandboxName)
+		if err == nil {
+			if sbObj.DeletionTimestamp != nil {
+				requeueAfter := o.retryAfterCappedAtDeadline(sandboxDeleteRetryInterval, run.Deadline)
+				log.V(2).Info("old sandbox still terminating during replacement; will retry", "sandbox", run.SandboxName)
+				return reconcile.Result{RequeueAfter: requeueAfter}, nil
+			}
+			if failMsg, failed := isSandboxFailed(sbObj); failed {
+				if delErr := o.harness.SandboxClient().DeleteSandboxByName(ctx, o.harness.Namespace(), run.SandboxName); delErr != nil && !k8serrors.IsNotFound(delErr) {
+					log.V(2).Info("error deleting old failed sandbox", "sandbox", run.SandboxName, "error", delErr)
+				}
+				requeueAfter := o.retryAfterCappedAtDeadline(sandboxDeleteRetryInterval, run.Deadline)
+				log.V(2).Info("deleting old failed sandbox before replacement; will retry", "sandbox", run.SandboxName, "reason", failMsg)
+				return reconcile.Result{RequeueAfter: requeueAfter}, nil
+			}
+			sbExists = true
+		} else if !k8serrors.IsNotFound(err) {
+			return reconcile.Result{}, fmt.Errorf("getting sandbox %s: %w", run.SandboxName, err)
+		}
+	}
+
+	if !sbExists {
+		sbOpts := o.buildCreateSandboxOptions(ctx, repo, run)
+		if _, err := o.harness.CreateSandboxWithOptions(ctx, sbOpts); err != nil {
+			if k8serrors.IsAlreadyExists(err) {
+				requeueAfter := o.retryAfterCappedAtDeadline(sandboxDeleteRetryInterval, run.Deadline)
+				log.V(2).Info("sandbox already exists while creating replacement; will retry", "sandbox", run.SandboxName)
+				return reconcile.Result{RequeueAfter: requeueAfter}, nil
+			}
+			run.ReadyDeadline = nil
+			msg := fmt.Sprintf("creating replacement sandbox: %v", err)
+			o.finishRun(ctx, repo, run, runEnd{
+				Phase:   state.PhaseFailed,
+				Kind:    "failed",
+				Message: msg,
+			})
+			return reconcile.Result{}, errors.New(msg)
+		}
+
+		run.SandboxReplacements++
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    o.clock().UTC(),
+			Phase:   state.PhaseWorking,
+			Kind:    "sandbox_replaced",
+			Message: fmt.Sprintf("Sandbox %s replaced", run.SandboxName),
+			Data:    map[string]any{"sandbox": run.SandboxName},
+		}); err != nil {
+			log.Error(err, "failed to append sandbox_replaced event", "run", run.ID)
+		}
+		if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
+			return reconcile.Result{}, fmt.Errorf("updating run after sandbox replacement: %w", err)
+		}
+	}
+
+	sb, res, err := o.waitForSandboxReady(ctx, repo, run)
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+
+	res, err = o.prepareReadySandbox(ctx, repo, run, sb)
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+
+	run.ReadyDeadline = nil
+	if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
+		return reconcile.Result{}, fmt.Errorf("updating run ready deadline: %w", err)
+	}
+
+	requeueAfter := time.Duration(0)
+	if run.Deadline != nil {
+		if run.Deadline.After(now) {
+			requeueAfter = run.Deadline.Sub(now)
+		}
+	}
+
+	o.startTurn(ctx, repo, run)
+	return reconcile.Result{RequeueAfter: requeueAfter}, nil
+}
+
+func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, run *state.Run, outcome turnOutcome) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
 	if run.Phase.IsTerminal() {
-		return nil
+		return reconcile.Result{}, nil
 	}
 
 	turnErr := outcome.Err
@@ -1793,7 +1974,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		now := o.clock().UTC()
 		run.SetPhase(state.PhaseSelecting, now)
 		if err := o.putRun(ctx, repo, run, prev); err != nil {
-			return fmt.Errorf("updating run to Selecting: %w", err)
+			return reconcile.Result{}, fmt.Errorf("updating run to Selecting: %w", err)
 		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    now,
@@ -1805,7 +1986,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		}
 		o.releaseSandbox(run.SandboxName)
 		o.Notify(repo.Key(), run.ID)
-		return nil
+		return reconcile.Result{}, nil
 	}
 
 	var sb *session.Sandbox
@@ -1821,7 +2002,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 			Message: outcome.Summary,
 			Sandbox: sb,
 		})
-		return nil
+		return reconcile.Result{}, nil
 	}
 
 	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
@@ -1831,14 +2012,25 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 			Message: "session ended without a pull request",
 			Sandbox: sb,
 		})
-		return nil
+		return reconcile.Result{}, nil
+	}
+
+	if isCanceled(turnErr) && o.isPreparingReplacement(run) {
+		return o.replaceWorkingSandbox(ctx, repo, run)
 	}
 
 	if ctx.Err() != nil || o.isManagerCanceled() || isCanceled(turnErr) {
-		return nil
+		return reconcile.Result{}, nil
 	}
 
 	if errors.Is(turnErr, session.ErrSandboxExpired) {
+		if o.canReplaceSandbox(ctx, repo, run) {
+			o.markReplacementInProgress(run)
+			if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
+				return reconcile.Result{}, fmt.Errorf("marking replacement in progress: %w", err)
+			}
+			return o.replaceWorkingSandbox(ctx, repo, run)
+		}
 		msg := "sandbox expired or was deleted during session"
 		if strings.Contains(turnErr.Error(), "expired or deleted") {
 			msg = turnErr.Error()
@@ -1849,7 +2041,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 			Message: msg,
 			Sandbox: sb,
 		})
-		return errors.New(msg)
+		return reconcile.Result{}, errors.New(msg)
 	}
 
 	errMsg := fmt.Sprintf("session error: %v", turnErr)
@@ -1859,7 +2051,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		Message: errMsg,
 		Sandbox: sb,
 	})
-	return errors.New(errMsg)
+	return reconcile.Result{}, errors.New(errMsg)
 }
 
 func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
