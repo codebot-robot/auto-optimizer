@@ -50,7 +50,7 @@ type SessionService interface {
 
 // RunStarter can start a new run for a goal in a repository.
 type RunStarter interface {
-	StartRun(ctx context.Context, repo *state.Repo, goalName string, reason string) (*state.Run, error)
+	StartRun(ctx context.Context, repo *state.Repo, goalName string, opts run.StartOptions) (*state.Run, error)
 }
 
 // ServerOptions configures optional settings for Server.
@@ -380,7 +380,15 @@ func (s *Server) handlePostRun(w http.ResponseWriter, r *http.Request, runID str
 		return
 	}
 
-	newRun, err := s.starter.StartRun(r.Context(), repo, runRec.GoalName, "manual")
+	by := "anonymous"
+	if u, ok := auth.UserFromContext(r.Context()); ok {
+		by = u
+	}
+
+	newRun, err := s.starter.StartRun(r.Context(), repo, runRec.GoalName, run.StartOptions{
+		Reason: "manual",
+		By:     by,
+	})
 	if err != nil {
 		if isConflict(err) {
 			events, readErr := s.stateStore.ReadEvents(r.Context(), runRec.Repo, runRec.ID)

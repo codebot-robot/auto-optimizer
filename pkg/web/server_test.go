@@ -1044,6 +1044,9 @@ func TestRunAgain(t *testing.T) {
 	if events[0].Data.(map[string]any)["reason"] != "manual" {
 		t.Errorf("event reason = %v, want manual", events[0].Data)
 	}
+	if events[0].Data.(map[string]any)["by"] != "anonymous" {
+		t.Errorf("event by = %v, want anonymous", events[0].Data)
+	}
 
 	// 5. Refuses while run is in progress
 	activeResp, activeBody := post(client, "/runs/"+newRunID+"/rerun")
@@ -1110,6 +1113,88 @@ type failRunStarter struct {
 	err error
 }
 
-func (f *failRunStarter) StartRun(_ context.Context, _ *state.Repo, _ string, _ string) (*state.Run, error) {
+func (f *failRunStarter) StartRun(_ context.Context, _ *state.Repo, _ string, _ run.StartOptions) (*state.Run, error) {
 	return nil, f.err
+}
+
+type recordRunStarter struct {
+	lastOpts run.StartOptions
+	run      *state.Run
+	err      error
+}
+
+func (r *recordRunStarter) StartRun(_ context.Context, _ *state.Repo, _ string, opts run.StartOptions) (*state.Run, error) {
+	r.lastOpts = opts
+	return r.run, r.err
+}
+
+func TestRunAgain_Actor(t *testing.T) {
+	ctx := t.Context()
+	stateStore := state.NewFileStore(t.TempDir())
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/auto-optimizer",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "auto-optimizer",
+		DefaultBranch: "main",
+	}
+	if err := stateStore.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID, err := state.NewRunIDAt(time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("NewRunIDAt: %v", err)
+	}
+	runRec := &state.Run{
+		ID:       runID,
+		Repo:     repoKey,
+		GoalName: "test-goal",
+		Phase:    state.PhaseFailed,
+	}
+	if err := stateStore.PutRun(ctx, runRec); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	starter := &recordRunStarter{
+		run: &state.Run{ID: "20261116T110000Z-newr"},
+	}
+	srv, err := NewServer(&fakeSessionService{}, stateStore, starter, ServerOptions{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	// 1. Signed-in user passes authenticated login
+	req := httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/rerun", nil)
+	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "valid-csrf"})
+	req = req.WithContext(auth.WithUser(req.Context(), "octocat"))
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /runs/<id>/rerun status = %d, want 303", rec.Code)
+	}
+	if starter.lastOpts.Reason != "manual" {
+		t.Errorf("starter reason = %q, want manual", starter.lastOpts.Reason)
+	}
+	if starter.lastOpts.By != "octocat" {
+		t.Errorf("starter by = %q, want octocat", starter.lastOpts.By)
+	}
+
+	// 2. Unauthenticated user passes anonymous
+	reqAnon := httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/rerun", nil)
+	reqAnon.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "valid-csrf"})
+	recAnon := httptest.NewRecorder()
+
+	srv.ServeHTTP(recAnon, reqAnon)
+
+	if recAnon.Code != http.StatusSeeOther {
+		t.Fatalf("POST /runs/<id>/rerun status = %d, want 303", recAnon.Code)
+	}
+	if starter.lastOpts.By != "anonymous" {
+		t.Errorf("starter by = %q, want anonymous", starter.lastOpts.By)
+	}
 }

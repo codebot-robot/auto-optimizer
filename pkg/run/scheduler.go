@@ -240,7 +240,7 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 			continue
 		}
 
-		run, err := s.StartRun(ctx, repo, g.Name, reason)
+		run, err := s.StartRun(ctx, repo, g.Name, StartOptions{Reason: reason})
 		if err != nil {
 			if errors.Is(err, ErrOpenPullRequest) {
 				log.V(2).Info("goal already has an open pull request; doing nothing", "repo", repo.URL, "goal", g.Name, "error", err)
@@ -259,10 +259,16 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 	return errors.Join(errs...)
 }
 
+// StartOptions configures a run started by Scheduler.StartRun.
+type StartOptions struct {
+	Reason string
+	By     string
+}
+
 // StartRun validates and creates a new Pending run for a named goal in repo.
 // It refuses with an error if the goal already has a non-terminal run, an open pull request,
 // or if the goal is no longer in the repository.
-func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName string, reason string) (*state.Run, error) {
+func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName string, opts StartOptions) (*state.Run, error) {
 	if s.Store == nil {
 		return nil, errors.New("state store is required")
 	}
@@ -324,18 +330,22 @@ func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName str
 		return nil, fmt.Errorf("creating run %s for goal %s: %w", runID, goalName, err)
 	}
 
+	eventData := map[string]any{"reason": opts.Reason}
+	if opts.By != "" {
+		eventData["by"] = opts.By
+	}
 	event := state.Event{
 		Time:    now,
 		Phase:   state.PhasePending,
 		Kind:    "created",
-		Message: fmt.Sprintf("Run created: %s", reason),
-		Data:    map[string]any{"reason": reason},
+		Message: fmt.Sprintf("Run created: %s", opts.Reason),
+		Data:    eventData,
 	}
 	if err := s.Store.AppendEvent(ctx, key, runID, event); err != nil {
 		return nil, fmt.Errorf("appending event for run %s: %w", runID, err)
 	}
 
-	scoped.Log(ctx).Info("created pending run", "repo", repo.URL, "goal", goalName, "run", runID, "reason", reason)
+	scoped.Log(ctx).Info("created pending run", "repo", repo.URL, "goal", goalName, "run", runID, "reason", opts.Reason)
 	if s.Orchestrator != nil {
 		s.Orchestrator.publishHeroRun(ctx, repo, run)
 		s.Orchestrator.Notify(key, runID)
