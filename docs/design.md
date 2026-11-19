@@ -41,6 +41,7 @@ goal the PR is a proposal and the maintainer is the judge.
 
 | Date | Topic | Decision |
 |---|---|---|
+| 2026-11-17 | Web UI authentication | Users sign in with GitHub through the OAuth authorization-code flow; `ao` keeps a signed session cookie (named `session_id`, always setting `Secure`) and stores no GitHub token; an allowlist of GitHub logins decides who may sign in; the gRPC session API on the `--listen` port is not covered and must stay on a trusted network. |
 | 2026-11-09 | Sandbox lifetime | A run's Sandbox gets one shutdownTime at creation (the run deadline plus a grace period), and nothing extends it afterwards. The orchestrator deletes the Sandbox when the run ends. |
 | 2026-10-23 | Sandbox transport | The control plane drives sandboxes through agent-sandbox's `sandboxd`. sandboxd serves a gRPC `ProcessService` on port 9090 and a REST filesystem API on port 8080. We write no custom in-sandbox server and we do not use `pods/exec`. We also maintain agent-sandbox, so we fix the gaps we find upstream instead of working around them. |
 | 2026-10-23 | Agent loop | A Go orchestrator watches GitHub and starts sessions. The session loop is the one from agent-sandbox's `examples/sandboxed-tools`, forked into this repository. The LLM loop runs in the control plane, and every tool call executes in the session's sandbox. In phase 1 each run has one all-in-one session that does the work and opens the PR. Later an outer session gets a tool to start inner sessions, and each inner session runs an agent personality such as gemini-cli, Claude Code, codex, opencode, pi, or a native toolset. |
@@ -626,8 +627,14 @@ with a meta refresh tag.
 | `/repos/.../runs/{id}/sessions/{sid}` | The transcript with tool calls, truncated results, and links to full outputs. |
 | `/healthz` | Liveness. |
 
-The UI has no authentication while it is cluster-internal. Before anything is
-exposed publicly, it gets GitHub OAuth with repository ownership checks.
+Users sign in with GitHub through the OAuth authorization-code flow (`/login`,
+`/auth/github/callback`, `/logout`). The middleware constructor is
+`auth.NewGitHubHandler`. `ao` keeps a signed session cookie named `session_id`
+(which always sets `Secure`) and stores no GitHub token; the token is used only
+to verify identity via the GitHub API during callback. An allowlist of GitHub
+logins (`AO_GITHUB_ALLOWED_USERS` or `--github-allowed-user`) decides who may sign in.
+The gRPC session API on the `--listen` port is not covered and must stay on a
+trusted network.
 
 ## Development without a GitHub App
 

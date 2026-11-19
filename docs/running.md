@@ -79,6 +79,40 @@ kubectl -n ao-system rollout restart deploy/ao
 Set `AO_REPOS` to the URL of your fork.
 Set `OPENAI_MODEL` to the model name for the agent.
 
+## Web UI Authentication
+
+Production deployments require authentication for the web UI.
+Configure GitHub sign-in through OAuth:
+
+1. Create a GitHub OAuth App in GitHub under **Settings > Developer settings > OAuth Apps > New OAuth App**.
+   Set the **Authorization callback URL** to `<public URL>/auth/github/callback` (for example, `https://ao.example.com/auth/github/callback`).
+   Note the Client ID and generate a Client Secret.
+
+2. Create the `ao-web-auth` Secret in the `ao-system` namespace, generating a session key of at least 32 bytes:
+
+```bash
+kubectl create secret generic ao-web-auth \
+  -n ao-system \
+  --from-literal=AO_GITHUB_CLIENT_ID="<client-id>" \
+  --from-literal=AO_GITHUB_CLIENT_SECRET="<client-secret>" \
+  --from-literal=AO_SESSION_KEY="$(openssl rand -hex 32)"
+```
+
+3. Set `AO_PUBLIC_URL` and the allowed GitHub users in the `ao-config` ConfigMap:
+
+```bash
+kubectl -n ao-system patch configmap ao-config --type=merge -p '{
+  "data": {
+    "AO_PUBLIC_URL": "https://<public-url>",
+    "AO_GITHUB_ALLOWED_USERS": "<github-login1>,<github-login2>"
+  }
+}'
+kubectl -n ao-system rollout restart deploy/ao
+```
+
+4. Sign in by navigating to `<public URL>` (or `http://localhost:8080` if using `kubectl port-forward`).
+   The browser completes the GitHub OAuth authorization flow and signs in users listed in `AO_GITHUB_ALLOWED_USERS`.
+
 ## Writing a First Goal
 
 A goal defines a task for the coding agent.
@@ -144,7 +178,7 @@ kubectl -n ao-system port-forward svc/ao 8080:8080
 ```
 
 Open `http://localhost:8080/` in your browser.
-Never expose this web service publicly because it does not require authentication.
+Sign in with an authorized GitHub account. The web UI requires authentication via GitHub OAuth; only users listed in `AO_GITHUB_ALLOWED_USERS` can sign in (local kind clusters run with `--insecure-no-auth`).
 The run page displays the session transcript, tool executions, and state events.
 
 You will see several event kinds in the run event log:

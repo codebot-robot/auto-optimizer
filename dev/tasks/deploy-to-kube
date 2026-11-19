@@ -442,8 +442,9 @@ if has_component "ao"; then
     VERTEX_LOCATION="${VERTEX_LOCATION:-}"
     AO_REPOS="${AO_REPOS:-}"
     AO_PUBLIC_URL="${AO_PUBLIC_URL:-}"
+    AO_GITHUB_ALLOWED_USERS="${AO_GITHUB_ALLOWED_USERS:-}"
 
-    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE}, VERTEX_PROJECT=${VERTEX_PROJECT}, VERTEX_LOCATION=${VERTEX_LOCATION}, AO_REPOS=${AO_REPOS}, AO_PUBLIC_URL=${AO_PUBLIC_URL})..."
+    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE}, VERTEX_PROJECT=${VERTEX_PROJECT}, VERTEX_LOCATION=${VERTEX_LOCATION}, AO_REPOS=${AO_REPOS}, AO_PUBLIC_URL=${AO_PUBLIC_URL}, AO_GITHUB_ALLOWED_USERS=${AO_GITHUB_ALLOWED_USERS})..."
     cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -461,6 +462,7 @@ data:
   VERTEX_LOCATION: "${VERTEX_LOCATION}"
   AO_REPOS: "${AO_REPOS}"
   AO_PUBLIC_URL: "${AO_PUBLIC_URL}"
+  AO_GITHUB_ALLOWED_USERS: "${AO_GITHUB_ALLOWED_USERS}"
 EOF
 
     kubectl rollout restart deployment/ao -n ao-system
@@ -481,9 +483,10 @@ EOF
     VERTEX_LOCATION="${VERTEX_LOCATION:-}"
     AO_REPOS="${AO_REPOS:-}"
     AO_PUBLIC_URL="${AO_PUBLIC_URL:-}"
+    AO_GITHUB_ALLOWED_USERS="${AO_GITHUB_ALLOWED_USERS:-}"
 
-    if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" || -n "${VERTEX_PROJECT:-}" || -n "${VERTEX_LOCATION:-}" || -n "${SANDBOXD_IMAGE:-}" || -n "${AO_REPOS:-}" || -n "${AO_PUBLIC_URL:-}" ]]; then
-      echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE:-}, VERTEX_PROJECT=${VERTEX_PROJECT:-}, VERTEX_LOCATION=${VERTEX_LOCATION:-}, AO_REPOS=${AO_REPOS}, AO_PUBLIC_URL=${AO_PUBLIC_URL})..."
+    if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" || -n "${VERTEX_PROJECT:-}" || -n "${VERTEX_LOCATION:-}" || -n "${SANDBOXD_IMAGE:-}" || -n "${AO_REPOS:-}" || -n "${AO_PUBLIC_URL:-}" || -n "${AO_GITHUB_ALLOWED_USERS:-}" ]]; then
+      echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE:-}, VERTEX_PROJECT=${VERTEX_PROJECT:-}, VERTEX_LOCATION=${VERTEX_LOCATION:-}, AO_REPOS=${AO_REPOS}, AO_PUBLIC_URL=${AO_PUBLIC_URL}, AO_GITHUB_ALLOWED_USERS=${AO_GITHUB_ALLOWED_USERS})..."
       cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -501,14 +504,23 @@ data:
   VERTEX_LOCATION: "${VERTEX_LOCATION:-}"
   AO_REPOS: "${AO_REPOS}"
   AO_PUBLIC_URL: "${AO_PUBLIC_URL}"
+  AO_GITHUB_ALLOWED_USERS: "${AO_GITHUB_ALLOWED_USERS}"
 EOF
 
       kubectl rollout restart deployment/ao -n ao-system
     fi
   fi
 
-  echo "Waiting for ao deployment in ao-system..."
-  kubectl rollout status deployment/ao -n ao-system --timeout=120s
+  if [[ "${IS_KIND}" != "true" ]] && ! kubectl get secret ao-web-auth -n ao-system >/dev/null 2>&1; then
+    echo "WARNING: Secret 'ao-web-auth' was not found in namespace ao-system."
+    echo "ao serve requires GitHub OAuth authentication when running without --insecure-no-auth."
+    echo "Create the secret with AO_GITHUB_CLIENT_ID, AO_GITHUB_CLIENT_SECRET, and AO_SESSION_KEY."
+    echo "See docs/running.md for instructions."
+    echo "Skipping rollout status wait because 'ao-web-auth' is missing."
+  else
+    echo "Waiting for ao deployment in ao-system..."
+    kubectl rollout status deployment/ao -n ao-system --timeout=120s
+  fi
 fi
 
 echo "=== deploy-to-kube completed successfully ==="
