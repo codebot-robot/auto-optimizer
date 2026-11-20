@@ -282,6 +282,9 @@ metadata:
   namespace: default
 spec:
   restartPolicy: Never
+  securityContext:
+    runAsUser: 1000
+    fsGroup: 1000
   volumes:
     - name: objectfs-vol
       persistentVolumeClaim:
@@ -289,7 +292,7 @@ spec:
   containers:
     - name: writer
       image: busybox:latest
-      command: ["sh", "-c", "echo 'smoke test data' > /workspace/test.txt && cat /workspace/test.txt && exit 0"]
+      command: ["sh", "-c", "mkdir /workspace/testdir && echo 'smoke test data' > /workspace/testdir/test.txt && cat /workspace/testdir/test.txt && exit 0"]
       volumeMounts:
         - name: objectfs-vol
           mountPath: /workspace
