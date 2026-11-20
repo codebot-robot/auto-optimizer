@@ -15,7 +15,6 @@
 package state
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -27,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gke-labs/auto-optimizer/pkg/jsonl"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
@@ -547,6 +547,9 @@ func (s *FileStore) FindRun(ctx context.Context, runID string) (*Run, error) {
 }
 
 // AppendEvent appends one or more events to events.jsonl.
+// Each append writes a leading newline followed by newline-delimited JSON records.
+// This ensures any trailing fragment from an interrupted previous append is closed
+// off and skipped on subsequent reads.
 func (s *FileStore) AppendEvent(ctx context.Context, key RepoKey, runID string, events ...Event) error {
 	if err := ValidateRepoKey(key); err != nil {
 		return err
@@ -566,6 +569,7 @@ func (s *FileStore) AppendEvent(ctx context.Context, key RepoKey, runID string, 
 	}
 
 	var buf bytes.Buffer
+	buf.WriteByte('\n')
 	enc := json.NewEncoder(&buf)
 	for i := range events {
 		if events[i].Time.IsZero() {
@@ -610,35 +614,11 @@ func (s *FileStore) ReadEvents(ctx context.Context, key RepoKey, runID string) (
 	p := s.eventsPath(key, runID)
 	log.V(2).Info("reading events", "repo", key.String(), "run", runID, "path", p)
 
-	f, err := os.Open(p)
+	events, err := jsonl.Read[Event](ctx, p)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("opening events file %s: %w", p, err)
-	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
-			log.V(2).Info("failed to close events file", "path", p, "error", closeErr)
-		}
-	}()
-
-	var events []Event
-	scanner := bufio.NewScanner(f)
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var ev Event
-		if err := json.Unmarshal(line, &ev); err != nil {
-			return nil, fmt.Errorf("decoding event at line %d in %s: %w", lineNum, p, err)
-		}
-		events = append(events, ev)
-	}
-	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("reading events file %s: %w", p, err)
 	}
 

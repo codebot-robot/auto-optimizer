@@ -15,19 +15,18 @@
 package session
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/gke-labs/auto-optimizer/pkg/jsonl"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
@@ -204,33 +203,16 @@ func (s *FileStore) LoadSession(ctx context.Context, sessionID string) ([]llm.Me
 
 	p := s.messagesPath(sessionID)
 	log.V(2).Info("loading session", "path", p)
-	file, err := os.Open(p)
+
+	messages, err := jsonl.Read[llm.Message](ctx, p)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			if metadata != nil {
 				return nil, metadata, nil
 			}
 			return nil, nil, fmt.Errorf("session %q: %w", sessionID, ErrNotFound)
 		}
-		return nil, nil, fmt.Errorf("failed to open session file %s: %w", p, err)
-	}
-	defer func() {
-		if closeErr := file.Close(); closeErr != nil {
-			log.V(2).Info("failed to close session file", "error", closeErr)
-		}
-	}()
-
-	var messages []llm.Message
-	decoder := json.NewDecoder(file)
-	for {
-		var msg llm.Message
-		if err := decoder.Decode(&msg); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, nil, fmt.Errorf("failed to decode message from session file: %w", err)
-		}
-		messages = append(messages, msg)
+		return nil, nil, fmt.Errorf("failed to decode message from session file: %w", err)
 	}
 
 	if metadata == nil {
@@ -241,6 +223,9 @@ func (s *FileStore) LoadSession(ctx context.Context, sessionID string) ([]llm.Me
 }
 
 // AppendMessages marshals and appends a set of messages to the session file.
+// Each append writes a leading newline followed by newline-delimited JSON records.
+// This ensures any trailing fragment from an interrupted previous append is closed
+// off and skipped on subsequent reads.
 func (s *FileStore) AppendMessages(ctx context.Context, sessionID string, messages ...llm.Message) error {
 	log := scoped.Log(ctx)
 
@@ -252,7 +237,11 @@ func (s *FileStore) AppendMessages(ctx context.Context, sessionID string, messag
 		return err
 	}
 
+	p := s.messagesPath(sessionID)
+	log.V(2).Info("appending to session", "path", p)
+
 	var b bytes.Buffer
+	b.WriteByte('\n')
 	enc := json.NewEncoder(&b)
 	for _, msg := range messages {
 		if err := enc.Encode(msg); err != nil {
@@ -262,8 +251,6 @@ func (s *FileStore) AppendMessages(ctx context.Context, sessionID string, messag
 		// Note: json.Encoder automatically adds a \n character, no need to add it manually
 	}
 
-	p := s.messagesPath(sessionID)
-	log.V(2).Info("appending to session", "path", p)
 	file, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open session file %s: %w", p, err)
@@ -342,31 +329,12 @@ func (s *FileStore) CountMessages(ctx context.Context, sessionID string) (int, e
 		return 0, err
 	}
 	p := s.messagesPath(sessionID)
-	log := scoped.Log(ctx)
-
-	f, err := os.Open(p)
+	msgs, err := jsonl.Read[llm.Message](ctx, p)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("opening session file %s: %w", p, err)
+		return 0, fmt.Errorf("reading session file %s: %w", p, err)
 	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
-			log.V(2).Info("failed to close session file", "error", closeErr)
-		}
-	}()
-
-	count := 0
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) > 0 {
-			count++
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return count, fmt.Errorf("reading session file %s: %w", p, err)
-	}
-	return count, nil
+	return len(msgs), nil
 }

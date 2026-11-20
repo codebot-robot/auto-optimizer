@@ -15,6 +15,7 @@
 package state
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -473,6 +474,100 @@ func TestEvents_AppendAndRead(t *testing.T) {
 
 	if readBack[0].Message != e1.Message || readBack[1].Message != e2.Message || readBack[2].Message != e3.Message {
 		t.Errorf("events content or order mismatch: got %+v", readBack)
+	}
+}
+
+func TestEvents_CutOffRecovery(t *testing.T) {
+	ctx := t.Context()
+	store := NewFileStore(t.TempDir())
+	key := RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	runID := "20261023T120000Z-test"
+
+	e1 := Event{Message: "event 1"}
+	e2 := Event{Message: "event 2"}
+	e3 := Event{Message: "event 3"}
+	e4 := Event{Message: "event 4"}
+
+	if err := store.AppendEvent(ctx, key, runID, e1, e2, e3); err != nil {
+		t.Fatalf("AppendEvent(e1, e2, e3): %v", err)
+	}
+	path := store.eventsPath(key, runID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	n0 := bytes.IndexByte(data, '\n')
+	n1 := bytes.IndexByte(data[n0+1:], '\n') + n0 + 1
+	n2 := bytes.IndexByte(data[n1+1:], '\n') + n1 + 1
+	len2 := n2 + 1
+
+	// Cut the file at every byte offset inside the third record, check that the
+	// reader returns the first two records, then append a record and read back
+	// three complete records.
+	for cut := len2; cut < len(data); cut++ {
+		if err := os.WriteFile(path, data[:cut], 0600); err != nil {
+			t.Fatalf("cut at %d: %v", cut, err)
+		}
+		got, err := store.ReadEvents(ctx, key, runID)
+		if err != nil {
+			t.Fatalf("cut at %d: ReadEvents failed: %v", cut, err)
+		}
+		if len(got) != 2 || got[0].Message != e1.Message || got[1].Message != e2.Message {
+			t.Fatalf("cut at %d: expected first 2 events, got %+v", cut, got)
+		}
+		if err := store.AppendEvent(ctx, key, runID, e4); err != nil {
+			t.Fatalf("cut at %d: AppendEvent(e4) failed: %v", cut, err)
+		}
+		got3, err := store.ReadEvents(ctx, key, runID)
+		if err != nil {
+			t.Fatalf("cut at %d: ReadEvents after append failed: %v", cut, err)
+		}
+		// If cut was before the closing bracket of e3, e3 was incomplete and is skipped,
+		// leaving [e1, e2, e4]. If cut was after the closing bracket (missing only the newline),
+		// the appended newline completes e3, giving [e1, e2, e3, e4].
+		if cut < len(data)-1 {
+			if len(got3) != 3 || got3[0].Message != e1.Message || got3[1].Message != e2.Message || got3[2].Message != e4.Message {
+				t.Fatalf("cut at %d: expected [e1, e2, e4], got %+v", cut, got3)
+			}
+		} else {
+			if len(got3) != 4 || got3[0].Message != e1.Message || got3[1].Message != e2.Message || got3[2].Message != e3.Message || got3[3].Message != e4.Message {
+				t.Fatalf("cut at %d: expected [e1, e2, e3, e4], got %+v", cut, got3)
+			}
+		}
+	}
+
+	// A damaged record anywhere in the file is skipped and logged.
+	damagedPath := store.eventsPath(key, "damaged")
+	if err := os.MkdirAll(filepath.Dir(damagedPath), 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	damaged := `{"message":"1"}` + "\n" + `{"bad json` + "\n" + `{"message":"3"}` + "\n"
+	if err := os.WriteFile(damagedPath, []byte(damaged), 0600); err != nil {
+		t.Fatalf("writeFile: %v", err)
+	}
+	gotDamaged, err := store.ReadEvents(ctx, key, "damaged")
+	if err != nil {
+		t.Fatalf("ReadEvents with damaged record: %v", err)
+	}
+	if len(gotDamaged) != 2 || gotDamaged[0].Message != "1" || gotDamaged[1].Message != "3" {
+		t.Fatalf("expected [1, 3], got %+v", gotDamaged)
+	}
+
+	// Two appends in a row with no crash read back with no extra records.
+	normalRunID := "20261023T120000Z-normal"
+	if err := store.AppendEvent(ctx, key, normalRunID, e1, e2); err != nil {
+		t.Fatalf("AppendEvent(e1, e2): %v", err)
+	}
+	if err := store.AppendEvent(ctx, key, normalRunID, e3, e4); err != nil {
+		t.Fatalf("AppendEvent(e3, e4): %v", err)
+	}
+	gotNormal, err := store.ReadEvents(ctx, key, normalRunID)
+	if err != nil {
+		t.Fatalf("ReadEvents(normal): %v", err)
+	}
+	if len(gotNormal) != 4 || gotNormal[0].Message != e1.Message || gotNormal[1].Message != e2.Message || gotNormal[2].Message != e3.Message || gotNormal[3].Message != e4.Message {
+		t.Fatalf("expected [e1, e2, e3, e4], got %+v", gotNormal)
 	}
 }
 
