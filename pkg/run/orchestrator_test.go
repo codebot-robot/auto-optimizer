@@ -7253,6 +7253,10 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
+	t.Cleanup(func() {
+		orch.cancelWorker(runID)
+		orch.workerWG.Wait()
+	})
 
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil || res.RequeueAfter != 10*time.Minute {
@@ -7305,13 +7309,7 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 	}
 
 	// Later outcome from finished worker is ignored
-	deadlineWait := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(runID) {
-		if time.Now().After(deadlineWait) {
-			t.Fatal("timed out waiting for worker goroutine to exit")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	orch.workerWG.Wait()
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile with leftover outcome: %v", err)
 	}
@@ -7370,6 +7368,10 @@ func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewOrchestrator: %v", err)
 			}
+			t.Cleanup(func() {
+				orch.cancelWorker(runID)
+				orch.workerWG.Wait()
+			})
 
 			if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 				t.Fatalf("Reconcile: %v", err)
@@ -7435,6 +7437,10 @@ func TestOrchestrator_Working_RequeueRemainingDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
+	t.Cleanup(func() {
+		orch.cancelWorker(runID)
+		orch.workerWG.Wait()
+	})
 
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil || res.RequeueAfter != 25*time.Minute {
@@ -7453,8 +7459,6 @@ func TestOrchestrator_Working_RequeueRemainingDeadline(t *testing.T) {
 	if err != nil || res2.RequeueAfter != 20*time.Minute {
 		t.Fatalf("Reconcile active got res2=%v err=%v, want RequeueAfter=20m", res2, err)
 	}
-
-	close(blockingLLM.release)
 }
 
 func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T) {

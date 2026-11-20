@@ -280,6 +280,7 @@ type Orchestrator struct {
 	activeRunsMu  sync.Mutex
 	activeRuns    map[string]bool
 	workerCancels map[string]context.CancelFunc
+	workerWG      sync.WaitGroup
 
 	turnOutcomesMu sync.Mutex
 	turnOutcomes   map[string]turnOutcome
@@ -1587,7 +1588,9 @@ func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *sta
 	workerCtx, cancel := context.WithCancel(o.getWorkerContext(ctx))
 	o.setWorkerCancel(run.ID, cancel)
 
+	o.workerWG.Add(1)
 	go func() {
+		defer o.workerWG.Done()
 		defer cancel()
 		defer o.setRunActive(run.ID, false)
 		outcome := o.runTurnWorker(workerCtx, repo, run)
