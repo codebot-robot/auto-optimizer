@@ -386,8 +386,8 @@ func (s *Server) handlePostRun(w http.ResponseWriter, r *http.Request, runID str
 	}
 
 	newRun, err := s.starter.StartRun(r.Context(), repo, runRec.GoalName, run.StartOptions{
-		Reason: "manual",
-		By:     by,
+		Reason:        "manual",
+		StartedByUser: by,
 	})
 	if err != nil {
 		if isConflict(err) {

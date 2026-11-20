@@ -261,8 +261,11 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 
 // StartOptions configures a run started by Scheduler.StartRun.
 type StartOptions struct {
+	// Reason describes why the run was started.
 	Reason string
-	By     string
+
+	// StartedByUser is the login of the user who started the run.
+	StartedByUser string
 }
 
 // StartRun validates and creates a new Pending run for a named goal in repo.
@@ -331,8 +334,8 @@ func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName str
 	}
 
 	eventData := map[string]any{"reason": opts.Reason}
-	if opts.By != "" {
-		eventData["by"] = opts.By
+	if opts.StartedByUser != "" {
+		eventData["by"] = opts.StartedByUser
 	}
 	event := state.Event{
 		Time:    now,
