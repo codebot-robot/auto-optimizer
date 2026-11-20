@@ -15,6 +15,7 @@
 package session
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"testing"
@@ -221,5 +222,103 @@ func TestFileStoreListSessions(t *testing.T) {
 	}
 	if list[1].Name != "sess2" || list[1].MessageCount != 0 || list[1].Metadata.Parent != "sess1" {
 		t.Errorf("list[1] = %+v, want sess2 with 0 messages", list[1])
+	}
+}
+
+func TestSession_CutOffRecovery(t *testing.T) {
+	ctx := t.Context()
+	store := NewFileStore(t.TempDir())
+	sessionID := "sesscutoff"
+
+	content1 := "message 1"
+	content2 := "message 2"
+	content3 := "message 3"
+	content4 := "message 4"
+	m1 := llm.Message{Role: "user", Content: &content1}
+	m2 := llm.Message{Role: "assistant", Content: &content2}
+	m3 := llm.Message{Role: "user", Content: &content3}
+	m4 := llm.Message{Role: "assistant", Content: &content4}
+
+	if err := store.AppendMessages(ctx, sessionID, m1, m2, m3); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	path := store.messagesPath(sessionID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	n0 := bytes.IndexByte(data, '\n')
+	n1 := bytes.IndexByte(data[n0+1:], '\n') + n0 + 1
+	n2 := bytes.IndexByte(data[n1+1:], '\n') + n1 + 1
+	len2 := n2 + 1
+
+	// Cut the file at every byte offset inside the third record, check that the
+	// reader returns the first two records, then append a record and read back
+	// three complete records.
+	for cut := len2; cut < len(data); cut++ {
+		if err := os.WriteFile(path, data[:cut], 0600); err != nil {
+			t.Fatalf("cut at %d: %v", cut, err)
+		}
+		got, _, err := store.LoadSession(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("cut at %d: LoadSession failed: %v", cut, err)
+		}
+		if len(got) != 2 || *got[0].Content != content1 || *got[1].Content != content2 {
+			t.Fatalf("cut at %d: expected first 2 messages, got %+v", cut, got)
+		}
+		if err := store.AppendMessages(ctx, sessionID, m4); err != nil {
+			t.Fatalf("cut at %d: AppendMessages(m4) failed: %v", cut, err)
+		}
+		got3, _, err := store.LoadSession(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("cut at %d: LoadSession after append failed: %v", cut, err)
+		}
+		// If cut was before the closing bracket of m3, m3 was incomplete and is skipped,
+		// leaving [m1, m2, m4]. If cut was after the closing bracket (missing only the newline),
+		// the appended newline completes m3, giving [m1, m2, m3, m4].
+		if cut < len(data)-1 {
+			if len(got3) != 3 || *got3[0].Content != content1 || *got3[1].Content != content2 || *got3[2].Content != content4 {
+				t.Fatalf("cut at %d: expected [m1, m2, m4], got %+v", cut, got3)
+			}
+		} else {
+			if len(got3) != 4 || *got3[0].Content != content1 || *got3[1].Content != content2 || *got3[2].Content != content3 || *got3[3].Content != content4 {
+				t.Fatalf("cut at %d: expected [m1, m2, m3, m4], got %+v", cut, got3)
+			}
+		}
+	}
+
+	// A damaged record anywhere in the file is skipped and logged.
+	damagedID := "sessdamaged"
+	if err := store.ensureDir(damagedID); err != nil {
+		t.Fatalf("ensureDir: %v", err)
+	}
+	damagedPath := store.messagesPath(damagedID)
+	damagedContent := `{"role":"user","content":"first"}` + "\n" + `{"bad json` + "\n" + `{"role":"assistant","content":"third"}` + "\n"
+	if err := os.WriteFile(damagedPath, []byte(damagedContent), 0600); err != nil {
+		t.Fatalf("writeFile: %v", err)
+	}
+	gotDamaged, _, err := store.LoadSession(ctx, damagedID)
+	if err != nil {
+		t.Fatalf("LoadSession with damaged record: %v", err)
+	}
+	if len(gotDamaged) != 2 || *gotDamaged[0].Content != "first" || *gotDamaged[1].Content != "third" {
+		t.Fatalf("expected [first, third], got %+v", gotDamaged)
+	}
+
+	// Two appends in a row with no crash read back with no extra records.
+	normalID := "sessnormal"
+	if err := store.AppendMessages(ctx, normalID, m1, m2); err != nil {
+		t.Fatalf("AppendMessages(m1, m2): %v", err)
+	}
+	if err := store.AppendMessages(ctx, normalID, m3, m4); err != nil {
+		t.Fatalf("AppendMessages(m3, m4): %v", err)
+	}
+	gotNormal, _, err := store.LoadSession(ctx, normalID)
+	if err != nil {
+		t.Fatalf("LoadSession(normal): %v", err)
+	}
+	if len(gotNormal) != 4 || *gotNormal[0].Content != content1 || *gotNormal[1].Content != content2 || *gotNormal[2].Content != content3 || *gotNormal[3].Content != content4 {
+		t.Fatalf("expected [m1, m2, m3, m4], got %+v", gotNormal)
 	}
 }
