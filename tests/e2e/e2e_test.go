@@ -32,6 +32,7 @@ import (
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func getSandboxdImage(t *testing.T, subH *Harness) string {
@@ -1041,6 +1042,7 @@ func startAOServe(t *testing.T, aoBin, repoURL string, env ...string) (serverAdd
 		"--state-dir", stateDir,
 		"--repo", repoURL,
 		"--insecure-no-auth",
+		"--workspace-storage-class=objectfs-exclusive-local",
 	)
 	serveCmd.Env = append(os.Environ(), env...)
 
@@ -1101,7 +1103,7 @@ type jsonListRunsResponse struct {
 	Runs []jsonRun `json:"runs"`
 }
 
-func pollRunPhase(t *testing.T, aoBin, serverAddr, repoURL, targetPhase string, timeout time.Duration, serveStderr *bytes.Buffer) (*jsonRun, []jsonEvent) {
+func pollRunPhase(t *testing.T, aoBin, serverAddr, repoURL, targetPhase string, timeout time.Duration, serveStderr *bytes.Buffer, onRun ...func(run *jsonRun)) (*jsonRun, []jsonEvent) {
 	t.Helper()
 	var runID string
 	var finalRun *jsonRun
@@ -1127,6 +1129,9 @@ func pollRunPhase(t *testing.T, aoBin, serverAddr, repoURL, targetPhase string, 
 				if getErr == nil {
 					var getResp jsonGetRunResponse
 					if unmarshalErr := json.Unmarshal(getOut, &getResp); unmarshalErr == nil {
+						for _, fn := range onRun {
+							fn(&getResp.Run)
+						}
 						if getResp.Run.Phase == targetPhase {
 							finalRun = &getResp.Run
 							finalEvents = getResp.Events
@@ -1145,6 +1150,91 @@ func pollRunPhase(t *testing.T, aoBin, serverAddr, repoURL, targetPhase string, 
 		t.Fatalf("timed out waiting for run to reach %s phase. Serve stderr:\n%s", targetPhase, serveStderr.String())
 	}
 	return finalRun, finalEvents
+}
+
+func assertSandboxPodObjectFS(t *testing.T, subH *Harness, sandboxName string) {
+	t.Helper()
+
+	var pod corev1.Pod
+	var podErr error
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := subH.Kubectl("get", "pod", "-n", "ao-sandboxes", sandboxName, "-o", "json")
+		if err != nil {
+			podErr = err
+		} else if jsonErr := json.Unmarshal([]byte(out), &pod); jsonErr != nil {
+			podErr = fmt.Errorf("parsing pod JSON: %w", jsonErr)
+		} else if len(pod.Spec.Containers) == 0 {
+			podErr = fmt.Errorf("pod %s has no containers", sandboxName)
+		} else {
+			podErr = nil
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if podErr != nil {
+		t.Fatalf("failed to get pod %s in ao-sandboxes: %v", sandboxName, podErr)
+	}
+
+	var workspaceVolName string
+	for _, c := range pod.Spec.Containers {
+		for _, m := range c.VolumeMounts {
+			if m.MountPath == "/workspace" {
+				workspaceVolName = m.Name
+				break
+			}
+		}
+		if workspaceVolName != "" {
+			break
+		}
+	}
+	if workspaceVolName == "" {
+		t.Fatalf("expected pod %s to mount a volume at /workspace", sandboxName)
+	}
+
+	var claimName string
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == workspaceVolName {
+			if v.PersistentVolumeClaim == nil {
+				t.Fatalf("expected workspace volume %q on pod %s to be a PersistentVolumeClaim, got %+v", v.Name, sandboxName, v)
+			}
+			claimName = v.PersistentVolumeClaim.ClaimName
+			break
+		}
+	}
+	if claimName == "" {
+		t.Fatalf("expected workspace volume %q on pod %s to have a ClaimName", workspaceVolName, sandboxName)
+	}
+
+	var pvc corev1.PersistentVolumeClaim
+	var pvcErr error
+	pvcDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(pvcDeadline) {
+		out, err := subH.Kubectl("get", "pvc", "-n", "ao-sandboxes", claimName, "-o", "json")
+		if err == nil {
+			if jsonErr := json.Unmarshal([]byte(out), &pvc); jsonErr == nil {
+				if pvc.Status.Phase == corev1.ClaimBound {
+					pvcErr = nil
+					break
+				}
+				pvcErr = fmt.Errorf("pvc %s phase is %s (want Bound)", claimName, pvc.Status.Phase)
+			} else {
+				pvcErr = jsonErr
+			}
+		} else {
+			pvcErr = err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if pvcErr != nil {
+		t.Fatalf("failed to verify bound PVC %s: %v", claimName, pvcErr)
+	}
+
+	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != "objectfs-exclusive-local" {
+		t.Fatalf("expected claim %s StorageClassName to be 'objectfs-exclusive-local', got %v", claimName, pvc.Spec.StorageClassName)
+	}
+
+	t.Logf("PASS: Sandbox pod %s mounts claim %s bound through StorageClass %s at /workspace", sandboxName, claimName, *pvc.Spec.StorageClassName)
 }
 
 func TestRunLifecycle(t *testing.T) {
@@ -1176,8 +1266,17 @@ func TestRunLifecycle(t *testing.T) {
 	_, repoURL, baseCommit := setupHelloRepoFixture(t)
 	serverAddr, _, stateDir, serveStderr := startAOServe(t, aoBin, repoURL, "OPENAI_MODEL=fake-eliza")
 
+	var assertedObjectFS bool
 	t.Log("Waiting for run to reach Working and then NoImprovement phase...")
-	finalRun, _ := pollRunPhase(t, aoBin, serverAddr, repoURL, "NoImprovement", 90*time.Second, serveStderr)
+	finalRun, _ := pollRunPhase(t, aoBin, serverAddr, repoURL, "NoImprovement", 90*time.Second, serveStderr, func(r *jsonRun) {
+		if !assertedObjectFS && r.SandboxName != "" {
+			assertSandboxPodObjectFS(t, subH, r.SandboxName)
+			assertedObjectFS = true
+		}
+	})
+	if !assertedObjectFS {
+		t.Fatal("expected to assert Sandbox pod ObjectFS mount during run")
+	}
 	runID := finalRun.ID
 
 	t.Logf("PASS: Run %s reached phase %s with session %s", finalRun.ID, finalRun.Phase, finalRun.SessionID)

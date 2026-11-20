@@ -504,8 +504,8 @@ if has_component "ao"; then
     # Do not wait for workloads here; ao is patched with --insecure-no-auth and configured below before waiting for rollout.
     (cd "${REPO_ROOT}" && "${REPO_ROOT}/.build/bin/ap" deploy --skip-push --wait=false)
 
-    echo "Configuring ao deployment for kind development (--insecure-no-auth)..."
-    kubectl patch deployment ao -n ao-system --patch '{"spec":{"template":{"spec":{"containers":[{"name":"ao","command":["/ao","serve","--insecure-no-auth"]}]}}}}'
+    echo "Configuring ao deployment for kind development (--insecure-no-auth, --workspace-storage-class=objectfs-exclusive-local)..."
+    kubectl patch deployment ao -n ao-system --patch '{"spec":{"template":{"spec":{"containers":[{"name":"ao","command":["/ao","serve","--insecure-no-auth","--workspace-storage-class=objectfs-exclusive-local"]}]}}}}'
 
     OPENAI_MODEL="${OPENAI_MODEL:-fake-eliza}"
     VERTEX_PROJECT="${VERTEX_PROJECT:-}"
