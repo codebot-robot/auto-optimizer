@@ -18,6 +18,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -77,6 +78,14 @@ func TestCSRFToken(t *testing.T) {
 	tokDiffKey := CSRFToken(sessVal, otherKey)
 	if tok1 == tokDiffKey {
 		t.Error("expected different tokens for different keys")
+	}
+
+	// Verify domain separation: token must differ from a bare HMAC of the cookie value.
+	bareMac := hmac.New(sha256.New, key)
+	bareMac.Write([]byte(sessVal))
+	bareToken := hex.EncodeToString(bareMac.Sum(nil))
+	if tok1 == bareToken {
+		t.Error("expected CSRF token to differ from bare HMAC of session value due to domain separation prefix")
 	}
 
 	if got := CSRFToken("", key); got != "" {

@@ -125,11 +125,23 @@ func Decode(key []byte, value string, now time.Time) (Session, error) {
 }
 
 // CSRFToken derives an anti-forgery token from the session cookie value and session signing key.
+// The token is not the session key. It is an HMAC-SHA256 of the session_id cookie value,
+// keyed with the session signing key and prefixed with a domain-separation label.
+//
+// This scheme is safe against CSRF attacks. A page on another site cannot read the
+// session_id cookie, and it does not know the key, so it cannot compute the token.
+// The token does not reveal the key, because HMAC is one-way. The token is bound to one session,
+// so a token from one session does not work in another.
+//
+// This is the HMAC-based token pattern (also called the signed double-submit pattern) from the
+// OWASP Cross-Site Request Forgery Prevention Cheat Sheet, used so that the server keeps no
+// per-session token state.
 func CSRFToken(sessionValue string, key []byte) string {
 	if sessionValue == "" || len(key) == 0 {
 		return ""
 	}
 	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte("csrf\x00"))
 	mac.Write([]byte(sessionValue))
 	return hex.EncodeToString(mac.Sum(nil))
 }

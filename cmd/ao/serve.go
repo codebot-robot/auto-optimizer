@@ -440,7 +440,8 @@ func runServe(ctx context.Context, opts serveOptions) error {
 			sessionKey = []byte(os.Getenv("AO_SESSION_KEY"))
 		}
 		webHandler, err := web.NewServer(srv, stateStore, scheduler, web.ServerOptions{
-			SessionKey: sessionKey,
+			RequireSignIn: opts.github.ClientID != "",
+			SessionKey:    sessionKey,
 		})
 		if err != nil {
 			return fmt.Errorf("initializing web server: %w", err)

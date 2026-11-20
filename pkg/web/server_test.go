@@ -124,6 +124,23 @@ func setupTestWebServer(t *testing.T, sb tools.Sandbox) (*httptest.Server, *sess
 	return ts, srv
 }
 
+func testCSRFToken(t *testing.T, client *http.Client, rawURL string) string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	if client.Jar != nil {
+		for _, c := range client.Jar.Cookies(u) {
+			if c.Name == csrfCookieName {
+				return c.Value
+			}
+		}
+	}
+	t.Fatalf("csrf cookie %q not found in client jar for %s", csrfCookieName, rawURL)
+	return ""
+}
+
 func TestAcceptance_SendMessageAndPoll(t *testing.T) {
 	sb := &recordingSandbox{}
 	ts, _ := setupTestWebServer(t, sb)
@@ -148,6 +165,7 @@ func TestAcceptance_SendMessageAndPoll(t *testing.T) {
 	prompt := "What is the capital of France?"
 	postResp, err := client.PostForm(ts.URL+"/sessions/test/messages", url.Values{
 		"text": {prompt},
+		"csrf": {testCSRFToken(t, client, ts.URL)},
 	})
 	if err != nil {
 		t.Fatalf("POST /sessions/test/messages: %v", err)
@@ -213,6 +231,7 @@ func TestSendMessage_ToolCallExecution(t *testing.T) {
 	// Post message triggering run_command tool call
 	postResp, err := client.PostForm(ts.URL+"/sessions/toolcall/messages", url.Values{
 		"text": {"run: uname -a"},
+		"csrf": {testCSRFToken(t, client, ts.URL)},
 	})
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -277,10 +296,12 @@ func TestSendMessage_BusySessionReturns409(t *testing.T) {
 		t.Fatalf("GET /: %v", err)
 	}
 	_ = resp.Body.Close()
+	tok := testCSRFToken(t, client, ts.URL)
 
 	// First message starts a blocking turn
 	postResp1, err := client.PostForm(ts.URL+"/sessions/busysess/messages", url.Values{
 		"text": {"run: sleep 10"},
+		"csrf": {tok},
 	})
 	if err != nil {
 		t.Fatalf("first POST: %v", err)
@@ -300,6 +321,7 @@ func TestSendMessage_BusySessionReturns409(t *testing.T) {
 	// Second POST to the busy session must return 409 Conflict
 	postResp2, err := client.PostForm(ts.URL+"/sessions/busysess/messages", url.Values{
 		"text": {"second message"},
+		"csrf": {tok},
 	})
 	if err != nil {
 		t.Fatalf("second POST: %v", err)
@@ -379,7 +401,8 @@ func TestCSRFToken_RenderedInPage(t *testing.T) {
 	key := []byte("secret-session-signing-key-32b!!")
 	fakeSvc := &fakeSessionService{}
 	webServer, err := NewServer(fakeSvc, nil, nil, ServerOptions{
-		SessionKey: key,
+		RequireSignIn: true,
+		SessionKey:    key,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -448,6 +471,7 @@ func TestCreateSessionForm(t *testing.T) {
 	postResp, err := client.PostForm(ts.URL+"/sessions", url.Values{
 		"name":    {"createdsess"},
 		"toolset": {"basic"},
+		"csrf":    {testCSRFToken(t, client, ts.URL)},
 	})
 	if err != nil {
 		t.Fatalf("POST /sessions: %v", err)
@@ -980,9 +1004,13 @@ func TestRunAgain(t *testing.T) {
 		},
 	}
 
-	post := func(c *http.Client, path string) (*http.Response, string) {
+	post := func(c *http.Client, path string, token string) (*http.Response, string) {
 		t.Helper()
-		resp, err := c.Post(ts.URL+path, "application/x-www-form-urlencoded", nil)
+		var body io.Reader
+		if token != "" {
+			body = strings.NewReader(url.Values{"csrf": {token}}.Encode())
+		}
+		resp, err := c.Post(ts.URL+path, "application/x-www-form-urlencoded", body)
 		if err != nil {
 			t.Fatalf("POST %s: %v", path, err)
 		}
@@ -992,7 +1020,7 @@ func TestRunAgain(t *testing.T) {
 	}
 
 	// 1. Refuses without a valid CSRF token
-	if resp, _ := post(&http.Client{}, "/runs/"+failedRunID+"/rerun"); resp.StatusCode != http.StatusForbidden {
+	if resp, _ := post(&http.Client{}, "/runs/"+failedRunID+"/rerun", ""); resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 Forbidden", resp.StatusCode)
 	}
 
@@ -1012,14 +1040,15 @@ func TestRunAgain(t *testing.T) {
 	if !strings.Contains(string(getBody), "Run again") {
 		t.Errorf("expected finished run page to contain 'Run again' button, got:\n%s", string(getBody))
 	}
+	tok := testCSRFToken(t, client, ts.URL)
 
 	// 3. POST to the run's own URL /runs/<id> is not accepted (returns 404)
-	if resp, _ := post(client, "/runs/"+failedRunID); resp.StatusCode != http.StatusNotFound {
+	if resp, _ := post(client, "/runs/"+failedRunID, tok); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("POST /runs/<id> status = %d, want 404 Not Found", resp.StatusCode)
 	}
 
 	// 4. Successfully starts a run for the failed goal
-	postResp, _ := post(client, "/runs/"+failedRunID+"/rerun")
+	postResp, _ := post(client, "/runs/"+failedRunID+"/rerun", tok)
 	if postResp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("POST /runs/<id>/rerun status = %d, want 303 See Other", postResp.StatusCode)
 	}
@@ -1049,7 +1078,7 @@ func TestRunAgain(t *testing.T) {
 	}
 
 	// 5. Refuses while run is in progress
-	activeResp, activeBody := post(client, "/runs/"+newRunID+"/rerun")
+	activeResp, activeBody := post(client, "/runs/"+newRunID+"/rerun", tok)
 	if activeResp.StatusCode != http.StatusConflict {
 		t.Fatalf("POST active run status = %d, want 409 Conflict", activeResp.StatusCode)
 	}
@@ -1082,7 +1111,7 @@ func TestRunAgain(t *testing.T) {
 	if err := stateStore.PutRun(ctx, missingRun); err != nil {
 		t.Fatalf("PutRun: %v", err)
 	}
-	missingResp, missingBody := post(client, "/runs/"+missingGoalRunID+"/rerun")
+	missingResp, missingBody := post(client, "/runs/"+missingGoalRunID+"/rerun", tok)
 	if missingResp.StatusCode != http.StatusConflict {
 		t.Fatalf("POST missing goal status = %d, want 409 Conflict", missingResp.StatusCode)
 	}
@@ -1099,7 +1128,7 @@ func TestRunAgain(t *testing.T) {
 	t.Cleanup(tsErr.Close)
 	errClient := tsErr.Client()
 	errClient.Jar = jar
-	errResp, err := errClient.Post(tsErr.URL+"/runs/"+failedRunID+"/rerun", "application/x-www-form-urlencoded", nil)
+	errResp, err := errClient.Post(tsErr.URL+"/runs/"+failedRunID+"/rerun", "application/x-www-form-urlencoded", strings.NewReader(url.Values{"csrf": {tok}}.Encode()))
 	if err != nil {
 		t.Fatalf("POST with error starter: %v", err)
 	}
@@ -1167,7 +1196,8 @@ func TestRunAgain_Actor(t *testing.T) {
 	}
 
 	// 1. Signed-in user passes authenticated login
-	req := httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/rerun", nil)
+	req := httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/rerun", strings.NewReader(url.Values{"csrf": {"valid-csrf"}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "valid-csrf"})
 	req = req.WithContext(auth.WithUser(req.Context(), "octocat"))
 	rec := httptest.NewRecorder()
@@ -1185,7 +1215,8 @@ func TestRunAgain_Actor(t *testing.T) {
 	}
 
 	// 2. Unauthenticated user passes anonymous
-	reqAnon := httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/rerun", nil)
+	reqAnon := httptest.NewRequest(http.MethodPost, "/runs/"+runID+"/rerun", strings.NewReader(url.Values{"csrf": {"valid-csrf"}}.Encode()))
+	reqAnon.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	reqAnon.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "valid-csrf"})
 	recAnon := httptest.NewRecorder()
 
@@ -1197,4 +1228,157 @@ func TestRunAgain_Actor(t *testing.T) {
 	if starter.lastOpts.StartedByUser != "anonymous" {
 		t.Errorf("starter startedByUser = %q, want anonymous", starter.lastOpts.StartedByUser)
 	}
+}
+
+func TestNewServer_Validation(t *testing.T) {
+	fakeSvc := &fakeSessionService{}
+	validKey := []byte("12345678901234567890123456789012") // 32 bytes
+
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: true}); err == nil {
+		t.Error("expected error when RequireSignIn is true and SessionKey is missing")
+	}
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: true, SessionKey: []byte("too-short")}); err == nil {
+		t.Error("expected error when RequireSignIn is true and SessionKey is shorter than MinKeyLength")
+	}
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: true, SessionKey: validKey}); err != nil {
+		t.Errorf("unexpected error with valid key: %v", err)
+	}
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: false}); err != nil {
+		t.Errorf("unexpected error when RequireSignIn is false: %v", err)
+	}
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: false, SessionKey: []byte("short")}); err != nil {
+		t.Errorf("unexpected error when RequireSignIn is false with short key: %v", err)
+	}
+}
+
+func TestCSRFValidation(t *testing.T) {
+	t.Run("insecure_no_auth", func(t *testing.T) {
+		ts, _ := setupTestWebServer(t, nil)
+		jar, _ := cookiejar.New(nil)
+		client := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+		getResp, err := client.Get(ts.URL + "/")
+		if err != nil {
+			t.Fatalf("GET /: %v", err)
+		}
+		body, _ := io.ReadAll(getResp.Body)
+		_ = getResp.Body.Close()
+
+		tok := testCSRFToken(t, client, ts.URL)
+		if want := fmt.Sprintf(`<input type="hidden" name="csrf" value="%s">`, tok); !strings.Contains(string(body), want) {
+			t.Errorf("expected page to render %q, got:\n%s", want, string(body))
+		}
+
+		post := func(csrf string) int {
+			vals := url.Values{"name": {"sess1"}, "toolset": {"basic"}}
+			if csrf != "" {
+				vals.Set("csrf", csrf)
+			}
+			resp, err := client.PostForm(ts.URL+"/sessions", vals)
+			if err != nil {
+				t.Fatalf("POST /sessions: %v", err)
+			}
+			_ = resp.Body.Close()
+			return resp.StatusCode
+		}
+
+		if got := post(""); got != http.StatusForbidden {
+			t.Errorf("POST with no csrf status = %d, want 403", got)
+		}
+		if got := post("wrong-token"); got != http.StatusForbidden {
+			t.Errorf("POST with wrong csrf status = %d, want 403", got)
+		}
+		if got := post(tok); got != http.StatusSeeOther {
+			t.Errorf("POST with correct csrf status = %d, want 303", got)
+		}
+	})
+
+	t.Run("sign_in_on", func(t *testing.T) {
+		key := []byte("secret-session-signing-key-32b!!")
+		webServer, err := NewServer(&fakeSessionService{}, nil, nil, ServerOptions{RequireSignIn: true, SessionKey: key})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		ts := httptest.NewServer(webServer)
+		t.Cleanup(ts.Close)
+
+		sess := auth.Session{Login: "alice", Expires: time.Now().Add(time.Hour)}
+		sessVal, err := sess.Encode(key)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		correctCSRF := auth.CSRFToken(sessVal, key)
+
+		jar, _ := cookiejar.New(nil)
+		u, _ := url.Parse(ts.URL)
+		jar.SetCookies(u, []*http.Cookie{{Name: auth.CookieName, Value: sessVal, Path: "/"}})
+		client := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+		post := func(csrf string) int {
+			vals := url.Values{"name": {"sess2"}, "toolset": {"basic"}}
+			if csrf != "" {
+				vals.Set("csrf", csrf)
+			}
+			resp, err := client.PostForm(ts.URL+"/sessions", vals)
+			if err != nil {
+				t.Fatalf("POST /sessions: %v", err)
+			}
+			_ = resp.Body.Close()
+			return resp.StatusCode
+		}
+
+		if got := post(""); got != http.StatusForbidden {
+			t.Errorf("POST with no csrf status = %d, want 403", got)
+		}
+		if got := post("wrong-token"); got != http.StatusForbidden {
+			t.Errorf("POST with wrong csrf status = %d, want 403", got)
+		}
+		if got := post(correctCSRF); got != http.StatusSeeOther {
+			t.Errorf("POST with correct csrf status = %d, want 303", got)
+		}
+	})
+
+	t.Run("sign_in_off_with_session_key", func(t *testing.T) {
+		key := []byte("secret-session-signing-key-32b!!")
+		webServer, err := NewServer(&fakeSessionService{}, nil, nil, ServerOptions{RequireSignIn: false, SessionKey: key})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		ts := httptest.NewServer(webServer)
+		t.Cleanup(ts.Close)
+
+		jar, _ := cookiejar.New(nil)
+		client := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+		resp, err := client.Get(ts.URL + "/")
+		if err != nil {
+			t.Fatalf("GET /: %v", err)
+		}
+		_ = resp.Body.Close()
+
+		browserTok := testCSRFToken(t, client, ts.URL)
+
+		sess := auth.Session{Login: "alice", Expires: time.Now().Add(time.Hour)}
+		sessVal, _ := sess.Encode(key)
+		signInCSRF := auth.CSRFToken(sessVal, key)
+
+		u, _ := url.Parse(ts.URL)
+		jar.SetCookies(u, []*http.Cookie{{Name: auth.CookieName, Value: sessVal, Path: "/"}})
+
+		post := func(csrf string) int {
+			resp, err := client.PostForm(ts.URL+"/sessions", url.Values{"name": {"sess3"}, "toolset": {"basic"}, "csrf": {csrf}})
+			if err != nil {
+				t.Fatalf("POST /sessions: %v", err)
+			}
+			_ = resp.Body.Close()
+			return resp.StatusCode
+		}
+
+		if got := post(signInCSRF); got != http.StatusForbidden {
+			t.Errorf("POST with sign-in CSRF token when sign-in is off status = %d, want 403", got)
+		}
+		if got := post(browserTok); got != http.StatusSeeOther {
+			t.Errorf("POST with browser cookie token status = %d, want 303", got)
+		}
+	})
 }
