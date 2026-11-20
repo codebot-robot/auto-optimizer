@@ -252,7 +252,7 @@ if has_component "service-portals"; then
 
   if [[ "${IS_KIND}" == "true" ]]; then
     echo "Building service-portals images locally..."
-    (cd "${SERVICE_PORTALS_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+    (cd "${SERVICE_PORTALS_DIR}" && "${REPO_ROOT}/.build/bin/ap" build)
     echo "Loading service-portals images into kind cluster ${KIND_CLUSTER_NAME}..."
     kind load docker-image \
       "${IMAGE_PREFIX}/init-service-portals:${IMAGE_TAG}" \
@@ -262,7 +262,7 @@ if has_component "service-portals"; then
       --name "${KIND_CLUSTER_NAME}"
   else
     echo "Building and pushing service-portals images to ${IMAGE_PREFIX}..."
-    (cd "${SERVICE_PORTALS_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build --push)
+    (cd "${SERVICE_PORTALS_DIR}" && "${REPO_ROOT}/.build/bin/ap" build --push)
   fi
 fi
 
@@ -288,7 +288,7 @@ if has_component "objectfs"; then
     if [[ "${IS_KIND}" == "true" ]]; then
       if [[ "${USE_FAKES3}" == "true" ]]; then
         echo "Building and loading fakes3 for kind..."
-        (cd "${IN_CLUSTER_STORAGE_DIR}/fakes3" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+        (cd "${IN_CLUSTER_STORAGE_DIR}/fakes3" && "${REPO_ROOT}/.build/bin/ap" build)
         kind load docker-image "${IMAGE_PREFIX}/fakes3:${IMAGE_TAG}" --name "${KIND_CLUSTER_NAME}"
 
         echo "Deploying in-cluster fakes3 service and deployment..."
@@ -333,7 +333,7 @@ EOF
       fi
 
       echo "Building in-cluster-storage images..."
-      (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+      (cd "${IN_CLUSTER_STORAGE_DIR}" && "${REPO_ROOT}/.build/bin/ap" build)
       echo "Loading in-cluster-storage images into kind cluster ${KIND_CLUSTER_NAME}..."
       kind load docker-image \
         "${IMAGE_PREFIX}/wal-buffer:${IMAGE_TAG}" \
@@ -342,10 +342,12 @@ EOF
         --name "${KIND_CLUSTER_NAME}"
 
       echo "Deploying in-cluster-storage manifests with ap deploy..."
-      (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy --skip-push)
+      # Do not wait for workloads here; backend config and credentials are configured below before waiting for rollout.
+      (cd "${IN_CLUSTER_STORAGE_DIR}" && "${REPO_ROOT}/.build/bin/ap" deploy --skip-push --wait=false)
     else
       echo "Deploying in-cluster-storage with ap deploy (pushing to ${IMAGE_PREFIX})..."
-      (cd "${IN_CLUSTER_STORAGE_DIR}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy)
+      # Do not wait for workloads here; backend config and credentials are configured below before waiting for rollout.
+      (cd "${IN_CLUSTER_STORAGE_DIR}" && "${REPO_ROOT}/.build/bin/ap" deploy --wait=false)
     fi
 
     # Configure backend via objectfs-config ConfigMap (replaces backend without patching manifests)
@@ -422,7 +424,7 @@ if has_component "ao"; then
 
   if [[ "${IS_KIND}" == "true" ]]; then
     echo "Building auto-optimizer images..."
-    (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+    (cd "${REPO_ROOT}" && "${REPO_ROOT}/.build/bin/ap" build)
     echo "Loading auto-optimizer images into kind cluster ${KIND_CLUSTER_NAME}..."
     kind load docker-image \
       "${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}" \
@@ -432,7 +434,8 @@ if has_component "ao"; then
       --name "${KIND_CLUSTER_NAME}"
 
     echo "Deploying auto-optimizer manifests with ap deploy..."
-    (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy --skip-push)
+    # Do not wait for workloads here; ao is patched with --insecure-no-auth and configured below before waiting for rollout.
+    (cd "${REPO_ROOT}" && "${REPO_ROOT}/.build/bin/ap" deploy --skip-push --wait=false)
 
     echo "Configuring ao deployment for kind development (--insecure-no-auth)..."
     kubectl patch deployment ao -n ao-system --patch '{"spec":{"template":{"spec":{"containers":[{"name":"ao","command":["/ao","serve","--insecure-no-auth"]}]}}}}'
@@ -468,10 +471,11 @@ EOF
     kubectl rollout restart deployment/ao -n ao-system
   else
     echo "Building and pushing auto-optimizer images to ${IMAGE_PREFIX} with ap build --push..."
-    (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build --push)
+    (cd "${REPO_ROOT}" && "${REPO_ROOT}/.build/bin/ap" build --push)
 
     echo "Deploying auto-optimizer with ap deploy (pushing to ${IMAGE_PREFIX})..."
-    (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy)
+    # Do not wait for workloads here; ao is configured below before waiting for rollout.
+    (cd "${REPO_ROOT}" && "${REPO_ROOT}/.build/bin/ap" deploy --wait=false)
 
     VERTEX_PROJECT="${VERTEX_PROJECT:-}"
     if [[ -z "${VERTEX_PROJECT}" ]] && command -v gcloud >/dev/null 2>&1; then
