@@ -17,6 +17,7 @@ package web
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -38,7 +39,7 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
-const csrfCookieName = "ao_session"
+const csrfCookieName = "csrf_token"
 
 // SessionService is the interface web requires from the session backend.
 type SessionService interface {
@@ -55,15 +56,17 @@ type RunStarter interface {
 
 // ServerOptions configures optional settings for Server.
 type ServerOptions struct {
-	SessionKey []byte
+	RequireSignIn bool
+	SessionKey    []byte
 }
 
 // Server handles HTTP requests for the web UI.
 type Server struct {
-	service    SessionService
-	stateStore state.Store
-	starter    RunStarter
-	sessionKey []byte
+	service       SessionService
+	stateStore    state.Store
+	starter       RunStarter
+	requireSignIn bool
+	sessionKey    []byte
 }
 
 // NewServer creates a new web Server backed by the given SessionService, state.Store, RunStarter, and ServerOptions.
@@ -71,12 +74,16 @@ func NewServer(service SessionService, stateStore state.Store, starter RunStarte
 	if service == nil {
 		return nil, errors.New("service is required")
 	}
+	if opts.RequireSignIn && len(opts.SessionKey) < auth.MinKeyLength {
+		return nil, fmt.Errorf("session key must be at least %d bytes when sign-in is enabled: %w", auth.MinKeyLength, auth.ErrKeyTooShort)
+	}
 
 	return &Server{
-		service:    service,
-		stateStore: stateStore,
-		starter:    starter,
-		sessionKey: opts.SessionKey,
+		service:       service,
+		stateStore:    stateStore,
+		starter:       starter,
+		requireSignIn: opts.RequireSignIn,
+		sessionKey:    opts.SessionKey,
 	}, nil
 }
 
@@ -100,14 +107,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ensure SameSite=Strict cookie on GET requests
-	if r.Method == http.MethodGet {
-		s.ensureCSRFCookie(w, r)
-	}
-
-	if len(s.sessionKey) > 0 {
+	if s.requireSignIn {
 		if c, err := r.Cookie(auth.CookieName); err == nil && c.Value != "" {
+			// Derive the anti-forgery token; see auth.CSRFToken for safety rationale.
 			token := auth.CSRFToken(c.Value, s.sessionKey)
+			r = r.WithContext(WithCSRFToken(r.Context(), token))
+		}
+	} else {
+		var token string
+		if r.Method == http.MethodGet {
+			token = s.ensureCSRFCookie(w, r)
+		} else if c, err := r.Cookie(csrfCookieName); err == nil && c.Value != "" {
+			token = c.Value
+		}
+		if token != "" {
 			r = r.WithContext(WithCSRFToken(r.Context(), token))
 		}
 	}
@@ -115,7 +128,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Validate CSRF on POST requests
 	if r.Method == http.MethodPost {
 		if !s.validateCSRF(r) {
-			http.Error(w, "Forbidden: CSRF cookie missing or invalid", http.StatusForbidden)
+			http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
 			return
 		}
 	}
@@ -164,9 +177,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) string {
 	if c, err := r.Cookie(csrfCookieName); err == nil && c.Value != "" {
-		return
+		return c.Value
 	}
 	tokenBytes := make([]byte, 16)
 	_, _ = rand.Read(tokenBytes)
@@ -179,11 +192,30 @@ func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteStrictMode,
 		HttpOnly: true,
 	})
+	return token
 }
 
 func (s *Server) validateCSRF(r *http.Request) bool {
+	formToken := r.PostFormValue("csrf")
+	if formToken == "" {
+		return false
+	}
+	if s.requireSignIn {
+		cookie, err := r.Cookie(auth.CookieName)
+		if err != nil || cookie.Value == "" {
+			return false
+		}
+		expected := auth.CSRFToken(cookie.Value, s.sessionKey)
+		if expected == "" {
+			return false
+		}
+		return hmac.Equal([]byte(formToken), []byte(expected))
+	}
 	cookie, err := r.Cookie(csrfCookieName)
-	return err == nil && cookie.Value != ""
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	return hmac.Equal([]byte(formToken), []byte(cookie.Value))
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
