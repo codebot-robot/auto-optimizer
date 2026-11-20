@@ -106,6 +106,9 @@ func TestScheduler_NewGoalCreatesRun(t *testing.T) {
 	if events[0].Data.(map[string]any)["reason"] != "new goal" {
 		t.Errorf("expected reason 'new goal', got %v", events[0].Data)
 	}
+	if _, ok := events[0].Data.(map[string]any)["by"]; ok {
+		t.Errorf("expected no 'by' for scheduler-created run, got %v", events[0].Data)
+	}
 
 	// Verify goal.json was NOT modified
 	recAfter, err := store.GetGoal(ctx, repo.Key(), "optimize-latency")
@@ -965,7 +968,10 @@ func TestScheduler_StartRun(t *testing.T) {
 	}
 
 	// 1. Successful manual start
-	run, err := scheduler.StartRun(ctx, repo, goalRec.Goal.Name, "manual")
+	run, err := scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{
+		Reason: "manual",
+		By:     "alice",
+	})
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
@@ -979,9 +985,12 @@ func TestScheduler_StartRun(t *testing.T) {
 	if events[0].Data.(map[string]any)["reason"] != "manual" {
 		t.Errorf("expected reason 'manual', got %v", events[0].Data)
 	}
+	if events[0].Data.(map[string]any)["by"] != "alice" {
+		t.Errorf("expected by 'alice', got %v", events[0].Data)
+	}
 
 	// 2. Refuses when goal has an active run
-	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, "manual")
+	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{Reason: "manual"})
 	if !errors.Is(err, ErrActiveRun) {
 		t.Fatalf("expected ErrActiveRun, got: %v", err)
 	}
@@ -995,14 +1004,28 @@ func TestScheduler_StartRun(t *testing.T) {
 	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
 		{Number: 1, Head: "ao/optimize-latency/run-1", State: "open", URL: repo.URL + "/pull/1"},
 	})
-	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, "manual")
+	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{Reason: "manual"})
 	if !errors.Is(err, ErrOpenPullRequest) {
 		t.Fatalf("expected ErrOpenPullRequest, got: %v", err)
 	}
 
 	// 4. Refuses when goal record is missing from repository
-	_, err = scheduler.StartRun(ctx, repo, "missing-goal", "manual")
+	_, err = scheduler.StartRun(ctx, repo, "missing-goal", StartOptions{Reason: "manual"})
 	if !errors.Is(err, ErrGoalNotFound) {
 		t.Fatalf("expected ErrGoalNotFound, got: %v", err)
+	}
+
+	// 5. StartRun without By omits "by" from event data
+	fakeForge.SetPullRequests(repo.URL, nil)
+	run2, err := scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{Reason: "manual"})
+	if err != nil {
+		t.Fatalf("StartRun without By: %v", err)
+	}
+	events2, err := store.ReadEvents(ctx, repo.Key(), run2.ID)
+	if err != nil || len(events2) != 1 {
+		t.Fatalf("expected 1 event for run2, got %d (err: %v)", len(events2), err)
+	}
+	if _, ok := events2[0].Data.(map[string]any)["by"]; ok {
+		t.Errorf("expected no 'by' in event data, got %v", events2[0].Data)
 	}
 }
