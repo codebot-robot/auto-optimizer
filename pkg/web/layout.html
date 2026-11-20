@@ -19,6 +19,7 @@
     <div class="header-user">
       <span class="user-login">{{.User}}</span>
       <form method="POST" action="/logout">
+        <input type="hidden" name="csrf" value="{{csrfToken}}">
         <button type="submit" class="btn-signout">Sign out</button>
       </form>
     </div>{{end}}

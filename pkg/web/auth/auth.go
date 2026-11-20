@@ -124,6 +124,16 @@ func Decode(key []byte, value string, now time.Time) (Session, error) {
 	return sess, nil
 }
 
+// CSRFToken derives an anti-forgery token from the session cookie value and session signing key.
+func CSRFToken(sessionValue string, key []byte) string {
+	if sessionValue == "" || len(key) == 0 {
+		return ""
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(sessionValue))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // UserFromContext returns the authenticated user's login from ctx, if present.
 func UserFromContext(ctx context.Context) (string, bool) {
 	if ctx == nil {

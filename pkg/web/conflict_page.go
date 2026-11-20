@@ -53,5 +53,5 @@ func RenderConflictPage(ctx context.Context, w http.ResponseWriter, data Conflic
 	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusConflict)
-	return conflictPageTmpl().Execute(w, data)
+	return executePageTemplate(ctx, conflictPageTmpl(), w, data)
 }

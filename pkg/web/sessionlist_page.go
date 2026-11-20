@@ -54,5 +54,5 @@ func RenderSessionListPage(ctx context.Context, w http.ResponseWriter, data Sess
 	}
 	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	return sessionListPageTmpl().Execute(w, data)
+	return executePageTemplate(ctx, sessionListPageTmpl(), w, data)
 }

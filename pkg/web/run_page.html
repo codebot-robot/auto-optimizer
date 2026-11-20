@@ -11,6 +11,7 @@
   </div>{{if .Finished}}
   <div>
     <form method="POST" action="/runs/{{.Run.ID}}/rerun">
+      <input type="hidden" name="csrf" value="{{csrfToken}}">
       <button type="submit" class="btn primary">Run again</button>
     </form>
   </div>{{end}}

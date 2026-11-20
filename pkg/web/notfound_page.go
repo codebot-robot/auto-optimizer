@@ -53,5 +53,5 @@ func RenderNotFoundPage(ctx context.Context, w http.ResponseWriter, data NotFoun
 	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)
-	return notFoundPageTmpl().Execute(w, data)
+	return executePageTemplate(ctx, notFoundPageTmpl(), w, data)
 }

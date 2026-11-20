@@ -65,5 +65,5 @@ func RenderRepoPage(ctx context.Context, w http.ResponseWriter, data RepoPageDat
 	}
 	populateUser(ctx, &data.User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	return repoPageTmpl().Execute(w, data)
+	return executePageTemplate(ctx, repoPageTmpl(), w, data)
 }

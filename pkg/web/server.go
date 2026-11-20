@@ -32,6 +32,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
+	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
 
 //go:embed static/*
@@ -52,15 +53,21 @@ type RunStarter interface {
 	StartRun(ctx context.Context, repo *state.Repo, goalName string, reason string) (*state.Run, error)
 }
 
+// ServerOptions configures optional settings for Server.
+type ServerOptions struct {
+	SessionKey []byte
+}
+
 // Server handles HTTP requests for the web UI.
 type Server struct {
 	service    SessionService
 	stateStore state.Store
 	starter    RunStarter
+	sessionKey []byte
 }
 
-// NewServer creates a new web Server backed by the given SessionService, state.Store, and RunStarter.
-func NewServer(service SessionService, stateStore state.Store, starter RunStarter) (*Server, error) {
+// NewServer creates a new web Server backed by the given SessionService, state.Store, RunStarter, and ServerOptions.
+func NewServer(service SessionService, stateStore state.Store, starter RunStarter, opts ServerOptions) (*Server, error) {
 	if service == nil {
 		return nil, errors.New("service is required")
 	}
@@ -69,6 +76,7 @@ func NewServer(service SessionService, stateStore state.Store, starter RunStarte
 		service:    service,
 		stateStore: stateStore,
 		starter:    starter,
+		sessionKey: opts.SessionKey,
 	}, nil
 }
 
@@ -95,6 +103,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Ensure SameSite=Strict cookie on GET requests
 	if r.Method == http.MethodGet {
 		s.ensureCSRFCookie(w, r)
+	}
+
+	if len(s.sessionKey) > 0 {
+		if c, err := r.Cookie(auth.CookieName); err == nil && c.Value != "" {
+			token := auth.CSRFToken(c.Value, s.sessionKey)
+			r = r.WithContext(WithCSRFToken(r.Context(), token))
+		}
 	}
 
 	// Validate CSRF on POST requests
