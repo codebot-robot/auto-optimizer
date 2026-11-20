@@ -1180,8 +1180,8 @@ func TestRunAgain_Actor(t *testing.T) {
 	if starter.lastOpts.Reason != "manual" {
 		t.Errorf("starter reason = %q, want manual", starter.lastOpts.Reason)
 	}
-	if starter.lastOpts.By != "octocat" {
-		t.Errorf("starter by = %q, want octocat", starter.lastOpts.By)
+	if starter.lastOpts.StartedByUser != "octocat" {
+		t.Errorf("starter startedByUser = %q, want octocat", starter.lastOpts.StartedByUser)
 	}
 
 	// 2. Unauthenticated user passes anonymous
@@ -1194,7 +1194,7 @@ func TestRunAgain_Actor(t *testing.T) {
 	if recAnon.Code != http.StatusSeeOther {
 		t.Fatalf("POST /runs/<id>/rerun status = %d, want 303", recAnon.Code)
 	}
-	if starter.lastOpts.By != "anonymous" {
-		t.Errorf("starter by = %q, want anonymous", starter.lastOpts.By)
+	if starter.lastOpts.StartedByUser != "anonymous" {
+		t.Errorf("starter startedByUser = %q, want anonymous", starter.lastOpts.StartedByUser)
 	}
 }

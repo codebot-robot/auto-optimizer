@@ -969,8 +969,8 @@ func TestScheduler_StartRun(t *testing.T) {
 
 	// 1. Successful manual start
 	run, err := scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{
-		Reason: "manual",
-		By:     "alice",
+		Reason:        "manual",
+		StartedByUser: "alice",
 	})
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
@@ -1015,11 +1015,11 @@ func TestScheduler_StartRun(t *testing.T) {
 		t.Fatalf("expected ErrGoalNotFound, got: %v", err)
 	}
 
-	// 5. StartRun without By omits "by" from event data
+	// 5. StartRun without StartedByUser omits "by" from event data
 	fakeForge.SetPullRequests(repo.URL, nil)
 	run2, err := scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{Reason: "manual"})
 	if err != nil {
-		t.Fatalf("StartRun without By: %v", err)
+		t.Fatalf("StartRun without StartedByUser: %v", err)
 	}
 	events2, err := store.ReadEvents(ctx, repo.Key(), run2.ID)
 	if err != nil || len(events2) != 1 {
