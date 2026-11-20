@@ -26,7 +26,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 # - IN_CLUSTER_STORAGE_COMMIT: Check latest commit at https://github.com/gke-labs/in-cluster-storage/commits/main
 AGENT_SANDBOX_VERSION="v1.0.8"
 SERVICE_PORTALS_COMMIT="686b34d8aa74546af1039119bbfa6e05ead15f53"
-IN_CLUSTER_STORAGE_COMMIT="1b4fbb5bc4f8ffa9ace7304fe6cf36c86e247994"
+IN_CLUSTER_STORAGE_COMMIT="8ece1bbfdefb4afaceac89dec3eaa112428917a9"
 
 GOBIN="${REPO_ROOT}/.build/bin" GOTOOLCHAIN=auto go install github.com/gke-labs/gke-labs-infra/ap@latest
 "${REPO_ROOT}/.build/bin/ap" tool install "${REPO_ROOT}/.build/bin"
@@ -339,6 +339,7 @@ EOF
         "${IMAGE_PREFIX}/wal-buffer:${IMAGE_TAG}" \
         "${IMAGE_PREFIX}/objectfs-controller:${IMAGE_TAG}" \
         "${IMAGE_PREFIX}/objectfs-node-daemon:${IMAGE_TAG}" \
+        "${IMAGE_PREFIX}/objectfs-fuse-holder:${IMAGE_TAG}" \
         --name "${KIND_CLUSTER_NAME}"
 
       echo "Deploying in-cluster-storage manifests with ap deploy..."
@@ -389,6 +390,9 @@ EOF
 
     echo "Waiting for objectfs-controller statefulset in kube-objectfs-system..."
     kubectl rollout status statefulset/objectfs-controller -n kube-objectfs-system --timeout=120s
+
+    echo "Waiting for objectfs-fuse-holder daemonset in kube-objectfs-system..."
+    kubectl rollout status daemonset/objectfs-fuse-holder -n kube-objectfs-system --timeout=120s
 
     echo "Waiting for objectfs-node-daemon daemonset in kube-objectfs-system..."
     kubectl rollout status daemonset/objectfs-node-daemon -n kube-objectfs-system --timeout=120s
