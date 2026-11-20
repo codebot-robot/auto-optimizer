@@ -487,6 +487,14 @@ if has_component "ao"; then
   kubectl create namespace ao-system --dry-run=client -o yaml | kubectl apply -f -
   kubectl create namespace ao-sandboxes --dry-run=client -o yaml | kubectl apply -f -
 
+  if kubectl get secret service-portal-controller-ca -n service-portal-system >/dev/null 2>&1; then
+    echo "Copying service-portal-controller-ca Secret into ao-system..."
+    CA_CERT="$(kubectl get secret service-portal-controller-ca -n service-portal-system -o jsonpath='{.data.tls\.crt}' | base64 -d)"
+    kubectl create secret generic service-portal-controller-ca \
+      --from-literal=tls.crt="${CA_CERT}" \
+      -n ao-system --dry-run=client -o yaml | kubectl apply -f -
+  fi
+
   SANDBOX_IMAGE="${SANDBOX_IMAGE:-${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}}"
 
   if [[ "${IS_KIND}" == "true" ]]; then
@@ -513,8 +521,15 @@ if has_component "ao"; then
     AO_REPOS="${AO_REPOS:-}"
     AO_PUBLIC_URL="${AO_PUBLIC_URL:-}"
     AO_GITHUB_ALLOWED_USERS="${AO_GITHUB_ALLOWED_USERS:-}"
+    PORTAL_CONTROLLER_ADDR="${PORTAL_CONTROLLER_ADDR:-}"
+    PORTAL_CONTROLLER_CA_FILE="${PORTAL_CONTROLLER_CA_FILE:-/etc/portal/tls.crt}"
+    PORTAL_TOKEN_FILE="${PORTAL_TOKEN_FILE:-/var/run/secrets/portal/token}"
+    SANDBOX_EGRESS_HOSTS="${SANDBOX_EGRESS_HOSTS:-}"
+    if [[ -z "${PORTAL_CONTROLLER_ADDR}" ]] && kubectl get secret service-portal-controller-ca -n service-portal-system >/dev/null 2>&1; then
+      PORTAL_CONTROLLER_ADDR="service-portal-controller.service-portal-system.svc:8443"
+    fi
 
-    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE}, VERTEX_PROJECT=${VERTEX_PROJECT}, VERTEX_LOCATION=${VERTEX_LOCATION}, AO_REPOS=${AO_REPOS}, AO_PUBLIC_URL=${AO_PUBLIC_URL}, AO_GITHUB_ALLOWED_USERS=${AO_GITHUB_ALLOWED_USERS})..."
+    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE}, VERTEX_PROJECT=${VERTEX_PROJECT}, VERTEX_LOCATION=${VERTEX_LOCATION}, AO_REPOS=${AO_REPOS}, AO_PUBLIC_URL=${AO_PUBLIC_URL}, AO_GITHUB_ALLOWED_USERS=${AO_GITHUB_ALLOWED_USERS}, PORTAL_CONTROLLER_ADDR=${PORTAL_CONTROLLER_ADDR}, SANDBOX_EGRESS_HOSTS=${SANDBOX_EGRESS_HOSTS})..."
     cat << EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -533,6 +548,10 @@ data:
   AO_REPOS: "${AO_REPOS}"
   AO_PUBLIC_URL: "${AO_PUBLIC_URL}"
   AO_GITHUB_ALLOWED_USERS: "${AO_GITHUB_ALLOWED_USERS}"
+  PORTAL_CONTROLLER_ADDR: "${PORTAL_CONTROLLER_ADDR}"
+  PORTAL_CONTROLLER_CA_FILE: "${PORTAL_CONTROLLER_CA_FILE}"
+  PORTAL_TOKEN_FILE: "${PORTAL_TOKEN_FILE}"
+  SANDBOX_EGRESS_HOSTS: "${SANDBOX_EGRESS_HOSTS}"
 EOF
 
     kubectl rollout restart deployment/ao -n ao-system
@@ -555,8 +574,12 @@ EOF
     AO_REPOS="${AO_REPOS:-}"
     AO_PUBLIC_URL="${AO_PUBLIC_URL:-}"
     AO_GITHUB_ALLOWED_USERS="${AO_GITHUB_ALLOWED_USERS:-}"
+    PORTAL_CONTROLLER_ADDR="${PORTAL_CONTROLLER_ADDR:-}"
+    PORTAL_CONTROLLER_CA_FILE="${PORTAL_CONTROLLER_CA_FILE:-/etc/portal/tls.crt}"
+    PORTAL_TOKEN_FILE="${PORTAL_TOKEN_FILE:-/var/run/secrets/portal/token}"
+    SANDBOX_EGRESS_HOSTS="${SANDBOX_EGRESS_HOSTS:-}"
 
-    if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" || -n "${VERTEX_PROJECT:-}" || -n "${VERTEX_LOCATION:-}" || -n "${SANDBOXD_IMAGE:-}" || -n "${AO_REPOS:-}" || -n "${AO_PUBLIC_URL:-}" || -n "${AO_GITHUB_ALLOWED_USERS:-}" ]]; then
+    if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" || -n "${VERTEX_PROJECT:-}" || -n "${VERTEX_LOCATION:-}" || -n "${SANDBOXD_IMAGE:-}" || -n "${AO_REPOS:-}" || -n "${AO_PUBLIC_URL:-}" || -n "${AO_GITHUB_ALLOWED_USERS:-}" || -n "${PORTAL_CONTROLLER_ADDR:-}" ]]; then
       echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-}, SANDBOXD_IMAGE=${SANDBOXD_IMAGE:-}, VERTEX_PROJECT=${VERTEX_PROJECT:-}, VERTEX_LOCATION=${VERTEX_LOCATION:-}, AO_REPOS=${AO_REPOS}, AO_PUBLIC_URL=${AO_PUBLIC_URL}, AO_GITHUB_ALLOWED_USERS=${AO_GITHUB_ALLOWED_USERS})..."
       cat << EOF | kubectl apply -f -
 apiVersion: v1
@@ -576,6 +599,10 @@ data:
   AO_REPOS: "${AO_REPOS}"
   AO_PUBLIC_URL: "${AO_PUBLIC_URL}"
   AO_GITHUB_ALLOWED_USERS: "${AO_GITHUB_ALLOWED_USERS}"
+  PORTAL_CONTROLLER_ADDR: "${PORTAL_CONTROLLER_ADDR}"
+  PORTAL_CONTROLLER_CA_FILE: "${PORTAL_CONTROLLER_CA_FILE}"
+  PORTAL_TOKEN_FILE: "${PORTAL_TOKEN_FILE}"
+  SANDBOX_EGRESS_HOSTS: "${SANDBOX_EGRESS_HOSTS}"
 EOF
 
       kubectl rollout restart deployment/ao -n ao-system
