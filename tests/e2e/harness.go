@@ -99,26 +99,29 @@ func (h *Harness) Setup() {
 
 		if !exists {
 			h.t.Logf("Cluster %s does not exist, creating with kind...", h.clusterName)
-			createCmd := exec.Command("kind", "create", "cluster", "--name", h.clusterName)
+			gitRoot, gitErr := h.getGitRoot()
+			if gitErr != nil {
+				h.t.Fatalf("failed to get git root to locate kind config: %v", gitErr)
+			}
+			kindConfigFile := filepath.Join(gitRoot, "dev", "kind-config.yaml")
+			if _, statErr := os.Stat(kindConfigFile); statErr != nil {
+				h.t.Fatalf("kind config file %s not found (required to enable containerd NRI): %v", kindConfigFile, statErr)
+			}
+			createCmd := exec.Command("kind", "create", "cluster", "--name", h.clusterName, "--config", kindConfigFile)
 			if createOut, createErr := createCmd.CombinedOutput(); createErr != nil {
 				h.t.Fatalf("failed to create kind cluster %s: %v\nOutput: %s", h.clusterName, createErr, string(createOut))
 			}
 
 			// Deploy dependencies using dev/tasks/deploy-to-kube
-			gitRoot, gitErr := h.getGitRoot()
-			if gitErr != nil {
-				h.t.Logf("failed to get git root: %v", gitErr)
+			deployScript := filepath.Join(gitRoot, "dev", "tasks", "deploy-to-kube")
+			if _, statErr := os.Stat(deployScript); statErr != nil {
+				h.t.Logf("deploy script not found: %v", statErr)
 			} else {
-				deployScript := filepath.Join(gitRoot, "dev", "tasks", "deploy-to-kube")
-				if _, statErr := os.Stat(deployScript); statErr != nil {
-					h.t.Logf("deploy script not found: %v", statErr)
-				} else {
-					h.t.Logf("Deploying dependencies via %s...", deployScript)
-					deployCmd := exec.Command(deployScript)
-					deployCmd.Env = append(os.Environ(), "KIND_CLUSTER_NAME="+h.clusterName)
-					if deployOut, deployErr := deployCmd.CombinedOutput(); deployErr != nil {
-						h.t.Fatalf("failed to deploy dependencies: %v\nOutput: %s", deployErr, string(deployOut))
-					}
+				h.t.Logf("Deploying dependencies via %s...", deployScript)
+				deployCmd := exec.Command(deployScript)
+				deployCmd.Env = append(os.Environ(), "KIND_CLUSTER_NAME="+h.clusterName)
+				if deployOut, deployErr := deployCmd.CombinedOutput(); deployErr != nil {
+					h.t.Fatalf("failed to deploy dependencies: %v\nOutput: %s", deployErr, string(deployOut))
 				}
 			}
 
