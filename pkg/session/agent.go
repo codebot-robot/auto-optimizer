@@ -239,27 +239,9 @@ func (s *Session) SetSandboxPreparer(fn func(ctx context.Context, sb *Sandbox) e
 	s.prepareSandbox = fn
 }
 
-// shouldSnapshotFS reports whether the session should take snapshots of its home directory.
-// Runs and sessions backed by a workspace claim persist files on their claim instead,
-// so filesystem snapshots are disabled for them.
-func (s *Session) shouldSnapshotFS() bool {
-	if s == nil {
-		return false
-	}
-	if s.Metadata.RunID != "" {
-		return false
-	}
-	if s.sandboxOpts != nil && s.sandboxOpts.WorkspaceClaimName != "" {
-		return false
-	}
-	return true
-}
-
-// shouldRestoreFS reports whether the session should restore its home directory from a snapshot.
-// Runs and sessions backed by a workspace claim persist files on their claim instead,
-// so filesystem restores are disabled for them.
-func (s *Session) shouldRestoreFS() bool {
-	return s.shouldSnapshotFS()
+// hasWorkspaceClaim reports whether the session's sandbox is backed by a workspace claim.
+func (s *Session) hasWorkspaceClaim() bool {
+	return s.sandboxOpts != nil && s.sandboxOpts.WorkspaceClaimName != ""
 }
 
 // SetActiveSandbox binds an existing sandbox to the session.
@@ -1348,9 +1330,6 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 		sandboxdImage = DefaultSandboxdImage
 	}
 	homeDir := h.opts.HomeDir
-	if homeDir == "" {
-		homeDir = DefaultHomeDir
-	}
 	cpNamespace := h.opts.ControlPlaneNamespace
 	if cpNamespace == "" {
 		return nil, errors.New("ControlPlaneNamespace must be specified in RunOptions")
@@ -1966,15 +1945,10 @@ func (h *Harness) NewSession(ctx context.Context, sessionStore Store, sessionNam
 		return nil, fmt.Errorf("creating session: %w", err)
 	}
 
-	homeDir := h.opts.HomeDir
-	if homeDir == "" {
-		homeDir = DefaultHomeDir
-	}
-
 	return &Session{
 		Name:            sessionName,
 		client:          h.sandboxClient,
-		HomeDir:         homeDir,
+		HomeDir:         h.opts.HomeDir,
 		stateDir:        h.opts.StateDir,
 		sessionStore:    sessionStore,
 		Metadata:        metadata,
@@ -2004,15 +1978,10 @@ func (h *Harness) LoadSession(ctx context.Context, sessionStore Store, sessionNa
 		meta = *metadata
 	}
 
-	homeDir := h.opts.HomeDir
-	if homeDir == "" {
-		homeDir = DefaultHomeDir
-	}
-
 	return &Session{
 		Name:            sessionName,
 		client:          h.sandboxClient,
-		HomeDir:         homeDir,
+		HomeDir:         h.opts.HomeDir,
 		stateDir:        h.opts.StateDir,
 		sessionStore:    sessionStore,
 		Metadata:        meta,
@@ -2145,7 +2114,7 @@ func (h *Harness) runLoop(ctx context.Context, session *Session, events TurnEven
 			events.AssistantMessage(ctx, valueOf(assistantMessage.Content))
 
 			// We take a snapshot at these "boundaries", rather than after every tool call
-			if shouldSnapshot && session.activeSandbox != nil && session.shouldSnapshotFS() {
+			if shouldSnapshot && session.activeSandbox != nil && !session.hasWorkspaceClaim() {
 				log.Info("snapshotting filesystem from sandbox...", "sandbox.name", session.activeSandbox.SandboxName())
 				if err := session.activeSandbox.SnapshotFS(ctx); err != nil {
 					log.Error(err, "failed to snapshot filesystem")
@@ -2351,7 +2320,7 @@ func (h *Harness) ensureSandbox(ctx context.Context, session *Session) (tools.Sa
 				}
 				return nil, err
 			}
-		} else if session.shouldRestoreFS() {
+		} else if !session.hasWorkspaceClaim() {
 			log.Info("restoring filesystem to sandbox...", "sandbox.name", sb.SandboxName())
 			if err := sb.RestoreFS(ctx); err != nil {
 				log.Error(err, "failed to restore filesystem; starting with a fresh sandbox instead", "sandbox.name", sb.SandboxName())

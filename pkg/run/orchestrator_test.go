@@ -180,6 +180,7 @@ func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServe
 		ControlPlaneNamespace: "ao-system",
 		SigningKey:            privKey,
 	}
+	opts.InitDefaults()
 
 	var toolsRegistry *tools.Registry
 	if llmClient != nil {

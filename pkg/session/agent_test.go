@@ -1534,6 +1534,7 @@ func TestCreateSandboxWithOptions_WorkspaceClaim(t *testing.T) {
 		Namespace:             ns,
 		ControlPlaneNamespace: cpNamespace,
 		SigningKey:            privKey,
+		HomeDir:               DefaultHomeDir,
 	})
 
 	tests := []struct {
@@ -1816,37 +1817,30 @@ func TestSandbox_PodUID(t *testing.T) {
 	}
 }
 
-func TestSession_SnapshotsDisabledForRuns(t *testing.T) {
-	// 1. Run session via Metadata.RunID
-	sessRun := &Session{
-		Metadata: Metadata{RunID: "run-20261121"},
-	}
-	if sessRun.shouldSnapshotFS() {
-		t.Error("expected shouldSnapshotFS to be false for run session")
-	}
-	if sessRun.shouldRestoreFS() {
-		t.Error("expected shouldRestoreFS to be false for run session")
-	}
-
-	// 2. Session with WorkspaceClaimName
+func TestSession_HasWorkspaceClaim(t *testing.T) {
+	// 1. Session with WorkspaceClaimName set
 	sessClaim := &Session{
 		sandboxOpts: &CreateSandboxOptions{
 			WorkspaceClaimName: "test-claim",
 		},
 	}
-	if sessClaim.shouldSnapshotFS() {
-		t.Error("expected shouldSnapshotFS to be false for session with workspace claim")
-	}
-	if sessClaim.shouldRestoreFS() {
-		t.Error("expected shouldRestoreFS to be false for session with workspace claim")
+	if !sessClaim.hasWorkspaceClaim() {
+		t.Error("expected hasWorkspaceClaim to be true when WorkspaceClaimName is set")
 	}
 
-	// 3. Interactive session without claim
-	sessInteractive := &Session{}
-	if !sessInteractive.shouldSnapshotFS() {
-		t.Error("expected shouldSnapshotFS to be true for interactive session without claim")
+	// 2. Session with nil sandboxOpts
+	sessNoOpts := &Session{}
+	if sessNoOpts.hasWorkspaceClaim() {
+		t.Error("expected hasWorkspaceClaim to be false when sandboxOpts is nil")
 	}
-	if !sessInteractive.shouldRestoreFS() {
-		t.Error("expected shouldRestoreFS to be true for interactive session without claim")
+
+	// 3. Session with empty WorkspaceClaimName
+	sessEmptyClaim := &Session{
+		sandboxOpts: &CreateSandboxOptions{
+			WorkspaceClaimName: "",
+		},
+	}
+	if sessEmptyClaim.hasWorkspaceClaim() {
+		t.Error("expected hasWorkspaceClaim to be false when WorkspaceClaimName is empty")
 	}
 }
