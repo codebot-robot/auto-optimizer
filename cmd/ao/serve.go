@@ -117,6 +117,14 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 	if envPortalToken := os.Getenv("PORTAL_TOKEN_FILE"); envPortalToken != "" {
 		opts.portal.TokenFile = envPortalToken
 	}
+	if envEgressHosts := os.Getenv("SANDBOX_EGRESS_HOSTS"); envEgressHosts != "" {
+		for _, h := range strings.Split(envEgressHosts, ",") {
+			h = strings.TrimSpace(h)
+			if h != "" {
+				opts.portal.EgressHosts = append(opts.portal.EgressHosts, h)
+			}
+		}
+	}
 	defaultListen := os.Getenv("AO_LISTEN")
 	if defaultListen == "" {
 		defaultListen = "127.0.0.1:8081"

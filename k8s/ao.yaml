@@ -116,6 +116,7 @@ data:
   PORTAL_CONTROLLER_ADDR: ""
   PORTAL_CONTROLLER_CA_FILE: "/etc/portal/tls.crt"
   PORTAL_TOKEN_FILE: "/var/run/secrets/portal/token"
+  SANDBOX_EGRESS_HOSTS: ""
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

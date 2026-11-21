@@ -16,12 +16,15 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/cgi"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +35,7 @@ import (
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
+	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -89,8 +93,10 @@ func assertSandboxdAuthAndNoSecretsRBAC(t *testing.T, subH *Harness, sessionName
 }
 
 // startFixtureGitServer starts an HTTP git server for the bare repository at bareRepoDir
-// accessible to kind cluster nodes, with http.receivepack enabled to allow git pushes.
-func startFixtureGitServer(t *testing.T, bareRepoDir string) string {
+// accessible to kind cluster nodes via a Kubernetes Service and EndpointSlice, and starts
+// an in-process HTTP forward proxy on localhost so host-side commands (git and ao serve)
+// can resolve the Service name without privileges.
+func startFixtureGitServer(t *testing.T, subH *Harness, bareRepoDir string) string {
 	t.Helper()
 
 	bareRepoDir = filepath.Clean(bareRepoDir)
@@ -161,7 +167,67 @@ func startFixtureGitServer(t *testing.T, bareRepoDir string) string {
 	go func() { _ = gitServer.Serve(gitListener) }()
 	t.Cleanup(func() { _ = gitServer.Close() })
 
-	repoURL := fmt.Sprintf("http://%s:%d/%s", kindGatewayIPv4, gitPort, filepath.Base(bareRepoDir))
+	svcName := fmt.Sprintf("git-fixture-%d", gitPort)
+	manifest := fmt.Sprintf(`apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: ao-sandboxes
+spec:
+  ports:
+    - name: http
+      port: 80
+      targetPort: %d
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: %s
+  namespace: ao-sandboxes
+  labels:
+    kubernetes.io/service-name: %s
+addressType: IPv4
+ports:
+  - name: http
+    port: %d
+endpoints:
+  - addresses:
+      - "%s"
+`, svcName, gitPort, svcName, svcName, gitPort, kindGatewayIPv4)
+
+	if _, err := subH.KubectlWithStdin(manifest, "apply", "-f", "-"); err != nil {
+		t.Fatalf("failed to create fixture git service and endpointslice: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = subH.Kubectl("delete", "service", svcName, "-n", "ao-sandboxes", "--ignore-not-found")
+		_, _ = subH.Kubectl("delete", "endpointslice", svcName, "-n", "ao-sandboxes", "--ignore-not-found")
+	})
+
+	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for forward HTTP proxy: %v", err)
+	}
+	proxyPort := proxyListener.Addr().(*net.TCPAddr).Port
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			if strings.Contains(req.Host, ".svc.cluster.local") || strings.Contains(req.URL.Host, ".svc.cluster.local") {
+				req.URL.Scheme = "http"
+				req.URL.Host = fmt.Sprintf("127.0.0.1:%d", gitPort)
+			}
+		},
+	}
+	proxyServer := &http.Server{Handler: proxy}
+	go func() { _ = proxyServer.Serve(proxyListener) }()
+	t.Cleanup(func() { _ = proxyServer.Close() })
+
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
+	t.Setenv("HTTP_PROXY", proxyURL)
+	t.Setenv("http_proxy", proxyURL)
+	t.Setenv("NO_PROXY", "127.0.0.1,localhost")
+	t.Setenv("no_proxy", "127.0.0.1,localhost")
+
+	repoHost := fmt.Sprintf("%s.ao-sandboxes.svc.cluster.local", svcName)
+	repoURL := fmt.Sprintf("http://%s:80/%s", repoHost, filepath.Base(bareRepoDir))
 	t.Logf("Git repository available at %s (backend %s)", repoURL, gitHTTPBackend)
 	return repoURL
 }
@@ -973,7 +1039,7 @@ func buildAOBinary(t *testing.T, gitRoot string) string {
 	return aoBin
 }
 
-func setupHelloRepoFixture(t *testing.T) (bareRepoDir, repoURL, baseCommit string) {
+func setupHelloRepoFixture(t *testing.T, subH *Harness) (bareRepoDir, repoURL, baseCommit string) {
 	t.Helper()
 	gitBaseDir := t.TempDir()
 	bareRepoDir = filepath.Join(gitBaseDir, "hello-repo.git")
@@ -1007,7 +1073,7 @@ func setupHelloRepoFixture(t *testing.T) (bareRepoDir, repoURL, baseCommit strin
 	runGit(t, bareRepoDir, "symbolic-ref", "HEAD", "refs/heads/main")
 	runGit(t, bareRepoDir, "config", "http.receivepack", "true")
 
-	repoURL = startFixtureGitServer(t, bareRepoDir)
+	repoURL = startFixtureGitServer(t, subH, bareRepoDir)
 	t.Logf("Git repository available at %s (base commit %s)", repoURL, baseCommit)
 
 	// Assert the fixture git server accepts pushes
@@ -1019,7 +1085,7 @@ func setupHelloRepoFixture(t *testing.T) (bareRepoDir, repoURL, baseCommit strin
 	return bareRepoDir, repoURL, baseCommit
 }
 
-func startAOServe(t *testing.T, aoBin, repoURL string, env ...string) (serverAddr, httpAddr, stateDir string, serveStderr *bytes.Buffer) {
+func startAOServe(t *testing.T, subH *Harness, aoBin, repoURL string, env ...string) (serverAddr, httpAddr, stateDir string, serveStderr *bytes.Buffer) {
 	t.Helper()
 	aoListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1036,14 +1102,58 @@ func startAOServe(t *testing.T, aoBin, repoURL string, env ...string) (serverAdd
 	_ = httpListener.Close()
 
 	stateDir = t.TempDir()
-	serveCmd := exec.Command(aoBin, "serve",
+
+	args := []string{
+		"serve",
 		"--listen", serverAddr,
 		"--http", httpAddr,
 		"--state-dir", stateDir,
 		"--repo", repoURL,
 		"--insecure-no-auth",
 		"--workspace-storage-class=objectfs-exclusive-local",
-	)
+	}
+
+	if subH != nil {
+		portalAddr, stopPortal := subH.PortForwardService("service-portal-system", "svc/service-portal-controller", 8443)
+		t.Cleanup(stopPortal)
+
+		caCertB64, err := subH.Kubectl("get", "secret", "-n", "ao-system", "service-portal-controller-ca", "-o", "jsonpath={.data.tls\\.crt}")
+		if err != nil {
+			t.Fatalf("failed to read service-portal-controller-ca secret: %v", err)
+		}
+		caCertBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(caCertB64))
+		if err != nil {
+			t.Fatalf("failed to decode service-portal-controller-ca: %v", err)
+		}
+		caFile := filepath.Join(stateDir, "portal-ca.crt")
+		if err := os.WriteFile(caFile, caCertBytes, 0600); err != nil {
+			t.Fatalf("failed to write portal-ca.crt: %v", err)
+		}
+
+		token, err := subH.Kubectl("create", "token", "ao", "-n", "ao-system", "--audience=https://service-portal-controller")
+		if err != nil {
+			t.Fatalf("failed to create portal token for ao: %v", err)
+		}
+		tokenFile := filepath.Join(stateDir, "portal-token")
+		if err := os.WriteFile(tokenFile, []byte(strings.TrimSpace(token)), 0600); err != nil {
+			t.Fatalf("failed to write portal-token: %v", err)
+		}
+
+		parsedURL, err := url.Parse(repoURL)
+		if err != nil {
+			t.Fatalf("failed to parse repo URL %s: %v", repoURL, err)
+		}
+		hosts := "github.com,http://" + parsedURL.Host
+
+		args = append(args,
+			"--portal-controller-addr="+portalAddr,
+			"--portal-controller-ca-file="+caFile,
+			"--portal-token-file="+tokenFile,
+			"--sandbox-egress-hosts="+hosts,
+		)
+	}
+
+	serveCmd := exec.Command(aoBin, args...)
 	serveCmd.Env = append(os.Environ(), env...)
 
 	var serveStdout bytes.Buffer
@@ -1263,8 +1373,8 @@ func TestRunLifecycle(t *testing.T) {
 		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
 	})
 
-	_, repoURL, baseCommit := setupHelloRepoFixture(t)
-	serverAddr, _, stateDir, serveStderr := startAOServe(t, aoBin, repoURL, "OPENAI_MODEL=fake-eliza")
+	_, repoURL, baseCommit := setupHelloRepoFixture(t, subH)
+	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, repoURL, "OPENAI_MODEL=fake-eliza")
 
 	var assertedObjectFS bool
 	t.Log("Waiting for run to reach Working and then NoImprovement phase...")
@@ -1388,11 +1498,12 @@ func TestRunPushesBranch(t *testing.T) {
 	}
 
 	aoBin := buildAOBinary(t, gitRoot)
-	bareRepoDir, repoURL, baseCommit := setupHelloRepoFixture(t)
+	subH := h.WithT(t)
+	bareRepoDir, repoURL, baseCommit := setupHelloRepoFixture(t, subH)
 
 	scriptJSON := `[{"tool":"run_command","args":{"command":"cd /workspace/repo && echo 'appended line for scripted run' >> README.md && git add README.md && git commit -m 'docs: add a line to the README'"}},{"tool":"open_pull_request","args":{"title":"docs: add a line to the README","body":"This scripted run adds a line to the README."}}]`
 
-	serverAddr, httpAddr, _, serveStderr := startAOServe(t, aoBin, repoURL,
+	serverAddr, httpAddr, _, serveStderr := startAOServe(t, subH, aoBin, repoURL,
 		"OPENAI_MODEL=fake-script",
 		"AO_FAKE_SCRIPT="+scriptJSON,
 	)
@@ -1475,7 +1586,6 @@ func TestRunPushesBranch(t *testing.T) {
 	t.Logf("PASS: Run page %s returned 200 and contained branch %s", runPageURL, wantBranch)
 
 	// 5. Verify sandbox was deleted in Kubernetes after session ended
-	subH := h.WithT(t)
 	deleteDeadline := time.Now().Add(30 * time.Second)
 	var sbDeleted bool
 	for time.Now().Before(deleteDeadline) {
@@ -1488,5 +1598,172 @@ func TestRunPushesBranch(t *testing.T) {
 	}
 	if !sbDeleted {
 		t.Errorf("expected sandbox %s to be deleted after session ended, but it still exists", finalRun.SandboxName)
+	}
+}
+
+func TestRunSandboxPortalIsolation(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("RUN_E2E env var not set, skipping e2e portal isolation test")
+	}
+
+	clusterName := os.Getenv("KIND_CLUSTER_NAME")
+	if clusterName == "" {
+		clusterName = "auto-optimizer"
+	}
+
+	h := NewHarness(t, clusterName)
+	h.Setup()
+
+	gitRoot, err := h.getGitRoot()
+	if err != nil {
+		t.Fatalf("failed to get git root: %v", err)
+	}
+
+	aoBin := buildAOBinary(t, gitRoot)
+	subH := h.WithT(t)
+
+	_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	t.Cleanup(func() {
+		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	})
+
+	aoClusterIP, err := subH.Kubectl("get", "service", "-n", "ao-system", "ao", "-o", "jsonpath={.spec.clusterIP}")
+	if err != nil {
+		t.Fatalf("failed to read ao service clusterIP: %v", err)
+	}
+	aoIP := strings.TrimSpace(aoClusterIP)
+
+	k8sClusterIP, err := subH.Kubectl("get", "service", "-n", "default", "kubernetes", "-o", "jsonpath={.spec.clusterIP}")
+	if err != nil {
+		t.Fatalf("failed to read kubernetes service clusterIP: %v", err)
+	}
+	k8sIP := strings.TrimSpace(k8sClusterIP)
+
+	_, repoURL, _ := setupHelloRepoFixture(t, subH)
+	scriptJSON := `[{"tool":"run_command","args":{"command":"sleep 10"}}]`
+	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, repoURL,
+		"OPENAI_MODEL=fake-script",
+		"AO_FAKE_SCRIPT="+scriptJSON,
+	)
+
+	t.Log("Waiting for run to reach Working phase and verify portal isolation...")
+	var assertedIsolation bool
+	pollRunPhase(t, aoBin, serverAddr, repoURL, "Working", 90*time.Second, serveStderr, func(r *jsonRun) {
+		if assertedIsolation || r.Phase != "Working" || r.SandboxName == "" {
+			return
+		}
+		subH.WaitForCondition("ao-sandboxes", "sandbox/"+r.SandboxName, "condition=Ready", 60*time.Second)
+
+		restConfig, err := session.GetRESTConfig()
+		if err != nil {
+			t.Fatalf("session.GetRESTConfig: %v", err)
+		}
+		sbClient, err := session.NewSandboxClient(restConfig)
+		if err != nil {
+			t.Fatalf("session.NewSandboxClient: %v", err)
+		}
+		signingKey, err := session.LoadOrGenerateSigningKey(filepath.Join(stateDir, "sandbox-signing-key"))
+		if err != nil {
+			t.Fatalf("loading signing key: %v", err)
+		}
+		runHarness := session.NewHarness(nil, sbClient, nil, session.RunOptions{
+			Namespace:             "ao-sandboxes",
+			SigningKey:            signingKey,
+			ControlPlaneNamespace: "ao-system",
+		})
+		sb := runHarness.GetOrAttachSandbox(r.SandboxName)
+
+		// 1. Positive control: request to listed test repository host succeeds
+		resListed, errListed := sb.ExecCommand(t.Context(), tools.ExecCommandOptions{
+			Command: []string{"curl", "-sS", "-f", "--connect-timeout", "5", repoURL + "/info/refs?service=git-upload-pack"},
+		})
+		if errListed != nil {
+			t.Fatalf("positive control exec failed: %v", errListed)
+		}
+		if resListed == nil || resListed.ExitCode != 0 {
+			t.Fatalf("expected request to listed host on egress list to succeed, got exit code %d (stdout: %s, stderr: %s)", resListed.ExitCode, resListed.Stdout, resListed.Stderr)
+		}
+		t.Logf("PASS: request to listed host %s succeeded as expected (exit: %d)", repoURL, resListed.ExitCode)
+
+		// 2. Negative check: connecting to control plane Service fails on web port 8080 (by name and address)
+		resWeb, errWeb := sb.ExecCommand(t.Context(), tools.ExecCommandOptions{
+			Command: []string{"curl", "-s", "--connect-timeout", "3", "http://ao.ao-system.svc:8080/"},
+		})
+		if errWeb != nil {
+			t.Fatalf("web port exec by name failed: %v", errWeb)
+		}
+		if resWeb == nil || resWeb.ExitCode == 0 {
+			t.Errorf("expected connection to control plane web port 8080 by name to fail, but succeeded: %+v", resWeb)
+		} else {
+			t.Logf("PASS: connection to control plane web port 8080 failed as expected (exit: %d)", resWeb.ExitCode)
+		}
+
+		resWebIP, errWebIP := sb.ExecCommand(t.Context(), tools.ExecCommandOptions{
+			Command: []string{"curl", "-s", "--connect-timeout", "3", fmt.Sprintf("http://%s:8080/", aoIP)},
+		})
+		if errWebIP != nil {
+			t.Fatalf("web port exec by address failed: %v", errWebIP)
+		}
+		if resWebIP == nil || resWebIP.ExitCode == 0 {
+			t.Errorf("expected connection to control plane web port 8080 by address to fail, but succeeded: %+v", resWebIP)
+		} else {
+			t.Logf("PASS: connection to control plane web port 8080 by address %s failed as expected (exit: %d)", aoIP, resWebIP.ExitCode)
+		}
+
+		// 3. Negative check: connecting to control plane Service fails on --listen port 8081 (by name and address)
+		resListen, errListen := sb.ExecCommand(t.Context(), tools.ExecCommandOptions{
+			Command: []string{"curl", "-s", "--connect-timeout", "3", "http://ao.ao-system.svc:8081/"},
+		})
+		if errListen != nil {
+			t.Fatalf("listen port exec by name failed: %v", errListen)
+		}
+		if resListen == nil || resListen.ExitCode == 0 {
+			t.Errorf("expected connection to control plane listen port 8081 by name to fail, but succeeded: %+v", resListen)
+		} else {
+			t.Logf("PASS: connection to control plane listen port 8081 failed as expected (exit: %d)", resListen.ExitCode)
+		}
+
+		resListenIP, errListenIP := sb.ExecCommand(t.Context(), tools.ExecCommandOptions{
+			Command: []string{"curl", "-s", "--connect-timeout", "3", fmt.Sprintf("http://%s:8081/", aoIP)},
+		})
+		if errListenIP != nil {
+			t.Fatalf("listen port exec by address failed: %v", errListenIP)
+		}
+		if resListenIP == nil || resListenIP.ExitCode == 0 {
+			t.Errorf("expected connection to control plane listen port 8081 by address to fail, but succeeded: %+v", resListenIP)
+		} else {
+			t.Logf("PASS: connection to control plane listen port 8081 by address %s failed as expected (exit: %d)", aoIP, resListenIP.ExitCode)
+		}
+
+		// 4. Negative check: request to unlisted host fails without --fail (by name and address)
+		resUnlisted, errUnlisted := sb.ExecCommand(t.Context(), tools.ExecCommandOptions{
+			Command: []string{"curl", "-s", "-k", "--connect-timeout", "3", "https://kubernetes.default.svc/"},
+		})
+		if errUnlisted != nil {
+			t.Fatalf("unlisted host exec by name failed: %v", errUnlisted)
+		}
+		if resUnlisted == nil || resUnlisted.ExitCode == 0 {
+			t.Errorf("expected request to unlisted host by name to fail, but succeeded: %+v", resUnlisted)
+		} else {
+			t.Logf("PASS: request to unlisted host https://kubernetes.default.svc/ failed as expected (exit: %d)", resUnlisted.ExitCode)
+		}
+
+		resUnlistedIP, errUnlistedIP := sb.ExecCommand(t.Context(), tools.ExecCommandOptions{
+			Command: []string{"curl", "-s", "-k", "--connect-timeout", "3", fmt.Sprintf("https://%s/", k8sIP)},
+		})
+		if errUnlistedIP != nil {
+			t.Fatalf("unlisted host exec by address failed: %v", errUnlistedIP)
+		}
+		if resUnlistedIP == nil || resUnlistedIP.ExitCode == 0 {
+			t.Errorf("expected request to unlisted host by address to fail, but succeeded: %+v", resUnlistedIP)
+		} else {
+			t.Logf("PASS: request to unlisted host https://%s/ failed as expected (exit: %d)", k8sIP, resUnlistedIP.ExitCode)
+		}
+
+		assertedIsolation = true
+	})
+
+	if !assertedIsolation {
+		t.Errorf("expected isolation checks to run, but did not")
 	}
 }
