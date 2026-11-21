@@ -8451,12 +8451,18 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		t.Fatalf("NewScheme: %v", err)
 	}
 
-	getWorkspaceVol := func(t *testing.T, sbName string) *corev1.Volume {
+	getSandbox := func(t *testing.T, sbName string) *sandboxv1beta1.Sandbox {
 		t.Helper()
 		sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sbName, metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("getting sandbox %s: %v", sbName, err)
 		}
+		return sb
+	}
+
+	getWorkspaceVol := func(t *testing.T, sbName string) *corev1.Volume {
+		t.Helper()
+		sb := getSandbox(t, sbName)
 		for i := range sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes {
 			if sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes[i].Name == "workspace" {
 				return &sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes[i]
@@ -8511,6 +8517,29 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		vol := getWorkspaceVol(t, name)
 		if vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != name || vol.EmptyDir != nil {
 			t.Errorf("expected workspace volume to mount claim %s, got %+v", name, vol)
+		}
+
+		sb := getSandbox(t, name)
+		for _, v := range sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes {
+			if v.Name == "home" {
+				t.Errorf("expected no separate 'home' volume when claim is set, got %+v", v)
+			}
+		}
+		var wsMount, homeMount *corev1.VolumeMount
+		for i := range sb.Spec.SandboxBlueprint.PodTemplate.Spec.Containers[0].VolumeMounts {
+			m := &sb.Spec.SandboxBlueprint.PodTemplate.Spec.Containers[0].VolumeMounts[i]
+			if m.MountPath == "/workspace" {
+				wsMount = m
+			}
+			if m.MountPath == session.DefaultHomeDir {
+				homeMount = m
+			}
+		}
+		if wsMount == nil || wsMount.Name != "workspace" || wsMount.SubPath != "workspace" {
+			t.Errorf("expected /workspace mount with name 'workspace' and subPath 'workspace', got %+v", wsMount)
+		}
+		if homeMount == nil || homeMount.Name != "workspace" || homeMount.SubPath != "home" {
+			t.Errorf("expected home mount with name 'workspace' and subPath 'home', got %+v", homeMount)
 		}
 
 		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
@@ -8593,6 +8622,33 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		vol := getWorkspaceVol(t, name)
 		if vol.EmptyDir == nil || vol.PersistentVolumeClaim != nil {
 			t.Errorf("expected emptyDir volume for workspace, got %+v", vol)
+		}
+
+		sb := getSandbox(t, name)
+		var foundHomeVol bool
+		for _, v := range sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes {
+			if v.Name == "home" && v.EmptyDir != nil {
+				foundHomeVol = true
+			}
+		}
+		if !foundHomeVol {
+			t.Error("expected emptyDir volume for home")
+		}
+		var wsMount, homeMount *corev1.VolumeMount
+		for i := range sb.Spec.SandboxBlueprint.PodTemplate.Spec.Containers[0].VolumeMounts {
+			m := &sb.Spec.SandboxBlueprint.PodTemplate.Spec.Containers[0].VolumeMounts[i]
+			if m.MountPath == "/workspace" {
+				wsMount = m
+			}
+			if m.MountPath == session.DefaultHomeDir {
+				homeMount = m
+			}
+		}
+		if wsMount == nil || wsMount.Name != "workspace" || wsMount.SubPath != "" {
+			t.Errorf("expected /workspace mount with name 'workspace' and empty subPath, got %+v", wsMount)
+		}
+		if homeMount == nil || homeMount.Name != "home" || homeMount.SubPath != "" {
+			t.Errorf("expected home mount with name 'home' and empty subPath, got %+v", homeMount)
 		}
 
 		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
