@@ -80,16 +80,13 @@ func TestHeroRunStatusPublisher_CoalescesPhasesWithinInterval(t *testing.T) {
 		Build()
 
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:                 store,
 		Harness:               harness,
 		KubeClient:            fakeClient,
 		HeroRunStatusInterval: 3 * time.Second,
 		Clock:                 func() time.Time { return prepTime },
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Move run through Preparing and then Working before any status flush tick occurs.
 	run.SetPhase(state.PhasePreparing, prepTime)
@@ -190,14 +187,11 @@ func TestHeroRunStatusPublisher_BranchMatchesRunBranch(t *testing.T) {
 		Build()
 
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	orch.statusPublisher.MarkDirty(repo.Key(), runID)
 	orch.statusPublisher.flush(ctx)
@@ -270,16 +264,13 @@ func TestHeroRunStatusPublisher_TerminalRunEndsWithFinishedAtAndReadyFalse(t *te
 		Build()
 
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:                 store,
 		Harness:               harness,
 		KubeClient:            fakeClient,
 		HeroRunStatusInterval: 3 * time.Second,
 		Clock:                 func() time.Time { return endTime },
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Move run to terminal phase NoImprovement
 	prev := run.Phase
@@ -400,14 +391,11 @@ func TestHeroRunStatusPublisher_WriteFailureRetriedOnNextTick(t *testing.T) {
 		Build()
 
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Pre-publish HeroRun so status update is attempted
 	orch.publishHeroRun(ctx, repo, run)
@@ -480,14 +468,11 @@ func TestHeroRunStatusPublisher_NilKubeClientPublishesNothing(t *testing.T) {
 	}
 
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: nil,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Mark dirty and run
 	orch.statusPublisher.MarkDirty(repo.Key(), runID)
@@ -539,14 +524,11 @@ func TestHeroRunStatusPublisher_Resume_MarksAllRunsDirty(t *testing.T) {
 		Build()
 
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Resume should mark all runs dirty, including terminal runs
 	if err := orch.Resume(ctx); err != nil {
@@ -611,15 +593,12 @@ func TestHeroRunStatusPublisher_FinalFlushOnContextCancel(t *testing.T) {
 		Build()
 
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:                 store,
 		Harness:               harness,
 		KubeClient:            fakeClient,
 		HeroRunStatusInterval: 10 * time.Minute, // Long interval so ticker does not tick during test
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Mark run dirty
 	orch.statusPublisher.MarkDirty(repo.Key(), runID)
@@ -682,12 +661,9 @@ func setupStatusTierTest(t *testing.T, interceptorFuncs *interceptor.Funcs) (*st
 	fakeClient := builder.Build()
 
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store: store, Harness: harness, KubeClient: fakeClient, HeroRunStatusInterval: 10 * time.Minute,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	_ = orch.publishHeroRun(ctx, repo, run)
 	if interceptorFuncs == nil {

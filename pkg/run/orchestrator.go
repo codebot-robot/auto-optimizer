@@ -466,12 +466,14 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 		}),
 	)
 
+	skipNameValidation := true
 	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&herorunv1alpha1.HeroRun{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&sandboxv1beta1.Sandbox{}).
 		WatchesRawSource(src).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: o.maxConcurrentRuns,
+			SkipNameValidation:      &skipNameValidation,
 		}).
 		Complete(o); err != nil {
 		return fmt.Errorf("creating run controller: %w", err)
@@ -1357,6 +1359,20 @@ func (o *Orchestrator) cancelWorker(runID string) {
 	cancel := o.workerCancels[runID]
 	o.activeRunsMu.Unlock()
 	if cancel != nil {
+		cancel()
+	}
+}
+
+func (o *Orchestrator) cancelWorkers() {
+	o.activeRunsMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(o.workerCancels))
+	for _, cancel := range o.workerCancels {
+		if cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+	}
+	o.activeRunsMu.Unlock()
+	for _, cancel := range cancels {
 		cancel()
 	}
 }
