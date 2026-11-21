@@ -107,23 +107,24 @@ func (p RunPhase) IsTerminal() bool {
 
 // Run represents a run record in run.json.
 type Run struct {
-	ID              string                 `json:"id"`
-	Repo            RepoKey                `json:"repo"`
-	GoalName        string                 `json:"goalName"`
-	Phase           RunPhase               `json:"phase"`
-	PhaseTimestamps map[RunPhase]time.Time `json:"phaseTimestamps,omitempty"`
-	BaseCommit      string                 `json:"baseCommit,omitempty"`
-	Branch          string                 `json:"branch,omitempty"`
-	PRTitle         string                 `json:"prTitle,omitempty"`
-	PRBody          string                 `json:"prBody,omitempty"`
-	PRURL           string                 `json:"prURL,omitempty"`
-	SessionID       string                 `json:"sessionId,omitempty"`
-	SandboxName     string                 `json:"sandboxName,omitempty"`
-	ReadyDeadline   *time.Time             `json:"readyDeadline,omitempty"`
-	Deadline        *time.Time             `json:"deadline,omitempty"`
-	Summary         string                 `json:"summary,omitempty"`
-	Error           string                 `json:"error,omitempty"`
-	PortalBoundAt   *time.Time             `json:"portalBoundAt,omitempty"`
+	ID                 string                 `json:"id"`
+	Repo               RepoKey                `json:"repo"`
+	GoalName           string                 `json:"goalName"`
+	Phase              RunPhase               `json:"phase"`
+	PhaseTimestamps    map[RunPhase]time.Time `json:"phaseTimestamps,omitempty"`
+	BaseCommit         string                 `json:"baseCommit,omitempty"`
+	Branch             string                 `json:"branch,omitempty"`
+	PRTitle            string                 `json:"prTitle,omitempty"`
+	PRBody             string                 `json:"prBody,omitempty"`
+	PRURL              string                 `json:"prURL,omitempty"`
+	SessionID          string                 `json:"sessionId,omitempty"`
+	SandboxName        string                 `json:"sandboxName,omitempty"`
+	WorkspaceClaimName string                 `json:"workspaceClaimName,omitempty"`
+	ReadyDeadline      *time.Time             `json:"readyDeadline,omitempty"`
+	Deadline           *time.Time             `json:"deadline,omitempty"`
+	Summary            string                 `json:"summary,omitempty"`
+	Error              string                 `json:"error,omitempty"`
+	PortalBoundAt      *time.Time             `json:"portalBoundAt,omitempty"`
 
 	// Goal holds the frozen goal definition captured for this run.
 	Goal *goals.Goal `json:"goal,omitempty"`
