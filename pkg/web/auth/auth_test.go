@@ -501,22 +501,92 @@ func TestGitHubOAuth(t *testing.T) {
 		}
 	})
 
-	t.Run("POST logout clears session cookie", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/logout", nil)
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
+	t.Run("POST logout requires anti-forgery token", func(t *testing.T) {
+		sess := Session{Login: "octocat", Expires: now.Add(time.Hour)}
+		sessVal, err := sess.Encode(key)
+		if err != nil {
+			t.Fatalf("Encode failed: %v", err)
+		}
+		sessCookie := &http.Cookie{Name: CookieName, Value: sessVal}
+		tok := CSRFToken(sessVal, key)
 
-		if rec.Code != http.StatusSeeOther {
-			t.Fatalf("logout code = %d, want 303", rec.Code)
+		// 1. Refused when no token is provided; leaves session cookie in place
+		reqNoToken := httptest.NewRequest(http.MethodPost, "/logout", nil)
+		reqNoToken.AddCookie(sessCookie)
+		recNoToken := httptest.NewRecorder()
+		handler.ServeHTTP(recNoToken, reqNoToken)
+
+		if recNoToken.Code != http.StatusForbidden {
+			t.Fatalf("logout without token code = %d, want 403", recNoToken.Code)
+		}
+		for _, c := range recNoToken.Result().Cookies() {
+			if c.Name == CookieName {
+				t.Fatalf("expected session cookie to be left in place, got cookie modification: %+v", c)
+			}
+		}
+
+		// 2. Refused when wrong token is provided; leaves session cookie in place
+		wrongBody := strings.NewReader(url.Values{"csrf": {"wrong-token"}}.Encode())
+		reqWrongToken := httptest.NewRequest(http.MethodPost, "/logout", wrongBody)
+		reqWrongToken.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		reqWrongToken.AddCookie(sessCookie)
+		recWrongToken := httptest.NewRecorder()
+		handler.ServeHTTP(recWrongToken, reqWrongToken)
+
+		if recWrongToken.Code != http.StatusForbidden {
+			t.Fatalf("logout with wrong token code = %d, want 403", recWrongToken.Code)
+		}
+		for _, c := range recWrongToken.Result().Cookies() {
+			if c.Name == CookieName {
+				t.Fatalf("expected session cookie to be left in place, got cookie modification: %+v", c)
+			}
+		}
+
+		// 3. Refused without session cookie
+		noCookieBody := strings.NewReader(url.Values{"csrf": {tok}}.Encode())
+		reqNoCookie := httptest.NewRequest(http.MethodPost, "/logout", noCookieBody)
+		reqNoCookie.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		recNoCookie := httptest.NewRecorder()
+		handler.ServeHTTP(recNoCookie, reqNoCookie)
+
+		if recNoCookie.Code != http.StatusForbidden {
+			t.Fatalf("logout without session cookie code = %d, want 403", recNoCookie.Code)
+		}
+
+		// 4. Allowed when correct token is provided; signs the user out
+		correctBody := strings.NewReader(url.Values{"csrf": {tok}}.Encode())
+		reqCorrect := httptest.NewRequest(http.MethodPost, "/logout", correctBody)
+		reqCorrect.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		reqCorrect.AddCookie(sessCookie)
+		recCorrect := httptest.NewRecorder()
+		handler.ServeHTTP(recCorrect, reqCorrect)
+
+		if recCorrect.Code != http.StatusSeeOther {
+			t.Fatalf("logout with correct token code = %d, want 303", recCorrect.Code)
+		}
+		if loc := recCorrect.Header().Get("Location"); loc != "/login" {
+			t.Errorf("Location = %q, want /login", loc)
 		}
 		var clearCookie *http.Cookie
-		for _, c := range rec.Result().Cookies() {
+		for _, c := range recCorrect.Result().Cookies() {
 			if c.Name == CookieName {
 				clearCookie = c
 			}
 		}
 		if clearCookie == nil || clearCookie.Value != "" || clearCookie.MaxAge >= 0 {
 			t.Fatalf("expected cleared session cookie, got %+v", clearCookie)
+		}
+
+		// 5. Allowed on /logout/ with trailing slash
+		correctBodySlash := strings.NewReader(url.Values{"csrf": {tok}}.Encode())
+		reqCorrectSlash := httptest.NewRequest(http.MethodPost, "/logout/", correctBodySlash)
+		reqCorrectSlash.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		reqCorrectSlash.AddCookie(sessCookie)
+		recCorrectSlash := httptest.NewRecorder()
+		handler.ServeHTTP(recCorrectSlash, reqCorrectSlash)
+
+		if recCorrectSlash.Code != http.StatusSeeOther {
+			t.Fatalf("logout with trailing slash code = %d, want 303", recCorrectSlash.Code)
 		}
 	})
 }
