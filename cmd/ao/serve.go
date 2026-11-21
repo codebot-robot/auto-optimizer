@@ -178,10 +178,8 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 				}
 				opts.orchestrator.PublicURL = strings.TrimRight(opts.orchestrator.PublicURL, "/")
 			}
-			if opts.portal.Enabled() {
-				if err := opts.portal.Validate(); err != nil {
-					return fmt.Errorf("invalid portal configuration: %w", err)
-				}
+			if err := opts.portal.Validate(); err != nil {
+				return fmt.Errorf("invalid portal configuration: %w", err)
 			}
 			if opts.github.PublicURL == "" {
 				opts.github.PublicURL = opts.orchestrator.PublicURL

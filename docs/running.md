@@ -205,7 +205,7 @@ Once a run finishes, you can use the **Run again** button on the run page to sta
 
 Keep current system limits in mind when running goals.
 
-- Without a Service Portal Controller configured, sandboxes have the cluster's default network egress and hold no credentials. When `--portal-controller-addr` is configured, sandboxes are intercepted by service-portals in per-node NRI mode and bound to an egress allowlist before execution begins.
+- Without a Service Portal Controller configured, sandboxes have the cluster's default network egress and hold no credentials. When `--portal-controller-addr` is configured, sandboxes are intercepted by service-portals in per-node NRI mode and bound to an egress allowlist before execution begins. Configure allowed egress with `--sandbox-egress-hosts`, which accepts bare host names (for HTTPS on port 443) or `http://name` / `http://name:port` for cleartext HTTP (such as an in-cluster git server). Each entry must be a valid DNS name pattern; IP addresses are not accepted.
 - The harness records `budget.maxCostUSD` in run records, but it does not enforce monetary limits yet. Enforce bounds by setting `--max-turns` on the server and `budget.maxDuration` in each goal.
 - Sandboxes default to an `emptyDir` volume for the workspace, meaning the workspace is lost with the Sandbox. Pass `--workspace-storage-class` (for example, `objectfs-exclusive-local` from gke-labs/in-cluster-storage) and `--workspace-size` (default `10Gi`) to provision a persistent workspace claim for each run so the workspace survives sandbox deletion.
 - State lives on the ReadWriteOnce PersistentVolumeClaim named `ao-state`. The volume is bound to one zone.

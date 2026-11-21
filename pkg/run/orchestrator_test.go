@@ -7696,7 +7696,10 @@ func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
 	if call.PodUID != podUID {
 		t.Errorf("expected pod UID %q, got %q", podUID, call.PodUID)
 	}
-	wantPolicy := portal.PolicyForHosts(egressHosts)
+	wantPolicy, err := portal.PolicyForHosts(egressHosts)
+	if err != nil {
+		t.Fatalf("PolicyForHosts: %v", err)
+	}
 	if call.Policy == nil || len(call.Policy.Rules) != len(wantPolicy.Rules) || call.Policy.Rules[0].Https == nil {
 		t.Fatalf("expected policy matching %+v, got %+v", wantPolicy, call.Policy)
 	}
