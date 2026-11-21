@@ -466,14 +466,12 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 		}),
 	)
 
-	skipNameValidation := true
 	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&herorunv1alpha1.HeroRun{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&sandboxv1beta1.Sandbox{}).
 		WatchesRawSource(src).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: o.maxConcurrentRuns,
-			SkipNameValidation:      &skipNameValidation,
 		}).
 		Complete(o); err != nil {
 		return fmt.Errorf("creating run controller: %w", err)

@@ -53,16 +53,21 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 
 	portalsv1 "github.com/gke-labs/service-portals/pkg/portals/v1"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	fakeagents "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
 	informers "sigs.k8s.io/agent-sandbox/clients/k8s/informers/externalversions"
 	processv1 "sigs.k8s.io/agent-sandbox/packages/sandboxd/spec/process/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	crconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -3357,7 +3362,28 @@ func TestNewManager(t *testing.T) {
 
 func TestOrchestrator_SetupWithManager(t *testing.T) {
 	restConfig := &rest.Config{Host: "http://127.0.0.1:65534"}
-	mgr, err := NewManager(restConfig, "ao-sandboxes")
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	skipNameValidation := true
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme: scheme,
+		Logger: klog.NewKlogr(),
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
+		HealthProbeBindAddress: "0",
+		LeaderElection:         false,
+		Cache: crcache.Options{
+			DefaultNamespaces: map[string]crcache.Config{
+				"ao-sandboxes": {},
+			},
+		},
+		Controller: crconfig.Controller{
+			SkipNameValidation: &skipNameValidation,
+		},
+	})
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -6165,7 +6191,7 @@ func TestNewTestOrchestrator_WaitsForWorkers(t *testing.T) {
 			Harness: harness,
 		})
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(subT.Context())
 		orch.setWorkerCancel("test-run", cancel)
 		orch.workerWG.Add(1)
 		go func() {
