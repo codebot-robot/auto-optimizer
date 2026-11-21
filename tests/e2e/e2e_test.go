@@ -1767,3 +1767,126 @@ func TestRunSandboxPortalIsolation(t *testing.T) {
 		t.Errorf("expected isolation checks to run, but did not")
 	}
 }
+
+func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("RUN_E2E env var not set, skipping e2e test")
+	}
+
+	clusterName := os.Getenv("KIND_CLUSTER_NAME")
+	if clusterName == "" {
+		clusterName = "auto-optimizer"
+	}
+
+	h := NewHarness(t, clusterName)
+	h.Setup()
+
+	gitRoot, err := h.getGitRoot()
+	if err != nil {
+		t.Fatalf("failed to get git root: %v", err)
+	}
+
+	aoBin := buildAOBinary(t, gitRoot)
+	subH := h.WithT(t)
+
+	_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	t.Cleanup(func() {
+		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	})
+
+	_, repoURL, _ := setupHelloRepoFixture(t, subH)
+
+	// Step 1: run sleep 10 so the command is in flight when sandbox is deleted.
+	// Step 2: request test repository host via curl to prove portal policy is bound on replacement sandbox.
+	// Step 3: commit changes and open a pull request to transition the run to Succeeded.
+	scriptSteps := []map[string]any{
+		{
+			"tool": "run_command",
+			"args": map[string]string{
+				"command": "sleep 10",
+			},
+		},
+		{
+			"tool": "run_command",
+			"args": map[string]string{
+				"command": "cd /workspace/repo && echo 'replacement verified' >> README.md && git add README.md && git commit -m 'test: replacement verified' && curl -sS -f --connect-timeout 5 " + repoURL + "/info/refs?service=git-upload-pack",
+			},
+		},
+		{
+			"tool": "open_pull_request",
+			"args": map[string]string{
+				"title": "test: replacement verified",
+				"body":  "Replacement sandbox verified with portal policy bound.",
+			},
+		},
+	}
+	scriptBytes, err := json.Marshal(scriptSteps)
+	if err != nil {
+		t.Fatalf("marshalling script: %v", err)
+	}
+
+	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, repoURL,
+		"OPENAI_MODEL=fake-script",
+		"AO_FAKE_SCRIPT="+string(scriptBytes),
+	)
+
+	t.Log("Waiting for run to reach Working phase, recording initial sandbox UID, then deleting sandbox while sleep is in flight...")
+	var initialUID string
+	var replacementUID string
+	finalRun, _ := pollRunPhase(t, aoBin, serverAddr, repoURL, "Succeeded", 180*time.Second, serveStderr, func(r *jsonRun) {
+		if r.Phase != "Working" || r.SandboxName == "" {
+			return
+		}
+
+		if initialUID == "" {
+			subH.WaitForCondition("ao-sandboxes", "sandbox/"+r.SandboxName, "condition=Ready", 60*time.Second)
+
+			uidOut, err := subH.Kubectl("get", "sandbox", r.SandboxName, "-n", "ao-sandboxes", "-o", "jsonpath={.metadata.uid}")
+			if err != nil {
+				t.Fatalf("failed to read sandbox UID before delete: %v", err)
+			}
+			initialUID = strings.TrimSpace(uidOut)
+			if initialUID == "" {
+				t.Fatalf("read empty initial sandbox UID for %s", r.SandboxName)
+			}
+
+			// Give the sleep tool call 2 seconds to enter flight inside the sandbox
+			time.Sleep(2 * time.Second)
+
+			t.Logf("Deleting sandbox %s (UID: %s) while tool call is in flight...", r.SandboxName, initialUID)
+			out, delErr := subH.Kubectl("delete", "sandbox", r.SandboxName, "-n", "ao-sandboxes")
+			if delErr != nil {
+				t.Fatalf("failed to delete sandbox %s: %v, output: %s", r.SandboxName, delErr, out)
+			}
+			t.Logf("Deleted sandbox %s; waiting for on-demand replacement and run completion...", r.SandboxName)
+			return
+		}
+
+		if replacementUID == "" {
+			uidOut, err := subH.Kubectl("get", "sandbox", r.SandboxName, "-n", "ao-sandboxes", "-o", "jsonpath={.metadata.uid}")
+			if err == nil {
+				uid := strings.TrimSpace(uidOut)
+				if uid != "" && uid != initialUID {
+					replacementUID = uid
+					t.Logf("Observed replacement sandbox %s with new UID: %s", r.SandboxName, replacementUID)
+				}
+			}
+		}
+	})
+
+	if initialUID == "" {
+		t.Fatal("expected initial sandbox UID to be recorded before delete")
+	}
+	if replacementUID == "" {
+		t.Fatal("expected replacement sandbox with a new UID to be observed")
+	}
+	if replacementUID == initialUID {
+		t.Fatalf("expected replacement sandbox to have a different UID than initial sandbox %s, got same: %s", initialUID, replacementUID)
+	}
+
+	if finalRun.Phase != "Succeeded" {
+		t.Errorf("expected final run phase Succeeded, got %s (error: %s)", finalRun.Phase, finalRun.Error)
+	}
+
+	_ = stateDir
+}
