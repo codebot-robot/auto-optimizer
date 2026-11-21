@@ -80,11 +80,6 @@ func (m Metadata) Depth() int {
 	return 0
 }
 
-// IsZero reports whether m is an empty Metadata.
-func (m Metadata) IsZero() bool {
-	return len(m.Ancestors) == 0 && m.Parent == "" && m.Toolset == "" && m.Repo == "" && m.RunID == "" && m.CreatedAt.IsZero()
-}
-
 // SessionSummary describes a session's metadata and message count.
 type SessionSummary struct {
 	Name         string

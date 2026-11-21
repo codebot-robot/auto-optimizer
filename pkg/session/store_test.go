@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -67,7 +68,7 @@ func TestFileStore(t *testing.T) {
 	if diff := cmp.Diff([]llm.Message{msg1}, msgs); diff != "" {
 		t.Errorf("messages mismatch (-want +got):\n%s", diff)
 	}
-	if meta == nil || !meta.IsZero() {
+	if meta == nil || !reflect.DeepEqual(*meta, Metadata{}) {
 		t.Errorf("expected empty metadata when only messages exist, got %+v", meta)
 	}
 
@@ -113,7 +114,7 @@ func TestFileStore(t *testing.T) {
 	if diff := cmp.Diff(wantMsgs, msgs); diff != "" {
 		t.Errorf("messages mismatch (-want +got):\n%s", diff)
 	}
-	if meta == nil || !meta.IsZero() {
+	if meta == nil || !reflect.DeepEqual(*meta, Metadata{}) {
 		t.Errorf("expected empty metadata when only messages exist, got %+v", meta)
 	}
 }
@@ -132,7 +133,7 @@ func TestFileStoreMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSession(legacy): %v", err)
 	}
-	if legacyMeta == nil || !legacyMeta.IsZero() {
+	if legacyMeta == nil || !reflect.DeepEqual(*legacyMeta, Metadata{}) {
 		t.Errorf("LoadSession(legacy) metadata = %+v, want empty Metadata", legacyMeta)
 	}
 

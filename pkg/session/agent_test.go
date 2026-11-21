@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -248,7 +249,7 @@ func TestNewAndLoadSession_Metadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSession (legacy): %v", err)
 	}
-	if !legacy.Metadata.IsZero() {
+	if !reflect.DeepEqual(legacy.Metadata, Metadata{}) {
 		t.Errorf("legacy metadata = %+v, want zero", legacy.Metadata)
 	}
 	if _, err := harness.NewSession(ctx, store, "legacy", Metadata{Toolset: "basic"}); err == nil {
