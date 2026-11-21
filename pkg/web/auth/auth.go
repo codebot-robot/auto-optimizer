@@ -403,11 +403,30 @@ func (h *gitHubHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/auth/github/callback" && r.Method == http.MethodGet:
 		h.handleCallback(w, r)
 	case (r.URL.Path == "/logout" || r.URL.Path == "/logout/") && r.Method == http.MethodPost:
-		ClearSessionCookie(w)
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		h.handleLogout(w, r)
 	default:
 		h.authed.ServeHTTP(w, r)
 	}
+}
+
+func (h *gitHubHandler) handleLogout(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie(CookieName)
+	if err != nil || cookie.Value == "" {
+		http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
+		return
+	}
+	formToken := r.PostFormValue("csrf")
+	if formToken == "" {
+		http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
+		return
+	}
+	expected := CSRFToken(cookie.Value, h.key)
+	if expected == "" || !hmac.Equal([]byte(formToken), []byte(expected)) {
+		http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
+		return
+	}
+	ClearSessionCookie(w)
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 func (h *gitHubHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
