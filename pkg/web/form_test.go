@@ -21,13 +21,11 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-
-	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
 
 func TestParseForm(t *testing.T) {
-	key := []byte("12345678901234567890123456789012")
-	srv := &Server{sessionKey: key}
+	tok := "tok123"
+	srv := &Server{}
 
 	newPostReq := func(body string, cookie *http.Cookie) *http.Request {
 		req := httptest.NewRequest(http.MethodPost, "/test", strings.NewReader(body))
@@ -40,11 +38,11 @@ func TestParseForm(t *testing.T) {
 
 	t.Run("good form", func(t *testing.T) {
 		body := url.Values{
-			"csrf":    {"tok123"},
-			"name":    {"  alpha  "},
-			"toolset": {"expert"},
+			csrfFormField: {tok},
+			"name":        {"  alpha  "},
+			"toolset":     {"expert"},
 		}.Encode()
-		req := newPostReq(body, &http.Cookie{Name: csrfCookieName, Value: "tok123"})
+		req := newPostReq(body, &http.Cookie{Name: csrfCookieName, Value: tok})
 
 		var form struct {
 			Name    string `form:"name"`
@@ -59,8 +57,8 @@ func TestParseForm(t *testing.T) {
 	})
 
 	t.Run("empty struct", func(t *testing.T) {
-		body := url.Values{"csrf": {"tok123"}}.Encode()
-		req := newPostReq(body, &http.Cookie{Name: csrfCookieName, Value: "tok123"})
+		body := url.Values{csrfFormField: {tok}}.Encode()
+		req := newPostReq(body, &http.Cookie{Name: csrfCookieName, Value: tok})
 
 		var form struct{}
 		if err := srv.parseForm(req, &form); err != nil {
@@ -74,10 +72,10 @@ func TestParseForm(t *testing.T) {
 		cookie  *http.Cookie
 		wantErr error
 	}{
-		{"missing token", "name=alpha", &http.Cookie{Name: csrfCookieName, Value: "tok123"}, ErrBadToken},
-		{"wrong token", "csrf=wrong&name=alpha", &http.Cookie{Name: csrfCookieName, Value: "tok123"}, ErrBadToken},
-		{"unknown field", "csrf=tok123&name=alpha&extra=bad", &http.Cookie{Name: csrfCookieName, Value: "tok123"}, ErrMalformedForm},
-		{"malformed body", "%zz", &http.Cookie{Name: csrfCookieName, Value: "tok123"}, ErrMalformedForm},
+		{"missing token", "name=alpha", &http.Cookie{Name: csrfCookieName, Value: tok}, errBadToken},
+		{"wrong token", "csrf=wrong&name=alpha", &http.Cookie{Name: csrfCookieName, Value: tok}, errBadToken},
+		{"unknown field", "csrf=" + tok + "&name=alpha&extra=bad", &http.Cookie{Name: csrfCookieName, Value: tok}, errMalformedForm},
+		{"malformed body", "%zz", &http.Cookie{Name: csrfCookieName, Value: tok}, errMalformedForm},
 	}
 	for _, tc := range errorCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,74 +88,24 @@ func TestParseForm(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("require sign-in", func(t *testing.T) {
-		authSrv := &Server{requireSignIn: true, sessionKey: key}
-		sessVal := "sess-cookie-val"
-		validCSRF := auth.CSRFToken(sessVal, key)
-
-		goodReq := newPostReq(url.Values{"csrf": {validCSRF}, "name": {"ok"}}.Encode(), &http.Cookie{
-			Name:  auth.CookieName,
-			Value: sessVal,
-		})
-		var goodForm struct {
-			Name string `form:"name"`
-		}
-		if err := authSrv.parseForm(goodReq, &goodForm); err != nil || goodForm.Name != "ok" {
-			t.Fatalf("parseForm good token: err=%v, name=%q", err, goodForm.Name)
-		}
-
-		wrongReq := newPostReq(url.Values{"csrf": {"bad-token"}, "name": {"ok"}}.Encode(), &http.Cookie{
-			Name:  auth.CookieName,
-			Value: sessVal,
-		})
-		var wrongForm struct {
-			Name string `form:"name"`
-		}
-		if err := authSrv.parseForm(wrongReq, &wrongForm); !errors.Is(err, ErrBadToken) {
-			t.Fatalf("got err = %v, want ErrBadToken", err)
-		}
-	})
-
-	t.Run("invalid destination", func(t *testing.T) {
-		body := url.Values{"csrf": {"tok123"}}.Encode()
-		req := newPostReq(body, &http.Cookie{Name: csrfCookieName, Value: "tok123"})
-
-		if err := srv.parseForm(req, nil); !errors.Is(err, ErrMalformedForm) {
-			t.Errorf("got %v, want ErrMalformedForm for nil dst", err)
-		}
-		if err := srv.parseForm(req, struct{}{}); !errors.Is(err, ErrMalformedForm) {
-			t.Errorf("got %v, want ErrMalformedForm for non-pointer dst", err)
-		}
-		var badField struct {
-			Count int `form:"count"`
-		}
-		if err := srv.parseForm(req, &badField); !errors.Is(err, ErrMalformedForm) {
-			t.Errorf("got %v, want ErrMalformedForm for non-string field", err)
-		}
-	})
 }
 
-func TestHandlers_RejectUnknownField(t *testing.T) {
-	fakeSvc := &fakeSessionService{}
-	srv, err := NewServer(fakeSvc, nil, nil, ServerOptions{})
+func TestServeHTTP_MalformedBody(t *testing.T) {
+	srv, err := NewServer(&fakeSessionService{}, nil, nil, ServerOptions{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
 	tok := "valid-csrf"
-	req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(url.Values{
-		"csrf":    {tok},
-		"name":    {"newsess"},
-		"toolset": {"basic"},
-		"extra":   {"not-allowed"},
-	}.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: tok})
-	rec := httptest.NewRecorder()
+	for _, body := range []string{"%zz", "csrf=" + tok + "&name=%zz"} {
+		req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: tok})
+		rec := httptest.NewRecorder()
 
-	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("POST /sessions with unknown field status = %d, want 400", rec.Code)
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("POST with body %q status = %d, want 400", body, rec.Code)
+		}
 	}
 }

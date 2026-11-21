@@ -17,7 +17,6 @@ package web
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -128,8 +127,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Validate CSRF on POST requests
 	if r.Method == http.MethodPost {
-		if !s.validateCSRF(r) {
-			http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
+		if err := s.validateCSRF(r); err != nil {
+			s.writeFormError(w, err)
 			return
 		}
 	}
@@ -194,29 +193,6 @@ func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) string
 		HttpOnly: true,
 	})
 	return token
-}
-
-func (s *Server) validateCSRF(r *http.Request) bool {
-	formToken := r.PostFormValue("csrf")
-	if formToken == "" {
-		return false
-	}
-	if s.requireSignIn {
-		cookie, err := r.Cookie(auth.CookieName)
-		if err != nil || cookie.Value == "" {
-			return false
-		}
-		expected := auth.CSRFToken(cookie.Value, s.sessionKey)
-		if expected == "" {
-			return false
-		}
-		return hmac.Equal([]byte(formToken), []byte(expected))
-	}
-	cookie, err := r.Cookie(csrfCookieName)
-	if err != nil || cookie.Value == "" {
-		return false
-	}
-	return hmac.Equal([]byte(formToken), []byte(cookie.Value))
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -381,11 +357,7 @@ func isConflict(err error) bool {
 func (s *Server) handlePostRun(w http.ResponseWriter, r *http.Request, runID string) {
 	var form struct{}
 	if err := s.parseForm(r, &form); err != nil {
-		if errors.Is(err, ErrBadToken) {
-			http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.writeFormError(w, err)
 		return
 	}
 
@@ -480,11 +452,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Toolset string `form:"toolset"`
 	}
 	if err := s.parseForm(r, &form); err != nil {
-		if errors.Is(err, ErrBadToken) {
-			http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.writeFormError(w, err)
 		return
 	}
 
@@ -512,11 +480,7 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, name 
 		Text string `form:"text"`
 	}
 	if err := s.parseForm(r, &form); err != nil {
-		if errors.Is(err, ErrBadToken) {
-			http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.writeFormError(w, err)
 		return
 	}
 
