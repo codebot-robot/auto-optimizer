@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
@@ -509,6 +510,27 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, name 
 		}
 		http.Error(w, "starting turn: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	if s.stateStore != nil {
+		if run, err := s.stateStore.FindRunBySession(r.Context(), name); err == nil {
+			by := "anonymous"
+			if u, ok := auth.UserFromContext(r.Context()); ok {
+				by = u
+			}
+			event := state.Event{
+				Time:    time.Now().UTC(),
+				Phase:   run.Phase,
+				Kind:    "message_posted",
+				Message: fmt.Sprintf("Message posted by %s", by),
+				Data:    map[string]any{"by": by},
+			}
+			if appendErr := s.stateStore.AppendEvent(r.Context(), run.Repo, run.ID, event); appendErr != nil {
+				scoped.Log(r.Context()).Error(appendErr, "appending message_posted event", "run", run.ID, "session", name)
+			}
+		} else if !errors.Is(err, state.ErrNotFound) {
+			scoped.Log(r.Context()).Error(err, "finding run for session", "session", name)
+		}
 	}
 
 	http.Redirect(w, r, "/sessions/"+url.PathEscape(name), http.StatusSeeOther)

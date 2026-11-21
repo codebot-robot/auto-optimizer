@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/jsonl"
@@ -74,6 +75,9 @@ type Store interface {
 	// FindRun searches across all registered repositories for a run by its ID.
 	FindRun(ctx context.Context, runID string) (*Run, error)
 
+	// FindRunBySession searches across all registered repositories for a run by its session ID.
+	FindRunBySession(ctx context.Context, sessionID string) (*Run, error)
+
 	// ListRuns returns all runs for a repository sorted chronologically by run ID.
 	ListRuns(ctx context.Context, key RepoKey) ([]*Run, error)
 
@@ -87,6 +91,7 @@ type Store interface {
 // FileStore is the disk-backed implementation of Store.
 type FileStore struct {
 	rootDir string
+	indexMu sync.Mutex
 }
 
 var _ Store = &FileStore{}
@@ -450,7 +455,15 @@ func (s *FileStore) PutRun(ctx context.Context, run *Run) error {
 	log := scoped.Log(ctx)
 	p := s.runPath(run.Repo, run.ID)
 	log.V(2).Info("putting run record", "repo", run.Repo.String(), "run", run.ID, "path", p)
-	return writeJSONAtomically(ctx, p, run)
+	if err := writeJSONAtomically(ctx, p, run); err != nil {
+		return err
+	}
+	if run.SessionID != "" {
+		if err := s.updateSessionIndex(ctx, run); err != nil {
+			log.Error(err, "updating session index", "run", run.ID, "session", run.SessionID)
+		}
+	}
+	return nil
 }
 
 // GetRun reads run.json for the given run ID.
@@ -544,6 +557,102 @@ func (s *FileStore) FindRun(ctx context.Context, runID string) (*Run, error) {
 	}
 
 	return nil, fmt.Errorf("run %q: %w", runID, ErrNotFound)
+}
+
+type sessionIndexEntry struct {
+	Repo  RepoKey `json:"repo"`
+	RunID string  `json:"runId"`
+}
+
+func (s *FileStore) sessionIndexPath() string {
+	return filepath.Join(s.rootDir, "session_index.json")
+}
+
+func (s *FileStore) rebuildSessionIndex(ctx context.Context) (map[string]sessionIndexEntry, error) {
+	repos, err := s.ListRepos(ctx)
+	if err != nil {
+		return nil, err
+	}
+	idx := make(map[string]sessionIndexEntry)
+	for _, repo := range repos {
+		runs, err := s.ListRuns(ctx, repo.Key())
+		if err != nil {
+			return nil, err
+		}
+		for _, run := range runs {
+			if run.SessionID != "" {
+				idx[run.SessionID] = sessionIndexEntry{Repo: run.Repo, RunID: run.ID}
+			}
+		}
+	}
+	if err := writeJSONAtomically(ctx, s.sessionIndexPath(), idx); err != nil {
+		return nil, err
+	}
+	return idx, nil
+}
+
+func (s *FileStore) loadSessionIndex(ctx context.Context) (map[string]sessionIndexEntry, error) {
+	data, err := os.ReadFile(s.sessionIndexPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return s.rebuildSessionIndex(ctx)
+		}
+		return nil, err
+	}
+	var idx map[string]sessionIndexEntry
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return s.rebuildSessionIndex(ctx)
+	}
+	return idx, nil
+}
+
+func (s *FileStore) updateSessionIndex(ctx context.Context, run *Run) error {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+
+	idx, err := s.loadSessionIndex(ctx)
+	if err != nil {
+		return err
+	}
+	if existing, ok := idx[run.SessionID]; ok && existing.Repo == run.Repo && existing.RunID == run.ID {
+		return nil
+	}
+	idx[run.SessionID] = sessionIndexEntry{Repo: run.Repo, RunID: run.ID}
+	return writeJSONAtomically(ctx, s.sessionIndexPath(), idx)
+}
+
+// FindRunBySession searches across all registered repositories for a run by its session ID.
+func (s *FileStore) FindRunBySession(ctx context.Context, sessionID string) (*Run, error) {
+	if sessionID == "" {
+		return nil, errors.New("session id cannot be empty")
+	}
+
+	s.indexMu.Lock()
+	idx, err := s.loadSessionIndex(ctx)
+	s.indexMu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("loading session index: %w", err)
+	}
+
+	entry, ok := idx[sessionID]
+	if !ok {
+		return nil, fmt.Errorf("session %q: %w", sessionID, ErrNotFound)
+	}
+
+	run, err := s.GetRun(ctx, entry.Repo, entry.RunID)
+	if err != nil && errors.Is(err, ErrNotFound) {
+		s.indexMu.Lock()
+		idx, err = s.rebuildSessionIndex(ctx)
+		s.indexMu.Unlock()
+		if err != nil {
+			return nil, fmt.Errorf("rebuilding session index: %w", err)
+		}
+		if entry, ok = idx[sessionID]; ok {
+			return s.GetRun(ctx, entry.Repo, entry.RunID)
+		}
+		return nil, fmt.Errorf("session %q: %w", sessionID, ErrNotFound)
+	}
+	return run, err
 }
 
 // AppendEvent appends one or more events to events.jsonl.

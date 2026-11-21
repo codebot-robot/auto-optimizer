@@ -420,6 +420,63 @@ func TestRun_FindRun(t *testing.T) {
 	}
 }
 
+func TestRun_FindRunBySession(t *testing.T) {
+	ctx := t.Context()
+	store := NewFileStore(t.TempDir())
+
+	if _, err := store.FindRunBySession(ctx, ""); err == nil {
+		t.Error("expected error for empty session ID")
+	}
+	if _, err := store.FindRunBySession(ctx, "missing-sess"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound for missing session, got %v", err)
+	}
+
+	repo := &Repo{Host: "github.com", Owner: "gke-labs", Name: "repo-a"}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+	run := &Run{ID: "20261023T150000Z-1111", Repo: repo.Key(), GoalName: "perf", SessionID: "sess-run-1"}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	found, err := store.FindRunBySession(ctx, "sess-run-1")
+	if diff := cmp.Diff(run, found); err != nil || diff != "" {
+		t.Fatalf("FindRunBySession mismatch (-want +got):\n%s (err: %v)", diff, err)
+	}
+	if _, err := store.FindRunBySession(ctx, "sess-without-run"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound for session with no run, got %v", err)
+	}
+
+	// Remove index file to verify cache rebuild
+	_ = os.Remove(store.sessionIndexPath())
+	found, err = store.FindRunBySession(ctx, "sess-run-1")
+	if diff := cmp.Diff(run, found); err != nil || diff != "" {
+		t.Fatalf("FindRunBySession after rebuild mismatch (-want +got):\n%s (err: %v)", diff, err)
+	}
+	// Rebuilt index still returns ErrNotFound for session with no run
+	if _, err := store.FindRunBySession(ctx, "sess-without-run"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound after rebuild for session with no run, got %v", err)
+	}
+
+	// Verify PutRun on an existing run does not re-write session_index.json
+	fi1, err := os.Stat(store.sessionIndexPath())
+	if err != nil {
+		t.Fatalf("os.Stat index: %v", err)
+	}
+	run.Phase = PhaseSelecting
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+	fi2, err := os.Stat(store.sessionIndexPath())
+	if err != nil {
+		t.Fatalf("os.Stat index after PutRun: %v", err)
+	}
+	if !fi1.ModTime().Equal(fi2.ModTime()) {
+		t.Errorf("PutRun re-wrote index file: mod time changed from %v to %v", fi1.ModTime(), fi2.ModTime())
+	}
+}
+
 func TestEvents_AppendAndRead(t *testing.T) {
 	ctx := t.Context()
 	storeDir := t.TempDir()

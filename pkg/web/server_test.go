@@ -24,6 +24,8 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1381,4 +1383,67 @@ func TestCSRFValidation(t *testing.T) {
 			t.Errorf("POST with browser cookie token status = %d, want 303", got)
 		}
 	})
+}
+
+func TestPostMessage_AppendsEvent(t *testing.T) {
+	ctx := t.Context()
+	stateDir := t.TempDir()
+	stateStore := state.NewFileStore(stateDir)
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	if err := stateStore.PutRepo(ctx, &state.Repo{Host: repoKey.Host, Owner: repoKey.Owner, Name: repoKey.Name}); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID, sessionID := "20261121T100000Z-0001", "sess-run-42"
+	if err := stateStore.PutRun(ctx, &state.Run{ID: runID, Repo: repoKey, GoalName: "test-goal", SessionID: sessionID}); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	webServer, err := NewServer(&fakeSessionService{}, stateStore, nil, ServerOptions{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	secretBody := "super secret instruction that must not leak"
+	post := func(user, sess, text string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/sessions/"+sess+"/messages", strings.NewReader(url.Values{"text": {text}, "csrf": {"csrf-val"}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf-val"})
+		if user != "" {
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+		}
+		rec := httptest.NewRecorder()
+		webServer.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Authenticated user posts a message
+	if rec := post("octocat", sessionID, secretBody); rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST status = %d, want 303", rec.Code)
+	}
+	events, err := stateStore.ReadEvents(ctx, repoKey, runID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d (err: %v)", len(events), err)
+	}
+	if events[0].Kind != "message_posted" || events[0].Data.(map[string]any)["by"] != "octocat" {
+		t.Errorf("unexpected event: %+v", events[0])
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "repos", repoKey.Dir(), "runs", runID, "events.jsonl"))
+	if strings.Contains(string(raw), secretBody) {
+		t.Errorf("events.jsonl contains secret body: %s", string(raw))
+	}
+
+	// 2. Anonymous user posts a message
+	if rec := post("", sessionID, "anon body"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST anon status = %d, want 303", rec.Code)
+	}
+	events, _ = stateStore.ReadEvents(ctx, repoKey, runID)
+	if len(events) != 2 || events[1].Data.(map[string]any)["by"] != "anonymous" {
+		t.Errorf("unexpected second event: %+v", events)
+	}
+
+	// 3. Standalone session without run
+	if rec := post("", "standalone", "hi"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST standalone status = %d, want 303", rec.Code)
+	}
 }
