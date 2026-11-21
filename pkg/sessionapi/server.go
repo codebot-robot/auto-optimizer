@@ -40,6 +40,7 @@ var ErrBusy = errors.New("session is busy")
 // SessionSummary summarizes an agent session for in-process consumers such as the web UI.
 type SessionSummary struct {
 	Name         string
+	Repo         string
 	RunID        string
 	Toolset      string
 	Parent       string
@@ -704,11 +705,14 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 			msgCount = len(act.Messages())
 		}
 		var runID string
-		if sessionRuns != nil {
+		if sum.Metadata.RunID != "" {
+			runID = sum.Metadata.RunID
+		} else if sessionRuns != nil {
 			runID = sessionRuns[sum.Name]
 		}
 		result = append(result, SessionSummary{
 			Name:         sum.Name,
+			Repo:         sum.Metadata.Repo,
 			RunID:        runID,
 			Toolset:      sum.Metadata.Toolset,
 			Parent:       sum.Metadata.Parent,
@@ -798,18 +802,21 @@ func (s *Server) GetSessionDetail(ctx context.Context, name string) (*SessionDet
 		})
 	}
 
-	sessionRuns, err := s.sessionRunsMap(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var runID string
-	if sessionRuns != nil {
-		runID = sessionRuns[name]
+	runID := meta.RunID
+	if runID == "" {
+		sessionRuns, err := s.sessionRunsMap(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if sessionRuns != nil {
+			runID = sessionRuns[name]
+		}
 	}
 
 	return &SessionDetail{
 		Summary: SessionSummary{
 			Name:         name,
+			Repo:         meta.Repo,
 			RunID:        runID,
 			Toolset:      meta.Toolset,
 			Parent:       meta.Parent,

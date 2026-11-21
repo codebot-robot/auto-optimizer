@@ -139,6 +139,8 @@ func TestFileStoreMetadata(t *testing.T) {
 	want := Metadata{
 		Parent:    "parent1",
 		Toolset:   "geminicli",
+		Repo:      "github.com/gke-labs/auto-optimizer",
+		RunID:     "20261021T180000Z-0001",
 		CreatedAt: time.Date(2026, 10, 21, 18, 0, 0, 0, time.UTC),
 	}
 

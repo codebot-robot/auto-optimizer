@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
@@ -511,7 +512,53 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 
+	s.recordMessagePosted(r.Context(), name)
+
 	http.Redirect(w, r, "/sessions/"+url.PathEscape(name), http.StatusSeeOther)
+}
+
+func (s *Server) recordMessagePosted(ctx context.Context, sessionName string) {
+	if s.stateStore == nil {
+		return
+	}
+	detail, err := s.service.GetSessionDetail(ctx, sessionName)
+	if err != nil {
+		scoped.Log(ctx).V(4).Info("getting session detail for run event", "session", sessionName, "error", err)
+		return
+	}
+	if detail == nil || detail.Summary.RunID == "" || detail.Summary.Repo == "" {
+		return
+	}
+
+	repoKey, err := state.ParseRepoKey(detail.Summary.Repo)
+	if err != nil {
+		scoped.Log(ctx).Error(err, "parsing repo key for session message", "repo", detail.Summary.Repo, "session", sessionName)
+		return
+	}
+
+	by := "anonymous"
+	if u, ok := auth.UserFromContext(ctx); ok {
+		by = u
+	}
+
+	var phase state.RunPhase
+	run, err := s.stateStore.GetRun(ctx, repoKey, detail.Summary.RunID)
+	if err != nil {
+		scoped.Log(ctx).V(4).Info("getting run for session event", "run", detail.Summary.RunID, "error", err)
+	} else if run != nil {
+		phase = run.Phase
+	}
+
+	event := state.Event{
+		Time:    time.Now().UTC(),
+		Phase:   phase,
+		Kind:    "message_posted",
+		Message: fmt.Sprintf("Message posted by %s", by),
+		Data:    map[string]any{"by": by},
+	}
+	if err := s.stateStore.AppendEvent(ctx, repoKey, detail.Summary.RunID, event); err != nil {
+		scoped.Log(ctx).Error(err, "appending message_posted event", "run", detail.Summary.RunID, "session", sessionName)
+	}
 }
 
 func (s *Server) render404(w http.ResponseWriter, r *http.Request, message string) {
