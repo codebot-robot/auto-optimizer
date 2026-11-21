@@ -155,6 +155,14 @@ func TestOptions_Validate(t *testing.T) {
 		t.Errorf("expected empty ControllerAddr to be valid, got: %v", err)
 	}
 
+	// Invalid egress host IP
+	invalidHost := Options{EgressHosts: []string{"192.168.1.1"}}
+	if err := invalidHost.Validate(); err == nil {
+		t.Error("expected error for IP address egress host, got nil")
+	} else if !strings.Contains(err.Error(), "192.168.1.1") {
+		t.Errorf("expected error to name %q, got: %v", "192.168.1.1", err)
+	}
+
 	// CAFile missing
 	missingCA := Options{ControllerAddr: "127.0.0.1:8443", TokenFile: "/var/token"}
 	if err := missingCA.Validate(); err == nil {
@@ -188,28 +196,134 @@ func TestOptions_Enabled(t *testing.T) {
 }
 
 func TestPolicyForHosts(t *testing.T) {
-	hosts := []string{"github.com", "proxy.golang.org"}
-	policy := PolicyForHosts(hosts)
+	t.Run("bare names only", func(t *testing.T) {
+		hosts := []string{"github.com", "proxy.golang.org"}
+		policy, err := PolicyForHosts(hosts)
+		if err != nil {
+			t.Fatalf("PolicyForHosts: %v", err)
+		}
 
-	if len(policy.Rules) != 1 {
-		t.Fatalf("len(Rules) = %d, want 1", len(policy.Rules))
-	}
-	r := policy.Rules[0]
-	if r.Https == nil {
-		t.Fatal("expected Https rule, got nil")
-	}
-	if r.Http != nil || r.TlsPassthrough != nil {
-		t.Errorf("expected only Https rule, got Http=%v, TlsPassthrough=%v", r.Http, r.TlsPassthrough)
-	}
-	if diff := cmp.Diff(hosts, r.Https.Hostnames); diff != "" {
-		t.Errorf("hostnames mismatch (-want +got):\n%s", diff)
-	}
-	if r.Https.Effects != nil {
-		t.Errorf("expected nil effects, got: %v", r.Https.Effects)
-	}
-	if err := policy.Validate(); err != nil {
-		t.Errorf("expected valid policy, got: %v", err)
-	}
+		if len(policy.Rules) != 1 {
+			t.Fatalf("len(Rules) = %d, want 1", len(policy.Rules))
+		}
+		r := policy.Rules[0]
+		if r.Https == nil {
+			t.Fatal("expected Https rule, got nil")
+		}
+		if r.Http != nil || r.TlsPassthrough != nil {
+			t.Errorf("expected only Https rule, got Http=%v, TlsPassthrough=%v", r.Http, r.TlsPassthrough)
+		}
+		if diff := cmp.Diff(hosts, r.Https.Hostnames); diff != "" {
+			t.Errorf("hostnames mismatch (-want +got):\n%s", diff)
+		}
+		if r.Https.Effects != nil {
+			t.Errorf("expected nil effects, got: %v", r.Https.Effects)
+		}
+		if err := policy.Validate(); err != nil {
+			t.Errorf("expected valid policy, got: %v", err)
+		}
+	})
+
+	t.Run("http with and without a port", func(t *testing.T) {
+		hosts := []string{"http://git-server", "http://git-server:8080"}
+		policy, err := PolicyForHosts(hosts)
+		if err != nil {
+			t.Fatalf("PolicyForHosts: %v", err)
+		}
+		if len(policy.Rules) != 2 {
+			t.Fatalf("len(Rules) = %d, want 2", len(policy.Rules))
+		}
+
+		r0 := policy.Rules[0]
+		if r0.Http == nil {
+			t.Fatal("expected Http rule for first entry, got nil")
+		}
+		if diff := cmp.Diff([]string{"git-server"}, r0.Http.Hostnames); diff != "" {
+			t.Errorf("r0 hostnames mismatch (-want +got):\n%s", diff)
+		}
+		if diff := cmp.Diff([]int32{80}, r0.Http.Ports.Numbers); diff != "" {
+			t.Errorf("r0 ports mismatch (-want +got):\n%s", diff)
+		}
+
+		r1 := policy.Rules[1]
+		if r1.Http == nil {
+			t.Fatal("expected Http rule for second entry, got nil")
+		}
+		if diff := cmp.Diff([]string{"git-server"}, r1.Http.Hostnames); diff != "" {
+			t.Errorf("r1 hostnames mismatch (-want +got):\n%s", diff)
+		}
+		if diff := cmp.Diff([]int32{8080}, r1.Http.Ports.Numbers); diff != "" {
+			t.Errorf("r1 ports mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("a mix", func(t *testing.T) {
+		hosts := []string{"github.com", "http://git-server:8080", "proxy.golang.org", "http://git-internal"}
+		policy, err := PolicyForHosts(hosts)
+		if err != nil {
+			t.Fatalf("PolicyForHosts: %v", err)
+		}
+		if len(policy.Rules) != 3 {
+			t.Fatalf("len(Rules) = %d, want 3", len(policy.Rules))
+		}
+
+		// Https rule for bare names
+		r0 := policy.Rules[0]
+		if r0.Https == nil {
+			t.Fatal("expected Https rule for bare names, got nil")
+		}
+		if diff := cmp.Diff([]string{"github.com", "proxy.golang.org"}, r0.Https.Hostnames); diff != "" {
+			t.Errorf("bare names mismatch (-want +got):\n%s", diff)
+		}
+
+		// Http rules
+		r1 := policy.Rules[1]
+		if r1.Http == nil {
+			t.Fatal("expected Http rule, got nil")
+		}
+		if diff := cmp.Diff([]string{"git-server"}, r1.Http.Hostnames); diff != "" {
+			t.Errorf("r1 hostnames mismatch (-want +got):\n%s", diff)
+		}
+		if diff := cmp.Diff([]int32{8080}, r1.Http.Ports.Numbers); diff != "" {
+			t.Errorf("r1 ports mismatch (-want +got):\n%s", diff)
+		}
+
+		r2 := policy.Rules[2]
+		if r2.Http == nil {
+			t.Fatal("expected Http rule, got nil")
+		}
+		if diff := cmp.Diff([]string{"git-internal"}, r2.Http.Hostnames); diff != "" {
+			t.Errorf("r2 hostnames mismatch (-want +got):\n%s", diff)
+		}
+		if diff := cmp.Diff([]int32{80}, r2.Http.Ports.Numbers); diff != "" {
+			t.Errorf("r2 ports mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("an IP address rejected", func(t *testing.T) {
+		invalidHosts := []struct {
+			entry   string
+			wantSub string
+		}{
+			{"192.168.1.1", "192.168.1.1"},
+			{"10.0.0.1", "10.0.0.1"},
+			{"http://192.168.1.1", "192.168.1.1"},
+			{"http://192.168.1.1:8080", "192.168.1.1"},
+			{"::1", "::1"},
+			{"http://[::1]:8080", "::1"},
+		}
+		for _, tc := range invalidHosts {
+			t.Run(tc.entry, func(t *testing.T) {
+				_, err := PolicyForHosts([]string{tc.entry})
+				if err == nil {
+					t.Fatalf("expected error for IP address %q, got nil", tc.entry)
+				}
+				if !strings.Contains(err.Error(), tc.wantSub) {
+					t.Errorf("expected error to name %q, got: %v", tc.wantSub, err)
+				}
+			})
+		}
+	})
 }
 
 func TestHostListPolicyFactory(t *testing.T) {
@@ -244,9 +358,9 @@ func TestHostListPolicyFactory(t *testing.T) {
 			wantHosts: []string{"proxy.golang.org", "gitlab.com"},
 		},
 		{
-			name:      "url with port extracts hostname",
+			name:      "https url with port extracts hostname",
 			hosts:     []string{"proxy.golang.org"},
-			repoURL:   "http://custom-forge.internal:8080/gke-labs/test-repo",
+			repoURL:   "https://custom-forge.internal:8443/gke-labs/test-repo",
 			wantHosts: []string{"proxy.golang.org", "custom-forge.internal"},
 		},
 		{
@@ -285,6 +399,68 @@ func TestHostListPolicyFactory(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("http repo URL with port and no configured hosts", func(t *testing.T) {
+		factory := HostListPolicyFactory(nil)
+		req := PolicyRequest{
+			RepoURL:     "http://custom-forge.internal:8080/gke-labs/test-repo",
+			GoalName:    "test-goal",
+			RunID:       "run-123",
+			SandboxName: "sandbox-123",
+		}
+		policy, err := factory(t.Context(), req)
+		if err != nil {
+			t.Fatalf("unexpected factory error: %v", err)
+		}
+		if len(policy.Rules) != 1 {
+			t.Fatalf("len(Rules) = %d, want 1", len(policy.Rules))
+		}
+		r := policy.Rules[0]
+		if r.Http == nil {
+			t.Fatalf("expected Http rule, got: %+v", r)
+		}
+		if diff := cmp.Diff([]string{"custom-forge.internal"}, r.Http.Hostnames); diff != "" {
+			t.Errorf("hostnames mismatch (-want +got):\n%s", diff)
+		}
+		if diff := cmp.Diff([]int32{8080}, r.Http.Ports.Numbers); diff != "" {
+			t.Errorf("ports mismatch (-want +got):\n%s", diff)
+		}
+		if r.Https != nil {
+			t.Errorf("expected nil Https rule, got: %+v", r.Https)
+		}
+	})
+
+	t.Run("http repo URL without port with configured hosts", func(t *testing.T) {
+		factory := HostListPolicyFactory([]string{"proxy.golang.org"})
+		req := PolicyRequest{
+			RepoURL:     "http://custom-forge.internal/gke-labs/test-repo",
+			GoalName:    "test-goal",
+			RunID:       "run-123",
+			SandboxName: "sandbox-123",
+		}
+		policy, err := factory(t.Context(), req)
+		if err != nil {
+			t.Fatalf("unexpected factory error: %v", err)
+		}
+		if len(policy.Rules) != 2 {
+			t.Fatalf("len(Rules) = %d, want 2", len(policy.Rules))
+		}
+		if policy.Rules[0].Https == nil {
+			t.Fatalf("expected Https rule for rule 0, got nil")
+		}
+		if diff := cmp.Diff([]string{"proxy.golang.org"}, policy.Rules[0].Https.Hostnames); diff != "" {
+			t.Errorf("Https hostnames mismatch (-want +got):\n%s", diff)
+		}
+		if policy.Rules[1].Http == nil {
+			t.Fatalf("expected Http rule for rule 1, got nil")
+		}
+		if diff := cmp.Diff([]string{"custom-forge.internal"}, policy.Rules[1].Http.Hostnames); diff != "" {
+			t.Errorf("Http hostnames mismatch (-want +got):\n%s", diff)
+		}
+		if diff := cmp.Diff([]int32{80}, policy.Rules[1].Http.Ports.Numbers); diff != "" {
+			t.Errorf("Http ports mismatch (-want +got):\n%s", diff)
+		}
+	})
 }
 
 func TestPolicyHostnames(t *testing.T) {
@@ -365,7 +541,10 @@ func TestBinder_GRPC(t *testing.T) {
 	}
 	defer client.Close()
 
-	policy := PolicyForHosts(DefaultEgressHosts)
+	policy, err := PolicyForHosts(DefaultEgressHosts)
+	if err != nil {
+		t.Fatalf("PolicyForHosts: %v", err)
+	}
 	const testPodUID = types.UID("pod-uid-test-1234")
 
 	t.Run("accepted bind returns nil and verifies server state", func(t *testing.T) {

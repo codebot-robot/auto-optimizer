@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/pflag"
@@ -67,13 +69,16 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.ControllerAddr, "portal-controller-addr", o.ControllerAddr, "Address of the Service Portal Controller")
 	fs.StringVar(&o.CAFile, "portal-controller-ca-file", o.CAFile, "Path to CA certificate for verifying the Service Portal Controller TLS certificate")
 	fs.StringVar(&o.TokenFile, "portal-token-file", o.TokenFile, "Path to projected service account token file for authenticating with the Service Portal Controller")
-	fs.StringSliceVar(&o.EgressHosts, "sandbox-egress-hosts", o.EgressHosts, "Allowed egress hosts for sandboxes")
+	fs.StringSliceVar(&o.EgressHosts, "sandbox-egress-hosts", o.EgressHosts, "Allowed egress hosts for sandboxes (bare host names for HTTPS:443, or http://name[:port] for cleartext HTTP)")
 }
 
 // Validate reports any invalid option values. The portal is off when ControllerAddr is empty.
 func (o *Options) Validate() error {
 	if o == nil {
 		return errors.New("portal options are required")
+	}
+	if _, err := PolicyForHosts(o.EgressHosts); err != nil {
+		return err
 	}
 	if o.ControllerAddr == "" {
 		return nil
@@ -191,18 +196,101 @@ func (c *Client) Bind(ctx context.Context, podUID types.UID, policy *portalsv1.E
 	}
 }
 
-// PolicyForHosts returns an EgressPolicy with a single HTTPS rule for hosts,
-// with no effects and no credentials.
-func PolicyForHosts(hosts []string) *portalsv1.EgressPolicy {
-	return &portalsv1.EgressPolicy{
-		Rules: []*portalsv1.EgressRule{
-			{
-				Https: &portalsv1.HttpsRule{
-					Hostnames: append([]string(nil), hosts...),
-				},
-			},
-		},
+type egressHost struct {
+	hostname string
+	isHTTP   bool
+	port     int32
+}
+
+func parseEgressHost(entry string) (egressHost, error) {
+	trimmed := strings.TrimSpace(entry)
+	if trimmed == "" {
+		return egressHost{}, fmt.Errorf("invalid egress host %q: empty entry", entry)
 	}
+	if strings.HasPrefix(trimmed, "http://") {
+		rest := strings.TrimPrefix(trimmed, "http://")
+		host := rest
+		port := int32(80)
+		if strings.Contains(rest, ":") {
+			h, portStr, err := net.SplitHostPort(rest)
+			if err != nil {
+				return egressHost{}, fmt.Errorf("invalid egress host %q: %w", entry, err)
+			}
+			p, err := strconv.ParseUint(portStr, 10, 16)
+			if err != nil || p == 0 || p > 65535 {
+				return egressHost{}, fmt.Errorf("invalid egress host %q: invalid port %q", entry, portStr)
+			}
+			host = h
+			port = int32(p)
+		}
+		return egressHost{
+			hostname: host,
+			isHTTP:   true,
+			port:     port,
+		}, nil
+	}
+
+	return egressHost{
+		hostname: trimmed,
+		isHTTP:   false,
+		port:     443,
+	}, nil
+}
+
+// PolicyForHosts returns an EgressPolicy with an HTTPS rule for bare host names
+// and HTTP rules for http:// entries, with no effects and no credentials.
+func PolicyForHosts(hosts []string) (*portalsv1.EgressPolicy, error) {
+	var bareNames []string
+	var httpRules []*portalsv1.EgressRule
+	seenBare := make(map[string]bool)
+	seenHTTP := make(map[string]bool)
+
+	for _, raw := range hosts {
+		if raw == "" {
+			continue
+		}
+		parsed, err := parseEgressHost(raw)
+		if err != nil {
+			return nil, err
+		}
+		if parsed.isHTTP {
+			key := fmt.Sprintf("%s:%d", parsed.hostname, parsed.port)
+			if !seenHTTP[key] {
+				seenHTTP[key] = true
+				httpRules = append(httpRules, &portalsv1.EgressRule{
+					Http: &portalsv1.HttpRule{
+						Hostnames: []string{parsed.hostname},
+						Ports: &portalsv1.Ports{
+							Numbers: []int32{parsed.port},
+						},
+					},
+				})
+			}
+		} else {
+			if !seenBare[parsed.hostname] {
+				seenBare[parsed.hostname] = true
+				bareNames = append(bareNames, parsed.hostname)
+			}
+		}
+	}
+
+	var rules []*portalsv1.EgressRule
+	if len(bareNames) > 0 {
+		rules = append(rules, &portalsv1.EgressRule{
+			Https: &portalsv1.HttpsRule{
+				Hostnames: bareNames,
+			},
+		})
+	}
+	rules = append(rules, httpRules...)
+
+	policy := &portalsv1.EgressPolicy{
+		Rules: rules,
+	}
+	if err := policy.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid egress policy: %w", err)
+	}
+	return policy, nil
 }
 
 func repoHost(repoURL string) string {
@@ -230,6 +318,12 @@ func repoHost(repoURL string) string {
 	if u.Scheme == "file" {
 		return ""
 	}
+	if u.Scheme == "http" {
+		if u.Host != "" {
+			return "http://" + u.Host
+		}
+		return ""
+	}
 	h := u.Hostname()
 	if h != "" {
 		return h
@@ -237,9 +331,9 @@ func repoHost(repoURL string) string {
 	return u.Host
 }
 
-// HostListPolicyFactory returns a PolicyFactory that creates an EgressPolicy with a
-// single HTTPS rule containing the configured hosts plus the host from the request's
-// repository URL, without duplicates.
+// HostListPolicyFactory returns a PolicyFactory that creates an EgressPolicy with an
+// HTTPS rule for configured bare hosts plus the host from the request's repository
+// URL, and HTTP rules for http:// entries, without duplicates.
 func HostListPolicyFactory(hosts []string) PolicyFactory {
 	return func(ctx context.Context, req PolicyRequest) (*portalsv1.EgressPolicy, error) {
 		var combined []string
@@ -254,7 +348,7 @@ func HostListPolicyFactory(hosts []string) PolicyFactory {
 			seen[h] = true
 			combined = append(combined, h)
 		}
-		return PolicyForHosts(combined), nil
+		return PolicyForHosts(combined)
 	}
 }
 

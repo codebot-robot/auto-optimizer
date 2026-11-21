@@ -440,6 +440,18 @@ func TestServeMaxTurnsValidation(t *testing.T) {
 	})
 }
 
+func TestServeEgressHostsValidation(t *testing.T) {
+	cmd := newServeCommand()
+	cmd.SetArgs([]string{"--sandbox-egress-hosts", "192.168.1.1"})
+	err := cmd.ExecuteContext(t.Context())
+	if err == nil {
+		t.Fatal("expected error from ExecuteContext, got nil")
+	}
+	if !strings.Contains(err.Error(), "192.168.1.1") {
+		t.Errorf("error = %q, want containing '192.168.1.1'", err.Error())
+	}
+}
+
 func TestSelectForge(t *testing.T) {
 	tests := []struct {
 		repoURL     string
