@@ -19,6 +19,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -141,7 +143,16 @@ func TestCreateAndGetSession(t *testing.T) {
 	ctx := t.Context()
 	client, _, _ := setupTestServer(t, nil)
 
-	// Create a new session.
+	// Create the root session first.
+	_, err := client.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    "root",
+		Toolset: "basic",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(root) failed: %v", err)
+	}
+
+	// Create a new session as a child of "root".
 	createResp, err := client.CreateSession(ctx, &sessionv1.CreateSessionRequest{
 		Name:    "alpha",
 		Toolset: "basic",
@@ -853,5 +864,329 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 	ev := getRunResp.Events[0]
 	if ev.Kind != "created" || ev.Message != "Run created" || ev.Phase != string(state.PhasePending) {
 		t.Errorf("unexpected event in GetRun: %+v", ev)
+	}
+}
+
+func TestRunSessionsTreeAndSideBySideRuns(t *testing.T) {
+	ctx := t.Context()
+
+	llmClient, err := llm.NewFromEnv("fake-eliza")
+	if err != nil {
+		t.Fatalf("llm.NewFromEnv: %v", err)
+	}
+	toolset, err := toolsets.Get("basic")
+	if err != nil {
+		t.Fatalf("toolsets.Get: %v", err)
+	}
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.ToolTimeout = session.DefaultToolTimeout
+	toolset.RegisterTools(toolsRegistry)
+
+	var opts session.RunOptions
+	opts.InitDefaults()
+	opts.ModelName = "fake-eliza"
+	opts.SystemPrompt = toolset.SystemPrompt()
+	harness := session.NewHarness(llmClient, nil, toolsRegistry, opts)
+
+	sessionStore := session.NewFileStore(t.TempDir())
+	stateStore := state.NewFileStore(t.TempDir())
+
+	srv, err := NewServer(ServerOptions{
+		Store:          sessionStore,
+		StateStore:     stateStore,
+		DefaultToolset: "basic",
+		Harness:        harness,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "octocat", Name: "myrepo"}
+	if err := stateStore.PutRepo(ctx, &state.Repo{
+		Host:          repoKey.Host,
+		Owner:         repoKey.Owner,
+		Name:          repoKey.Name,
+		URL:           "https://github.com/octocat/myrepo",
+		DefaultBranch: "main",
+	}); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	// 1. Setup Run 1 with top-level session created the way the orchestrator does (with run and repo in metadata).
+	runID1 := "20261121T100000Z-0001"
+	parent1 := "run1parent"
+	if err := stateStore.PutRun(ctx, &state.Run{
+		ID:        runID1,
+		Repo:      repoKey,
+		GoalName:  "optimize",
+		Phase:     state.PhaseWorking,
+		SessionID: parent1,
+	}); err != nil {
+		t.Fatalf("PutRun(1): %v", err)
+	}
+	if err := sessionStore.NewSession(ctx, parent1, session.Metadata{
+		Repo:      repoKey.String(),
+		RunID:     runID1,
+		Toolset:   "basic",
+		CreatedAt: time.Now().Add(-10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("NewSession(%s): %v", parent1, err)
+	}
+
+	// Create two children and one grandchild for Run 1.
+	child1a := "run1childa"
+	child1b := "run1childb"
+	grandchild1 := "run1grandchild"
+	for _, req := range []*sessionv1.CreateSessionRequest{
+		{Name: child1a, Parent: parent1, Toolset: "basic"},
+		{Name: child1b, Parent: parent1, Toolset: "basic"},
+		{Name: grandchild1, Parent: child1a, Toolset: "basic"},
+	} {
+		if _, err := srv.CreateSession(ctx, req); err != nil {
+			t.Fatalf("CreateSession(%s): %v", req.Name, err)
+		}
+	}
+
+	// 2. Setup Run 2 side-by-side with Run 1, with its own top-level session and child.
+	runID2 := "20261121T110000Z-0002"
+	parent2 := "run2parent"
+	if err := stateStore.PutRun(ctx, &state.Run{
+		ID:        runID2,
+		Repo:      repoKey,
+		GoalName:  "lint",
+		Phase:     state.PhaseWorking,
+		SessionID: parent2,
+	}); err != nil {
+		t.Fatalf("PutRun(2): %v", err)
+	}
+	if err := sessionStore.NewSession(ctx, parent2, session.Metadata{
+		Repo:      repoKey.String(),
+		RunID:     runID2,
+		Toolset:   "basic",
+		CreatedAt: time.Now().Add(-5 * time.Minute),
+	}); err != nil {
+		t.Fatalf("NewSession(%s): %v", parent2, err)
+	}
+
+	child2a := "run2childa"
+	if _, err := srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    child2a,
+		Parent:  parent2,
+		Toolset: "basic",
+	}); err != nil {
+		t.Fatalf("CreateSession(%s): %v", child2a, err)
+	}
+
+	// 3. Setup a session with no run, and a child of that session (parent with no run gives child with no run).
+	noRunParent := "sessionnorun"
+	if _, err := srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    noRunParent,
+		Toolset: "basic",
+	}); err != nil {
+		t.Fatalf("CreateSession(%s): %v", noRunParent, err)
+	}
+
+	noRunChild := "norunchild"
+	if _, err := srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    noRunChild,
+		Parent:  noRunParent,
+		Toolset: "basic",
+	}); err != nil {
+		t.Fatalf("CreateSession(%s): %v", noRunChild, err)
+	}
+
+	// Verify metadata persisted for noRunChild: parent recorded, but no RunID or Repo.
+	_, noRunChildMeta, err := sessionStore.LoadSession(ctx, noRunChild)
+	if err != nil {
+		t.Fatalf("LoadSession(%s): %v", noRunChild, err)
+	}
+	if noRunChildMeta.Parent != noRunParent {
+		t.Errorf("noRunChild Parent = %q, want %q", noRunChildMeta.Parent, noRunParent)
+	}
+	if noRunChildMeta.RunID != "" {
+		t.Errorf("noRunChild RunID = %q, want empty", noRunChildMeta.RunID)
+	}
+	if noRunChildMeta.Repo != "" {
+		t.Errorf("noRunChild Repo = %q, want empty", noRunChildMeta.Repo)
+	}
+
+	// 4. Verify ListRunSessions for Run 1: exactly 4 sessions, only from Run 1, ordered by depth.
+	sessions1, err := srv.ListRunSessions(ctx, runID1)
+	if err != nil {
+		t.Fatalf("ListRunSessions(run1): %v", err)
+	}
+	if len(sessions1) != 4 {
+		t.Fatalf("ListRunSessions(run1) returned %d sessions, want 4", len(sessions1))
+	}
+	if sessions1[0].Name != parent1 || sessions1[0].Depth != 0 || sessions1[0].Parent != "" || sessions1[0].RunID != runID1 {
+		t.Errorf("unexpected summary for parent1: %+v", sessions1[0])
+	}
+	if sessions1[1].Depth != 1 || sessions1[2].Depth != 1 {
+		t.Errorf("expected depth 1 for items 1 and 2, got %d and %d", sessions1[1].Depth, sessions1[2].Depth)
+	}
+	if sessions1[3].Name != grandchild1 || sessions1[3].Depth != 2 || sessions1[3].Parent != child1a || sessions1[3].RunID != runID1 {
+		t.Errorf("unexpected summary for grandchild1: %+v", sessions1[3])
+	}
+
+	// 5. Verify ListRunSessions for Run 2: exactly 2 sessions, only from Run 2.
+	sessions2, err := srv.ListRunSessions(ctx, runID2)
+	if err != nil {
+		t.Fatalf("ListRunSessions(run2): %v", err)
+	}
+	if len(sessions2) != 2 {
+		t.Fatalf("ListRunSessions(run2) returned %d sessions, want 2", len(sessions2))
+	}
+	if sessions2[0].Name != parent2 || sessions2[0].Depth != 0 || sessions2[0].RunID != runID2 {
+		t.Errorf("unexpected summary for parent2: %+v", sessions2[0])
+	}
+	if sessions2[1].Name != child2a || sessions2[1].Depth != 1 || sessions2[1].Parent != parent2 || sessions2[1].RunID != runID2 {
+		t.Errorf("unexpected summary for child2a: %+v", sessions2[1])
+	}
+
+	// 6. Verify SessionDepth for individual sessions.
+	for _, tc := range []struct {
+		name      string
+		wantDepth int
+	}{
+		{parent1, 0},
+		{child1a, 1},
+		{child1b, 1},
+		{grandchild1, 2},
+		{parent2, 0},
+		{child2a, 1},
+		{noRunParent, 0},
+		{noRunChild, 1},
+	} {
+		depth, err := srv.SessionDepth(ctx, tc.name)
+		if err != nil {
+			t.Errorf("SessionDepth(%s) error: %v", tc.name, err)
+		}
+		if depth != tc.wantDepth {
+			t.Errorf("SessionDepth(%s) = %d, want %d", tc.name, depth, tc.wantDepth)
+		}
+	}
+
+	// 7. Verify ListRunSessions with empty or nonexistent run ID.
+	if _, err := srv.ListRunSessions(ctx, ""); err == nil {
+		t.Error("ListRunSessions with empty runID should fail")
+	}
+	unknown, err := srv.ListRunSessions(ctx, "nonexistent-run")
+	if err != nil {
+		t.Fatalf("ListRunSessions(nonexistent): %v", err)
+	}
+	if len(unknown) != 0 {
+		t.Errorf("expected 0 sessions for nonexistent run, got %d", len(unknown))
+	}
+}
+
+func TestCreateSessionAndSessionDepth_Errors(t *testing.T) {
+	ctx := t.Context()
+
+	llmClient, err := llm.NewFromEnv("fake-eliza")
+	if err != nil {
+		t.Fatalf("llm.NewFromEnv: %v", err)
+	}
+	toolset, err := toolsets.Get("basic")
+	if err != nil {
+		t.Fatalf("toolsets.Get: %v", err)
+	}
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.ToolTimeout = session.DefaultToolTimeout
+	toolset.RegisterTools(toolsRegistry)
+
+	var opts session.RunOptions
+	opts.InitDefaults()
+	opts.ModelName = "fake-eliza"
+	opts.SystemPrompt = toolset.SystemPrompt()
+	harness := session.NewHarness(llmClient, nil, toolsRegistry, opts)
+
+	storeDir := t.TempDir()
+	sessionStore := session.NewFileStore(storeDir)
+
+	srv, err := NewServer(ServerOptions{
+		Store:          sessionStore,
+		DefaultToolset: "basic",
+		Harness:        harness,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	// 1. Missing parent on CreateSession returns NotFound.
+	_, err = srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    "orphan",
+		Parent:  "doesnotexist",
+		Toolset: "basic",
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("CreateSession with missing parent got code %v, want NotFound (%v)", status.Code(err), err)
+	}
+
+	// 2. Unreadable/corrupted parent metadata returns Internal.
+	corruptDir := filepath.Join(storeDir, "corrupt")
+	if err := os.MkdirAll(corruptDir, 0700); err != nil {
+		t.Fatalf("MkdirAll(corrupt): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptDir, "metadata.json"), []byte("{not-valid-json"), 0600); err != nil {
+		t.Fatalf("WriteFile(corrupt metadata): %v", err)
+	}
+
+	_, err = srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    "childofcorrupt",
+		Parent:  "corrupt",
+		Toolset: "basic",
+	})
+	if status.Code(err) != codes.Internal {
+		t.Errorf("CreateSession with unreadable parent got code %v, want Internal (%v)", status.Code(err), err)
+	}
+
+	// 3. SessionDepth on nonexistent session returns NotFound.
+	if _, err := srv.SessionDepth(ctx, "doesnotexist"); status.Code(err) != codes.NotFound {
+		t.Errorf("SessionDepth on nonexistent session got code %v, want NotFound (%v)", status.Code(err), err)
+	}
+
+	// 4. SessionDepth on session whose parent does not exist returns NotFound.
+	missingParentDir := filepath.Join(storeDir, "brokenchild")
+	if err := os.MkdirAll(missingParentDir, 0700); err != nil {
+		t.Fatalf("MkdirAll(brokenchild): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(missingParentDir, "metadata.json"), []byte(`{"parent":"missingancestor"}`), 0600); err != nil {
+		t.Fatalf("WriteFile(brokenchild metadata): %v", err)
+	}
+	if _, err := srv.SessionDepth(ctx, "brokenchild"); status.Code(err) != codes.NotFound {
+		t.Errorf("SessionDepth with missing ancestor got code %v, want NotFound (%v)", status.Code(err), err)
+	}
+
+	// 5. SessionDepth on cycle returns an error.
+	cycleDirA := filepath.Join(storeDir, "cyclea")
+	cycleDirB := filepath.Join(storeDir, "cycleb")
+	if err := os.MkdirAll(cycleDirA, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.MkdirAll(cycleDirB, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cycleDirA, "metadata.json"), []byte(`{"parent":"cycleb"}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cycleDirB, "metadata.json"), []byte(`{"parent":"cyclea"}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := srv.SessionDepth(ctx, "cyclea"); err == nil {
+		t.Error("SessionDepth on cyclic hierarchy should return an error, got nil")
+	}
+
+	// 6. SessionDepth on self-parent cycle returns an error.
+	selfDir := filepath.Join(storeDir, "selfcycle")
+	if err := os.MkdirAll(selfDir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(selfDir, "metadata.json"), []byte(`{"parent":"selfcycle"}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := srv.SessionDepth(ctx, "selfcycle"); err == nil {
+		t.Error("SessionDepth on self-cycle should return an error, got nil")
 	}
 }

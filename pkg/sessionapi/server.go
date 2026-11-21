@@ -44,6 +44,7 @@ type SessionSummary struct {
 	RunID        string
 	Toolset      string
 	Parent       string
+	Depth        int
 	CreatedAt    time.Time
 	MessageCount int
 	InFlight     bool
@@ -128,6 +129,45 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}, nil
 }
 
+// sessionMetadata returns the metadata for a session, checking in-memory active sessions
+// first, then loading from the store.
+func (s *Server) sessionMetadata(ctx context.Context, name string) (*session.Metadata, error) {
+	s.mu.Lock()
+	sess, ok := s.activeSessions[name]
+	s.mu.Unlock()
+	if ok {
+		return &sess.Metadata, nil
+	}
+
+	_, meta, err := s.store.LoadSession(ctx, name)
+	if err != nil {
+		if errors.Is(err, session.ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "session %q not found", name)
+		}
+		return nil, status.Errorf(codes.Internal, "loading session %q: %v", name, err)
+	}
+	if meta == nil {
+		meta = &session.Metadata{}
+	}
+	return meta, nil
+}
+
+// lookupParent validates the parent session name and retrieves its metadata.
+// It returns NotFound if the parent session does not exist, and Internal for any loading error.
+func (s *Server) lookupParent(ctx context.Context, parent string) (*session.Metadata, error) {
+	if err := session.ValidateSessionName(parent); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid parent session name %q: %v", parent, err)
+	}
+	meta, err := s.sessionMetadata(ctx, parent)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil, status.Errorf(codes.NotFound, "parent session %q not found", parent)
+		}
+		return nil, status.Errorf(codes.Internal, "loading parent session %q: %v", parent, err)
+	}
+	return meta, nil
+}
+
 // CreateSession creates a new agent session.
 func (s *Server) CreateSession(ctx context.Context, req *sessionv1.CreateSessionRequest) (*sessionv1.Session, error) {
 	log := scoped.Log(ctx)
@@ -146,10 +186,14 @@ func (s *Server) CreateSession(ctx context.Context, req *sessionv1.CreateSession
 	}
 
 	parent := req.GetParent()
+	var runID, repo string
 	if parent != "" {
-		if err := session.ValidateSessionName(parent); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "invalid parent session name %q: %v", parent, err)
+		parentMeta, err := s.lookupParent(ctx, parent)
+		if err != nil {
+			return nil, err
 		}
+		runID = parentMeta.RunID
+		repo = parentMeta.Repo
 	}
 
 	harness, err := s.harnessFactory(toolset)
@@ -160,6 +204,8 @@ func (s *Server) CreateSession(ctx context.Context, req *sessionv1.CreateSession
 	meta := session.Metadata{
 		Toolset:   toolset,
 		Parent:    parent,
+		Repo:      repo,
+		RunID:     runID,
 		CreatedAt: time.Now(),
 	}
 
@@ -683,6 +729,24 @@ func (s *Server) getOrLoadSession(ctx context.Context, name string) (*session.Se
 	return sess, harness, nil
 }
 
+// computeSessionDepth calculates how deep a session is in the session tree.
+// A top-level session (with no parent) has depth 0.
+func computeSessionDepth(name string, sessionMetas map[string]session.Metadata) int {
+	depth := 0
+	curr := name
+	visited := make(map[string]bool)
+	for {
+		visited[curr] = true
+		parent := sessionMetas[curr].Parent
+		if parent == "" || visited[parent] {
+			break
+		}
+		depth++
+		curr = parent
+	}
+	return depth
+}
+
 // ListSessionSummaries returns summaries for all known sessions, ordered newest first.
 func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, error) {
 	summaries, err := s.store.ListSessions(ctx)
@@ -697,6 +761,14 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	sessionMetas := make(map[string]session.Metadata, len(summaries))
+	for _, sum := range summaries {
+		sessionMetas[sum.Name] = sum.Metadata
+	}
+	for name, act := range s.activeSessions {
+		sessionMetas[name] = act.Metadata
+	}
 
 	var result []SessionSummary
 	for _, sum := range summaries {
@@ -716,6 +788,7 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 			RunID:        runID,
 			Toolset:      sum.Metadata.Toolset,
 			Parent:       sum.Metadata.Parent,
+			Depth:        computeSessionDepth(sum.Name, sessionMetas),
 			CreatedAt:    sum.Metadata.CreatedAt,
 			MessageCount: msgCount,
 			InFlight:     s.busySessions[sum.Name],
@@ -813,6 +886,11 @@ func (s *Server) GetSessionDetail(ctx context.Context, name string) (*SessionDet
 		}
 	}
 
+	depth, err := s.SessionDepth(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("getting session depth for %q: %w", name, err)
+	}
+
 	return &SessionDetail{
 		Summary: SessionSummary{
 			Name:         name,
@@ -820,6 +898,7 @@ func (s *Server) GetSessionDetail(ctx context.Context, name string) (*SessionDet
 			RunID:        runID,
 			Toolset:      meta.Toolset,
 			Parent:       meta.Parent,
+			Depth:        depth,
 			CreatedAt:    meta.CreatedAt,
 			MessageCount: len(messages),
 			InFlight:     inFlight,
@@ -835,6 +914,68 @@ func (s *Server) CreateNewSession(ctx context.Context, name, toolset string) err
 		Toolset: toolset,
 	})
 	return err
+}
+
+// ListRunSessions returns all sessions belonging to the specified run,
+// ordered by depth and creation time, with each session's parent and depth.
+func (s *Server) ListRunSessions(ctx context.Context, runID string) ([]SessionSummary, error) {
+	if runID == "" {
+		return nil, status.Error(codes.InvalidArgument, "run ID is required")
+	}
+
+	all, err := s.ListSessionSummaries(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []SessionSummary
+	for _, sum := range all {
+		if sum.RunID == runID {
+			result = append(result, sum)
+		}
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Depth != result[j].Depth {
+			return result[i].Depth < result[j].Depth
+		}
+		if !result[i].CreatedAt.Equal(result[j].CreatedAt) {
+			return result[i].CreatedAt.Before(result[j].CreatedAt)
+		}
+		return result[i].Name < result[j].Name
+	})
+
+	return result, nil
+}
+
+// SessionDepth returns how deep the session is in the session tree.
+// A top-level session (with no parent) has depth 0.
+// It returns an error if the session or any ancestor does not exist,
+// or if a cycle is detected.
+func (s *Server) SessionDepth(ctx context.Context, name string) (int, error) {
+	if err := session.ValidateSessionName(name); err != nil {
+		return 0, status.Errorf(codes.InvalidArgument, "invalid session name %q: %v", name, err)
+	}
+
+	depth := 0
+	curr := name
+	visited := map[string]bool{curr: true}
+
+	for {
+		meta, err := s.sessionMetadata(ctx, curr)
+		if err != nil {
+			return 0, err
+		}
+		if meta.Parent == "" {
+			return depth, nil
+		}
+		if visited[meta.Parent] {
+			return 0, status.Errorf(codes.InvalidArgument, "cycle detected: session %q is its own ancestor", meta.Parent)
+		}
+		visited[meta.Parent] = true
+		depth++
+		curr = meta.Parent
+	}
 }
 
 // StartTurn starts one agent turn asynchronously in the background.
