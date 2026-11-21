@@ -1048,6 +1048,8 @@ func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo
 	return sb, reconcile.Result{}, nil
 }
 
+// portalBindError marks a failure the caller may retry, because the portal can lag
+// behind the pod. Every other error from prepareSandbox is final for that Sandbox.
 type portalBindError struct {
 	err error
 }
@@ -1067,6 +1069,35 @@ func (e *portalBindError) Unwrap() error {
 func (o *Orchestrator) prepareSandbox(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox) error {
 	if sb == nil {
 		return errors.New("sandbox handle is nil")
+	}
+
+	failCommand := func(desc string, args []string, errMsg string, cmdTime time.Time, res *tools.ExecCommandResult) error {
+		var exitCode int
+		var stdout, stderr string
+		if res != nil {
+			exitCode = int(res.ExitCode)
+			stdout = res.Stdout
+			stderr = res.Stderr
+		}
+
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    cmdTime,
+			Phase:   run.Phase,
+			Kind:    "command",
+			Message: errMsg,
+			Error:   errMsg,
+			Data: map[string]any{
+				"command":   desc,
+				"args":      args,
+				"exit_code": exitCode,
+				"stdout":    stdout,
+				"stderr":    stderr,
+			},
+		}); err != nil {
+			scoped.Log(ctx).Error(err, "failed to append command failure event", "run", run.ID)
+		}
+
+		return errors.New(errMsg)
 	}
 
 	if o.portalBinder != nil {
@@ -1116,35 +1147,9 @@ func (o *Orchestrator) prepareSandbox(ctx context.Context, repo *state.Repo, run
 
 	var workspaceReused bool
 	if checkErr != nil {
-		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-			Time:    checkTime,
-			Phase:   run.Phase,
-			Kind:    "command",
-			Message: fmt.Sprintf("command error: %v", checkErr),
-			Error:   fmt.Sprintf("command error: %v", checkErr),
-			Data: map[string]any{
-				"command": checkDesc,
-				"args":    checkArgs,
-			},
-		}); err != nil {
-			scoped.Log(ctx).Error(err, "failed to append command error event", "run", run.ID)
-		}
-		return fmt.Errorf("command error: %w", checkErr)
+		return failCommand(checkDesc, checkArgs, fmt.Sprintf("command error: %v", checkErr), checkTime, checkRes)
 	} else if checkRes == nil {
-		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-			Time:    checkTime,
-			Phase:   run.Phase,
-			Kind:    "command",
-			Message: "command returned nil result",
-			Error:   "command returned nil result",
-			Data: map[string]any{
-				"command": checkDesc,
-				"args":    checkArgs,
-			},
-		}); err != nil {
-			scoped.Log(ctx).Error(err, "failed to append command nil result event", "run", run.ID)
-		}
-		return errors.New("command returned nil result")
+		return failCommand(checkDesc, checkArgs, "command returned nil result", checkTime, checkRes)
 	} else if checkRes.ExitCode == 0 {
 		workspaceReused = true
 	} else if checkRes.ExitCode != 128 {
@@ -1155,23 +1160,7 @@ func (o *Orchestrator) prepareSandbox(ctx context.Context, repo *state.Repo, run
 		} else {
 			errMsg = fmt.Sprintf("command failed with exit code %d", checkRes.ExitCode)
 		}
-		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-			Time:    checkTime,
-			Phase:   run.Phase,
-			Kind:    "command",
-			Message: errMsg,
-			Error:   errMsg,
-			Data: map[string]any{
-				"command":   checkDesc,
-				"args":      checkArgs,
-				"exit_code": int(checkRes.ExitCode),
-				"stdout":    checkRes.Stdout,
-				"stderr":    checkRes.Stderr,
-			},
-		}); err != nil {
-			scoped.Log(ctx).Error(err, "failed to append command failure event", "run", run.ID)
-		}
-		return errors.New(errMsg)
+		return failCommand(checkDesc, checkArgs, errMsg, checkTime, checkRes)
 	}
 
 	if workspaceReused {
@@ -1223,30 +1212,7 @@ func (o *Orchestrator) prepareSandbox(ctx context.Context, repo *state.Repo, run
 			}
 
 			if cmdErrMsg != "" {
-				var exitCode int
-				var stdout, stderr string
-				if res != nil {
-					exitCode = int(res.ExitCode)
-					stdout = res.Stdout
-					stderr = res.Stderr
-				}
-				if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-					Time:    cmdTime,
-					Phase:   run.Phase,
-					Kind:    "command",
-					Message: cmdErrMsg,
-					Error:   cmdErrMsg,
-					Data: map[string]any{
-						"command":   cmd.desc,
-						"args":      cmd.args,
-						"exit_code": exitCode,
-						"stdout":    stdout,
-						"stderr":    stderr,
-					},
-				}); err != nil {
-					scoped.Log(ctx).Error(err, "failed to append command failure event", "run", run.ID)
-				}
-				return errors.New(cmdErrMsg)
+				return failCommand(cmd.desc, cmd.args, cmdErrMsg, cmdTime, res)
 			}
 
 			// Command succeeded! Record command result event
