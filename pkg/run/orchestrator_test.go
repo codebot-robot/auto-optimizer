@@ -53,16 +53,21 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 
 	portalsv1 "github.com/gke-labs/service-portals/pkg/portals/v1"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	fakeagents "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
 	informers "sigs.k8s.io/agent-sandbox/clients/k8s/informers/externalversions"
 	processv1 "sigs.k8s.io/agent-sandbox/packages/sandboxd/spec/process/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	crconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -184,6 +189,33 @@ func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServe
 	return harness, agentsCS, coreCS
 }
 
+func (o *Orchestrator) cancelWorkers() {
+	o.activeRunsMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(o.workerCancels))
+	for _, cancel := range o.workerCancels {
+		if cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+	}
+	o.activeRunsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func newTestOrchestrator(t *testing.T, opts OrchestratorOptions) *Orchestrator {
+	t.Helper()
+	orch, err := NewOrchestrator(opts)
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	t.Cleanup(func() {
+		orch.cancelWorkers()
+		orch.workerWG.Wait()
+	})
+	return orch
+}
+
 func runRequest(orch *Orchestrator, repo state.RepoKey, runID string) reconcile.Request {
 	name := sandboxNameForRun(runID)
 	orch.recordRunIndex(name, repo, runID)
@@ -259,15 +291,12 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 
 	const author = "auto-optimizer <auto-optimizer@users.noreply.github.com>"
 	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:     store,
 		Harness:   harness,
 		Clock:     func() time.Time { return fixedTime },
 		GitAuthor: author,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Reconcile Pending run.
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -441,15 +470,12 @@ func TestOrchestrator_ConfigureGitIdentityFailure(t *testing.T) {
 	harness, agentsCS, _ := setupTestHarness(t, procSrv)
 
 	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:     store,
 		Harness:   harness,
 		Clock:     func() time.Time { return fixedTime },
 		GitAuthor: "invalid-author<",
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Reconcile Pending run to Preparing.
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -553,14 +579,11 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 	harness, agentsCS, _ := setupTestHarness(t, procSrv)
 
 	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:   store,
 		Harness: harness,
 		Clock:   func() time.Time { return fixedTime },
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: reconcile Pending run to Preparing.
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -658,15 +681,12 @@ func TestOrchestrator_WorkspaceReuse(t *testing.T) {
 			t.Fatalf("PutRun: %v", err)
 		}
 		harness, agentsCS, _ := setupTestHarness(t, procSrv)
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:     store,
 			Harness:   harness,
 			Clock:     func() time.Time { return time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC) },
 			GitAuthor: "bot <bot@test.com>",
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("Reconcile step 1: %v", err)
 		}
@@ -839,14 +859,11 @@ func TestOrchestrator_Preparing_DeleteSandboxFailsRun(t *testing.T) {
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
 	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:   store,
 		Harness: harness,
 		Clock:   func() time.Time { return fixedTime },
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Reconcile creates sandbox and moves to Preparing
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -929,15 +946,12 @@ func TestOrchestrator_Preparing_NeverReadyDeadlinePasses(t *testing.T) {
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
 	currentTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		Harness:      harness,
 		Clock:        func() time.Time { return currentTime },
 		ReadyTimeout: 10 * time.Second,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Reconcile creates sandbox and sets ReadyDeadline = currentTime + 10s
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -1043,14 +1057,11 @@ func TestOrchestrator_Resume_PreparingEnqueued(t *testing.T) {
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 5, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:   store,
 		Harness: harness,
 		Clock:   func() time.Time { return fixedTime },
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if err := orch.Resume(ctx); err != nil {
 		t.Fatalf("orch.Resume: %v", err)
@@ -1143,16 +1154,13 @@ func TestOrchestrator_Working_StartsSession_ModelStops_NoImprovement(t *testing.
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
@@ -1312,16 +1320,13 @@ func TestOrchestrator_Working_MaxTurns(t *testing.T) {
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     3,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
@@ -1388,16 +1393,13 @@ func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 	// Sandbox is intentionally NOT created in fake k8s (already expired/deleted)
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 		t.Logf("reconcileWorkingRun completed (errors handled)")
@@ -1519,16 +1521,13 @@ func TestOrchestrator_Working_ExpiredSandbox_DuringSession(t *testing.T) {
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 		t.Logf("reconcileWorkingRun completed (errors handled)")
@@ -1587,16 +1586,13 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, &llm.ElizaClient{})
 
 	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Pending -> Preparing
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -1751,16 +1747,13 @@ func TestOrchestrator_Working_FinishTool_EndsSession_RecordsSummary(t *testing.T
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
@@ -1949,16 +1942,13 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
@@ -2046,9 +2036,26 @@ func startReconcileDriver(t *testing.T, orch *Orchestrator) *reconcileDriver {
 		ctx:    ctx,
 		cancel: cancel,
 	}
+
+	var workersWG sync.WaitGroup
+	workers := orch.maxConcurrentRuns
+	if workers <= 0 {
+		workers = 1
+	}
+	for i := 0; i < workers; i++ {
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			d.worker()
+		}()
+	}
+
 	t.Cleanup(func() {
 		cancel()
 		queue.ShutDown()
+		workersWG.Wait()
+		orch.cancelWorkers()
+		orch.workerWG.Wait()
 	})
 
 	go func() {
@@ -2065,14 +2072,6 @@ func startReconcileDriver(t *testing.T, orch *Orchestrator) *reconcileDriver {
 			}
 		}
 	}()
-
-	workers := orch.maxConcurrentRuns
-	if workers <= 0 {
-		workers = 1
-	}
-	for i := 0; i < workers; i++ {
-		go d.worker()
-	}
 
 	if orch.harness != nil && orch.harness.SandboxClient() != nil && orch.harness.SandboxClient().AgentsClient() != nil {
 		factory := informers.NewSharedInformerFactoryWithOptions(
@@ -2214,14 +2213,11 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	scheduler, err := NewScheduler(SchedulerOptions{
 		Store:        store,
@@ -2391,15 +2387,12 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:             store,
 		Harness:           harness,
 		KubeClient:        fakeClient,
 		MaxConcurrentRuns: 4,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	d := startReconcileDriver(t, orch)
 
@@ -2482,14 +2475,11 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 		t.Fatalf("creating sandbox in fake k8s: %v", err)
 	}
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	go func() {
 		_ = orch.Start(testCtx)
@@ -2555,14 +2545,11 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 		t.Fatalf("creating sandbox in fake k8s on restart: %v", err)
 	}
 
-	restartedOrch, err := NewOrchestrator(OrchestratorOptions{
+	restartedOrch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      restartedHarness,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator on restart: %v", err)
-	}
 	if _, err := reconcileWorkingRun(t.Context(), restartedOrch, runRequest(restartedOrch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun on restart: %v", err)
 	}
@@ -2611,14 +2598,11 @@ func TestOrchestrator_Working_GRPCCanceled_LeavesWorking(t *testing.T) {
 	}
 
 	harness, _, _ := setupTestHarnessWithLLM(t, nil, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Storing a gRPC codes.Canceled outcome (like an in-flight sandbox call being canceled) must leave the run Working.
 	grpcErr := status.Error(codes.Canceled, "in-flight sandbox rpc canceled")
@@ -2730,14 +2714,11 @@ func TestOrchestrator_Working_UnansweredToolCall_ContinuesWithoutUserMessage(t *
 		t.Fatalf("creating sandbox in fake k8s: %v", err)
 	}
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
@@ -2842,14 +2823,11 @@ func TestOrchestrator_Working_SystemPromptOnly_RunsTurnWithGoal(t *testing.T) {
 		t.Fatalf("creating sandbox in fake k8s: %v", err)
 	}
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
@@ -2944,14 +2922,11 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 		}
 	}
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	d := startReconcileDriver(t, orch)
 
@@ -3004,14 +2979,11 @@ func TestOrchestrator_GitAuthor(t *testing.T) {
 	harness, _, _ := setupTestHarness(t, nil)
 
 	const author = "auto-optimizer <auto-optimizer@users.noreply.github.com>"
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:     store,
 		Harness:   harness,
 		GitAuthor: author,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 	if orch.gitAuthor != author {
 		t.Errorf("orch.gitAuthor = %q, want %q", orch.gitAuthor, author)
 	}
@@ -3021,14 +2993,11 @@ func TestOrchestrator_PublicURL(t *testing.T) {
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:     store,
 		Harness:   harness,
 		PublicURL: "https://ao.example.com/",
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 	if want := "https://ao.example.com"; orch.publicURL != want {
 		t.Errorf("orch.publicURL = %q, want %q", orch.publicURL, want)
 	}
@@ -3130,14 +3099,11 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	d := startReconcileDriver(t, orch)
 
@@ -3226,14 +3192,11 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	d := startReconcileDriver(t, orch)
 
@@ -3309,14 +3272,11 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	d := startReconcileDriver(t, orch)
 
@@ -3402,21 +3362,39 @@ func TestNewManager(t *testing.T) {
 
 func TestOrchestrator_SetupWithManager(t *testing.T) {
 	restConfig := &rest.Config{Host: "http://127.0.0.1:65534"}
-	mgr, err := NewManager(restConfig, "ao-sandboxes")
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	skipNameValidation := true
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme: scheme,
+		Logger: klog.NewKlogr(),
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
+		HealthProbeBindAddress: "0",
+		LeaderElection:         false,
+		Cache: crcache.Options{
+			DefaultNamespaces: map[string]crcache.Config{
+				"ao-sandboxes": {},
+			},
+		},
+		Controller: crconfig.Controller{
+			SkipNameValidation: &skipNameValidation,
+		},
+	})
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
 
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: mgr.GetClient(),
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if err := orch.SetupWithManager(mgr); err != nil {
 		t.Fatalf("SetupWithManager failed: %v", err)
@@ -3464,13 +3442,10 @@ func TestRunForRequest_ResolvesThroughIndex(t *testing.T) {
 	ctx := t.Context()
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:   store,
 		Harness: harness,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
 	runID := "20261030T120000Z-index"
@@ -3505,14 +3480,11 @@ func TestRunForRequest_ResolvesThroughHeroRunOnIndexMiss(t *testing.T) {
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
 	runID := "20261030T120000Z-hrlookup"
@@ -3579,14 +3551,11 @@ func TestOrchestrator_Reconcile_UnknownNameDroppedWithoutError(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	for _, c := range []client.Client{nil, fakeClient} {
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:      store,
 			Harness:    harness,
 			KubeClient: c,
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 
 		req := reconcile.Request{
 			NamespacedName: types.NamespacedName{
@@ -3615,14 +3584,11 @@ func TestOrchestrator_Reconcile_ReadErrorReturnsError(t *testing.T) {
 		},
 	}).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	req := reconcile.Request{
 		NamespacedName: types.NamespacedName{
@@ -3630,7 +3596,7 @@ func TestOrchestrator_Reconcile_ReadErrorReturnsError(t *testing.T) {
 			Name:      "some-run",
 		},
 	}
-	_, err = orch.Reconcile(ctx, req)
+	_, err := orch.Reconcile(ctx, req)
 	if err == nil {
 		t.Fatal("expected Reconcile to return error on API read failure")
 	}
@@ -3646,14 +3612,11 @@ func TestOrchestrator_FinishedRunHasNoIndexEntry(t *testing.T) {
 	scheme, _ := NewScheme()
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
 	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: repoKey.Host, Owner: repoKey.Owner, Name: repoKey.Name}
@@ -3727,15 +3690,12 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		Clock:      func() time.Time { return fixedTime },
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Reconcile Pending run -> leaves Pending to Preparing
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -3914,14 +3874,11 @@ func TestOrchestrator_PublishHeroRun_Resume(t *testing.T) {
 		t.Fatalf("fakeClient.Create existingHR: %v", err)
 	}
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if err := orch.Resume(ctx); err != nil {
 		t.Fatalf("orch.Resume: %v", err)
@@ -4000,14 +3957,11 @@ func TestOrchestrator_PublishHeroRun_NilKubeClient(t *testing.T) {
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: nil,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Run leaves Pending in prepareRun with nil KubeClient
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -4076,14 +4030,11 @@ func TestOrchestrator_PublishHeroRun_FailureDoesNotFailRun(t *testing.T) {
 		},
 	}).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
@@ -4145,14 +4096,11 @@ func TestOrchestrator_SandboxOwnerReference_NilKubeClientReachesWorking(t *testi
 	}
 	harness, agentsCS, _ := setupTestHarness(t, procSrv)
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: nil,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Reconcile Pending -> Preparing
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -4255,14 +4203,11 @@ func TestOrchestrator_SandboxOwnerReference_PreExistingHeroRunHasUID(t *testing.
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(preExistingHR).Build()
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
@@ -4440,12 +4385,9 @@ func setupSelectingRun(t *testing.T, phase state.RunPhase, baseSHA string, procS
 		t.Fatalf("creating sandbox: %v", err)
 	}
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store: store, SessionStore: session.NewFileStore(t.TempDir()), Harness: harness, Clock: func() time.Time { return fixedTime }, MaxTurns: 30,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 	return orch, store, agentsCS, repo, run
 }
 
@@ -4546,7 +4488,7 @@ func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
@@ -4556,9 +4498,6 @@ func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 			return forge.NewGitRemote(), nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
@@ -4706,7 +4645,7 @@ func TestOrchestrator_Selecting_BranchMoved_Fails(t *testing.T) {
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
@@ -4716,9 +4655,6 @@ func TestOrchestrator_Selecting_BranchMoved_Fails(t *testing.T) {
 			return forge.NewGitRemote(), nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
@@ -4823,7 +4759,7 @@ func TestOrchestrator_Selecting_PushFailed(t *testing.T) {
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
@@ -4833,9 +4769,6 @@ func TestOrchestrator_Selecting_PushFailed(t *testing.T) {
 			return forge.NewGitRemote(), nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
@@ -4929,7 +4862,7 @@ func TestOrchestrator_Selecting_NilForge_Fails(t *testing.T) {
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
@@ -4937,9 +4870,6 @@ func TestOrchestrator_Selecting_NilForge_Fails(t *testing.T) {
 		MaxTurns:     30,
 		ForgeFor:     nil, // explicitly nil
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
@@ -5385,7 +5315,7 @@ func setupOpeningPRTest(t *testing.T, forgeFor func(string) (forge.Forge, error)
 
 	harness, _, _ := setupTestHarness(t, nil)
 	fixedTime := time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
@@ -5393,9 +5323,6 @@ func setupOpeningPRTest(t *testing.T, forgeFor func(string) (forge.Forge, error)
 		Clock:        func() time.Time { return fixedTime },
 		ForgeFor:     forgeFor,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 	return orch, store, repo, run
 }
 
@@ -5643,7 +5570,7 @@ func TestOrchestrator_Selecting_PushesAndOpensPullRequest_WithFakeForge(t *testi
 	fakeForge := forge.NewFake()
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
@@ -5653,9 +5580,6 @@ func TestOrchestrator_Selecting_PushesAndOpensPullRequest_WithFakeForge(t *testi
 			return fakeForge, nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
@@ -5875,16 +5799,13 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// 1. Reconcile run1 (Working). This starts the turn worker, which runs in a goroutine.
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo1.Key(), run1ID)); err != nil {
@@ -5979,14 +5900,11 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 			t.Fatalf("creating sandbox: %v", err)
 		}
 
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:        store,
 			SessionStore: sessionStore,
 			Harness:      harness,
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 
 		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("reconcileWorkingRun: %v", err)
@@ -6024,14 +5942,11 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 
 		// Intentionally do not create sandbox so it fails with expired/deleted
 		harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:        store,
 			SessionStore: sessionStore,
 			Harness:      harness,
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 
 		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 			t.Logf("reconcileWorkingRun completed (errors handled)")
@@ -6093,15 +6008,12 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 	}
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Pre-store an outcome for the run
 	orch.storeTurnOutcome(runID, turnOutcome{
@@ -6253,6 +6165,47 @@ func TestOrchestrator_CancelWorker(t *testing.T) {
 	orch.cancelWorker("nonexistent")
 }
 
+func TestOrchestrator_CancelWorkers(t *testing.T) {
+	orch := &Orchestrator{
+		workerCancels: make(map[string]context.CancelFunc),
+	}
+
+	var canc1, canc2 bool
+	orch.setWorkerCancel("run-1", func() { canc1 = true })
+	orch.setWorkerCancel("run-2", func() { canc2 = true })
+	orch.cancelWorkers()
+
+	if !canc1 || !canc2 {
+		t.Errorf("expected both workers to be cancelled, got canc1=%v canc2=%v", canc1, canc2)
+	}
+}
+
+func TestNewTestOrchestrator_WaitsForWorkers(t *testing.T) {
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+
+	var workerExited bool
+	t.Run("subtest with worker", func(subT *testing.T) {
+		orch := newTestOrchestrator(subT, OrchestratorOptions{
+			Store:   store,
+			Harness: harness,
+		})
+
+		ctx, cancel := context.WithCancel(subT.Context())
+		orch.setWorkerCancel("test-run", cancel)
+		orch.workerWG.Add(1)
+		go func() {
+			defer orch.workerWG.Done()
+			<-ctx.Done()
+			workerExited = true
+		}()
+	})
+
+	if !workerExited {
+		t.Errorf("expected worker goroutine to have exited before subtest cleanup completed")
+	}
+}
+
 func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 	t.Run("goal with budget.maxDuration 30m sets deadline 30m out and shutdownTime with grace", func(t *testing.T) {
 		ctx := t.Context()
@@ -6289,7 +6242,7 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 		}
 
 		harness, agentsCS, _ := setupTestHarness(t, nil)
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:        store,
 			SessionStore: sessionStore,
 			Harness:      harness,
@@ -6297,9 +6250,6 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 				return currentTime
 			},
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
@@ -6360,7 +6310,7 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 		}
 
 		harness, agentsCS, _ := setupTestHarness(t, nil)
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:        store,
 			SessionStore: sessionStore,
 			Harness:      harness,
@@ -6368,9 +6318,6 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 				return currentTime
 			},
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
@@ -6433,14 +6380,11 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 		}
 
 		harness, agentsCS, _ := setupTestHarness(t, nil)
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:        store,
 			SessionStore: sessionStore,
 			Harness:      harness,
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
@@ -6587,16 +6531,13 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 		return currentTime
 	}
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        getClock,
 		MaxTurns:     30,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// 1. First reconcile pass starts the turn worker. RequeueAfter should be 0.
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -6777,7 +6718,7 @@ func TestOrchestrator_Working_SandboxExpiredAtStart_ProducesSandboxExpiredOutcom
 			t.Fatalf("creating sandbox: %v", err)
 		}
 
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:        store,
 			SessionStore: sessionStore,
 			Harness:      harness,
@@ -6785,9 +6726,6 @@ func TestOrchestrator_Working_SandboxExpiredAtStart_ProducesSandboxExpiredOutcom
 				return currentTime
 			},
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 
 		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 			t.Logf("reconcileWorkingRun completed (errors handled)")
@@ -6853,14 +6791,11 @@ func TestOrchestrator_Working_SandboxExpiredAtStart_ProducesSandboxExpiredOutcom
 
 		harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
 
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:        store,
 			SessionStore: sessionStore,
 			Harness:      harness,
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 
 		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 			t.Logf("reconcileWorkingRun completed (errors handled)")
@@ -7246,16 +7181,9 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 	_ = store.PutRun(ctx, run)
 
 	currentTime := startTime
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store: store, SessionStore: sessionStore, Harness: harness,
 		Clock: func() time.Time { return currentTime },
-	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
-	t.Cleanup(func() {
-		orch.cancelWorker(runID)
-		orch.workerWG.Wait()
 	})
 
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -7361,16 +7289,9 @@ func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
 			blockingLLM := newMidTurnBlockingLLM()
 			store, sessionStore, repo, _, harness, agentsCS := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
 
-			orch, err := NewOrchestrator(OrchestratorOptions{
+			orch := newTestOrchestrator(t, OrchestratorOptions{
 				Store: store, SessionStore: sessionStore, Harness: harness,
 				Clock: func() time.Time { return startTime },
-			})
-			if err != nil {
-				t.Fatalf("NewOrchestrator: %v", err)
-			}
-			t.Cleanup(func() {
-				orch.cancelWorker(runID)
-				orch.workerWG.Wait()
 			})
 
 			if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -7430,16 +7351,9 @@ func TestOrchestrator_Working_RequeueRemainingDeadline(t *testing.T) {
 	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
 
 	currentTime := startTime
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store: store, SessionStore: sessionStore, Harness: harness,
 		Clock: func() time.Time { return currentTime },
-	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
-	t.Cleanup(func() {
-		orch.cancelWorker(runID)
-		orch.workerWG.Wait()
 	})
 
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -8208,7 +8122,7 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		t.Helper()
 		sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, sbName, metav1.GetOptions{})
 		if err != nil {
-			t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
+			t.Fatalf("getting sandbox %s: %v", sbName, err)
 		}
 		for i := range sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes {
 			if sb.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes[i].Name == "workspace" {
@@ -8225,13 +8139,10 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			t.Fatalf("PutRun: %v", err)
 		}
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store: store, Harness: harness, KubeClient: fakeClient,
 			WorkspaceStorageClass: "standard", WorkspaceSize: "20Gi",
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
@@ -8294,13 +8205,10 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			},
 		}
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingClaim).Build()
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store: store, Harness: harness, KubeClient: fakeClient,
 			WorkspaceStorageClass: "standard",
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
@@ -8333,12 +8241,9 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			t.Fatalf("PutRun: %v", err)
 		}
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store: store, Harness: harness, KubeClient: fakeClient,
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
@@ -8379,15 +8284,12 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 				return client.Create(ctx, obj, opts...)
 			},
 		}).Build()
-		orch, err := NewOrchestrator(OrchestratorOptions{
+		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:                 store,
 			Harness:               harness,
 			KubeClient:            fakeClient,
 			WorkspaceStorageClass: "standard",
 		})
-		if err != nil {
-			t.Fatalf("NewOrchestrator: %v", err)
-		}
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}

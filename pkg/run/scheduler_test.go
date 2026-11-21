@@ -157,14 +157,11 @@ func TestScheduler_PublishesHeroRunOnRunCreation(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 	harness, _, _ := setupTestHarness(t, nil)
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
 	scheduler, err := NewScheduler(SchedulerOptions{
