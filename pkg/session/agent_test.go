@@ -1535,6 +1535,7 @@ func TestCreateSandboxWithOptions_WorkspaceClaim(t *testing.T) {
 		Namespace:             ns,
 		ControlPlaneNamespace: cpNamespace,
 		SigningKey:            privKey,
+		HomeDir:               DefaultHomeDir,
 	})
 
 	tests := []struct {
@@ -1581,12 +1582,23 @@ func TestCreateSandboxWithOptions_WorkspaceClaim(t *testing.T) {
 				t.Fatal("expected workspace volume to exist")
 			}
 
+			var homeVol *corev1.Volume
+			for i := range created.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes {
+				if created.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes[i].Name == "home" {
+					homeVol = &created.Spec.SandboxBlueprint.PodTemplate.Spec.Volumes[i]
+					break
+				}
+			}
+
 			if tc.claimName != "" {
 				if vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != tc.claimName {
 					t.Errorf("expected PersistentVolumeClaim with ClaimName %q, got %+v", tc.claimName, vol.PersistentVolumeClaim)
 				}
 				if vol.EmptyDir != nil {
 					t.Errorf("expected EmptyDir to be nil, got %+v", vol.EmptyDir)
+				}
+				if homeVol != nil {
+					t.Errorf("expected no separate home volume when claim is set, got %+v", homeVol)
 				}
 			} else {
 				if vol.EmptyDir == nil {
@@ -1595,24 +1607,47 @@ func TestCreateSandboxWithOptions_WorkspaceClaim(t *testing.T) {
 				if vol.PersistentVolumeClaim != nil {
 					t.Errorf("expected PersistentVolumeClaim to be nil, got %+v", vol.PersistentVolumeClaim)
 				}
+				if homeVol == nil || homeVol.EmptyDir == nil {
+					t.Errorf("expected EmptyDir home volume when claim is empty, got %+v", homeVol)
+				}
 			}
 
 			containers := created.Spec.SandboxBlueprint.PodTemplate.Spec.Containers
 			if len(containers) == 0 {
 				t.Fatal("expected at least one container")
 			}
-			var mount *corev1.VolumeMount
+			var workspaceMount *corev1.VolumeMount
+			var homeMount *corev1.VolumeMount
 			for i := range containers[0].VolumeMounts {
-				if containers[0].VolumeMounts[i].Name == "workspace" {
-					mount = &containers[0].VolumeMounts[i]
-					break
+				m := &containers[0].VolumeMounts[i]
+				if m.MountPath == "/workspace" {
+					workspaceMount = m
+				}
+				if m.MountPath == DefaultHomeDir {
+					homeMount = m
 				}
 			}
-			if mount == nil {
+			if workspaceMount == nil {
 				t.Fatal("expected workspace volume mount to exist")
 			}
-			if mount.MountPath != "/workspace" {
-				t.Errorf("expected MountPath /workspace, got %q", mount.MountPath)
+			if homeMount == nil {
+				t.Fatal("expected home directory volume mount to exist")
+			}
+
+			if tc.claimName != "" {
+				if workspaceMount.Name != "workspace" || workspaceMount.SubPath != "workspace" {
+					t.Errorf("expected workspace mount name 'workspace' and subPath 'workspace', got %+v", workspaceMount)
+				}
+				if homeMount.Name != "workspace" || homeMount.SubPath != "home" {
+					t.Errorf("expected home mount name 'workspace' and subPath 'home', got %+v", homeMount)
+				}
+			} else {
+				if workspaceMount.Name != "workspace" || workspaceMount.SubPath != "" {
+					t.Errorf("expected workspace mount name 'workspace' and empty subPath, got %+v", workspaceMount)
+				}
+				if homeMount.Name != "home" || homeMount.SubPath != "" {
+					t.Errorf("expected home mount name 'home' and empty subPath, got %+v", homeMount)
+				}
 			}
 		})
 	}
@@ -1780,5 +1815,33 @@ func TestSandbox_PodUID(t *testing.T) {
 	}
 	if gotOtherUID != otherUID {
 		t.Errorf("PodUID with custom pod name = %q, want %q", gotOtherUID, otherUID)
+	}
+}
+
+func TestSession_HasWorkspaceClaim(t *testing.T) {
+	// 1. Session with WorkspaceClaimName set
+	sessClaim := &Session{
+		sandboxOpts: &CreateSandboxOptions{
+			WorkspaceClaimName: "test-claim",
+		},
+	}
+	if !sessClaim.hasWorkspaceClaim() {
+		t.Error("expected hasWorkspaceClaim to be true when WorkspaceClaimName is set")
+	}
+
+	// 2. Session with nil sandboxOpts
+	sessNoOpts := &Session{}
+	if sessNoOpts.hasWorkspaceClaim() {
+		t.Error("expected hasWorkspaceClaim to be false when sandboxOpts is nil")
+	}
+
+	// 3. Session with empty WorkspaceClaimName
+	sessEmptyClaim := &Session{
+		sandboxOpts: &CreateSandboxOptions{
+			WorkspaceClaimName: "",
+		},
+	}
+	if sessEmptyClaim.hasWorkspaceClaim() {
+		t.Error("expected hasWorkspaceClaim to be false when WorkspaceClaimName is empty")
 	}
 }

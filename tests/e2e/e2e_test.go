@@ -1344,7 +1344,44 @@ func assertSandboxPodObjectFS(t *testing.T, subH *Harness, sandboxName string) {
 		t.Fatalf("expected claim %s StorageClassName to be 'objectfs-exclusive-local', got %v", claimName, pvc.Spec.StorageClassName)
 	}
 
-	t.Logf("PASS: Sandbox pod %s mounts claim %s bound through StorageClass %s at /workspace", sandboxName, claimName, *pvc.Spec.StorageClassName)
+	var workspaceMount, homeMount *corev1.VolumeMount
+	homeDir := "/home/auto-optimizer"
+	for _, c := range pod.Spec.Containers {
+		for _, env := range c.Env {
+			if env.Name == "HOME" && env.Value != "" {
+				homeDir = env.Value
+			}
+		}
+		for i := range c.VolumeMounts {
+			m := &c.VolumeMounts[i]
+			if m.MountPath == "/workspace" {
+				workspaceMount = m
+			}
+			if m.MountPath == homeDir {
+				homeMount = m
+			}
+		}
+	}
+	if workspaceMount == nil {
+		t.Fatalf("expected pod %s to mount /workspace", sandboxName)
+	}
+	if workspaceMount.Name != workspaceVolName || workspaceMount.SubPath != "workspace" {
+		t.Fatalf("expected /workspace mount to use volume %s and subPath 'workspace', got %+v", workspaceVolName, workspaceMount)
+	}
+	if homeMount == nil {
+		t.Fatalf("expected pod %s to mount home directory at %s", sandboxName, homeDir)
+	}
+	if homeMount.Name != workspaceVolName || homeMount.SubPath != "home" {
+		t.Fatalf("expected home directory mount to use volume %s and subPath 'home', got %+v", workspaceVolName, homeMount)
+	}
+
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "home" {
+			t.Errorf("expected no separate 'home' volume on pod %s when workspace claim is configured, got %+v", sandboxName, v)
+		}
+	}
+
+	t.Logf("PASS: Sandbox pod %s mounts claim %s bound through StorageClass %s at /workspace and %s", sandboxName, claimName, *pvc.Spec.StorageClassName, homeDir)
 }
 
 func TestRunLifecycle(t *testing.T) {
@@ -1474,6 +1511,12 @@ func TestRunLifecycle(t *testing.T) {
 	}
 	if finalHRPhase != string(finalRun.Phase) {
 		t.Errorf("expected HeroRun status.phase %q, got %q", string(finalRun.Phase), finalHRPhase)
+	}
+
+	// 9. Verify no snapshot backup tarballs were created for the run
+	fsDir := filepath.Join(stateDir, finalRun.SessionID, "fs")
+	if matches, err := filepath.Glob(filepath.Join(fsDir, "backup-*.tar.gz")); err == nil && len(matches) > 0 {
+		t.Errorf("expected no backup tarballs for run session, found %v", matches)
 	}
 
 	t.Logf("PASS: session transcript for run %s shows agent reading cloned repository README", runID)
@@ -1796,10 +1839,17 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 
 	_, repoURL, _ := setupHelloRepoFixture(t, subH)
 
-	// Step 1: run sleep 10 so the command is in flight when sandbox is deleted.
-	// Step 2: request test repository host via curl to prove portal policy is bound on replacement sandbox.
-	// Step 3: commit changes and open a pull request to transition the run to Succeeded.
+	// Step 1: write a file under the home directory in the initial sandbox.
+	// Step 2: run sleep 10 so the command is in flight when sandbox is deleted.
+	// Step 3: verify file in home directory persists across sandbox replacement, and verify portal policy by curling repo.
+	// Step 4: commit changes and open a pull request to transition the run to Succeeded.
 	scriptSteps := []map[string]any{
+		{
+			"tool": "run_command",
+			"args": map[string]string{
+				"command": "echo 'persisted in home' > ~/sb1-home-file.txt",
+			},
+		},
 		{
 			"tool": "run_command",
 			"args": map[string]string{
@@ -1809,7 +1859,7 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 		{
 			"tool": "run_command",
 			"args": map[string]string{
-				"command": "cd /workspace/repo && echo 'replacement verified' >> README.md && git add README.md && git commit -m 'test: replacement verified' && curl -sS -f --connect-timeout 5 " + repoURL + "/info/refs?service=git-upload-pack",
+				"command": "grep 'persisted in home' ~/sb1-home-file.txt && cd /workspace/repo && echo 'replacement verified' >> README.md && git add README.md && git commit -m 'test: replacement verified' && curl -sS -f --connect-timeout 5 " + repoURL + "/info/refs?service=git-upload-pack",
 			},
 		},
 		{
@@ -1888,5 +1938,9 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 		t.Errorf("expected final run phase Succeeded, got %s (error: %s)", finalRun.Phase, finalRun.Error)
 	}
 
-	_ = stateDir
+	// Verify no snapshot backup tarballs were created for the run
+	fsDir := filepath.Join(stateDir, finalRun.SessionID, "fs")
+	if matches, err := filepath.Glob(filepath.Join(fsDir, "backup-*.tar.gz")); err == nil && len(matches) > 0 {
+		t.Errorf("expected no backup tarballs for run session, found %v", matches)
+	}
 }

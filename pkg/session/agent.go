@@ -181,8 +181,11 @@ type Session struct {
 	// client is the sandbox client to use to interact with the cluster
 	client *SandboxClient
 
-	// HomeDir is the home directory; we mount a EmptyDir volume here.
-	// We currently only snapshot and restore this directory.
+	// HomeDir is the home directory inside the sandbox.
+	// For interactive sessions without a workspace claim, an emptyDir volume
+	// is mounted here and persisted across sandbox restarts via snapshot/restore.
+	// For runs and sessions backed by a workspace claim, this directory is mounted
+	// on the claim so files persist across sandboxes with no snapshot or restore step.
 	HomeDir string
 
 	// stateDir is the root directory for session state and snapshots.
@@ -234,6 +237,11 @@ func (s *Session) SetCreateSandboxOptions(opts CreateSandboxOptions) {
 // before any tool call runs in it.
 func (s *Session) SetSandboxPreparer(fn func(ctx context.Context, sb *Sandbox) error) {
 	s.prepareSandbox = fn
+}
+
+// hasWorkspaceClaim reports whether the session's sandbox is backed by a workspace claim.
+func (s *Session) hasWorkspaceClaim() bool {
+	return s.sandboxOpts != nil && s.sandboxOpts.WorkspaceClaimName != ""
 }
 
 // SetActiveSandbox binds an existing sandbox to the session.
@@ -1367,6 +1375,55 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 		}
 	}
 
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "sandboxd-bin",
+			MountPath: "/sandboxd-bin",
+			ReadOnly:  true,
+		},
+	}
+	volumes := []corev1.Volume{
+		{
+			Name: "sandboxd-bin",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		workspaceVolume,
+	}
+
+	if opts.WorkspaceClaimName != "" {
+		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{
+				Name:      "workspace",
+				MountPath: "/workspace",
+				SubPath:   "workspace",
+			},
+			corev1.VolumeMount{
+				Name:      "workspace",
+				MountPath: homeDir,
+				SubPath:   "home",
+			},
+		)
+	} else {
+		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{
+				Name:      "workspace",
+				MountPath: "/workspace",
+			},
+			corev1.VolumeMount{
+				Name:      "home",
+				MountPath: homeDir,
+			},
+		)
+		volumes = append(volumes, corev1.Volume{
+			Name: "home",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
+	}
+
 	var podMeta sandboxv1beta1.PodMetadata
 	if opts.PortalIntercept {
 		podMeta.Labels = map[string]string{
@@ -1464,21 +1521,7 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 									InitialDelaySeconds: 1,
 									PeriodSeconds:       1,
 								},
-								VolumeMounts: []corev1.VolumeMount{
-									{
-										Name:      "sandboxd-bin",
-										MountPath: "/sandboxd-bin",
-										ReadOnly:  true,
-									},
-									{
-										Name:      "workspace",
-										MountPath: "/workspace",
-									},
-									{
-										Name:      "home",
-										MountPath: homeDir,
-									},
-								},
+								VolumeMounts: volumeMounts,
 								Env: []corev1.EnvVar{
 									{
 										Name:  "HOME",
@@ -1487,21 +1530,7 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 								},
 							},
 						},
-						Volumes: []corev1.Volume{
-							{
-								Name: "sandboxd-bin",
-								VolumeSource: corev1.VolumeSource{
-									EmptyDir: &corev1.EmptyDirVolumeSource{},
-								},
-							},
-							workspaceVolume,
-							{
-								Name: "home",
-								VolumeSource: corev1.VolumeSource{
-									EmptyDir: &corev1.EmptyDirVolumeSource{},
-								},
-							},
-						},
+						Volumes:       volumes,
 						RestartPolicy: corev1.RestartPolicyNever,
 					},
 				},
@@ -2155,7 +2184,7 @@ func (h *Harness) runLoop(ctx context.Context, session *Session, events TurnEven
 			events.AssistantMessage(ctx, valueOf(assistantMessage.Content))
 
 			// We take a snapshot at these "boundaries", rather than after every tool call
-			if shouldSnapshot && session.activeSandbox != nil {
+			if shouldSnapshot && session.activeSandbox != nil && !session.hasWorkspaceClaim() {
 				log.Info("snapshotting filesystem from sandbox...", "sandbox.name", session.activeSandbox.SandboxName())
 				if err := session.activeSandbox.SnapshotFS(ctx); err != nil {
 					log.Error(err, "failed to snapshot filesystem")
@@ -2361,7 +2390,7 @@ func (h *Harness) ensureSandbox(ctx context.Context, session *Session) (tools.Sa
 				}
 				return nil, err
 			}
-		} else {
+		} else if !session.hasWorkspaceClaim() {
 			log.Info("restoring filesystem to sandbox...", "sandbox.name", sb.SandboxName())
 			if err := sb.RestoreFS(ctx); err != nil {
 				log.Error(err, "failed to restore filesystem; starting with a fresh sandbox instead", "sandbox.name", sb.SandboxName())
