@@ -1363,20 +1363,6 @@ func (o *Orchestrator) cancelWorker(runID string) {
 	}
 }
 
-func (o *Orchestrator) cancelWorkers() {
-	o.activeRunsMu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(o.workerCancels))
-	for _, cancel := range o.workerCancels {
-		if cancel != nil {
-			cancels = append(cancels, cancel)
-		}
-	}
-	o.activeRunsMu.Unlock()
-	for _, cancel := range cancels {
-		cancel()
-	}
-}
-
 func (o *Orchestrator) isRunActive(runID string) bool {
 	o.activeRunsMu.Lock()
 	defer o.activeRunsMu.Unlock()

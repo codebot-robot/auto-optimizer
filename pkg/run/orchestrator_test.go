@@ -184,6 +184,20 @@ func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServe
 	return harness, agentsCS, coreCS
 }
 
+func (o *Orchestrator) cancelWorkers() {
+	o.activeRunsMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(o.workerCancels))
+	for _, cancel := range o.workerCancels {
+		if cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+	}
+	o.activeRunsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
 func newTestOrchestrator(t *testing.T, opts OrchestratorOptions) *Orchestrator {
 	t.Helper()
 	orch, err := NewOrchestrator(opts)
