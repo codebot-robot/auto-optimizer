@@ -36,11 +36,16 @@ goal the PR is a proposal and the maintainer is the judge.
   github.com or a bare git remote.
 - The **portal** is the gke-labs/service-portals sidecar. It lets a sandbox
   reach outside services without holding any credentials.
+- A **workflow** is a multi-step process that persists its state so that it can
+  be resumed. The caller calls Run on it repeatedly until the workflow is done,
+  saving the state after each call. After a crash, the caller loads the saved
+  state and calls Run again.
 
 ## Decisions
 
 | Date | Topic | Decision |
 |---|---|---|
+| 2026-11-21 | Resumable run workflow | A run's execution is structured as a resumable workflow whose state is saved after each call to Run. The caller calls Run repeatedly until the workflow reports done, saving state atomically after each call. Run is idempotent, making crash recovery safe without replaying an event log. The controller-runtime reconciler drives the workflow without sleep loops, using watches and requeue backstops. HeroRun remains a thin summary. |
 | 2026-11-17 | Web UI authentication | Users sign in with GitHub through the OAuth authorization-code flow; `ao` keeps a signed session cookie (named `session_id`, always setting `Secure`) and stores no GitHub token; an allowlist of GitHub logins decides who may sign in; the gRPC session API on the `--listen` port is not covered and must stay on a trusted network. |
 | 2026-11-09 | Sandbox lifetime | A run's Sandbox gets one shutdownTime at creation (the run deadline plus a grace period), and nothing extends it afterwards. The orchestrator deletes the Sandbox when the run ends. |
 | 2026-10-23 | Sandbox transport | The control plane drives sandboxes through agent-sandbox's `sandboxd`. sandboxd serves a gRPC `ProcessService` on port 9090 and a REST filesystem API on port 8080. We write no custom in-sandbox server and we do not use `pods/exec`. We also maintain agent-sandbox, so we fix the gaps we find upstream instead of working around them. |
@@ -554,6 +559,404 @@ To implement `HeroRun`, we will:
 4. Replace `sandboxSource` with standard `For` and `Owns` watches (done).
 5. Keep session transcripts, tool outputs, and events in the state directory.
 
+### Workflow abstraction
+
+The run orchestrator is a controller-runtime reconciler, but a run's state
+lives in the state directory, not in the Kubernetes API. Each part of a run
+carries its own bookkeeping by hand. Fields such as `ReadyDeadline` and
+`PortalBoundAt`, requeue intervals, event writes, and in-memory maps are
+interleaved with the work in `pkg/run/orchestrator.go`. The code is neither a
+Kubernetes controller that stores its state in a resource, nor a workflow that
+owns its own state.
+
+A small workflow abstraction separates the execution of a run from its
+bookkeeping:
+- A workflow is an object with state that can be persisted.
+- The caller calls `Run` on it repeatedly until the workflow is done. Each call
+  does some of the work and updates the state.
+- The caller saves the state after each call to `Run`.
+- After a crash, the caller loads the saved state and calls `Run` again. `Run`
+  is therefore idempotent: calling it again from the same saved state is safe,
+  even when the last call had side effects that were not saved.
+- There is no log of step records to replay. The saved state is the record.
+- The event log in `events.jsonl` and the `HeroRun` custom resource follow from
+  the saved state. Neither is the source of truth.
+
+The design follows six rules:
+1. **State is files, with one writer per file.** No database and no index file.
+2. **Fix resumption after a crash at any point.** Do not add graceful-shutdown
+   handling.
+3. **Standard library first.** Do not adopt an external workflow library.
+4. **The saved state never holds a credential.**
+5. **Saving overwrites the state file by default.** An option keeps the previous
+   state before each overwrite, as a copy named with a timestamp, for example
+   `run.json.<timestamp>`, so that a person can look at the full state over
+   time.
+6. **Run should return quickly.** The design does not enforce a time limit. For
+   a long-running operation, `Run` records the operation's ID in the state and
+   returns. A later call to `Run` looks the operation up by that ID. `Run` does
+   not poll the operation in-process.
+
+#### Workflow runner interface
+
+There is only one kind of workflow in auto-optimizer: the run workflow. Rather
+than defining a premature generic interface, `RunWorkflow` is the concrete
+runner that drives a run as a resumable state machine:
+
+```go
+// Result instructs the caller how and when to invoke Run again.
+type Result struct {
+	// Done is true when the workflow has reached a terminal state.
+	Done bool
+
+	// Requeue indicates that the caller should invoke Run again immediately.
+	Requeue bool
+
+	// RequeueAfter indicates that the caller should invoke Run again after
+	// the given duration has elapsed, or sooner when an external watch fires.
+	RequeueAfter time.Duration
+}
+
+// RunWorkflow executes a run as a resumable state machine.
+type RunWorkflow struct {
+	run *state.Run
+	// ... dependencies: harness, store, forge, clock
+}
+
+// Run executes one unit of work and updates the workflow state.
+// Run is idempotent: calling it again from the same saved state is safe.
+func (w *RunWorkflow) Run(ctx context.Context) (Result, error)
+
+// State returns the current run state for persistence.
+func (w *RunWorkflow) State() *state.Run
+```
+
+The caller drives the workflow by calling `Run` in a reconciliation loop:
+- **"Done":** `Run` returns `Result{Done: true}, nil` when the run enters a
+  terminal phase, such as `Succeeded`, `Failed`, or `NoImprovement`. The caller
+  saves the final state to disk and halts execution.
+- **"Call me again":** `Run` returns `Result{Requeue: true}, nil` when a unit
+  of work finishes and more work is ready immediately. The caller saves the
+  updated state to disk and invokes `Run` again.
+- **"Call me again when something external changes":** `Run` returns
+  `Result{RequeueAfter: rem}, nil` when execution is waiting on an external
+  condition, such as a Sandbox pod becoming ready. The caller saves state and
+  yields the worker thread. An informer watching Sandbox resources enqueues the
+  run immediately when conditions change, while `rem` provides a safety
+  backstop.
+- **Error:** When an infrastructure error occurs, `Run` returns
+  `Result{}, err`. The caller saves the state, logs the error, and retries with
+  backoff.
+
+The workflow provides functions to save and load state:
+
+```go
+// SaveOptions configures state persistence.
+type SaveOptions struct {
+	// KeepHistory preserves the previous state file as run.json.<timestamp>
+	// before each overwrite.
+	KeepHistory bool
+}
+
+// SaveState atomically writes the workflow state to run.json.
+func SaveState(path string, run *state.Run, opts SaveOptions) error
+
+// LoadState loads the persisted workflow state from run.json.
+func LoadState(path string) (*state.Run, error)
+```
+
+#### Run workflow state
+
+The existing `state.Run` type is the single authoritative state representation
+for a run, serialized directly to `run.json`. Existing consumers, including the
+server-rendered web UI, the scheduler, and the `HeroRun` publisher, continue
+reading `state.Run` from disk without modification:
+
+```go
+// Run represents the persisted workflow state in run.json.
+type Run struct {
+	ID         string        `json:"id"`
+	Repo       RepoKey       `json:"repo"`
+	GoalName   string        `json:"goalName"`
+	Goal       *goals.Goal   `json:"goal,omitempty"`
+	BaseCommit string        `json:"baseCommit,omitempty"`
+	Deadline   *time.Time    `json:"deadline,omitempty"`
+
+	Phase           RunPhase               `json:"phase"`
+	PhaseTimestamps map[RunPhase]time.Time `json:"phaseTimestamps,omitempty"`
+
+	WorkspaceClaimName string `json:"workspaceClaimName,omitempty"`
+	SandboxName        string `json:"sandboxName,omitempty"`
+	SessionID          string `json:"sessionId,omitempty"`
+
+	// ActiveOperation records the identifier of an active long-running operation.
+	ActiveOperation string `json:"activeOperation,omitempty"`
+
+	TurnCount int     `json:"turnCount,omitempty"`
+	CostUSD   float64 `json:"costUSD,omitempty"`
+
+	CandidateCommit string   `json:"candidateCommit,omitempty"`
+	Candidate       *float64 `json:"candidate,omitempty"`
+	Baseline        *float64 `json:"baseline,omitempty"`
+
+	Branch  string `json:"branch,omitempty"`
+	PRTitle string `json:"prTitle,omitempty"`
+	PRBody  string `json:"prBody,omitempty"`
+	PRURL   string `json:"prURL,omitempty"`
+
+	Summary string `json:"summary,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+```
+
+The phases and fields of a run on main map directly onto `state.Run`:
+- Phase `Pending`:
+  `Run` ensures the workspace persistent volume claim exists, storing its name
+  in `WorkspaceClaimName`. When complete, `Run` sets `Phase` to `Preparing` and
+  returns `Result{Requeue: true}`.
+- Phase `Preparing`:
+  `prepareSandbox` takes a context and a Sandbox, returns an error, and does no
+  run bookkeeping. It binds the portal egress policy, ensures the repository
+  clone is present at the base commit or reuses the workspace volume, and sets
+  git identity. If an upfront sandbox exists, `Run` waits for readiness,
+  returning `RequeueAfter` when unready, and executes `prepareSandbox`. When
+  complete, `Phase` advances to `Working`.
+- Phase `Working`:
+  `Run` drives the agent session. The session obtains and prepares its Sandbox
+  on demand. For long-running turns, `Run` records the turn operation ID in
+  `ActiveOperation` and returns promptly. When a turn completes, `Run` updates
+  `TurnCount` and `CostUSD`, clearing `ActiveOperation`. If the session requests
+  a pull request, `Run` records `PRTitle` and `PRBody` and advances `Phase` to
+  `Selecting`. If the session finishes without a pull request, `Phase` advances
+  to `NoImprovement`.
+- Phase `Selecting`:
+  `Run` executes candidate verification tests, exports candidate commits into a
+  packfile, recording `CandidateCommit`, and pushes the branch to the remote
+  forge, recording `Branch`. If the sandbox pod was lost, a replacement sandbox
+  is prepared on demand. When push succeeds, `Phase` advances to `OpeningPR`.
+- Phase `OpeningPR`:
+  `Run` queries the forge for an existing pull request on `Branch` or opens a
+  new pull request, recording `PRURL`. `Phase` advances to `Succeeded`.
+
+Several fields and in-memory maps on main are eliminated by this abstraction:
+- `ReadyDeadline` is removed from `state.Run`. Readiness timeouts are evaluated
+  directly against the run deadline or caller context rather than tracked in
+  persistent state.
+- `PortalBoundAt` is removed from `state.Run`. Because `prepareSandbox` binds
+  portal egress policy idempotently whenever a sandbox is created, recording a
+  binding timestamp in run state is unnecessary.
+- The `turnOutcomes` map on `Orchestrator` is removed. Turn outcomes are
+  recorded directly into `state.Run` upon turn completion.
+- The `activeRuns` and `workerCancels` maps on `Orchestrator` are reduced to an
+  in-memory execution cache. The persisted `ActiveOperation` in `run.json` is
+  the authoritative record of work in flight, and an orchestrator restart
+  rebuilds in-memory execution handles directly from that operation ID.
+
+#### State persistence and crash resilience
+
+The workflow state is saved to `repos/<host>/<owner>/<name>/runs/<run-id>/run.json`.
+The saved state never contains credentials or secrets; all authentication tokens
+remain in memory or are injected by the portal sidecar.
+
+Saving overwrites `run.json` by default. When the history option is enabled,
+the caller copies the existing `run.json` to `run.json.<timestamp>` before
+overwriting it. These timestamped copies provide an immutable record of full
+state snapshots over time. Old copies are not removed automatically during the
+run; they are retained for auditing and debugging until the run directory itself
+is deleted during repository retention or garbage collection.
+
+To survive a crash part-way through a write, `SaveState` uses an atomic write
+pattern:
+1. The caller encodes `state.Run` to JSON formatting.
+2. The caller writes the bytes to a temporary file in the same directory, named
+   `run.json.tmp.<pid>`. Writing to the same directory ensures the temporary
+   file is created on the same filesystem and mount point as the destination.
+3. The caller flushes and syncs the file descriptor using `Sync()` to force
+   pending writes to persistent storage.
+4. The caller closes the temporary file.
+5. If the history option is enabled and `run.json` already exists, the caller
+   copies the existing file to `run.json.<RFC3339-timestamp>`.
+6. The caller replaces the target file using `os.Rename`.
+
+In production, the state directory is an ObjectFS volume provided by
+`gke-labs/in-cluster-storage`. While POSIX defines `rename(2)` within the same
+filesystem as atomic, whether ObjectFS guarantees atomicity across storage
+nodes is marked as something to verify against the `in-cluster-storage`
+specification. If `os.Rename` on ObjectFS is not atomic, a temporary file with a
+write-intent marker or distributed lock will be used.
+
+#### Worked example: crash between side effect and save
+
+Consider pushing candidate commits to a remote branch in phase `Selecting`:
+
+1. **State before call:**
+   `run.json` on disk contains `Phase: "Selecting"`, `Branch: "ao/sort-benchmark/run-1"`,
+   and candidate commit `d3b0738a9`.
+2. **Caller calls `Run`:**
+   The caller reads `run.json` and invokes `Run(ctx)`.
+3. **Side effect occurs:**
+   The workflow executes `forge.PushPackfile`. The push succeeds over HTTPS to
+   GitHub, updating `refs/heads/ao/sort-benchmark/run-1` on the remote
+   repository to commit `d3b0738a9`.
+4. **State mutated in memory:**
+   The workflow updates its internal state, setting `Phase: "OpeningPR"`, and
+   prepares to return `Result{Requeue: true}`.
+5. **The crash:**
+   Before the caller can call `SaveState` to write `run.json`, the pod receives
+   `SIGKILL`. On disk, `run.json` still records `Phase: "Selecting"`.
+6. **Resumption:**
+   The control plane restarts. The caller loads `run.json`, which still reflects
+   `Phase: "Selecting"`.
+7. **Next call to `Run`:**
+   The caller invokes `Run(ctx)` again from the loaded state.
+8. **Why `Run` is safe:**
+   `Run` enters the `Selecting` handler and calls `forge.PushPackfile` with the
+   same branch and commit tip. The remote forge advertises that the remote ref
+   is already at `d3b0738a9`. Git recognises that the push is up to date and
+   returns success immediately without error or duplicate side effects.
+9. **State saved:**
+   `Run` sets `Phase: "OpeningPR"` and returns `Result{Requeue: true}`. The
+   caller atomically saves `run.json` to disk.
+10. Execution advances to `OpeningPR`.
+
+#### Handling long-running work
+
+`Run` returns quickly without blocking on long operations or polling in-process:
+
+1. **Operation ID tracking:**
+   For a long-running operation, such as an agent session turn in phase
+   `Working`, `Run` does not block for the duration of the turn. Instead, `Run`
+   initiates the turn, records the operation ID in `state.Run.ActiveOperation`
+   (for example, `session-1:turn-3`), and returns immediately with
+   `Result{RequeueAfter: pollBackstop}`.
+2. **Where the operation runs:**
+   The session turn executes in a background worker goroutine managed by the
+   session harness in the control plane. It calls the model and executes tool
+   calls against the sandbox asynchronously.
+3. **Subsequent calls to `Run`:**
+   When the reconciler calls `Run` again (woken by `Orchestrator.Notify` when
+   the turn worker signals completion, or by `RequeueAfter` as a backstop),
+   `Run` looks up the operation by its ID:
+   - If the turn is still running in the background, `Run` returns
+     `Result{RequeueAfter: pollBackstop}` without polling in-process.
+   - If the turn has finished, `Run` collects the outcome from the worker,
+     updates `TurnCount` and `CostUSD`, clears `ActiveOperation`, and returns
+     `Result{Requeue: true}` to continue to the next step.
+4. **Resumption when the control plane restarts:**
+   If the control plane crashes while a turn is running, the background
+   goroutine terminates, but `ActiveOperation` remains in `run.json`. When the
+   system restarts, the next call to `Run` inspects `ActiveOperation` and
+   consults the session transcript in `messages.jsonl`:
+   - If `messages.jsonl` contains the completed turn (the assistant message and
+     tool results were persisted before the crash), `Run` reconstructs the
+     outcome, updates `state.Run`, clears `ActiveOperation`, and advances.
+   - If `messages.jsonl` shows the turn was interrupted mid-flight, `Run`
+     detects that the worker is dead. Because completed turns are preserved in
+     `messages.jsonl`, `Run` clears the stale operation ID and launches a fresh
+     turn worker to resume from the last completed turn.
+5. **In-memory state as an ephemeral cache:**
+   Any in-memory worker handles or cancellation functions are strictly an
+   execution cache. After a restart, the control plane reconstructs its worker
+   tracking directly from the persisted `ActiveOperation` ID.
+
+#### Event log and HeroRun status
+
+Neither `events.jsonl` nor `HeroRun` is the source of truth for a run. Both
+follow strictly from `state.Run`:
+
+- **Event log (`events.jsonl`):**
+  The event log is an append-only audit trail for user visibility and UI
+  rendering. The caller compares `state.Run` before and after each call to
+  `Run`:
+  - When `run.Phase != prevPhase`, the caller detects the transition and appends
+    a phase change event to `events.jsonl`.
+  - When `run.Candidate != nil` and `prevCandidate == nil`, the caller appends a
+    measurement event.
+  - When `run.Error != ""` and `prevError == ""`, the caller appends an error
+    event.
+  During `Working`, tool-call and message events are appended directly by the
+  background turn worker as they execute via `orchestratorTurnEvents`. The
+  workflow never reads from `events.jsonl` to determine what to execute next.
+- **HeroRun status:**
+  The `HeroRun` custom resource provides a thin summary in the Kubernetes API.
+  The caller updates `HeroRun.Status` in accordance with the two-tier reporting
+  policy defined in [Runs as custom resources: the HeroRun decision](#runs-as-custom-resources-the-herorun-decision).
+  Progress tier fields are coalesced at bounded intervals, while terminal
+  phase transitions are written synchronously before the workflow halts. The
+  workflow never reads state from `HeroRun`.
+
+#### Why workflow state is not stored in HeroRun
+
+Storing workflow state in the `HeroRun` custom resource was considered and
+rejected in favor of `run.json` in the state directory:
+
+1. **Storage philosophy: state is files:** Project architecture mandates that
+   the state directory on cluster storage is the authoritative source of truth,
+   with one writer per file and no database. Moving workflow state into `HeroRun`
+   turns the Kubernetes API server and etcd into a transactional database.
+2. **etcd write churn and write amplification:** Saving state after every call to
+   `Run` or every session turn generates high write volume to etcd, triggering
+   frequent Raft consensus rounds and optimistic locking conflicts under
+   concurrent runs. Local atomic file writes to `run.json` are unmetered,
+   low-latency, and conflict-free.
+3. **etcd size limits:** Kubernetes objects are capped at 1.5 megabytes in etcd.
+   Pull request descriptions, goal specifications, commit metadata, and error
+   traces can exceed this limit. Files on cluster storage have no such size
+   constraints.
+4. **Offline inspectability and UI decoupling:** State files can be inspected,
+   copied, and debugged offline with standard tools without requiring a
+   Kubernetes API client or active cluster credentials. The server-rendered web
+   UI reads directly from `run.json` on disk, avoiding cache synchronization
+   loops.
+5. **Role of HeroRun:** `HeroRun` exists to provide an ownership root for
+   Kubernetes garbage collection and high-level cluster visibility. It is a
+   summary projection, not an execution state store.
+
+#### Migration roadmap
+
+The orchestrator moves to the resumable workflow abstraction through an ordered
+sequence of small PRs of approximately 200 non-test lines each, where each PR
+moves one phase of the live reconciler onto `Run` so that main uses what each PR
+adds:
+
+1. **PR 1: Workflow runner skeleton and state persistence (about 180 lines, zero behavior change)**
+   Introduces `RunWorkflow`, `Result`, atomic state saving with the history copy
+   option, and the `ActiveOperation` field on `state.Run`. Tested in `pkg/run`
+   with unit tests. Changes no existing orchestrator behavior.
+2. **PR 2: Live adoption of Phase Pending (about 190 lines)**
+   Implements workspace claim creation in `RunWorkflow.Run` for `PhasePending`.
+   The live reconciler in `orchestrator.go` delegates `Pending` reconciliation
+   directly to `RunWorkflow.Run` and saves `run.json` after the call. Main uses
+   `Run` for all pending runs.
+3. **PR 3: Live adoption of Phase Preparing (about 200 lines)**
+   Implements sandbox readiness check with `RequeueAfter` and `prepareSandbox`
+   invocation in `RunWorkflow.Run` for `PhasePreparing`. The live reconciler
+   delegates `Preparing` reconciliation to `RunWorkflow.Run`. Main uses `Run`
+   for all preparing runs.
+4. **PR 4: Live adoption of Phase Working (about 210 lines)**
+   Implements turn worker launching, `ActiveOperation` tracking, quick return
+   without in-process polling, and turn completion collection in
+   `RunWorkflow.Run` for `PhaseWorking`. The live reconciler delegates `Working`
+   reconciliation to `RunWorkflow.Run`. Main runs session turns through `Run`.
+5. **PR 5: Live adoption of Phase Selecting (about 200 lines)**
+   Implements candidate verification, commit export, and branch pushing in
+   `RunWorkflow.Run` for `PhaseSelecting`, using on-demand sandbox provisioning.
+   The live reconciler delegates `Selecting` reconciliation to `RunWorkflow.Run`.
+   Main runs selection through `Run`.
+6. **PR 6: Live adoption of Phase OpeningPR and terminal transitions (about 190 lines)**
+   Implements pull request discovery or creation in `RunWorkflow.Run` for
+   `PhaseOpeningPR`, alongside terminal phase transitions with synchronous
+   `HeroRun` status updates. The live reconciler delegates `OpeningPR` to
+   `RunWorkflow.Run`.
+7. **PR 7: Live reconciler unification (about 170 lines)**
+   Simplifies the reconciler's top-level `Reconcile` method into a single
+   invocation of `RunWorkflow.Run`, followed by state save and event logging,
+   removing the individual phase delegation methods.
+8. **PR 8: Obsolete field and in-memory map cleanup (about 150 lines)**
+   Removes `ReadyDeadline`, `PortalBoundAt`, and the obsolete in-memory maps
+   (`turnOutcomes`, `activeRuns`, `workerCancels`) from `Orchestrator` and
+   `state.Run`.
+
 ## State
 
 Every record is a file under the state directory. The `--state-dir` flag
@@ -575,8 +978,9 @@ forge/forge.db                                                 rebuildable cache
 ```
 
 Run IDs sort by time, for example `20261023T120000Z-ab12`. Each file has
-exactly one writer. The session manager owns its run directory. The syncer
-owns `repo.json` and `goal.json`.
+exactly one writer. The workflow runner is the sole writer to `run.json` and
+appends to `events.jsonl`. The session manager owns the session
+subdirectories. The syncer owns `repo.json` and `goal.json`.
 
 ## Security model
 
