@@ -379,6 +379,16 @@ func isConflict(err error) bool {
 }
 
 func (s *Server) handlePostRun(w http.ResponseWriter, r *http.Request, runID string) {
+	var form struct{}
+	if err := s.parseForm(r, &form); err != nil {
+		if errors.Is(err, ErrBadToken) {
+			http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	if s.stateStore == nil {
 		s.render404(w, r, "Run not found")
 		return
@@ -465,13 +475,21 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, name s
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid form data: "+err.Error(), http.StatusBadRequest)
+	var form struct {
+		Name    string `form:"name"`
+		Toolset string `form:"toolset"`
+	}
+	if err := s.parseForm(r, &form); err != nil {
+		if errors.Is(err, ErrBadToken) {
+			http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	name := strings.TrimSpace(r.FormValue("name"))
-	toolset := strings.TrimSpace(r.FormValue("toolset"))
+	name := form.Name
+	toolset := form.Toolset
 	if toolset == "" {
 		toolset = "basic"
 	}
@@ -490,12 +508,19 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, name string) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid form data: "+err.Error(), http.StatusBadRequest)
+	var form struct {
+		Text string `form:"text"`
+	}
+	if err := s.parseForm(r, &form); err != nil {
+		if errors.Is(err, ErrBadToken) {
+			http.Error(w, "Forbidden: CSRF token missing or invalid", http.StatusForbidden)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	text := strings.TrimSpace(r.FormValue("text"))
+	text := form.Text
 	if text == "" {
 		http.Error(w, "message text is required", http.StatusBadRequest)
 		return
