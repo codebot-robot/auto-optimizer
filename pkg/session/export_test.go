@@ -104,6 +104,12 @@ func (s *scriptedProcessServer) WriteStdin(_ context.Context, req *processv1.Wri
 	return &processv1.WriteStdinResponse{}, nil
 }
 
+func (s *scriptedProcessServer) CapturedStdin() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return string(s.capturedStdin)
+}
+
 func setupScriptedSandbox(t *testing.T, srv *scriptedProcessServer) (*Sandbox, func()) {
 	t.Helper()
 	lis := bufconn.Listen(1024 * 1024)
@@ -253,8 +259,8 @@ func TestExportCommits(t *testing.T) {
 					t.Errorf("temp packfile exists despite error")
 				}
 			}
-			if tc.checkStdin != "" && string(srv.capturedStdin) != tc.checkStdin {
-				t.Errorf("stdin = %q, want %q", srv.capturedStdin, tc.checkStdin)
+			if tc.checkStdin != "" && srv.CapturedStdin() != tc.checkStdin {
+				t.Errorf("stdin = %q, want %q", srv.CapturedStdin(), tc.checkStdin)
 			}
 		})
 	}
