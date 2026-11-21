@@ -1759,6 +1759,54 @@ type TurnEvents interface {
 	MessageAppended(ctx context.Context, msg llm.Message)
 }
 
+// TurnBudget coordinates turn limits across one or more sessions.
+type TurnBudget struct {
+	mu       sync.Mutex
+	maxTurns int
+	used     int
+}
+
+// NewTurnBudget creates a new TurnBudget with the given maximum turns limit.
+// A limit <= 0 means unlimited turns.
+func NewTurnBudget(maxTurns int) *TurnBudget {
+	return &TurnBudget{maxTurns: maxTurns}
+}
+
+// Take attempts to consume one turn from the budget.
+// It returns true if the turn is allowed, or false if the budget is exhausted.
+func (b *TurnBudget) Take() bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.maxTurns > 0 && b.used >= b.maxTurns {
+		return false
+	}
+	b.used++
+	return true
+}
+
+// MaxTurns returns the maximum turns limit configured for this budget.
+func (b *TurnBudget) MaxTurns() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.maxTurns
+}
+
+// Used returns the number of turns consumed from the budget so far.
+func (b *TurnBudget) Used() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.used
+}
+
 // Harness wires the LLM, the tool registry, and the sandbox client together
 // into an agentic loop.
 type Harness struct {
@@ -1773,6 +1821,9 @@ type Harness struct {
 
 	// opts contains the options for the run command.
 	opts RunOptions
+
+	// turnBudget bounds LLM turns across sessions sharing this budget.
+	turnBudget *TurnBudget
 
 	// sandboxOverride allows substituting a custom tools.Sandbox implementation
 	// (e.g. for testing without a Kubernetes cluster).
@@ -1802,7 +1853,23 @@ func (h *Harness) RunOptions() RunOptions {
 func (h *Harness) WithMaxTurns(maxTurns int) *Harness {
 	c := *h
 	c.opts.MaxTurns = maxTurns
+	c.turnBudget = nil
 	return &c
+}
+
+// WithTurnBudget returns a shallow copy of the harness with the given turn budget.
+func (h *Harness) WithTurnBudget(budget *TurnBudget) *Harness {
+	c := *h
+	c.turnBudget = budget
+	if budget != nil {
+		c.opts.MaxTurns = budget.MaxTurns()
+	}
+	return &c
+}
+
+// TurnBudget returns the turn budget configured on the harness, or nil.
+func (h *Harness) TurnBudget() *TurnBudget {
+	return h.turnBudget
 }
 
 // WithExtraTools returns a shallow copy of the harness with the given run-scoped
@@ -2049,13 +2116,16 @@ func (h *Harness) runLoop(ctx context.Context, session *Session, events TurnEven
 		}
 	}
 
-	turnCount := 0
+	budget := h.turnBudget
+	if budget == nil {
+		budget = NewTurnBudget(h.opts.MaxTurns)
+	}
+
 	for {
-		if h.opts.MaxTurns > 0 && turnCount >= h.opts.MaxTurns {
-			log.Info("maximum turns reached", "maxTurns", h.opts.MaxTurns)
+		if !budget.Take() {
+			log.Info("maximum turns reached", "maxTurns", budget.MaxTurns())
 			return ErrMaxTurns
 		}
-		turnCount++
 
 		req := llm.ChatCompletionRequest{
 			Model:    h.opts.ModelName,

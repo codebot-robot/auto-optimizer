@@ -1399,6 +1399,177 @@ func TestOrchestrator_Working_MaxTurns(t *testing.T) {
 	}
 }
 
+type multiCallLLM struct {
+	mu            sync.Mutex
+	callCount     int
+	textResponses int
+}
+
+func (l *multiCallLLM) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.callCount++
+	callIdx := l.callCount
+
+	if l.textResponses > 0 && callIdx <= l.textResponses {
+		text := fmt.Sprintf("text reply %d", callIdx)
+		return &llm.ChatCompletionResponse{
+			ID: fmt.Sprintf("resp-%d", callIdx),
+			Choices: []llm.Choice{
+				{
+					Message: llm.Message{
+						Role:    "assistant",
+						Content: &text,
+					},
+					FinishReason: "stop",
+				},
+			},
+		}, nil
+	}
+
+	args, _ := json.Marshal(map[string]string{"command": "echo loop"})
+	return &llm.ChatCompletionResponse{
+		ID: "looping-llm",
+		Choices: []llm.Choice{
+			{
+				Message: llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{
+						{
+							ID:   fmt.Sprintf("loop-%d", callIdx),
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "run_command",
+								Arguments: string(args),
+							},
+						},
+					},
+				},
+				FinishReason: "tool_calls",
+			},
+		},
+	}, nil
+}
+
+func TestOrchestrator_Working_SharedTurnBudget(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-sharedbudget"
+	sandboxName := "run-20261030t120000z-sharedbudget"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "shared-goal",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha",
+		SandboxName: sandboxName,
+		SessionID:   "session1",
+		Goal: &goals.Goal{
+			Name: "shared-goal",
+			Body: "optimize",
+		},
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &mockProcessServer{
+		exitCode: 0,
+		stdout:   "ok\n",
+	}
+
+	// LLM: call 1 finishes with text; subsequent calls return tool calls (looping).
+	mockLLM := &multiCallLLM{
+		textResponses: 1,
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, mockLLM)
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   &metav1.Time{Time: time.Now().Add(5 * time.Minute)},
+				ShutdownPolicy: &policy,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     3,
+	})
+
+	// 1. Session 1 runs turn worker: uses 1 turn and finishes normally.
+	outcome1 := orch.runTurnWorker(ctx, repo, run)
+	if outcome1.Err != nil {
+		t.Fatalf("session 1 turnErr: %v", outcome1.Err)
+	}
+
+	// 2. Session 2 for the same run runs turn worker: uses remaining 2 turns and hits max turns.
+	run.SessionID = "session2"
+	outcome2 := orch.runTurnWorker(ctx, repo, run)
+	if !errors.Is(outcome2.Err, session.ErrMaxTurns) {
+		t.Fatalf("session 2 expected ErrMaxTurns, got %v", outcome2.Err)
+	}
+
+	// 3. Verify total LLM calls stopped at exactly MaxTurns (3)
+	mockLLM.mu.Lock()
+	calls := mockLLM.callCount
+	mockLLM.mu.Unlock()
+	if calls != 3 {
+		t.Errorf("expected 3 total LLM calls across sessions, got %d", calls)
+	}
+
+	// 4. Session 2's next turn also immediately ends with ErrMaxTurns without additional LLM calls
+	outcome3 := orch.runTurnWorker(ctx, repo, run)
+	if !errors.Is(outcome3.Err, session.ErrMaxTurns) {
+		t.Fatalf("session 2 next turn expected ErrMaxTurns, got %v", outcome3.Err)
+	}
+
+	// 5. Append a new user message to session 1; its next turn also immediately ends with ErrMaxTurns
+	nextPrompt := "continue session 1"
+	if err := sessionStore.AppendMessages(ctx, "session1", llm.Message{Role: "user", Content: &nextPrompt}); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	run.SessionID = "session1"
+	outcome4 := orch.runTurnWorker(ctx, repo, run)
+	if !errors.Is(outcome4.Err, session.ErrMaxTurns) {
+		t.Fatalf("session 1 next turn expected ErrMaxTurns, got %v", outcome4.Err)
+	}
+
+	mockLLM.mu.Lock()
+	callsAfter := mockLLM.callCount
+	mockLLM.mu.Unlock()
+	if callsAfter != 3 {
+		t.Errorf("expected no additional LLM calls when budget is spent, got %d", callsAfter)
+	}
+}
+
 func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 	ctx := t.Context()
 	storeDir := t.TempDir()
