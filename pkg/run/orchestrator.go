@@ -1641,6 +1641,8 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	if err != nil {
 		if errors.Is(err, session.ErrNotFound) {
 			sess, err = o.harness.NewSession(ctx, o.sessionStore, sessionID, session.Metadata{
+				Repo:      repo.Key().String(),
+				RunID:     run.ID,
 				CreatedAt: o.clock().UTC(),
 			})
 			if err != nil {

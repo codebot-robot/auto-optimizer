@@ -1195,9 +1195,12 @@ func TestOrchestrator_Working_StartsSession_ModelStops_NoImprovement(t *testing.
 	}
 
 	// 4. Verify session transcript in sessionStore contains the goal prompt, tool call, and tool result
-	msgs, _, err := sessionStore.LoadSession(ctx, gotRun.SessionID)
+	msgs, meta, err := sessionStore.LoadSession(ctx, gotRun.SessionID)
 	if err != nil {
 		t.Fatalf("LoadSession: %v", err)
+	}
+	if meta == nil || meta.Repo != repo.Key().String() || meta.RunID != gotRun.ID {
+		t.Errorf("session metadata = %+v, want Repo %q and RunID %q", meta, repo.Key().String(), gotRun.ID)
 	}
 	if len(msgs) == 0 {
 		t.Fatal("expected session messages, got 0")

@@ -48,6 +48,12 @@ type Metadata struct {
 	// recorded against.
 	Toolset string `json:"toolset,omitempty"`
 
+	// Repo is the repository the session belongs to, if it was created for a run.
+	Repo string `json:"repo,omitempty"`
+
+	// RunID is the run ID the session belongs to, if it was created for a run.
+	RunID string `json:"runId,omitempty"`
+
 	// CreatedAt is when the session was created.
 	CreatedAt time.Time `json:"createdAt"`
 }
