@@ -285,6 +285,9 @@ type Orchestrator struct {
 	turnOutcomesMu sync.Mutex
 	turnOutcomes   map[string]turnOutcome
 
+	turnBudgetsMu sync.Mutex
+	turnBudgets   map[string]*session.TurnBudget
+
 	managerCtxMu sync.Mutex
 	managerCtx   context.Context
 }
@@ -363,9 +366,33 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		activeRuns:            make(map[string]bool),
 		workerCancels:         make(map[string]context.CancelFunc),
 		turnOutcomes:          make(map[string]turnOutcome),
+		turnBudgets:           make(map[string]*session.TurnBudget),
 	}
 	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, opts.Clock, opts.HeroRunStatusInterval, opts.Harness.Namespace(), orch.publishHeroRun)
 	return orch, nil
+}
+
+func (o *Orchestrator) turnBudget(runID string) *session.TurnBudget {
+	if o == nil {
+		return nil
+	}
+	o.turnBudgetsMu.Lock()
+	defer o.turnBudgetsMu.Unlock()
+	b, ok := o.turnBudgets[runID]
+	if !ok {
+		b = session.NewTurnBudget(o.maxTurns)
+		o.turnBudgets[runID] = b
+	}
+	return b
+}
+
+func (o *Orchestrator) deleteTurnBudget(runID string) {
+	if o == nil {
+		return
+	}
+	o.turnBudgetsMu.Lock()
+	defer o.turnBudgetsMu.Unlock()
+	delete(o.turnBudgets, runID)
 }
 
 func (o *Orchestrator) recordRunIndex(name string, repo state.RepoKey, runID string) {
@@ -566,6 +593,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 
 	if run.Phase.IsTerminal() {
 		o.deleteRunIndex(req.Name)
+		o.deleteTurnBudget(run.ID)
 		if outcome, ok := o.popTurnOutcome(run.ID); ok {
 			if err := o.handleTurnOutcome(ctx, repo, run, outcome); err != nil {
 				log.V(2).Info("error handling leftover outcome for terminal run", "run", run.ID, "error", err)
@@ -1419,6 +1447,7 @@ func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.
 	}
 	if run != nil && run.Phase.IsTerminal() {
 		o.deleteRunIndex(sandboxNameForRun(run.ID))
+		o.deleteTurnBudget(run.ID)
 	}
 	if o.statusPublisher != nil {
 		var key state.RepoKey
@@ -1753,7 +1782,8 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		Repository: repo.URL,
 		Branch:     run.BranchName(),
 	})
-	harness := o.harness.WithMaxTurns(o.maxTurns).WithExtraTools(finishTool, prTool)
+	budget := o.turnBudget(run.ID)
+	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool)
 
 	var turnErr error
 	if hasUserMessage {
