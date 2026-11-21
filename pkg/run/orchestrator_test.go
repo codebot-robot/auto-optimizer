@@ -8268,6 +8268,14 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		if vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != name || vol.EmptyDir != nil {
 			t.Errorf("expected workspace volume to mount claim %s, got %+v", name, vol)
 		}
+
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.WorkspaceClaimName != name {
+			t.Errorf("expected WorkspaceClaimName %q, got %q", name, gotRun.WorkspaceClaimName)
+		}
 	})
 
 	t.Run("second pass reuses existing claim", func(t *testing.T) {
@@ -8309,6 +8317,14 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		if vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != name {
 			t.Errorf("expected workspace volume to mount claim %s, got %+v", name, vol)
 		}
+
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.WorkspaceClaimName != name {
+			t.Errorf("expected WorkspaceClaimName %q, got %q", name, gotRun.WorkspaceClaimName)
+		}
 	})
 
 	t.Run("with no StorageClass no claim is created and sandbox uses emptyDir", func(t *testing.T) {
@@ -8339,6 +8355,14 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		vol := getWorkspaceVol(t, name)
 		if vol.EmptyDir == nil || vol.PersistentVolumeClaim != nil {
 			t.Errorf("expected emptyDir volume for workspace, got %+v", vol)
+		}
+
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.WorkspaceClaimName != "" {
+			t.Errorf("expected empty WorkspaceClaimName, got %q", gotRun.WorkspaceClaimName)
 		}
 	})
 

@@ -669,28 +669,11 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 
 	log.Info("preparing run: creating sandbox", "repo", repo.URL, "run", run.ID, "sandbox", sandboxName)
 
-	// 3. Publish HeroRun before creating the sandbox so the sandbox can reference it as owner
-	heroRun := o.publishHeroRun(ctx, repo, run)
+	// 3. Build sandbox options (including HeroRun owner reference) and workspace claim if configured
+	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run)
 
-	var ownerRefs []metav1.OwnerReference
-	if heroRun != nil {
-		isController := true
-		ownerRefs = []metav1.OwnerReference{
-			{
-				APIVersion: herorunv1alpha1.GroupVersion.String(),
-				Kind:       "HeroRun",
-				Name:       heroRun.Name,
-				UID:        heroRun.UID,
-				Controller: &isController,
-			},
-		}
-	} else {
-		log.Info("creating unowned sandbox: no HeroRun available", "run", run.ID, "sandbox", sandboxName)
-	}
-
-	var workspaceClaimName string
 	if o.workspaceStorageClass != "" {
-		if heroRun == nil {
+		if len(sbOpts.OwnerReferences) == 0 {
 			msg := "cannot create workspace claim: HeroRun owner is required"
 			run.ReadyDeadline = nil
 			o.finishRun(ctx, repo, run, runEnd{
@@ -701,7 +684,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 			return errors.New(msg)
 		}
 		claimName := sandboxNameForRun(run.ID)
-		if err := o.ensureWorkspaceClaim(ctx, claimName, ownerRefs); err != nil {
+		if err := o.ensureWorkspaceClaim(ctx, claimName, sbOpts.OwnerReferences); err != nil {
 			run.ReadyDeadline = nil
 			msg := fmt.Sprintf("creating workspace claim: %v", err)
 			o.finishRun(ctx, repo, run, runEnd{
@@ -711,26 +694,11 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 			})
 			return errors.New(msg)
 		}
-		workspaceClaimName = claimName
+		run.WorkspaceClaimName = claimName
+		sbOpts.WorkspaceClaimName = claimName
 	}
 
 	// 4. Create sandbox with a label naming the run, annotation naming the repository, owner reference, and shutdown time
-	labels := map[string]string{
-		LabelRun: run.ID,
-	}
-	annotations := map[string]string{
-		AnnotationRepo: repo.Key().String(),
-	}
-	sbShutdown := runDeadline.Add(SandboxShutdownGrace)
-	sbOpts := session.CreateSandboxOptions{
-		Name:               sandboxName,
-		Labels:             labels,
-		Annotations:        annotations,
-		OwnerReferences:    ownerRefs,
-		ShutdownTime:       sbShutdown,
-		WorkspaceClaimName: workspaceClaimName,
-		PortalIntercept:    o.portalBinder != nil,
-	}
 	if _, err := o.harness.CreateSandboxWithOptions(ctx, sbOpts); err != nil {
 		prev := run.Phase
 		failTime := o.clock().UTC()
@@ -776,6 +744,59 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 // sandboxNameForRun returns the canonical name for a run's Sandbox and HeroRun objects.
 func sandboxNameForRun(runID string) string {
 	return fmt.Sprintf("run-%s", strings.ToLower(runID))
+}
+
+// heroRunOwnerReferences constructs an metav1.OwnerReference slice pointing to the HeroRun.
+func heroRunOwnerReferences(heroRun *herorunv1alpha1.HeroRun) []metav1.OwnerReference {
+	if heroRun == nil {
+		return nil
+	}
+	isController := true
+	return []metav1.OwnerReference{
+		{
+			APIVersion: herorunv1alpha1.GroupVersion.String(),
+			Kind:       "HeroRun",
+			Name:       heroRun.Name,
+			UID:        heroRun.UID,
+			Controller: &isController,
+		},
+	}
+}
+
+// buildCreateSandboxOptions builds the session.CreateSandboxOptions for a run,
+// including labels, annotations, HeroRun owner reference, shutdown time, and workspace claim.
+func (o *Orchestrator) buildCreateSandboxOptions(ctx context.Context, repo *state.Repo, run *state.Run) session.CreateSandboxOptions {
+	sandboxName := run.SandboxName
+	if sandboxName == "" {
+		sandboxName = sandboxNameForRun(run.ID)
+	}
+
+	heroRun := o.publishHeroRun(ctx, repo, run)
+	ownerRefs := heroRunOwnerReferences(heroRun)
+	if heroRun == nil {
+		scoped.Log(ctx).Info("creating unowned sandbox: no HeroRun available", "run", run.ID, "sandbox", sandboxName)
+	}
+
+	labels := map[string]string{
+		LabelRun: run.ID,
+	}
+	annotations := map[string]string{
+		AnnotationRepo: repo.Key().String(),
+	}
+	var sbShutdown time.Time
+	if run.Deadline != nil {
+		sbShutdown = run.Deadline.Add(SandboxShutdownGrace)
+	}
+
+	return session.CreateSandboxOptions{
+		Name:               sandboxName,
+		Labels:             labels,
+		Annotations:        annotations,
+		OwnerReferences:    ownerRefs,
+		ShutdownTime:       sbShutdown,
+		WorkspaceClaimName: run.WorkspaceClaimName,
+		PortalIntercept:    o.portalBinder != nil,
+	}
 }
 
 // ensureWorkspaceClaim creates a PersistentVolumeClaim for the run's workspace if it does not already exist.
@@ -919,25 +940,29 @@ func isSandboxFailed(sb *sandboxv1beta1.Sandbox) (string, bool) {
 	return "", false
 }
 
-// reconcilePreparing executes the second step of Preparing: reads the Sandbox,
-// checks failure conditions / deletion / deadline expiration, clones the repository,
-// moves the run to Working, and enqueues it.
-func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
+// waitForSandboxReady checks whether the Sandbox for run is ready.
+// If the Sandbox was deleted, reported a failure condition, or the ready deadline expired,
+// it marks the run failed and returns an error.
+// If the Sandbox is not ready yet and the ready deadline has not passed, it returns a
+// reconcile.Result with RequeueAfter.
+// If the Sandbox is ready, it records the sandbox_ready event, attaches the sandbox handle,
+// sets its pod info, and returns the handle.
+func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo, run *state.Run) (*session.Sandbox, reconcile.Result, error) {
 	log := scoped.Log(ctx)
 	now := o.clock().UTC()
 
 	// 1. Fetch Sandbox resource
 	if o.harness == nil || o.harness.SandboxClient() == nil {
-		return reconcile.Result{}, errors.New("harness sandbox client is nil")
+		return nil, reconcile.Result{}, errors.New("harness sandbox client is nil")
 	}
 
 	sbObj, err := o.harness.SandboxClient().GetSandboxResource(ctx, o.harness.Namespace(), run.SandboxName)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			run.ReadyDeadline = nil
-			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s was deleted before becoming ready", run.SandboxName))
+			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s was deleted before becoming ready", run.SandboxName))
 		}
-		return reconcile.Result{}, fmt.Errorf("getting sandbox %s: %w", run.SandboxName, err)
+		return nil, reconcile.Result{}, fmt.Errorf("getting sandbox %s: %w", run.SandboxName, err)
 	}
 
 	// 2. Check for reported failure on Sandbox
@@ -946,7 +971,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 			log.V(2).Info("error deleting failed sandbox", "sandbox", run.SandboxName, "error", delErr)
 		}
 		run.ReadyDeadline = nil
-		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s failed: %s", run.SandboxName, failMsg))
+		return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s failed: %s", run.SandboxName, failMsg))
 	}
 
 	sb := o.harness.GetOrAttachSandbox(run.SandboxName)
@@ -956,7 +981,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 				log.V(2).Info("error deleting failed sandbox", "sandbox", run.SandboxName, "error", delErr)
 			}
 			run.ReadyDeadline = nil
-			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s pod image pull failed: %v", run.SandboxName, pullErr))
+			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s pod image pull failed: %v", run.SandboxName, pullErr))
 		}
 	}
 
@@ -978,7 +1003,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 				}
 			}
 			run.ReadyDeadline = nil
-			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "sandbox not ready before deadline")
+			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "sandbox not ready before deadline")
 		}
 
 		// Otherwise return RequeueAfter with a slow safety interval capped at the deadline.
@@ -992,13 +1017,13 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 		if requeueAfter <= 0 {
 			requeueAfter = time.Millisecond
 		}
-		return reconcile.Result{RequeueAfter: requeueAfter}, nil
+		return nil, reconcile.Result{RequeueAfter: requeueAfter}, nil
 	}
 
-	// 4. Sandbox is Ready! Attach, bind egress policy if configured, run clone and checkout, move to Working, and return.
+	// 4. Sandbox is Ready! Attach, set pod info, record sandbox_ready event.
 	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 		Time:    o.clock().UTC(),
-		Phase:   state.PhasePreparing,
+		Phase:   run.Phase,
 		Kind:    "sandbox_ready",
 		Message: fmt.Sprintf("Sandbox %s is ready", run.SandboxName),
 		Data:    map[string]any{"sandbox": run.SandboxName},
@@ -1011,7 +1036,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 	}
 	if sb == nil {
 		run.ReadyDeadline = nil
-		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "failed to get sandbox handle")
+		return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "failed to get sandbox handle")
 	}
 
 	podIP := ""
@@ -1019,6 +1044,25 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 		podIP = sbObj.Status.PodIPs[0]
 	}
 	sb.SetPodInfo(sbObj.Name, podIP)
+
+	return sb, reconcile.Result{}, nil
+}
+
+// prepareReadySandbox configures a ready Sandbox for the run: binds the portal egress
+// policy if configured, clones or reuses the repo, and configures the git identity.
+// If portal binding fails before the ready deadline, it returns a reconcile.Result with RequeueAfter.
+// If any command fails or deadline expires, it cleans up and marks the run failed.
+func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox) (reconcile.Result, error) {
+	log := scoped.Log(ctx)
+	now := o.clock().UTC()
+
+	if sb == nil {
+		sb = o.harness.GetOrAttachSandbox(run.SandboxName)
+	}
+	if sb == nil {
+		run.ReadyDeadline = nil
+		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "failed to get sandbox handle")
+	}
 
 	if o.portalBinder != nil && run.PortalBoundAt == nil {
 		policy, err := o.policyFactory(ctx, portal.PolicyRequest{
@@ -1072,7 +1116,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    nowBound,
-			Phase:   state.PhasePreparing,
+			Phase:   run.Phase,
 			Kind:    "portal_bound",
 			Message: fmt.Sprintf("portal egress policy bound for hosts: %s", strings.Join(hosts, ", ")),
 			Data: map[string]any{
@@ -1097,7 +1141,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 		// Record command failure event
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    cmdTime,
-			Phase:   state.PhasePreparing,
+			Phase:   run.Phase,
 			Kind:    "command",
 			Message: errMsg,
 			Error:   errMsg,
@@ -1149,7 +1193,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 	if workspaceReused {
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    checkTime,
-			Phase:   state.PhasePreparing,
+			Phase:   run.Phase,
 			Kind:    "workspace_reused",
 			Message: fmt.Sprintf("Workspace reused in sandbox %s", run.SandboxName),
 			Data:    map[string]any{"sandbox": run.SandboxName},
@@ -1201,7 +1245,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 			// Command succeeded! Record command result event
 			if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 				Time:    cmdTime,
-				Phase:   state.PhasePreparing,
+				Phase:   run.Phase,
 				Kind:    "command",
 				Message: fmt.Sprintf("Executed %s", cmd.desc),
 				Data: map[string]any{
@@ -1232,13 +1276,32 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    o.clock().UTC(),
-			Phase:   state.PhasePreparing,
+			Phase:   run.Phase,
 			Kind:    "git_identity_configured",
 			Message: fmt.Sprintf("git identity configured: %s", o.gitAuthor),
 			Data:    map[string]any{"author": o.gitAuthor},
 		}); err != nil {
 			log.Error(err, "failed to append git_identity_configured event", "run", run.ID)
 		}
+	}
+
+	return reconcile.Result{}, nil
+}
+
+// reconcilePreparing executes the second step of Preparing: reads the Sandbox,
+// checks failure conditions / deletion / deadline expiration, clones the repository,
+// moves the run to Working, and enqueues it.
+func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
+	log := scoped.Log(ctx)
+
+	sb, res, err := o.waitForSandboxReady(ctx, repo, run)
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+
+	res, err = o.prepareReadySandbox(ctx, repo, run, sb)
+	if err != nil || !res.IsZero() {
+		return res, err
 	}
 
 	// Move to Working phase
