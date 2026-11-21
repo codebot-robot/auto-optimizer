@@ -210,45 +210,69 @@ type Session struct {
 	// Note that the sandbox does not always exist (for example, when idle)
 	sandboxID types.NamespacedName
 
-	// activeSandbox is the sandbox currently provisioned for this session,
-	// or nil when no sandbox is running (e.g. before the first tool call).
-	activeSandbox *Sandbox
+	ownerMu      sync.Mutex
+	sandboxOwner *SandboxOwner
+	harness      *Harness
+}
 
-	// sandboxOpts contains options used when creating a sandbox for this session on demand.
-	sandboxOpts *CreateSandboxOptions
+// SetSandboxOwner assigns the shared or owned SandboxOwner to this session.
+func (s *Session) SetSandboxOwner(owner *SandboxOwner) {
+	s.ownerMu.Lock()
+	defer s.ownerMu.Unlock()
+	s.sandboxOwner = owner
+	if owner != nil && owner.harness == nil {
+		owner.harness = s.harness
+	}
+}
 
-	// prepareSandbox prepares a freshly created sandbox before any tool call runs in it
-	// (e.g. binding portal policy, cloning/checking repo, setting git identity).
-	prepareSandbox func(ctx context.Context, sb *Sandbox) error
+// SandboxOwner returns the session's SandboxOwner, creating one if not yet set.
+func (s *Session) SandboxOwner() *SandboxOwner {
+	s.ownerMu.Lock()
+	defer s.ownerMu.Unlock()
+	if s.sandboxOwner == nil {
+		s.sandboxOwner = s.newAloneSandboxOwner()
+	}
+	return s.sandboxOwner
+}
 
-	// extendLifecycle indicates whether ensureSandbox and tool execution should
-	// extend the sandbox shutdown time (used for interactive sessions).
-	// Runs do not extend sandbox shutdown time.
-	extendLifecycle bool
+// newAloneSandboxOwner builds the SandboxOwner for a session that is alone.
+func (s *Session) newAloneSandboxOwner() *SandboxOwner {
+	owner := NewSandboxOwner(s.harness)
+	owner.SetCreateSandboxOptions(CreateSandboxOptions{
+		Name:            s.Name,
+		ExtendLifecycle: true,
+	})
+	owner.SetSandboxRestorer(func(ctx context.Context, sb *Sandbox) error {
+		return s.RestoreFS(ctx, sb)
+	})
+	return owner
+}
+
+// ActiveSandbox returns the current active sandbox, or nil if none is provisioned.
+func (s *Session) ActiveSandbox() *Sandbox {
+	return s.SandboxOwner().ActiveSandbox()
 }
 
 // SetCreateSandboxOptions configures the options used when creating a sandbox on demand.
 func (s *Session) SetCreateSandboxOptions(opts CreateSandboxOptions) {
-	s.sandboxOpts = &opts
-	s.extendLifecycle = opts.ExtendLifecycle
+	s.SandboxOwner().SetCreateSandboxOptions(opts)
 }
 
 // SetSandboxPreparer configures the preparation step executed on a ready sandbox
 // before any tool call runs in it.
 func (s *Session) SetSandboxPreparer(fn func(ctx context.Context, sb *Sandbox) error) {
-	s.prepareSandbox = fn
+	s.SandboxOwner().SetSandboxPreparer(fn)
 }
 
-// hasWorkspaceClaim reports whether the session's sandbox is backed by a workspace claim.
-func (s *Session) hasWorkspaceClaim() bool {
-	return s.sandboxOpts != nil && s.sandboxOpts.WorkspaceClaimName != ""
+// HasWorkspaceClaim reports whether the session's sandbox is backed by a workspace claim.
+func (s *Session) HasWorkspaceClaim() bool {
+	return s.SandboxOwner().HasWorkspaceClaim()
 }
 
 // SetActiveSandbox binds an existing sandbox to the session.
 func (s *Session) SetActiveSandbox(sb *Sandbox) {
-	s.activeSandbox = sb
+	s.SandboxOwner().SetActiveSandbox(sb)
 	if sb != nil {
-		sb.session = s
 		s.sandboxID = sb.NamespacedName()
 	}
 }
@@ -274,10 +298,10 @@ func (s *Session) AddMessages(ctx context.Context, messages ...llm.Message) erro
 
 // Sandbox represents an active sandbox instance.
 type Sandbox struct {
-	client  *SandboxClient
-	session *Session
+	client *SandboxClient
 
-	id types.NamespacedName
+	id  types.NamespacedName
+	uid types.UID
 
 	podName string
 	podIP   string
@@ -446,18 +470,12 @@ func (s *Sandbox) coreClient() corev1client.CoreV1Interface {
 	if s.client != nil {
 		return s.client.coreClient
 	}
-	if s.session != nil && s.session.client != nil {
-		return s.session.client.coreClient
-	}
 	return nil
 }
 
 func (s *Sandbox) agentsClient() agentsclientset.Interface {
 	if s.client != nil {
 		return s.client.agentsClient
-	}
-	if s.session != nil && s.session.client != nil {
-		return s.session.client.agentsClient
 	}
 	return nil
 }
@@ -635,9 +653,6 @@ func (s *Sandbox) startPortForward(ctx context.Context, targetPort int) (int, fu
 	if s.client != nil {
 		coreClient = s.client.coreClient
 		restConfig = s.client.restConfig
-	} else if s.session != nil && s.session.client != nil {
-		coreClient = s.session.client.coreClient
-		restConfig = s.session.client.restConfig
 	}
 	if coreClient == nil || restConfig == nil {
 		return 0, nil, errors.New("kubernetes client is not available for port-forwarding")
@@ -721,8 +736,6 @@ func (s *Sandbox) resolveTarget(ctx context.Context) (string, func(), error) {
 	connMode := ""
 	if s.client != nil {
 		connMode = s.client.connectivity
-	} else if s.session != nil && s.session.client != nil {
-		connMode = s.session.client.connectivity
 	}
 
 	podIP := s.podIP
@@ -787,8 +800,6 @@ func (s *Sandbox) ensureClient(ctx context.Context) error {
 	var client *SandboxClient
 	if s.client != nil {
 		client = s.client
-	} else if s.session != nil {
-		client = s.session.client
 	}
 
 	if client != nil && client.processClientFactory != nil {
@@ -1128,13 +1139,13 @@ func (s *Session) PruneBackups(ctx context.Context, keepCount int) error {
 }
 
 // RestoreFS restores the filesystem in the sandbox from the latest local backup tarball, if one exists.
-func (s *Sandbox) RestoreFS(ctx context.Context) error {
-	if s.session == nil {
+func (s *Session) RestoreFS(ctx context.Context, sb *Sandbox) error {
+	if s == nil || sb == nil {
 		return nil
 	}
 	log := scoped.Log(ctx)
 
-	latestBackup, err := s.session.FindLatestBackup()
+	latestBackup, err := s.FindLatestBackup()
 	if err != nil {
 		return fmt.Errorf("failed to search for latest backup: %w", err)
 	}
@@ -1155,10 +1166,10 @@ func (s *Sandbox) RestoreFS(ctx context.Context) error {
 	}()
 
 	opts := tools.ExecCommandOptions{
-		Command: []string{"tar", "-zxf", "-", "-C", s.session.HomeDir},
+		Command: []string{"tar", "-zxf", "-", "-C", s.HomeDir},
 		Stdin:   f,
 	}
-	res, err := s.ExecCommand(ctx, opts)
+	res, err := sb.ExecCommand(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("failed to execute restore: %w", err)
 	}
@@ -1170,13 +1181,13 @@ func (s *Sandbox) RestoreFS(ctx context.Context) error {
 }
 
 // SnapshotFS archives the filesystem in the sandbox and saves it to a new timestamped backup inside the session's backup directory.
-func (s *Sandbox) SnapshotFS(ctx context.Context) error {
-	if s.session == nil {
+func (s *Session) SnapshotFS(ctx context.Context, sb *Sandbox) error {
+	if s == nil || sb == nil {
 		return nil
 	}
 	log := scoped.Log(ctx)
 
-	dir, err := s.session.getBackupDir()
+	dir, err := s.getBackupDir()
 	if err != nil {
 		return err
 	}
@@ -1206,10 +1217,10 @@ func (s *Sandbox) SnapshotFS(ctx context.Context) error {
 	}()
 
 	opts := tools.ExecCommandOptions{
-		Command: []string{"tar", "-zcf", "-", "-C", s.session.HomeDir, "."},
+		Command: []string{"tar", "-zcf", "-", "-C", s.HomeDir, "."},
 		Stdout:  backupFile,
 	}
-	res, err := s.ExecCommand(ctx, opts)
+	res, err := sb.ExecCommand(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("failed to execute snapshot: %w", err)
 	}
@@ -1230,7 +1241,7 @@ func (s *Sandbox) SnapshotFS(ctx context.Context) error {
 	shouldDeleteTempFile = false
 
 	// Prune backups, keeping only the last 5
-	if err := s.session.PruneBackups(ctx, 5); err != nil {
+	if err := s.PruneBackups(ctx, 5); err != nil {
 		log.Error(err, "failed to prune old backups")
 	}
 
@@ -1267,7 +1278,7 @@ func (h *Harness) CreateSandboxWithOptions(ctx context.Context, opts CreateSandb
 		Namespace: h.opts.Namespace,
 		Name:      opts.Name,
 	}
-	return h.createSandboxResourceWithMetadata(ctx, id, nil, opts)
+	return h.createSandboxResourceWithMetadata(ctx, id, opts)
 }
 
 // StartSandbox creates a Sandbox resource with the specified name and waits for it to become ready.
@@ -1308,18 +1319,18 @@ func (h *Harness) Namespace() string {
 
 func (h *Harness) createSandboxResource(ctx context.Context, id types.NamespacedName, session *Session) (*Sandbox, error) {
 	opts := CreateSandboxOptions{Name: id.Name, ExtendLifecycle: true}
-	if session != nil && session.sandboxOpts != nil {
-		opts = *session.sandboxOpts
+	if session != nil && session.SandboxOwner().sandboxOpts != nil {
+		opts = *session.SandboxOwner().sandboxOpts
 		if opts.Name != "" {
 			id.Name = opts.Name
 		} else {
 			opts.Name = id.Name
 		}
 	}
-	return h.createSandboxResourceWithMetadata(ctx, id, session, opts)
+	return h.createSandboxResourceWithMetadata(ctx, id, opts)
 }
 
-func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id types.NamespacedName, session *Session, opts CreateSandboxOptions) (*Sandbox, error) {
+func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id types.NamespacedName, opts CreateSandboxOptions) (*Sandbox, error) {
 	agentsClient := h.sandboxClient.agentsClient
 	image := h.opts.Image
 	if image == "" {
@@ -1542,8 +1553,10 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 		},
 	}
 
+	var createdSb *sandboxv1beta1.Sandbox
 	for {
-		_, err := agentsClient.AgentsV1beta1().Sandboxes(id.Namespace).Create(ctx, sb, metav1.CreateOptions{})
+		var err error
+		createdSb, err = agentsClient.AgentsV1beta1().Sandboxes(id.Namespace).Create(ctx, sb, metav1.CreateOptions{})
 		if err == nil {
 			break
 		}
@@ -1569,10 +1582,15 @@ func (h *Harness) createSandboxResourceWithMetadata(ctx context.Context, id type
 		}
 	}
 
+	var sbUID types.UID
+	if createdSb != nil {
+		sbUID = createdSb.UID
+	}
+
 	sandbox := &Sandbox{
 		client:                h.sandboxClient,
-		session:               session,
 		id:                    id,
+		uid:                   sbUID,
 		created:               true,
 		signingKey:            h.opts.SigningKey,
 		audience:              audience,
@@ -2012,19 +2030,21 @@ func (h *Harness) NewSession(ctx context.Context, sessionStore Store, sessionNam
 		return nil, fmt.Errorf("creating session: %w", err)
 	}
 
-	return &Session{
-		Name:            sessionName,
-		client:          h.sandboxClient,
-		HomeDir:         h.opts.HomeDir,
-		stateDir:        h.opts.StateDir,
-		sessionStore:    sessionStore,
-		Metadata:        metadata,
-		extendLifecycle: true,
+	sess := &Session{
+		Name:         sessionName,
+		harness:      h,
+		client:       h.sandboxClient,
+		HomeDir:      h.opts.HomeDir,
+		stateDir:     h.opts.StateDir,
+		sessionStore: sessionStore,
+		Metadata:     metadata,
 		sandboxID: types.NamespacedName{
 			Name:      sessionName,
 			Namespace: h.opts.Namespace,
 		},
-	}, nil
+	}
+	sess.SetSandboxOwner(sess.newAloneSandboxOwner())
+	return sess, nil
 }
 
 // LoadSession loads an existing Session named sessionName (its message
@@ -2045,20 +2065,22 @@ func (h *Harness) LoadSession(ctx context.Context, sessionStore Store, sessionNa
 		meta = *metadata
 	}
 
-	return &Session{
-		Name:            sessionName,
-		client:          h.sandboxClient,
-		HomeDir:         h.opts.HomeDir,
-		stateDir:        h.opts.StateDir,
-		sessionStore:    sessionStore,
-		Metadata:        meta,
-		messages:        messages,
-		extendLifecycle: true,
+	sess := &Session{
+		Name:         sessionName,
+		harness:      h,
+		client:       h.sandboxClient,
+		HomeDir:      h.opts.HomeDir,
+		stateDir:     h.opts.StateDir,
+		sessionStore: sessionStore,
+		Metadata:     meta,
+		messages:     messages,
 		sandboxID: types.NamespacedName{
 			Name:      sessionName,
 			Namespace: h.opts.Namespace,
 		},
-	}, nil
+	}
+	sess.SetSandboxOwner(sess.newAloneSandboxOwner())
+	return sess, nil
 }
 
 // EnsureSystemPrompt seeds a new session with the configured system prompt.
@@ -2184,10 +2206,12 @@ func (h *Harness) runLoop(ctx context.Context, session *Session, events TurnEven
 			events.AssistantMessage(ctx, valueOf(assistantMessage.Content))
 
 			// We take a snapshot at these "boundaries", rather than after every tool call
-			if shouldSnapshot && session.activeSandbox != nil && !session.hasWorkspaceClaim() {
-				log.Info("snapshotting filesystem from sandbox...", "sandbox.name", session.activeSandbox.SandboxName())
-				if err := session.activeSandbox.SnapshotFS(ctx); err != nil {
-					log.Error(err, "failed to snapshot filesystem")
+			if shouldSnapshot && !session.HasWorkspaceClaim() {
+				if active := session.ActiveSandbox(); active != nil {
+					log.Info("snapshotting filesystem from sandbox...", "sandbox.name", active.SandboxName())
+					if err := session.SnapshotFS(ctx, active); err != nil {
+						log.Error(err, "failed to snapshot filesystem")
+					}
 				}
 			}
 
@@ -2225,8 +2249,8 @@ func (h *Harness) executeToolCalls(ctx context.Context, session *Session, events
 				callErr = fmt.Errorf("failed to parse arguments: %w", err)
 			} else {
 				var sb tools.Sandbox
-				if session.activeSandbox != nil {
-					sb = session.activeSandbox
+				if active := session.ActiveSandbox(); active != nil {
+					sb = active
 				}
 				toolMsg, callErr = h.callWithSandboxRetry(ctx, session, tc.Function.Name, sb, func(s tools.Sandbox) (llm.Message, error) {
 					return extraTool.Run(ctx, s)
@@ -2252,12 +2276,8 @@ func (h *Harness) executeToolCalls(ctx context.Context, session *Session, events
 
 			// The tool call could take a while, so extend the lifecycle for interactive sessions.
 			// A run's sandbox gets one shutdownTime at creation and is not extended.
-			if session.extendLifecycle {
-				if sb, ok := sandbox.(*Sandbox); ok {
-					if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {
-						log.Error(err, "extending sandbox lifecycle")
-					}
-				}
+			if err := session.SandboxOwner().ExtendLifecycle(ctx); err != nil {
+				log.Error(err, "extending sandbox lifecycle")
 			}
 		}
 
@@ -2307,37 +2327,22 @@ func (h *Harness) executeToolCalls(ctx context.Context, session *Session, events
 func (h *Harness) callWithSandboxRetry(ctx context.Context, session *Session, toolName string, initialSb tools.Sandbox, callFn func(sb tools.Sandbox) (llm.Message, error)) (llm.Message, error) {
 	msg, callErr := callFn(initialSb)
 	if callErr != nil && ctx.Err() == nil {
-		if sb, ok := initialSb.(*Sandbox); ok && isSandboxDead(ctx, sb) {
-			scoped.Log(ctx).Info("sandbox died during tool call; retrying in a new sandbox", "tool", toolName)
-			h.dropDeadSandbox(ctx, session, sb)
-
-			newSb, err := h.ensureSandbox(ctx, session)
+		if sb, ok := initialSb.(*Sandbox); ok {
+			owner := session.SandboxOwner()
+			if owner.harness == nil {
+				owner.harness = h
+			}
+			newSb, replaced, err := owner.ReplaceDead(ctx, sb)
 			if err != nil {
 				return llm.Message{}, err
 			}
-			msg, callErr = callFn(newSb)
+			if replaced {
+				scoped.Log(ctx).Info("sandbox died during tool call; retrying in a new sandbox", "tool", toolName)
+				msg, callErr = callFn(newSb)
+			}
 		}
 	}
 	return msg, callErr
-}
-
-// dropDeadSandbox closes and releases a sandbox that has died or expired.
-func (h *Harness) dropDeadSandbox(ctx context.Context, session *Session, sb *Sandbox) {
-	if sb == nil {
-		session.activeSandbox = nil
-		return
-	}
-	log := scoped.Log(ctx)
-	if err := sb.Close(); err != nil {
-		log.V(2).Info("error closing dead sandbox connection", "error", err)
-	}
-	if h.sandboxClient != nil {
-		if err := h.sandboxClient.DeleteSandboxByName(context.WithoutCancel(ctx), sb.id.Namespace, sb.id.Name); err != nil && !k8serrors.IsNotFound(err) {
-			log.Error(err, "failed to delete dead sandbox", "sandbox", sb.id.Name)
-		}
-		h.sandboxClient.ReleaseSandbox(sb)
-	}
-	session.activeSandbox = nil
 }
 
 // ensureSandbox returns the session's running sandbox, creating it (and
@@ -2347,60 +2352,11 @@ func (h *Harness) ensureSandbox(ctx context.Context, session *Session) (tools.Sa
 	if h.sandboxOverride != nil {
 		return h.sandboxOverride, nil
 	}
-
-	log := scoped.Log(ctx)
-
-	if sb := session.activeSandbox; sb != nil {
-		if session.extendLifecycle {
-			if err := sb.ExtendLifecycle(ctx, SandboxInactivityTimeout); err != nil {
-				if k8serrors.IsNotFound(err) {
-					log.Info("Active sandbox was deleted or expired, will recreate it", "sandbox.name", session.sandboxID.Name)
-					h.dropDeadSandbox(ctx, session, sb)
-				} else {
-					return nil, fmt.Errorf("extending sandbox TTL: %w", err)
-				}
-			}
-		}
+	owner := session.SandboxOwner()
+	if owner.harness == nil {
+		owner.harness = h
 	}
-
-	if session.activeSandbox == nil {
-		log.Info("launching sandbox for tool execution...")
-
-		sb, err := h.CreateSandbox(ctx, session)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create sandbox: %w", err)
-		}
-
-		if err := sb.WaitForReady(ctx); err != nil {
-			log.Error(err, "sandbox not ready")
-			if delErr := h.sandboxClient.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-				log.Error(delErr, "failed to delete unready sandbox")
-			}
-			return nil, err
-		}
-
-		log.V(1).Info("sandbox ready", "sandbox.name", sb.SandboxName())
-
-		if session.prepareSandbox != nil {
-			log.Info("preparing sandbox...", "sandbox.name", sb.SandboxName())
-			if err := session.prepareSandbox(ctx, sb); err != nil {
-				log.Error(err, "failed to prepare sandbox")
-				if delErr := h.sandboxClient.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-					log.Error(delErr, "failed to delete unprepared sandbox")
-				}
-				return nil, err
-			}
-		} else if !session.hasWorkspaceClaim() {
-			log.Info("restoring filesystem to sandbox...", "sandbox.name", sb.SandboxName())
-			if err := sb.RestoreFS(ctx); err != nil {
-				log.Error(err, "failed to restore filesystem; starting with a fresh sandbox instead", "sandbox.name", sb.SandboxName())
-			}
-		}
-
-		session.activeSandbox = sb
-	}
-
-	return session.activeSandbox, nil
+	return owner.EnsureSandbox(ctx)
 }
 
 // IsSandboxFailed inspects sandbox status conditions to detect failure conditions.
@@ -2450,6 +2406,9 @@ func isSandboxDead(ctx context.Context, sb *Sandbox) bool {
 			return true
 		}
 		return false
+	}
+	if sb.uid != "" && latest.UID != "" && latest.UID != sb.uid {
+		return true
 	}
 	if latest.DeletionTimestamp != nil {
 		return true

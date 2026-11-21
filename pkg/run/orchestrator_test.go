@@ -193,14 +193,14 @@ func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServe
 }
 
 func (o *Orchestrator) cancelWorkers() {
-	o.activeRunsMu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(o.workerCancels))
-	for _, cancel := range o.workerCancels {
-		if cancel != nil {
-			cancels = append(cancels, cancel)
+	o.runStatesMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(o.runStates))
+	for _, rs := range o.runStates {
+		if rs != nil && rs.workerCancel != nil {
+			cancels = append(cancels, rs.workerCancel)
 		}
 	}
-	o.activeRunsMu.Unlock()
+	o.runStatesMu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
 	}
@@ -3119,6 +3119,7 @@ func TestOrchestrator_Working_GRPCCanceled_LeavesWorking(t *testing.T) {
 
 	// Storing a gRPC codes.Canceled outcome (like an in-flight sandbox call being canceled) must leave the run Working.
 	grpcErr := status.Error(codes.Canceled, "in-flight sandbox rpc canceled")
+	orch.ensureRunState(runID)
 	orch.storeTurnOutcome(runID, turnOutcome{
 		Err:      fmt.Errorf("in-flight sandbox call: %w", grpcErr),
 		Finished: time.Now(),
@@ -6529,6 +6530,7 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 	})
 
 	// Pre-store an outcome for the run
+	orch.ensureRunState(runID)
 	orch.storeTurnOutcome(runID, turnOutcome{
 		Err:      nil,
 		Finished: fixedTime,
@@ -6659,7 +6661,7 @@ func findGoroutinesContaining(target string) []string {
 
 func TestOrchestrator_CancelWorker(t *testing.T) {
 	orch := &Orchestrator{
-		workerCancels: make(map[string]context.CancelFunc),
+		runStates: make(map[string]*runState),
 	}
 
 	cancelled := false
@@ -6667,6 +6669,7 @@ func TestOrchestrator_CancelWorker(t *testing.T) {
 		cancelled = true
 	})
 
+	orch.ensureRunState("run-1")
 	orch.setWorkerCancel("run-1", cancel)
 	orch.cancelWorker("run-1")
 
@@ -6680,11 +6683,13 @@ func TestOrchestrator_CancelWorker(t *testing.T) {
 
 func TestOrchestrator_CancelWorkers(t *testing.T) {
 	orch := &Orchestrator{
-		workerCancels: make(map[string]context.CancelFunc),
+		runStates: make(map[string]*runState),
 	}
 
 	var canc1, canc2 bool
+	orch.ensureRunState("run-1")
 	orch.setWorkerCancel("run-1", func() { canc1 = true })
+	orch.ensureRunState("run-2")
 	orch.setWorkerCancel("run-2", func() { canc2 = true })
 	orch.cancelWorkers()
 
@@ -6705,6 +6710,7 @@ func TestNewTestOrchestrator_WaitsForWorkers(t *testing.T) {
 		})
 
 		ctx, cancel := context.WithCancel(subT.Context())
+		orch.ensureRunState("test-run")
 		orch.setWorkerCancel("test-run", cancel)
 		orch.workerWG.Add(1)
 		go func() {
@@ -7898,6 +7904,7 @@ func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T)
 	}
 
 	// Store an outcome that finished before the deadline
+	orch.ensureRunState(runID)
 	orch.storeTurnOutcome(runID, turnOutcome{
 		Err:      session.ErrSessionFinished,
 		Finished: startTime.Add(5 * time.Minute),

@@ -277,19 +277,21 @@ type Orchestrator struct {
 
 	notifyCh chan event.TypedGenericEvent[reconcile.Request]
 
-	activeRunsMu  sync.Mutex
-	activeRuns    map[string]bool
-	workerCancels map[string]context.CancelFunc
-	workerWG      sync.WaitGroup
-
-	turnOutcomesMu sync.Mutex
-	turnOutcomes   map[string]turnOutcome
-
-	turnBudgetsMu sync.Mutex
-	turnBudgets   map[string]*session.TurnBudget
+	runStatesMu sync.Mutex
+	runStates   map[string]*runState
+	workerWG    sync.WaitGroup
 
 	managerCtxMu sync.Mutex
 	managerCtx   context.Context
+}
+
+// runState holds in-memory runtime state for an active run.
+type runState struct {
+	active       bool
+	workerCancel context.CancelFunc
+	turnOutcome  *turnOutcome
+	sandboxOwner *session.SandboxOwner
+	turnBudget   *session.TurnBudget
 }
 
 var _ reconcile.Reconciler = (*Orchestrator)(nil)
@@ -363,10 +365,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		workspaceSize:         opts.WorkspaceSize,
 		runIndex:              make(map[string]runIndexEntry),
 		notifyCh:              make(chan event.TypedGenericEvent[reconcile.Request], 1024),
-		activeRuns:            make(map[string]bool),
-		workerCancels:         make(map[string]context.CancelFunc),
-		turnOutcomes:          make(map[string]turnOutcome),
-		turnBudgets:           make(map[string]*session.TurnBudget),
+		runStates:             make(map[string]*runState),
 	}
 	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, opts.Clock, opts.HeroRunStatusInterval, opts.Harness.Namespace(), orch.publishHeroRun)
 	return orch, nil
@@ -376,23 +375,23 @@ func (o *Orchestrator) turnBudget(runID string) *session.TurnBudget {
 	if o == nil {
 		return nil
 	}
-	o.turnBudgetsMu.Lock()
-	defer o.turnBudgetsMu.Unlock()
-	b, ok := o.turnBudgets[runID]
-	if !ok {
-		b = session.NewTurnBudget(o.maxTurns)
-		o.turnBudgets[runID] = b
+	o.runStatesMu.Lock()
+	defer o.runStatesMu.Unlock()
+	rs := o.runStates[runID]
+	if rs == nil {
+		return nil
 	}
-	return b
+	if rs.turnBudget == nil {
+		rs.turnBudget = session.NewTurnBudget(o.maxTurns)
+	}
+	return rs.turnBudget
 }
 
 func (o *Orchestrator) deleteTurnBudget(runID string) {
 	if o == nil {
 		return
 	}
-	o.turnBudgetsMu.Lock()
-	defer o.turnBudgetsMu.Unlock()
-	delete(o.turnBudgets, runID)
+	o.deleteRunState(runID)
 }
 
 func (o *Orchestrator) recordRunIndex(name string, repo state.RepoKey, runID string) {
@@ -1363,59 +1362,86 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 	return reconcile.Result{}, nil
 }
 
+// ensureRunState creates the in-memory state for a run if it does not yet exist.
+func (o *Orchestrator) ensureRunState(runID string) *runState {
+	o.runStatesMu.Lock()
+	defer o.runStatesMu.Unlock()
+	rs := o.runStates[runID]
+	if rs == nil {
+		rs = &runState{}
+		o.runStates[runID] = rs
+	}
+	return rs
+}
+
 func (o *Orchestrator) setRunActive(runID string, active bool) bool {
-	o.activeRunsMu.Lock()
-	defer o.activeRunsMu.Unlock()
+	o.runStatesMu.Lock()
+	defer o.runStatesMu.Unlock()
+	rs := o.runStates[runID]
+	if rs == nil {
+		return false
+	}
 	if active {
-		if o.activeRuns[runID] {
+		if rs.active {
 			return false
 		}
-		o.activeRuns[runID] = true
+		rs.active = true
 		return true
 	}
-	delete(o.activeRuns, runID)
-	delete(o.workerCancels, runID)
+	rs.active = false
+	rs.workerCancel = nil
 	return true
 }
 
 func (o *Orchestrator) setWorkerCancel(runID string, cancel context.CancelFunc) {
-	o.activeRunsMu.Lock()
-	defer o.activeRunsMu.Unlock()
-	if o.workerCancels == nil {
-		o.workerCancels = make(map[string]context.CancelFunc)
+	o.runStatesMu.Lock()
+	defer o.runStatesMu.Unlock()
+	rs := o.runStates[runID]
+	if rs == nil {
+		return
 	}
-	o.workerCancels[runID] = cancel
+	rs.workerCancel = cancel
 }
 
 func (o *Orchestrator) cancelWorker(runID string) {
-	o.activeRunsMu.Lock()
-	cancel := o.workerCancels[runID]
-	o.activeRunsMu.Unlock()
+	o.runStatesMu.Lock()
+	var cancel context.CancelFunc
+	if rs := o.runStates[runID]; rs != nil {
+		cancel = rs.workerCancel
+	}
+	o.runStatesMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 }
 
 func (o *Orchestrator) isRunActive(runID string) bool {
-	o.activeRunsMu.Lock()
-	defer o.activeRunsMu.Unlock()
-	return o.activeRuns[runID]
+	o.runStatesMu.Lock()
+	defer o.runStatesMu.Unlock()
+	rs := o.runStates[runID]
+	return rs != nil && rs.active
 }
 
 func (o *Orchestrator) storeTurnOutcome(runID string, outcome turnOutcome) {
-	o.turnOutcomesMu.Lock()
-	defer o.turnOutcomesMu.Unlock()
-	o.turnOutcomes[runID] = outcome
+	o.runStatesMu.Lock()
+	defer o.runStatesMu.Unlock()
+	rs := o.runStates[runID]
+	if rs == nil {
+		return
+	}
+	rs.turnOutcome = &outcome
 }
 
 func (o *Orchestrator) popTurnOutcome(runID string) (turnOutcome, bool) {
-	o.turnOutcomesMu.Lock()
-	defer o.turnOutcomesMu.Unlock()
-	outcome, ok := o.turnOutcomes[runID]
-	if ok {
-		delete(o.turnOutcomes, runID)
+	o.runStatesMu.Lock()
+	defer o.runStatesMu.Unlock()
+	rs := o.runStates[runID]
+	if rs != nil && rs.turnOutcome != nil {
+		outcome := *rs.turnOutcome
+		rs.turnOutcome = nil
+		return outcome, true
 	}
-	return outcome, ok
+	return turnOutcome{}, false
 }
 
 func (o *Orchestrator) getWorkerContext(ctx context.Context) context.Context {
@@ -1436,6 +1462,57 @@ func (o *Orchestrator) releaseSandbox(sandboxName string) {
 	if sb != nil {
 		o.harness.ReleaseSandbox(sb)
 	}
+}
+
+func (o *Orchestrator) deleteRunState(runID string) {
+	o.runStatesMu.Lock()
+	defer o.runStatesMu.Unlock()
+	delete(o.runStates, runID)
+}
+
+func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.Repo, run *state.Run, initialSb *session.Sandbox) *session.SandboxOwner {
+	o.runStatesMu.Lock()
+	rs := o.runStates[run.ID]
+	if rs == nil {
+		o.runStatesMu.Unlock()
+		return nil
+	}
+	if rs.sandboxOwner == nil {
+		rs.sandboxOwner = session.NewSandboxOwner(o.harness)
+	}
+	owner := rs.sandboxOwner
+	o.runStatesMu.Unlock()
+
+	if initialSb != nil && owner.ActiveSandbox() == nil {
+		owner.SetActiveSandbox(initialSb)
+	}
+	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run)
+	owner.SetCreateSandboxOptions(sbOpts)
+	// Set preparer each time a turn worker starts so it uses the current turn's repo and run.
+	owner.SetSandboxPreparer(func(ctx context.Context, s *session.Sandbox) error {
+		// When a replacement Sandbox pod becomes ready in the Working phase, the service portal
+		// controller's pod watch or NRI registration can briefly lag behind pod readiness.
+		// While reconcilePreparing retries via the reconciler's RequeueAfter queue, this worker
+		// preparer retries prepareSandbox for up to 10 attempts (5 seconds) while the error is a
+		// portalBindError before giving up.
+		var err error
+		for attempt := 0; attempt < 10; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+			err = o.prepareSandbox(ctx, repo, run, s)
+			var pErr *portalBindError
+			if err == nil || !errors.As(err, &pErr) {
+				break
+			}
+		}
+		return err
+	})
+	return owner
 }
 
 // putRun writes a run record to the state store and updates HeroRun status:
@@ -1545,6 +1622,7 @@ func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *sta
 	}
 
 	o.cancelWorker(run.ID)
+	o.deleteRunState(run.ID)
 
 	if end.Sandbox != nil {
 		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), end.Sandbox); delErr != nil {
@@ -1637,6 +1715,7 @@ func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *sta
 		return
 	}
 
+	o.ensureRunState(run.ID)
 	if !o.setRunActive(run.ID, true) {
 		return
 	}
@@ -1672,6 +1751,8 @@ func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *sta
 }
 
 func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run *state.Run) turnOutcome {
+	o.ensureRunState(run.ID)
+
 	sandboxName := run.SandboxName
 	if sandboxName == "" {
 		return turnOutcome{
@@ -1719,33 +1800,11 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		}
 	}
 
-	// Bind sandbox to session if available
-	sess.SetActiveSandbox(sb)
-	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run)
-	sess.SetCreateSandboxOptions(sbOpts)
-	sess.SetSandboxPreparer(func(ctx context.Context, s *session.Sandbox) error {
-		// When a replacement Sandbox pod becomes ready in the Working phase, the service portal
-		// controller's pod watch or NRI registration can briefly lag behind pod readiness.
-		// While reconcilePreparing retries via the reconciler's RequeueAfter queue, this worker
-		// preparer retries prepareSandbox for up to 10 attempts (5 seconds) while the error is a
-		// portalBindError before giving up.
-		var err error
-		for attempt := 0; attempt < 10; attempt++ {
-			if attempt > 0 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(500 * time.Millisecond):
-				}
-			}
-			err = o.prepareSandbox(ctx, repo, run, s)
-			var pErr *portalBindError
-			if err == nil || !errors.As(err, &pErr) {
-				break
-			}
-		}
-		return err
-	})
+	// Bind sandbox owner to session
+	owner := o.getOrCreateSandboxOwner(ctx, repo, run, sb)
+	if owner != nil {
+		sess.SetSandboxOwner(owner)
+	}
 
 	// Seed system prompt if new session
 	if len(sess.Messages()) == 0 {
