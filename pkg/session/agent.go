@@ -382,8 +382,8 @@ func (s *Sandbox) Close() error {
 			errs = append(errs, err)
 		}
 		s.grpcConn = nil
-		s.processClient = nil
 	}
+	s.processClient = nil
 	if s.portForwardStop != nil {
 		s.portForwardStop()
 		s.portForwardStop = nil
@@ -863,19 +863,31 @@ func (s *Sandbox) ensureClient(ctx context.Context) error {
 	return nil
 }
 
+// getProcessClient returns the active process client, or nil if the sandbox is closed.
+func (s *Sandbox) getProcessClient() processv1.ProcessServiceClient {
+	s.grpcMu.Lock()
+	defer s.grpcMu.Unlock()
+	return s.processClient
+}
+
 // execExecute executes a short-lived command synchronously via ProcessService.Execute.
 // On context cancellation (such as tool timeout or turn cancellation), sandboxd's
 // ProcessServer.Execute invokes killProcessGroupOnContextDone to terminate the entire
 // process group with SIGKILL, ensuring clean cancellation on the unary path without
 // requiring explicit client signal delivery.
 func (s *Sandbox) execExecute(ctx context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
+	client := s.getProcessClient()
+	if client == nil {
+		return nil, fmt.Errorf("sandbox is closed")
+	}
+
 	req := &processv1.ExecuteRequest{
 		Config: &processv1.ProcessConfig{
 			Command: opts.Command,
 		},
 	}
 
-	resp, err := s.processClient.Execute(ctx, req)
+	resp, err := client.Execute(ctx, req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -893,7 +905,12 @@ func (s *Sandbox) execExecute(ctx context.Context, opts tools.ExecCommandOptions
 // execStart executes a command via ProcessService.Start, streaming stdout/stderr events
 // and delivering a cancellation signal if ctx expires or is cancelled.
 func (s *Sandbox) execStart(ctx context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
-	stream, err := s.processClient.Start(ctx, &processv1.StartRequest{
+	client := s.getProcessClient()
+	if client == nil {
+		return nil, fmt.Errorf("sandbox is closed")
+	}
+
+	stream, err := client.Start(ctx, &processv1.StartRequest{
 		Config: &processv1.ProcessConfig{
 			Command: opts.Command,
 		},
@@ -930,9 +947,13 @@ func (s *Sandbox) execStart(ctx context.Context, opts tools.ExecCommandOptions) 
 		case <-doneCh:
 		}
 		if ctx.Err() != nil {
+			sigClient := s.getProcessClient()
+			if sigClient == nil {
+				return
+			}
 			sigCtx, sigCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer sigCancel()
-			if _, sigErr := s.processClient.SendSignal(sigCtx, &processv1.SendSignalRequest{
+			if _, sigErr := sigClient.SendSignal(sigCtx, &processv1.SendSignalRequest{
 				ProcessId: pid,
 				Signal:    processv1.Signal_SIGNAL_SIGKILL,
 			}); sigErr != nil {
@@ -958,7 +979,7 @@ func (s *Sandbox) execStart(ctx context.Context, opts tools.ExecCommandOptions) 
 
 				n, readErr := opts.Stdin.Read(buf)
 				if n > 0 {
-					_, wErr := s.processClient.WriteStdin(ctx, &processv1.WriteStdinRequest{
+					_, wErr := client.WriteStdin(ctx, &processv1.WriteStdinRequest{
 						ProcessId: pid,
 						Payload: &processv1.WriteStdinRequest_Input{
 							Input: buf[:n],
@@ -970,7 +991,7 @@ func (s *Sandbox) execStart(ctx context.Context, opts tools.ExecCommandOptions) 
 				}
 				if readErr != nil {
 					if errors.Is(readErr, io.EOF) {
-						if _, eofErr := s.processClient.WriteStdin(ctx, &processv1.WriteStdinRequest{
+						if _, eofErr := client.WriteStdin(ctx, &processv1.WriteStdinRequest{
 							ProcessId: pid,
 							Payload: &processv1.WriteStdinRequest_Eof{
 								Eof: &emptypb.Empty{},

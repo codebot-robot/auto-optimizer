@@ -547,3 +547,100 @@ func TestExecCommand_Start_ContextCancellationDeliversSignal(t *testing.T) {
 		t.Errorf("SendSignal Signal = %v, want SIGKILL", signalCalls[0].GetSignal())
 	}
 }
+
+func TestExecCommand_Start_CancelledWhileSandboxClosing(t *testing.T) {
+	for range 50 {
+		startedCh := make(chan struct{})
+		srv := &fakeProcessServer{
+			startPID:     9999,
+			startedCh:    startedCh,
+			startBlockCh: make(chan struct{}),
+			startExit:    137,
+		}
+		sb, cleanup := setupTestProcessClient(t, srv, nil, "")
+
+		ctx, cancel := context.WithCancel(t.Context())
+
+		execDone := make(chan struct{})
+		go func() {
+			defer close(execDone)
+			_, _ = sb.ExecCommand(ctx, tools.ExecCommandOptions{
+				Command: []string{"sleep", "999"},
+				Stream:  true,
+			})
+		}()
+
+		select {
+		case <-startedCh:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for process to start")
+		}
+
+		// Cancel context and close sandbox at the same time
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			cancel()
+		}()
+		go func() {
+			defer wg.Done()
+			_ = sb.Close()
+		}()
+		wg.Wait()
+
+		select {
+		case <-execDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for ExecCommand to return")
+		}
+		cleanup()
+	}
+}
+
+func TestExecCommand_Start_CancelledAfterSandboxClosed(t *testing.T) {
+	startedCh := make(chan struct{})
+	srv := &fakeProcessServer{
+		startPID:     9999,
+		startedCh:    startedCh,
+		startBlockCh: make(chan struct{}),
+		startExit:    137,
+	}
+	sb, cleanup := setupTestProcessClient(t, srv, nil, "")
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	execDone := make(chan struct{})
+	go func() {
+		defer close(execDone)
+		_, _ = sb.ExecCommand(ctx, tools.ExecCommandOptions{
+			Command: []string{"sleep", "999"},
+			Stream:  true,
+		})
+	}()
+
+	select {
+	case <-startedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for process to start")
+	}
+
+	// Close sandbox first, then cancel context
+	_ = sb.Close()
+	cancel()
+
+	select {
+	case <-execDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for ExecCommand to return")
+	}
+
+	// Verify SendSignal was NOT called because sandbox was already closed
+	srv.mu.Lock()
+	signalCalls := len(srv.signalCalls)
+	srv.mu.Unlock()
+	if signalCalls != 0 {
+		t.Errorf("expected 0 SendSignal calls on closed sandbox, got %d", signalCalls)
+	}
+}
