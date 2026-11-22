@@ -19,7 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -188,16 +187,13 @@ func (s *Server) CreateSession(ctx context.Context, req *sessionv1.CreateSession
 	}
 
 	parent := req.GetParent()
-	var runID, repo string
-	var ancestors []string
+	var meta session.Metadata
 	if parent != "" {
 		parentMeta, err := s.lookupParent(ctx, parent)
 		if err != nil {
 			return nil, err
 		}
-		runID = parentMeta.RunID
-		repo = parentMeta.Repo
-		ancestors = append(slices.Clone(parentMeta.Ancestors), parent)
+		meta = parentMeta.Child(parent)
 	}
 
 	harness, err := s.harnessFactory(toolset)
@@ -205,14 +201,8 @@ func (s *Server) CreateSession(ctx context.Context, req *sessionv1.CreateSession
 		return nil, status.Errorf(codes.Internal, "resolving harness for toolset %q: %v", toolset, err)
 	}
 
-	meta := session.Metadata{
-		Toolset:   toolset,
-		Parent:    parent,
-		Ancestors: ancestors,
-		Repo:      repo,
-		RunID:     runID,
-		CreatedAt: time.Now(),
-	}
+	meta.Toolset = toolset
+	meta.CreatedAt = time.Now()
 
 	sess, err := harness.NewSession(ctx, s.store, name, meta)
 	if err != nil {

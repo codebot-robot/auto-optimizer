@@ -80,6 +80,18 @@ func (m Metadata) Depth() int {
 	return 0
 }
 
+// Child returns metadata for a child session whose parent is parent.
+// The child derives its run ID, repository, and ancestor chain from m:
+// the same run, the same repository, and the parent's ancestor chain plus parent.
+func (m Metadata) Child(parent string) Metadata {
+	return Metadata{
+		Ancestors: append(slices.Clone(m.Ancestors), parent),
+		Parent:    parent,
+		Repo:      m.Repo,
+		RunID:     m.RunID,
+	}
+}
+
 // SessionSummary describes a session's metadata and message count.
 type SessionSummary struct {
 	Name         string
