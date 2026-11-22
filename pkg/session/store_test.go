@@ -469,4 +469,3 @@ func TestMetadataChild(t *testing.T) {
 		t.Errorf("standaloneChild.Depth() = %d, want 1", standaloneChild.Depth())
 	}
 }
-
