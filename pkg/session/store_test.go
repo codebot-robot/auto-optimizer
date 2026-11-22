@@ -397,3 +397,76 @@ func TestMetadataDepth(t *testing.T) {
 		t.Errorf("loadedMeta.Depth() = %d, want 2", loadedMeta.Depth())
 	}
 }
+
+func TestMetadataChild(t *testing.T) {
+	// 1. Child of a top-level session.
+	topMeta := Metadata{
+		Repo:    "github.com/example/repo",
+		RunID:   "run-123",
+		Toolset: "basic",
+	}
+	childMeta := topMeta.Child("top")
+	wantChild := Metadata{
+		Ancestors: []string{"top"},
+		Parent:    "top",
+		Repo:      "github.com/example/repo",
+		RunID:     "run-123",
+	}
+	if diff := cmp.Diff(wantChild, childMeta); diff != "" {
+		t.Errorf("child metadata mismatch (-want +got):\n%s", diff)
+	}
+	if childMeta.Depth() != 1 {
+		t.Errorf("childMeta.Depth() = %d, want 1", childMeta.Depth())
+	}
+
+	// 2. Grandchild (child of child).
+	grandchildMeta := childMeta.Child("child-session")
+	wantGrandchild := Metadata{
+		Ancestors: []string{"top", "child-session"},
+		Parent:    "child-session",
+		Repo:      "github.com/example/repo",
+		RunID:     "run-123",
+	}
+	if diff := cmp.Diff(wantGrandchild, grandchildMeta); diff != "" {
+		t.Errorf("grandchild metadata mismatch (-want +got):\n%s", diff)
+	}
+	if grandchildMeta.Depth() != 2 {
+		t.Errorf("grandchildMeta.Depth() = %d, want 2", grandchildMeta.Depth())
+	}
+
+	// 3. Great-grandchild.
+	greatGrandchildMeta := grandchildMeta.Child("grandchild-session")
+	wantGreatGrandchild := Metadata{
+		Ancestors: []string{"top", "child-session", "grandchild-session"},
+		Parent:    "grandchild-session",
+		Repo:      "github.com/example/repo",
+		RunID:     "run-123",
+	}
+	if diff := cmp.Diff(wantGreatGrandchild, greatGrandchildMeta); diff != "" {
+		t.Errorf("great-grandchild metadata mismatch (-want +got):\n%s", diff)
+	}
+	if greatGrandchildMeta.Depth() != 3 {
+		t.Errorf("greatGrandchildMeta.Depth() = %d, want 3", greatGrandchildMeta.Depth())
+	}
+
+	// 4. Cloned ancestor slice independence (mutating child does not mutate parent).
+	childMeta.Ancestors[0] = "mutated"
+	if len(topMeta.Ancestors) != 0 {
+		t.Errorf("topMeta.Ancestors was mutated: %v", topMeta.Ancestors)
+	}
+
+	// 5. Standalone session with no repo or run ID.
+	standaloneParent := Metadata{}
+	standaloneChild := standaloneParent.Child("standalone-root")
+	wantStandalone := Metadata{
+		Ancestors: []string{"standalone-root"},
+		Parent:    "standalone-root",
+	}
+	if diff := cmp.Diff(wantStandalone, standaloneChild); diff != "" {
+		t.Errorf("standalone child metadata mismatch (-want +got):\n%s", diff)
+	}
+	if standaloneChild.Depth() != 1 {
+		t.Errorf("standaloneChild.Depth() = %d, want 1", standaloneChild.Depth())
+	}
+}
+
