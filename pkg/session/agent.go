@@ -905,6 +905,9 @@ func (s *Sandbox) execExecute(ctx context.Context, opts tools.ExecCommandOptions
 // execStart executes a command via ProcessService.Start, streaming stdout/stderr events
 // and delivering a cancellation signal if ctx expires or is cancelled.
 func (s *Sandbox) execStart(ctx context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
+	// Hold onto this client for the entire execution so the stream, context,
+	// stdin, and cancellation signal all operate on the same client even if
+	// the Sandbox is closed concurrently.
 	client := s.getProcessClient()
 	if client == nil {
 		return nil, fmt.Errorf("sandbox is closed")
@@ -947,13 +950,9 @@ func (s *Sandbox) execStart(ctx context.Context, opts tools.ExecCommandOptions) 
 		case <-doneCh:
 		}
 		if ctx.Err() != nil {
-			sigClient := s.getProcessClient()
-			if sigClient == nil {
-				return
-			}
 			sigCtx, sigCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer sigCancel()
-			if _, sigErr := sigClient.SendSignal(sigCtx, &processv1.SendSignalRequest{
+			if _, sigErr := client.SendSignal(sigCtx, &processv1.SendSignalRequest{
 				ProcessId: pid,
 				Signal:    processv1.Signal_SIGNAL_SIGKILL,
 			}); sigErr != nil {
