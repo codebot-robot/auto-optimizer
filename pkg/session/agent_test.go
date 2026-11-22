@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -28,6 +29,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,6 +46,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	fakeagents "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
+	processv1 "sigs.k8s.io/agent-sandbox/packages/sandboxd/spec/process/v1"
 )
 
 // newTestSession returns a Session backed by a scratch backup directory.
@@ -290,13 +296,8 @@ func TestWaitForReady_Success(t *testing.T) {
 		coreClient:   coreCS.CoreV1(),
 	}
 
-	session := &Session{
-		Name:   "test-session",
-		client: client,
-	}
-
 	sandbox := &Sandbox{
-		session: session,
+		client: client,
 		id: types.NamespacedName{
 			Namespace: ns,
 			Name:      sbName,
@@ -377,13 +378,8 @@ func TestWaitForReady_FailsFast_ImagePullBackOff_WithEvent(t *testing.T) {
 		coreClient:   coreCS.CoreV1(),
 	}
 
-	session := &Session{
-		Name:   "test-session",
-		client: client,
-	}
-
 	sandbox := &Sandbox{
-		session: session,
+		client: client,
 		id: types.NamespacedName{
 			Namespace: ns,
 			Name:      sbName,
@@ -457,13 +453,8 @@ func TestWaitForReady_FailsFast_ErrImagePull_NoEvent(t *testing.T) {
 		coreClient:   coreCS.CoreV1(),
 	}
 
-	session := &Session{
-		Name:   "test-session",
-		client: client,
-	}
-
 	sandbox := &Sandbox{
-		session: session,
+		client: client,
 		id: types.NamespacedName{
 			Namespace: ns,
 			Name:      sbName,
@@ -534,13 +525,8 @@ func TestWaitForReady_FailsFast_InitContainer_ImagePullBackOff(t *testing.T) {
 		coreClient:   coreCS.CoreV1(),
 	}
 
-	session := &Session{
-		Name:   "test-session",
-		client: client,
-	}
-
 	sandbox := &Sandbox{
-		session: session,
+		client: client,
 		id: types.NamespacedName{
 			Namespace: ns,
 			Name:      sbName,
@@ -1015,7 +1001,7 @@ func TestEnsureSandbox_OnDemandWithCustomOptionsAndPreparer(t *testing.T) {
 	}
 
 	// Drop dead sandbox through helper and verify ensureSandbox recreates on demand, calling preparer again
-	harness.dropDeadSandbox(ctx, sess, sess.activeSandbox)
+	sess.SandboxOwner().DropDeadSandbox(ctx, sess.ActiveSandbox())
 	sb2, err := harness.ensureSandbox(ctx, sess)
 	if err != nil {
 		t.Fatalf("ensureSandbox 2: %v", err)
@@ -1104,8 +1090,8 @@ func TestControlPlaneTool_RunsBeforeSandboxExists(t *testing.T) {
 	}
 
 	// Verify no sandbox exists initially
-	if sess.activeSandbox != nil {
-		t.Fatal("expected activeSandbox to be nil")
+	if sess.ActiveSandbox() != nil {
+		t.Fatal("expected ActiveSandbox to be nil")
 	}
 
 	events := &recordingEvents{}
@@ -1118,6 +1104,160 @@ func TestControlPlaneTool_RunsBeforeSandboxExists(t *testing.T) {
 	}
 	if cpTool.calledWithSb != nil {
 		t.Errorf("expected mock_cp_tool to receive nil Sandbox, got %v", cpTool.calledWithSb)
+	}
+}
+
+func TestSession_NoClaim_OnDemandSandbox_SnapshotsAtTurnBoundary(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	sandboxClient := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+
+	agentsCS.PrependReactor("create", "sandboxes", func(action k8stesting.Action) (bool, apiruntime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		sb := createAction.GetObject().(*sandboxv1beta1.Sandbox).DeepCopy()
+		sb.Status.Conditions = []metav1.Condition{
+			{
+				Type:   string(sandboxv1beta1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			},
+		}
+		_ = agentsCS.Tracker().Create(action.GetResource(), sb, action.GetNamespace())
+		return true, sb, nil
+	})
+
+	procSrv := &scriptedProcessServer{
+		commands: map[string]cmdResult{
+			"sh -c echo hello": {exitCode: 0, stdout: "hello\n"},
+		},
+		startStdout: []byte("fake-snapshot-tar-data"),
+	}
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	processv1.RegisterProcessServiceServer(grpcServer, procSrv)
+	go func() { _ = grpcServer.Serve(lis) }()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = lis.Close()
+	})
+
+	sandboxClient.SetProcessClientFactory(func(ctx context.Context, sb *Sandbox) (processv1.ProcessServiceClient, func(), error) {
+		conn, err := grpc.NewClient("passthrough:///bufnet",
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+				return lis.Dial()
+			}),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		return processv1.NewProcessServiceClient(conn), func() { _ = conn.Close() }, nil
+	})
+
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.Add(&tools.RunCommand{})
+
+	done := "turn complete"
+	mockLLM := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			{
+				ID: "call-1",
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{
+								{
+									ID:   "call-run-cmd",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "run_command",
+										Arguments: `{"command":"echo hello"}`,
+									},
+								},
+							},
+						},
+						FinishReason: "tool_calls",
+					},
+				},
+			},
+			{
+				ID: "final-done",
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role:    "assistant",
+							Content: &done,
+						},
+						FinishReason: "stop",
+					},
+				},
+			},
+		},
+	}
+
+	stateDir := t.TempDir()
+	homeDir := t.TempDir()
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	harness := NewHarness(mockLLM, sandboxClient, toolsRegistry, RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: "ao-system",
+		SigningKey:            privKey,
+		StateDir:              stateDir,
+		HomeDir:               homeDir,
+	})
+
+	sessionStore := NewFileStore(t.TempDir())
+	sess, err := harness.NewSession(ctx, sessionStore, "ondemandsession", Metadata{CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// Verify no sandbox exists initially before tool call
+	if sess.ActiveSandbox() != nil {
+		t.Fatal("expected ActiveSandbox to be nil initially")
+	}
+
+	// Verify no backups exist initially
+	initialBackup, err := sess.FindLatestBackup()
+	if err != nil {
+		t.Fatalf("FindLatestBackup initial: %v", err)
+	}
+	if initialBackup != "" {
+		t.Fatalf("expected no initial backup, got %q", initialBackup)
+	}
+
+	events := &recordingEvents{}
+	if err := harness.RunTurn(ctx, sess, "run tool", events); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+
+	// Verify sandbox was provisioned on demand
+	if sess.ActiveSandbox() == nil {
+		t.Fatal("expected ActiveSandbox to be created on demand")
+	}
+
+	// Verify snapshot was taken at the turn boundary
+	latestBackup, err := sess.FindLatestBackup()
+	if err != nil {
+		t.Fatalf("FindLatestBackup after turn: %v", err)
+	}
+	if latestBackup == "" {
+		t.Fatal("expected snapshot backup file to exist after turn boundary")
+	}
+
+	content, err := os.ReadFile(latestBackup)
+	if err != nil {
+		t.Fatalf("reading backup file: %v", err)
+	}
+	if string(content) != "fake-snapshot-tar-data" {
+		t.Errorf("expected backup content 'fake-snapshot-tar-data', got %q", string(content))
 	}
 }
 
@@ -1820,28 +1960,164 @@ func TestSandbox_PodUID(t *testing.T) {
 
 func TestSession_HasWorkspaceClaim(t *testing.T) {
 	// 1. Session with WorkspaceClaimName set
-	sessClaim := &Session{
-		sandboxOpts: &CreateSandboxOptions{
-			WorkspaceClaimName: "test-claim",
-		},
-	}
-	if !sessClaim.hasWorkspaceClaim() {
-		t.Error("expected hasWorkspaceClaim to be true when WorkspaceClaimName is set")
+	sessClaim := &Session{}
+	sessClaim.SetCreateSandboxOptions(CreateSandboxOptions{
+		WorkspaceClaimName: "test-claim",
+	})
+	if !sessClaim.HasWorkspaceClaim() {
+		t.Error("expected HasWorkspaceClaim to be true when WorkspaceClaimName is set")
 	}
 
-	// 2. Session with nil sandboxOpts
+	// 2. Session with default options (no claim)
 	sessNoOpts := &Session{}
-	if sessNoOpts.hasWorkspaceClaim() {
-		t.Error("expected hasWorkspaceClaim to be false when sandboxOpts is nil")
+	if sessNoOpts.HasWorkspaceClaim() {
+		t.Error("expected HasWorkspaceClaim to be false when no claim is configured")
 	}
 
 	// 3. Session with empty WorkspaceClaimName
-	sessEmptyClaim := &Session{
-		sandboxOpts: &CreateSandboxOptions{
-			WorkspaceClaimName: "",
+	sessEmptyClaim := &Session{}
+	sessEmptyClaim.SetCreateSandboxOptions(CreateSandboxOptions{
+		WorkspaceClaimName: "",
+	})
+	if sessEmptyClaim.HasWorkspaceClaim() {
+		t.Error("expected HasWorkspaceClaim to be false when WorkspaceClaimName is empty")
+	}
+}
+
+func TestSession_Claim_NoSnapshotAtTurnBoundary(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	sandboxClient := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+
+	agentsCS.PrependReactor("create", "sandboxes", func(action k8stesting.Action) (bool, apiruntime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		sb := createAction.GetObject().(*sandboxv1beta1.Sandbox).DeepCopy()
+		sb.Status.Conditions = []metav1.Condition{
+			{
+				Type:   string(sandboxv1beta1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			},
+		}
+		_ = agentsCS.Tracker().Create(action.GetResource(), sb, action.GetNamespace())
+		return true, sb, nil
+	})
+
+	procSrv := &scriptedProcessServer{
+		commands: map[string]cmdResult{
+			"sh -c echo hello": {exitCode: 0, stdout: "hello\n"},
+		},
+		startStdout: []byte("fake-snapshot-tar-data"),
+	}
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	processv1.RegisterProcessServiceServer(grpcServer, procSrv)
+	go func() { _ = grpcServer.Serve(lis) }()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = lis.Close()
+	})
+
+	sandboxClient.SetProcessClientFactory(func(ctx context.Context, sb *Sandbox) (processv1.ProcessServiceClient, func(), error) {
+		conn, err := grpc.NewClient("passthrough:///bufnet",
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+				return lis.Dial()
+			}),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		return processv1.NewProcessServiceClient(conn), func() { _ = conn.Close() }, nil
+	})
+
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.Add(&tools.RunCommand{})
+
+	done := "turn complete"
+	mockLLM := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			{
+				ID: "call-1",
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{
+								{
+									ID:   "call-run-cmd",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "run_command",
+										Arguments: `{"command":"echo hello"}`,
+									},
+								},
+							},
+						},
+						FinishReason: "tool_calls",
+					},
+				},
+			},
+			{
+				ID: "final-done",
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role:    "assistant",
+							Content: &done,
+						},
+						FinishReason: "stop",
+					},
+				},
+			},
 		},
 	}
-	if sessEmptyClaim.hasWorkspaceClaim() {
-		t.Error("expected hasWorkspaceClaim to be false when WorkspaceClaimName is empty")
+
+	stateDir := t.TempDir()
+	homeDir := t.TempDir()
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	harness := NewHarness(mockLLM, sandboxClient, toolsRegistry, RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: "ao-system",
+		SigningKey:            privKey,
+		StateDir:              stateDir,
+		HomeDir:               homeDir,
+	})
+
+	sessionStore := NewFileStore(t.TempDir())
+	sess, err := harness.NewSession(ctx, sessionStore, "claimsession", Metadata{CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// Configure workspace claim on the session's sandbox options
+	sess.SetCreateSandboxOptions(CreateSandboxOptions{
+		Name:               "claimsession",
+		WorkspaceClaimName: "test-workspace-claim",
+	})
+
+	events := &recordingEvents{}
+	if err := harness.RunTurn(ctx, sess, "run tool", events); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+
+	// Verify sandbox was provisioned on demand
+	if sess.ActiveSandbox() == nil {
+		t.Fatal("expected ActiveSandbox to be created on demand")
+	}
+
+	// Verify NO snapshot was taken for a session with a workspace claim
+	latestBackup, err := sess.FindLatestBackup()
+	if err != nil {
+		t.Fatalf("FindLatestBackup: %v", err)
+	}
+	if latestBackup != "" {
+		t.Errorf("expected no snapshot backup file for session with workspace claim, got %q", latestBackup)
 	}
 }
