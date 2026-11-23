@@ -673,6 +673,50 @@ func TestWebMethods_StartTurnAndBusy(t *testing.T) {
 	}
 }
 
+func TestStartTurn_SessionBelongsToRun_Rejected(t *testing.T) {
+	ctx := t.Context()
+	srv, store := newTestServer(t, nil)
+
+	runSess := "runsession"
+	if err := store.NewSession(ctx, runSess, session.Metadata{
+		Toolset: "basic",
+		Repo:    "github.com/gke-labs/test-repo",
+		RunID:   "20261123T100000Z-0001",
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	err := srv.StartTurn(ctx, runSess, "hello")
+	if !errors.Is(err, ErrSessionBelongsToRun) {
+		t.Fatalf("expected ErrSessionBelongsToRun, got: %v", err)
+	}
+}
+
+func TestSendMessage_SessionBelongsToRun_Rejected(t *testing.T) {
+	ctx := t.Context()
+	client, store, _ := setupTestServer(t, nil)
+
+	runSess := "runsessiongrpc"
+	if err := store.NewSession(ctx, runSess, session.Metadata{
+		Toolset: "basic",
+		Repo:    "github.com/gke-labs/test-repo",
+		RunID:   "20261123T100000Z-0001",
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	stream, err := client.SendMessage(ctx, &sessionv1.SendMessageRequest{
+		Name: runSess,
+		Text: "hello",
+	})
+	if err == nil {
+		_, err = stream.Recv()
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got error: %v", err)
+	}
+}
+
 func TestListRepositoriesAndGoals(t *testing.T) {
 	ctx := t.Context()
 	stateStore := state.NewFileStore(t.TempDir())
@@ -1079,9 +1123,9 @@ func TestRunSessionsTreeAndSideBySideRuns(t *testing.T) {
 		t.Errorf("expected 0 sessions for nonexistent run, got %d", len(unknown))
 	}
 
-	// 8. Verify SendMessage and StartTurn are refused for child sessions, but permitted for a run's top-level session.
-	if err := srv.StartTurn(ctx, child1a, "test message"); err == nil || !strings.Contains(err.Error(), "cannot post messages to child sessions") {
-		t.Errorf("StartTurn on child1a: got %v, want error containing 'cannot post messages to child sessions'", err)
+	// 8. Verify SendMessage and StartTurn are refused for any session that belongs to a run (both child and top-level).
+	if err := srv.StartTurn(ctx, child1a, "test message"); !errors.Is(err, ErrSessionBelongsToRun) {
+		t.Errorf("StartTurn on child1a: got %v, want ErrSessionBelongsToRun", err)
 	}
 
 	mockStream := &mockSendMessageServer{ctx: ctx}
@@ -1089,13 +1133,18 @@ func TestRunSessionsTreeAndSideBySideRuns(t *testing.T) {
 		Name: child1a,
 		Text: "test message",
 	}, mockStream)
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "cannot post messages to child sessions") {
-		t.Errorf("SendMessage on child1a: got %v, want FailedPrecondition with 'cannot post messages to child sessions'", err)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("SendMessage on child1a: got %v, want FailedPrecondition", err)
 	}
 
-	// Top-level session in a run (parent1, which has Parent == "" and RunID != "") allows StartTurn.
-	if err := srv.StartTurn(ctx, parent1, "message to run top-level session"); err != nil {
-		t.Errorf("StartTurn on parent1: got %v, want nil", err)
+	// Top-level session in a run (parent1) is also refused by the session server.
+	if err := srv.StartTurn(ctx, parent1, "message to run top-level session"); !errors.Is(err, ErrSessionBelongsToRun) {
+		t.Errorf("StartTurn on parent1: got %v, want ErrSessionBelongsToRun", err)
+	}
+
+	// Standalone session without run allows StartTurn.
+	if err := srv.StartTurn(ctx, noRunParent, "message to standalone session"); err != nil {
+		t.Errorf("StartTurn on noRunParent: got %v, want nil", err)
 	}
 }
 

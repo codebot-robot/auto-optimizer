@@ -845,3 +845,55 @@ func TestRun_BranchName(t *testing.T) {
 		t.Errorf("empty Run.BranchName() = %q, want empty", got)
 	}
 }
+
+func TestFileStore_PendingMessages(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := NewFileStore(storeDir)
+
+	repoKey := RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	runID := "20261123T100000Z-0001"
+
+	// Initially empty
+	msgs, err := store.ReadPendingMessages(ctx, repoKey, runID)
+	if err != nil {
+		t.Fatalf("ReadPendingMessages on empty: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("expected 0 pending messages, got %d", len(msgs))
+	}
+
+	// Append messages
+	if err := store.AppendPendingMessage(ctx, repoKey, runID, "first message"); err != nil {
+		t.Fatalf("AppendPendingMessage: %v", err)
+	}
+	if err := store.AppendPendingMessage(ctx, repoKey, runID, "second message"); err != nil {
+		t.Fatalf("AppendPendingMessage: %v", err)
+	}
+
+	msgs, err = store.ReadPendingMessages(ctx, repoKey, runID)
+	if err != nil {
+		t.Fatalf("ReadPendingMessages: %v", err)
+	}
+	if len(msgs) != 2 || msgs[0] != "first message" || msgs[1] != "second message" {
+		t.Fatalf("unexpected pending messages: %+v", msgs)
+	}
+
+	// Clear messages
+	if err := store.ClearPendingMessages(ctx, repoKey, runID); err != nil {
+		t.Fatalf("ClearPendingMessages: %v", err)
+	}
+
+	msgs, err = store.ReadPendingMessages(ctx, repoKey, runID)
+	if err != nil {
+		t.Fatalf("ReadPendingMessages after clear: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("expected 0 pending messages after clear, got %d", len(msgs))
+	}
+
+	// Clear on non-existent is a no-op
+	if err := store.ClearPendingMessages(ctx, repoKey, runID); err != nil {
+		t.Fatalf("ClearPendingMessages on non-existent: %v", err)
+	}
+}

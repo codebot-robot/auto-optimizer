@@ -294,9 +294,14 @@ type Orchestrator struct {
 	runStates   map[string]*runState
 	workerWG    sync.WaitGroup
 
+	pendingMessagesMu sync.Mutex
+
 	managerCtxMu sync.Mutex
 	managerCtx   context.Context
 }
+
+// ErrRunNotWorking indicates that a message cannot be posted because the run has left the working state.
+var ErrRunNotWorking = errors.New("run is no longer working")
 
 // runState holds in-memory runtime state for an active run.
 type runState struct {
@@ -1484,6 +1489,77 @@ func (o *Orchestrator) deleteRunState(runID string) {
 	delete(o.runStates, runID)
 }
 
+func (o *Orchestrator) deliverPendingMessages(ctx context.Context, repo state.RepoKey, runID string, session *session.Session) error {
+	o.pendingMessagesMu.Lock()
+	defer o.pendingMessagesMu.Unlock()
+
+	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID)
+	if err != nil {
+		return err
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	var toAdd []llm.Message
+	for _, text := range msgs {
+		t := text
+		toAdd = append(toAdd, llm.Message{
+			Role:    "user",
+			Content: &t,
+		})
+	}
+
+	// Persist to session first under the lock.
+	if err := session.AddMessages(ctx, toAdd...); err != nil {
+		return fmt.Errorf("adding pending messages to session: %w", err)
+	}
+
+	// Remove from pending messages file only after AddMessages succeeds.
+	if err := o.store.ClearPendingMessages(ctx, repo, runID); err != nil {
+		return fmt.Errorf("clearing pending messages: %w", err)
+	}
+	return nil
+}
+
+func (o *Orchestrator) hasPendingMessages(ctx context.Context, repo state.RepoKey, runID string) (bool, error) {
+	o.pendingMessagesMu.Lock()
+	defer o.pendingMessagesMu.Unlock()
+	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID)
+	if err != nil {
+		return false, err
+	}
+	return len(msgs) > 0, nil
+}
+
+// PostMessage enqueues a user message to be delivered to the session of a run before its next model call.
+func (o *Orchestrator) PostMessage(ctx context.Context, repo state.RepoKey, runID string, text string) error {
+	if strings.TrimSpace(text) == "" {
+		return errors.New("message text is required")
+	}
+
+	run, err := o.store.GetRun(ctx, repo, runID)
+	if err != nil {
+		return fmt.Errorf("getting run %s: %w", runID, err)
+	}
+	if run == nil {
+		return fmt.Errorf("run %s not found", runID)
+	}
+	if run.Phase != state.PhaseWorking && run.Phase != state.PhasePending && run.Phase != state.PhasePreparing {
+		return fmt.Errorf("%w: run %s is in phase %s", ErrRunNotWorking, runID, run.Phase)
+	}
+
+	o.pendingMessagesMu.Lock()
+	err = o.store.AppendPendingMessage(ctx, repo, runID, text)
+	o.pendingMessagesMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("appending pending message: %w", err)
+	}
+
+	o.Notify(repo, runID)
+	return nil
+}
+
 func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.Repo, run *state.Run, initialSb *session.Sandbox) *session.SandboxOwner {
 	o.runStatesMu.Lock()
 	rs := o.runStates[run.ID]
@@ -1834,14 +1910,6 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		}
 	}
 
-	hasUserMessage := false
-	for _, m := range sess.Messages() {
-		if m.Role == "user" {
-			hasUserMessage = true
-			break
-		}
-	}
-
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1854,6 +1922,17 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		repoKey: repo.Key(),
 		runID:   run.ID,
 	}
+
+	// A fresh session starts with RunTurn to supply the initial goal prompt.
+	// A resumed session (after restart or previous turn) continues from transcript history.
+	hasUserMessage := false
+	for _, m := range sess.Messages() {
+		if m.Role == "user" {
+			hasUserMessage = true
+			break
+		}
+	}
+
 	finishTool := ao.NewFinishTool()
 	prTool := ao.NewOpenPullRequestTool(ao.OpenPullRequestExpectation{
 		Repository: repo.URL,
@@ -1866,7 +1945,10 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		return o.listRunSessions(toolCtx, run, children)
 	})
 	budget := o.turnBudget(run.ID)
-	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool, listSessionsTool)
+	messageSource := func(ctx context.Context, session *session.Session) error {
+		return o.deliverPendingMessages(ctx, repo.Key(), run.ID, session)
+	}
+	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool, listSessionsTool).WithMessageSource(messageSource)
 
 	var turnErr error
 	if hasUserMessage {
@@ -1935,6 +2017,14 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 	}
 
 	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
+		hasPending, err := o.hasPendingMessages(ctx, repo.Key(), run.ID)
+		if err != nil {
+			return fmt.Errorf("checking pending messages: %w", err)
+		}
+		if hasPending && !errors.Is(turnErr, session.ErrMaxTurns) {
+			o.Notify(repo.Key(), run.ID)
+			return nil
+		}
 		o.finishRun(ctx, repo, run, runEnd{
 			Phase:   state.PhaseNoImprovement,
 			Kind:    "no_improvement",

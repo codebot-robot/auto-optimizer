@@ -54,10 +54,16 @@ type RunStarter interface {
 	StartRun(ctx context.Context, repo *state.Repo, goalName string, opts run.StartOptions) (*state.Run, error)
 }
 
+// Orchestrator delivers messages to runs.
+type Orchestrator interface {
+	PostMessage(ctx context.Context, repo state.RepoKey, runID string, text string) error
+}
+
 // ServerOptions configures optional settings for Server.
 type ServerOptions struct {
 	RequireSignIn bool
 	SessionKey    []byte
+	Orchestrator  Orchestrator
 }
 
 // Server handles HTTP requests for the web UI.
@@ -65,6 +71,7 @@ type Server struct {
 	service       SessionService
 	stateStore    state.Store
 	starter       RunStarter
+	orchestrator  Orchestrator
 	requireSignIn bool
 	sessionKey    []byte
 }
@@ -82,6 +89,7 @@ func NewServer(service SessionService, stateStore state.Store, starter RunStarte
 		service:       service,
 		stateStore:    stateStore,
 		starter:       starter,
+		orchestrator:  opts.Orchestrator,
 		requireSignIn: opts.RequireSignIn,
 		sessionKey:    opts.SessionKey,
 	}, nil
@@ -490,20 +498,60 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 
-	if err := s.service.StartTurn(r.Context(), name, text); err != nil {
-		if errors.Is(err, sessionapi.ErrBusy) {
-			if execErr := RenderConflictPage(r.Context(), w, ConflictPageData{Name: name}); execErr != nil {
-				scoped.Log(r.Context()).V(4).Info("rendering conflict page", "error", execErr)
-			}
+	detail, err := s.service.GetSessionDetail(r.Context(), name)
+	if err != nil && !errors.Is(err, session.ErrNotFound) {
+		http.Error(w, "getting session: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if detail != nil && detail.Summary.RunID != "" && detail.Summary.Repo != "" {
+		if !s.postToRun(w, r, detail.Summary.Repo, detail.Summary.RunID, text) {
 			return
 		}
-		http.Error(w, "starting turn: "+err.Error(), http.StatusInternalServerError)
-		return
+	} else {
+		if !s.startStandaloneTurn(w, r, name, text) {
+			return
+		}
 	}
 
 	s.recordMessagePosted(r.Context(), name)
 
 	http.Redirect(w, r, "/sessions/"+url.PathEscape(name), http.StatusSeeOther)
+}
+
+func (s *Server) postToRun(w http.ResponseWriter, r *http.Request, repo, runID, text string) bool {
+	if s.orchestrator == nil {
+		http.Error(w, "orchestrator not available", http.StatusInternalServerError)
+		return false
+	}
+	repoKey, err := state.ParseRepoKey(repo)
+	if err != nil {
+		http.Error(w, "parsing repo key: "+err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	if err := s.orchestrator.PostMessage(r.Context(), repoKey, runID, text); err != nil {
+		if errors.Is(err, run.ErrRunNotWorking) {
+			http.Error(w, "Run is no longer working. Start a new run to continue.", http.StatusConflict)
+			return false
+		}
+		http.Error(w, "posting message: "+err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	return true
+}
+
+func (s *Server) startStandaloneTurn(w http.ResponseWriter, r *http.Request, name, text string) bool {
+	if err := s.service.StartTurn(r.Context(), name, text); err != nil {
+		if errors.Is(err, sessionapi.ErrBusy) {
+			if execErr := RenderConflictPage(r.Context(), w, ConflictPageData{Name: name}); execErr != nil {
+				scoped.Log(r.Context()).V(4).Info("rendering conflict page", "error", execErr)
+			}
+			return false
+		}
+		http.Error(w, "starting turn: "+err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	return true
 }
 
 func (s *Server) recordMessagePosted(ctx context.Context, sessionName string) {
