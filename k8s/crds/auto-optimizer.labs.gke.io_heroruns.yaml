@@ -74,9 +74,83 @@ spec:
                 description: BaseCommit is the commit SHA in the repository from which
                   the run started.
                 type: string
+              deadline:
+                description: Deadline is the time by which the run should complete.
+                format: date-time
+                type: string
               goal:
                 description: Goal is the name of the optimization goal.
                 type: string
+              goalDefinition:
+                description: GoalDefinition holds the frozen goal definition captured
+                  for this run.
+                properties:
+                  agents:
+                    description: Agents lists custom agents permitted to work on this
+                      goal.
+                    items:
+                      type: string
+                    type: array
+                  body:
+                    description: Body holds the Markdown description of the goal.
+                    type: string
+                  budget:
+                    description: Budget defines resource and time limits for a goal
+                      run.
+                    properties:
+                      maxCostUSD:
+                        description: MaxCostUSD is the maximum estimated LLM budget
+                          in USD for the run.
+                        type: number
+                      maxDuration:
+                        description: MaxDuration is the maximum wall-clock duration
+                          for the run.
+                        type: string
+                    type: object
+                  hash:
+                    description: Hash is the content hash of the goal file.
+                    type: string
+                  metric:
+                    description: Metric defines benchmark measurement parameters for
+                      a metric goal.
+                    properties:
+                      command:
+                        description: Command is the benchmark command to measure.
+                        type: string
+                      direction:
+                        description: Direction is "lower" or "higher", indicating
+                          whether a smaller or larger measurement is better.
+                        type: string
+                      minImprovement:
+                        description: MinImprovement is the minimum improvement threshold
+                          required to declare victory.
+                        type: string
+                      runs:
+                        description: Runs is the number of benchmark repetitions to
+                          execute per measurement.
+                        type: integer
+                      timeout:
+                        description: Timeout is the maximum execution duration for
+                          one benchmark run.
+                        type: string
+                      unit:
+                        description: Unit is the measurement unit string (e.g., "ns/op",
+                          "ms", "MB").
+                        type: string
+                    required:
+                    - command
+                    - direction
+                    type: object
+                  schedule:
+                    description: Schedule specifies when the goal should run automatically.
+                    type: string
+                  verify:
+                    description: Verify is the shell command used to verify goal satisfaction.
+                    type: string
+                required:
+                - body
+                - hash
+                type: object
               repository:
                 description: Repository is the forge URL of the repository being optimized,
                   matching state.Repo.URL.
@@ -94,8 +168,23 @@ spec:
             description: HeroRunStatus defines the observed state and lifecycle progress
               of a HeroRun.
             properties:
+              activeOperation:
+                description: ActiveOperation is the identifier of an active long-running
+                  operation in flight.
+                type: string
+              baseline:
+                description: Baseline holds the baseline metric measurement for metric
+                  goals.
+                type: number
               branch:
                 description: Branch is the git branch name created for this run.
+                type: string
+              candidate:
+                description: Candidate holds the candidate metric measurement for
+                  metric goals.
+                type: number
+              candidateCommit:
+                description: CandidateCommit is the commit SHA produced by the run.
                 type: string
               conditions:
                 description: Conditions track the state transitions and observations
@@ -155,6 +244,13 @@ spec:
                   - type
                   type: object
                 type: array
+              costUSD:
+                description: CostUSD holds the total estimated LLM cost for this run.
+                type: number
+              error:
+                description: Error holds any fatal error message that caused the run
+                  to fail.
+                type: string
               finishedAt:
                 description: FinishedAt is the time when the run reached a terminal
                   phase.
@@ -169,17 +265,58 @@ spec:
                 description: Phase is the current lifecycle phase of the run, matching
                   the state.RunPhase value.
                 type: string
+              phaseTimestamps:
+                additionalProperties:
+                  format: date-time
+                  type: string
+                description: PhaseTimestamps tracks the timestamps of lifecycle phase
+                  transitions.
+                type: object
+              portalBoundAt:
+                description: |-
+                  PortalBoundAt is the time when the egress portal was bound to the sandbox.
+                  Temporary: retained for compatibility with today's reconciler until PhasePreparing is migrated to Run.
+                format: date-time
+                type: string
+              prBody:
+                description: PRBody is the markdown description of the pull request
+                  for this run.
+                type: string
+              prTitle:
+                description: PRTitle is the title of the pull request for this run.
+                type: string
               pullRequestURL:
                 description: PullRequestURL is the forge URL of the pull request opened
                   for this run, if any.
+                type: string
+              readyDeadline:
+                description: |-
+                  ReadyDeadline is the deadline by which the sandbox environment must become ready.
+                  Temporary: retained for compatibility with today's reconciler until PhasePreparing is migrated to Run.
+                format: date-time
                 type: string
               sandboxName:
                 description: SandboxName is the name of the Sandbox resource running
                   this optimization session.
                 type: string
+              sessionId:
+                description: SessionID is the unique identifier of the active optimization
+                  session.
+                type: string
               startedAt:
                 description: StartedAt is the time when the run started.
                 format: date-time
+                type: string
+              summary:
+                description: Summary is a human-readable summary of the run outcome.
+                type: string
+              turns:
+                description: Turns is the count of agent interaction turns executed
+                  in this run.
+                type: integer
+              workspaceClaimName:
+                description: WorkspaceClaimName is the name of the persistent volume
+                  claim holding the workspace.
                 type: string
             type: object
         type: object
