@@ -1847,7 +1847,7 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 
 	childCtx, cancelChildren := context.WithCancel(ctx)
 	defer cancelChildren()
-	var childWG sync.WaitGroup
+	children := newChildGroup(childCtx)
 
 	events := &orchestratorTurnEvents{
 		orch:    o,
@@ -1860,10 +1860,13 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		Branch:     run.BranchName(),
 	})
 	startSessionTool := ao.NewStartSessionTool(func(toolCtx context.Context, task string) (string, error) {
-		return o.startChildSession(toolCtx, childCtx, &childWG, repo, run, sess, task)
+		return o.startChildSession(toolCtx, children, repo, run, sess, task)
+	})
+	listSessionsTool := ao.NewListSessionsTool(func(toolCtx context.Context) ([]ao.SessionInfo, error) {
+		return o.listRunSessions(toolCtx, run, children)
 	})
 	budget := o.turnBudget(run.ID)
-	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool)
+	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool, listSessionsTool)
 
 	var turnErr error
 	if hasUserMessage {
@@ -1873,7 +1876,7 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	}
 
 	cancelChildren()
-	childWG.Wait()
+	children.wg.Wait()
 
 	return turnOutcome{
 		Err:      turnErr,
@@ -2427,7 +2430,7 @@ func (o *Orchestrator) generateChildSessionName(parent string) (string, error) {
 }
 
 // startChildSession creates and starts a child session for parentSession within run.
-func (o *Orchestrator) startChildSession(ctx, childCtx context.Context, childWG *sync.WaitGroup, repo *state.Repo, run *state.Run, parentSession *session.Session, task string) (string, error) {
+func (o *Orchestrator) startChildSession(ctx context.Context, children *childGroup, repo *state.Repo, run *state.Run, parentSession *session.Session, task string) (string, error) {
 	if parentSession.Metadata.RunID == "" {
 		return "", errors.New("cannot call start_session: session belongs to no run")
 	}
@@ -2474,23 +2477,28 @@ func (o *Orchestrator) startChildSession(ctx, childCtx context.Context, childWG 
 	}
 
 	childStartTool := ao.NewStartSessionTool(func(toolCtx context.Context, subTask string) (string, error) {
-		return o.startChildSession(toolCtx, childCtx, childWG, repo, run, childSess, subTask)
+		return o.startChildSession(toolCtx, children, repo, run, childSess, subTask)
 	})
-	childHarness := o.harness.WithTurnBudget(budget).WithExtraTools(childStartTool, ao.NewFinishTool())
+	childListTool := ao.NewListSessionsTool(func(toolCtx context.Context) ([]ao.SessionInfo, error) {
+		return o.listRunSessions(toolCtx, run, children)
+	})
+	childHarness := o.harness.WithTurnBudget(budget).WithExtraTools(childStartTool, childListTool, ao.NewFinishTool())
 
-	childWG.Add(1)
+	children.setRunning(childName, true)
+	children.wg.Add(1)
 	o.workerWG.Add(1)
 	go func() {
 		defer o.workerWG.Done()
-		defer childWG.Done()
+		defer children.wg.Done()
+		defer children.setRunning(childName, false)
 
 		if len(childSess.Messages()) == 0 {
 			sysPrompt := buildSystemPrompt(o.harness.RunOptions().SystemPrompt, repo, run, task)
-			if err := childSess.AddMessages(childCtx, llm.Message{
+			if err := childSess.AddMessages(children.ctx, llm.Message{
 				Role:    "system",
 				Content: &sysPrompt,
 			}); err != nil {
-				scoped.Log(childCtx).Error(err, "failed to seed system prompt", "session", childName)
+				scoped.Log(children.ctx).Error(err, "failed to seed system prompt", "session", childName)
 				return
 			}
 		}
@@ -2500,12 +2508,64 @@ func (o *Orchestrator) startChildSession(ctx, childCtx context.Context, childWG 
 			repoKey: repo.Key(),
 			runID:   run.ID,
 		}
-		if err := childHarness.RunTurn(childCtx, childSess, task, events); err != nil {
-			scoped.Log(childCtx).Info("child session finished with error", "session", childName, "error", err)
+		if err := childHarness.RunTurn(children.ctx, childSess, task, events); err != nil {
+			scoped.Log(children.ctx).Info("child session finished with error", "session", childName, "error", err)
 		}
 	}()
 
 	return childName, nil
+}
+
+func (o *Orchestrator) listRunSessions(ctx context.Context, run *state.Run, children *childGroup) ([]ao.SessionInfo, error) {
+	sessions, err := session.ListRunSessions(ctx, o.sessionStore, run.ID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]ao.SessionInfo, len(sessions))
+	for i, s := range sessions {
+		st := "stopped"
+		if s.Name == run.SessionID || children.isRunning(s.Name) {
+			st = "running"
+		}
+		result[i] = ao.SessionInfo{
+			Name:   s.Name,
+			Parent: s.Metadata.Parent,
+			State:  st,
+		}
+	}
+	return result, nil
+}
+
+// childGroup coordinates child sessions started within a turn worker.
+type childGroup struct {
+	ctx     context.Context
+	wg      *sync.WaitGroup
+	mu      sync.Mutex
+	running map[string]bool
+}
+
+func newChildGroup(ctx context.Context) *childGroup {
+	return &childGroup{
+		ctx:     ctx,
+		wg:      &sync.WaitGroup{},
+		running: make(map[string]bool),
+	}
+}
+
+func (g *childGroup) setRunning(name string, running bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if running {
+		g.running[name] = true
+	} else {
+		delete(g.running, name)
+	}
+}
+
+func (g *childGroup) isRunning(name string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.running[name]
 }
 
 type orchestratorTurnEvents struct {

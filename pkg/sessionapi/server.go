@@ -745,28 +745,11 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 
 	var result []SessionSummary
 	for _, sum := range summaries {
-		msgCount := sum.MessageCount
-		if act, ok := s.activeSessions[sum.Name]; ok {
-			msgCount = len(act.Messages())
+		var fallbackRunID string
+		if sessionRuns != nil {
+			fallbackRunID = sessionRuns[sum.Name]
 		}
-		var runID string
-		if sum.Metadata.RunID != "" {
-			runID = sum.Metadata.RunID
-		} else if sessionRuns != nil {
-			runID = sessionRuns[sum.Name]
-		}
-		result = append(result, SessionSummary{
-			Name:         sum.Name,
-			Repo:         sum.Metadata.Repo,
-			RunID:        runID,
-			Toolset:      sum.Metadata.Toolset,
-			Parent:       sum.Metadata.Parent,
-			Ancestors:    sum.Metadata.Ancestors,
-			Depth:        sum.Metadata.Depth(),
-			CreatedAt:    sum.Metadata.CreatedAt,
-			MessageCount: msgCount,
-			InFlight:     s.busySessions[sum.Name],
-		})
+		result = append(result, s.sessionSummaryFromStore(sum, fallbackRunID))
 	}
 
 	sort.Slice(result, func(i, j int) bool {
@@ -774,6 +757,29 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 	})
 
 	return result, nil
+}
+
+func (s *Server) sessionSummaryFromStore(sum session.SessionSummary, fallbackRunID string) SessionSummary {
+	msgCount := sum.MessageCount
+	if act, ok := s.activeSessions[sum.Name]; ok {
+		msgCount = len(act.Messages())
+	}
+	runID := sum.Metadata.RunID
+	if runID == "" {
+		runID = fallbackRunID
+	}
+	return SessionSummary{
+		Name:         sum.Name,
+		Repo:         sum.Metadata.Repo,
+		RunID:        runID,
+		Toolset:      sum.Metadata.Toolset,
+		Parent:       sum.Metadata.Parent,
+		Ancestors:    sum.Metadata.Ancestors,
+		Depth:        sum.Metadata.Depth(),
+		CreatedAt:    sum.Metadata.CreatedAt,
+		MessageCount: msgCount,
+		InFlight:     s.busySessions[sum.Name],
+	}
 }
 
 func (s *Server) sessionRunsMap(ctx context.Context) (map[string]string, error) {
@@ -893,27 +899,18 @@ func (s *Server) ListRunSessions(ctx context.Context, runID string) ([]SessionSu
 		return nil, status.Error(codes.InvalidArgument, "run ID is required")
 	}
 
-	all, err := s.ListSessionSummaries(ctx)
+	sessions, err := session.ListRunSessions(ctx, s.store, runID)
 	if err != nil {
 		return nil, err
 	}
 
-	var result []SessionSummary
-	for _, sum := range all {
-		if sum.RunID == runID {
-			result = append(result, sum)
-		}
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Depth != result[j].Depth {
-			return result[i].Depth < result[j].Depth
-		}
-		if !result[i].CreatedAt.Equal(result[j].CreatedAt) {
-			return result[i].CreatedAt.Before(result[j].CreatedAt)
-		}
-		return result[i].Name < result[j].Name
-	})
+	result := make([]SessionSummary, len(sessions))
+	for i, sum := range sessions {
+		result[i] = s.sessionSummaryFromStore(sum, runID)
+	}
 
 	return result, nil
 }

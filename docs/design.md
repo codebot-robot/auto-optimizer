@@ -297,6 +297,7 @@ written for maintainers.
 | `open_pull_request(title, body)` | control plane | Commits any uncommitted changes, pushes the branch `ao/<goal>/<run-id>` through the portal, and hands over to the orchestrator's select step. The tool result tells the model whether a PR was opened, and if not, why. |
 | `finish(summary)` | control plane | Ends the session without a PR. |
 | `start_session(task)` | control plane | Starts a child session in the same run to work on a task in the background and returns its name immediately. |
+| `list_sessions` | control plane | Lists the sessions of the calling run: each one's name, its parent, and whether it is running or stopped. |
 
 ### Child sessions
 
@@ -316,9 +317,8 @@ child sessions stop. A session that belongs to no run cannot call the tool.
 When the control plane restarts while a run is in `Working`, the top-level session
 resumes execution on its next turn. Child sessions are ephemeral and do not
 automatically restart; any in-flight child session remains stopped at its last
-recorded turn in the session store. Later phases will introduce session listing
-and status checking so the parent can inspect whether a child is still running or
-has stopped.
+recorded turn in the session store. Sessions can call `list_sessions`
+to inspect whether other sessions in the run are running or stopped.
 
 ### Personalities for phase 2
 
