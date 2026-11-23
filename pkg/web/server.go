@@ -87,13 +87,14 @@ func NewServer(service SessionService, stateStore state.Store, starter RunStarte
 	if service == nil {
 		return nil, errors.New("service is required")
 	}
+	if opts.KubeClient == nil {
+		return nil, errors.New("KubeClient is required")
+	}
+	if opts.Namespace == "" {
+		return nil, errors.New("Namespace is required")
+	}
 	if opts.RequireSignIn && len(opts.SessionKey) < auth.MinKeyLength {
 		return nil, fmt.Errorf("session key must be at least %d bytes when sign-in is enabled: %w", auth.MinKeyLength, auth.ErrKeyTooShort)
-	}
-
-	ns := opts.Namespace
-	if ns == "" {
-		ns = session.DefaultNamespace
 	}
 
 	return &Server{
@@ -102,24 +103,10 @@ func NewServer(service SessionService, stateStore state.Store, starter RunStarte
 		starter:       starter,
 		orchestrator:  opts.Orchestrator,
 		kubeClient:    opts.KubeClient,
-		namespace:     ns,
+		namespace:     opts.Namespace,
 		requireSignIn: opts.RequireSignIn,
 		sessionKey:    opts.SessionKey,
 	}, nil
-}
-
-func (s *Server) getRun(ctx context.Context, runID string) (*state.Run, error) {
-	if s.kubeClient == nil {
-		return nil, state.ErrNotFound
-	}
-	return run.GetRun(ctx, s.kubeClient, s.namespace, runID)
-}
-
-func (s *Server) listRuns(ctx context.Context, repo *state.Repo) ([]*state.Run, error) {
-	if s.kubeClient == nil {
-		return nil, nil
-	}
-	return run.ListRuns(ctx, s.kubeClient, s.namespace, repo.URL)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -311,13 +298,13 @@ func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request, host, own
 	for _, g := range goals {
 		var latestPhase state.RunPhase
 		if g.LastRunID != "" {
-			run, err := s.getRun(r.Context(), g.LastRunID)
+			runRec, err := run.GetRun(r.Context(), s.kubeClient, s.namespace, g.LastRunID)
 			if err != nil {
 				if !errors.Is(err, state.ErrNotFound) {
 					scoped.Log(r.Context()).V(2).Info("getting latest run for goal", "run", g.LastRunID, "error", err)
 				}
 			} else {
-				latestPhase = run.Phase
+				latestPhase = runRec.Phase
 			}
 		}
 		goalEntries = append(goalEntries, GoalEntry{
@@ -326,7 +313,7 @@ func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request, host, own
 		})
 	}
 
-	runs, err := s.listRuns(r.Context(), repo)
+	runs, err := run.ListRuns(r.Context(), s.kubeClient, s.namespace, key)
 	if err != nil {
 		scoped.Log(r.Context()).Error(err, "listing runs", "repo", key)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -335,8 +322,8 @@ func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request, host, own
 
 	// Reverse runs so newest runs appear first
 	recentRuns := make([]*state.Run, len(runs))
-	for i, run := range runs {
-		recentRuns[len(runs)-1-i] = run
+	for i, runRec := range runs {
+		recentRuns[len(runs)-1-i] = runRec
 	}
 
 	if err := RenderRepoPage(r.Context(), w, RepoPageData{
@@ -354,7 +341,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request, runID stri
 		return
 	}
 
-	run, err := s.getRun(r.Context(), runID)
+	runRec, err := run.GetRun(r.Context(), s.kubeClient, s.namespace, runID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.render404(w, r, fmt.Sprintf("Run %q not found", runID))
@@ -365,18 +352,15 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request, runID stri
 		return
 	}
 
-	var events []state.Event
-	if s.stateStore != nil {
-		events, err = s.stateStore.ReadEvents(r.Context(), run.Repo, run.ID)
-		if err != nil {
-			scoped.Log(r.Context()).Error(err, "reading events for run", "run", runID)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+	events, err := s.stateStore.ReadEvents(r.Context(), runRec.Repo, runRec.ID)
+	if err != nil {
+		scoped.Log(r.Context()).Error(err, "reading events for run", "run", runID)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	if err := RenderRunPage(r.Context(), w, RunPageData{
-		Run:    run,
+		Run:    runRec,
 		Events: events,
 	}); err != nil {
 		scoped.Log(r.Context()).Error(err, "rendering run page", "run", runID)
@@ -399,7 +383,7 @@ func (s *Server) handlePostRun(w http.ResponseWriter, r *http.Request, runID str
 		return
 	}
 
-	runRec, err := s.getRun(r.Context(), runID)
+	runRec, err := run.GetRun(r.Context(), s.kubeClient, s.namespace, runID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.render404(w, r, fmt.Sprintf("Run %q not found", runID))
@@ -599,11 +583,11 @@ func (s *Server) recordMessagePosted(ctx context.Context, sessionName string) {
 	}
 
 	var phase state.RunPhase
-	run, err := s.getRun(ctx, detail.Summary.RunID)
+	runRec, err := run.GetRun(ctx, s.kubeClient, s.namespace, detail.Summary.RunID)
 	if err != nil {
 		scoped.Log(ctx).V(4).Info("getting run for session event", "run", detail.Summary.RunID, "error", err)
-	} else if run != nil {
-		phase = run.Phase
+	} else if runRec != nil {
+		phase = runRec.Phase
 	}
 
 	event := state.Event{

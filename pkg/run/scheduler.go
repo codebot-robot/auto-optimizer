@@ -381,7 +381,7 @@ func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName str
 }
 
 func (s *Scheduler) listRuns(ctx context.Context, repo *state.Repo) ([]*state.Run, error) {
-	return ListRuns(ctx, s.Orchestrator.kubeClient, s.Orchestrator.namespace(), repo.URL)
+	return ListRuns(ctx, s.Orchestrator.kubeClient, s.Orchestrator.namespace(), repo.Key())
 }
 
 func (s *Scheduler) findOpenPullRequest(ctx context.Context, repo *state.Repo, goalName string) (*forge.PullRequest, error) {

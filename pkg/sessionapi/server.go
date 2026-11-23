@@ -20,11 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
-	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/run"
@@ -132,9 +130,11 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		}
 	}
 
-	ns := opts.Namespace
-	if ns == "" {
-		ns = session.DefaultNamespace
+	if opts.KubeClient == nil {
+		return nil, errors.New("KubeClient is required")
+	}
+	if opts.Namespace == "" {
+		return nil, errors.New("Namespace is required")
 	}
 
 	return &Server{
@@ -143,7 +143,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		defaultToolset: defaultToolset,
 		harnessFactory: factory,
 		kubeClient:     opts.KubeClient,
-		namespace:      ns,
+		namespace:      opts.Namespace,
 		busySessions:   make(map[string]bool),
 		activeSessions: make(map[string]*session.Session),
 	}, nil
@@ -627,11 +627,12 @@ func (s *Server) ListRuns(ctx context.Context, req *sessionv1.ListRunsRequest) (
 		return nil, status.Error(codes.InvalidArgument, "repo_url is required")
 	}
 
-	if s.kubeClient == nil {
-		return &sessionv1.ListRunsResponse{}, nil
+	key, err := state.ParseRepoURL(repoURL)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid repo_url %q: %v", repoURL, err)
 	}
 
-	runs, err := run.ListRuns(ctx, s.kubeClient, s.namespace, repoURL)
+	runs, err := run.ListRuns(ctx, s.kubeClient, s.namespace, key)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "listing runs: %v", err)
 	}
@@ -657,10 +658,6 @@ func (s *Server) ListRuns(ctx context.Context, req *sessionv1.ListRunsRequest) (
 
 // GetRun returns details and events for a run.
 func (s *Server) GetRun(ctx context.Context, req *sessionv1.GetRunRequest) (*sessionv1.GetRunResponse, error) {
-	if s.kubeClient == nil {
-		return nil, status.Error(codes.FailedPrecondition, "kube client not configured")
-	}
-
 	runID := req.GetId()
 	if runID == "" {
 		return nil, status.Error(codes.InvalidArgument, "id is required")
@@ -675,18 +672,13 @@ func (s *Server) GetRun(ctx context.Context, req *sessionv1.GetRunRequest) (*ses
 	}
 
 	repoURL := runRec.Repo.String()
-	if s.stateStore != nil {
-		if repo, err := s.stateStore.GetRepo(ctx, runRec.Repo); err == nil && repo != nil && repo.URL != "" {
-			repoURL = repo.URL
-		}
+	if repo, err := s.stateStore.GetRepo(ctx, runRec.Repo); err == nil && repo != nil && repo.URL != "" {
+		repoURL = repo.URL
 	}
 
-	var events []state.Event
-	if s.stateStore != nil {
-		events, err = s.stateStore.ReadEvents(ctx, runRec.Repo, runRec.ID)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "reading events for run: %v", err)
-		}
+	events, err := s.stateStore.ReadEvents(ctx, runRec.Repo, runRec.ID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "reading events for run: %v", err)
 	}
 
 	pbRun := &sessionv1.RunRecord{
@@ -821,22 +813,14 @@ func (s *Server) sessionSummaryFromStore(sum session.SessionSummary, fallbackRun
 }
 
 func (s *Server) sessionRunsMap(ctx context.Context) (map[string]string, error) {
-	if s.kubeClient == nil {
-		return nil, nil
-	}
-	var hrList herorunv1alpha1.HeroRunList
-	if err := s.kubeClient.List(ctx, &hrList, client.InNamespace(s.namespace)); err != nil {
-		return nil, fmt.Errorf("listing HeroRuns for session runs: %w", err)
+	runs, err := run.ListRuns(ctx, s.kubeClient, s.namespace, state.RepoKey{})
+	if err != nil {
+		return nil, fmt.Errorf("listing runs for session runs: %w", err)
 	}
 	sessionRuns := make(map[string]string)
-	for i := range hrList.Items {
-		hr := &hrList.Items[i]
-		runID := hr.Spec.RunID
-		if runID == "" {
-			runID = strings.TrimPrefix(hr.Name, "run-")
-		}
-		if hr.Status.SessionID != "" && runID != "" {
-			sessionRuns[hr.Status.SessionID] = runID
+	for _, r := range runs {
+		if r.SessionID != "" {
+			sessionRuns[r.SessionID] = r.ID
 		}
 	}
 	return sessionRuns, nil

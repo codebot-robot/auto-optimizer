@@ -91,7 +91,7 @@ func TestParseForm(t *testing.T) {
 }
 
 func TestServeHTTP_MalformedBody(t *testing.T) {
-	srv, err := NewServer(&fakeSessionService{}, nil, nil, ServerOptions{})
+	srv, err := NewServer(&fakeSessionService{}, nil, nil, testServerOptions(t))
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

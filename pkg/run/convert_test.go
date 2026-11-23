@@ -441,7 +441,8 @@ func TestGetRun_And_ListRuns(t *testing.T) {
 	}
 
 	// Test ListRuns for repo1
-	runs1, err := run.ListRuns(ctx, fakeClient, ns, repoURL1)
+	repoKey1 := state.RepoKey{Host: "github.com", Owner: "example", Name: "repo1"}
+	runs1, err := run.ListRuns(ctx, fakeClient, ns, repoKey1)
 	if err != nil {
 		t.Fatalf("ListRuns repo1: %v", err)
 	}
@@ -454,7 +455,8 @@ func TestGetRun_And_ListRuns(t *testing.T) {
 	}
 
 	// Test ListRuns for repo2
-	runs2, err := run.ListRuns(ctx, fakeClient, ns, repoURL2)
+	repoKey2 := state.RepoKey{Host: "github.com", Owner: "example", Name: "repo2"}
+	runs2, err := run.ListRuns(ctx, fakeClient, ns, repoKey2)
 	if err != nil {
 		t.Fatalf("ListRuns repo2: %v", err)
 	}
@@ -462,8 +464,8 @@ func TestGetRun_And_ListRuns(t *testing.T) {
 		t.Errorf("ListRuns repo2 mismatch: got %+v", runs2)
 	}
 
-	// Test ListRuns all repos (empty repoURL)
-	allRuns, err := run.ListRuns(ctx, fakeClient, ns, "")
+	// Test ListRuns all repos (zero RepoKey)
+	allRuns, err := run.ListRuns(ctx, fakeClient, ns, state.RepoKey{})
 	if err != nil {
 		t.Fatalf("ListRuns all: %v", err)
 	}

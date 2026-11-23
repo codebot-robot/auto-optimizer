@@ -587,6 +587,7 @@ func TestRunListCommand_Execution(t *testing.T) {
 		StateStore:     stateStore,
 		DefaultToolset: "basic",
 		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 		HarnessFactory: func(_ string) (*session.Harness, error) {
 			return nil, nil
 		},
@@ -688,6 +689,7 @@ func TestRunGetCommand_Execution(t *testing.T) {
 		StateStore:     stateStore,
 		DefaultToolset: "basic",
 		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 		HarnessFactory: func(_ string) (*session.Harness, error) {
 			return nil, nil
 		},
