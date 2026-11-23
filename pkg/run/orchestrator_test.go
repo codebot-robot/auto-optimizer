@@ -208,10 +208,45 @@ func (o *Orchestrator) cancelWorkers() {
 	}
 }
 
+func newTestFakeClientBuilder(scheme *apiruntime.Scheme) *fake.ClientBuilder {
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&herorunv1alpha1.HeroRun{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if obj.GetUID() == "" {
+					obj.SetUID(types.UID("test-uid-" + obj.GetName()))
+				}
+				return client.Create(ctx, obj, opts...)
+			},
+		})
+}
+
 func newTestOrchestrator(t *testing.T, opts OrchestratorOptions) *Orchestrator {
 	t.Helper()
 	if opts.MaxSessionDepth == 0 {
 		opts.MaxSessionDepth = DefaultMaxSessionDepth
+	}
+	if opts.KubeClient == nil {
+		scheme, err := NewScheme()
+		if err != nil {
+			t.Fatalf("NewScheme: %v", err)
+		}
+		fakeClient := newTestFakeClientBuilder(scheme).Build()
+		if opts.Store != nil && opts.Harness != nil {
+			repos, _ := opts.Store.ListRepos(t.Context())
+			for _, r := range repos {
+				runs, _ := opts.Store.ListRuns(t.Context(), r.Key())
+				for _, run := range runs {
+					hr := HeroRunFromRun(run)
+					hr.Namespace = opts.Harness.Namespace()
+					hr.Spec.Repository = r.URL
+					_ = fakeClient.Create(t.Context(), hr)
+					_ = fakeClient.Status().Update(t.Context(), hr)
+				}
+			}
+		}
+		opts.KubeClient = fakeClient
 	}
 	orch, err := NewOrchestrator(opts)
 	if err != nil {
@@ -231,6 +266,34 @@ func runRequest(orch *Orchestrator, repo state.RepoKey, runID string) reconcile.
 	if orch != nil && orch.harness != nil {
 		ns = orch.harness.Namespace()
 	}
+	if orch != nil && orch.kubeClient != nil {
+		ctx := context.Background()
+		var hr herorunv1alpha1.HeroRun
+		if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &hr); k8serrors.IsNotFound(err) {
+			if r, err := orch.store.GetRun(ctx, repo, runID); err == nil {
+				repoObj, _ := orch.store.GetRepo(ctx, repo)
+				newHR := HeroRunFromRun(r)
+				newHR.Namespace = ns
+				if repoObj != nil {
+					newHR.Spec.Repository = repoObj.URL
+				}
+				_ = orch.kubeClient.Create(ctx, newHR)
+				_ = orch.kubeClient.Status().Update(ctx, newHR)
+			}
+		} else if err == nil {
+			if r, err := orch.store.GetRun(ctx, repo, runID); err == nil {
+				repoObj, _ := orch.store.GetRepo(ctx, repo)
+				freshHR := HeroRunFromRun(r)
+				hr.Spec = freshHR.Spec
+				hr.Status = freshHR.Status
+				if repoObj != nil {
+					hr.Spec.Repository = repoObj.URL
+				}
+				_ = orch.kubeClient.Update(ctx, &hr)
+				_ = orch.kubeClient.Status().Update(ctx, &hr)
+			}
+		}
+	}
 	return reconcile.Request{
 		NamespacedName: types.NamespacedName{
 			Namespace: ns,
@@ -240,13 +303,14 @@ func runRequest(orch *Orchestrator, repo state.RepoKey, runID string) reconcile.
 }
 
 func reconcileWorkingRun(ctx context.Context, orch *Orchestrator, req reconcile.Request) (reconcile.Result, error) {
-	_, runID, ok, err := orch.runForRequest(ctx, req)
+	run, _, _, err := orch.getRunForReconcile(ctx, req)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	if !ok {
+	if run == nil {
 		return reconcile.Result{}, fmt.Errorf("could not resolve request %v to run", req)
 	}
+	runID := run.ID
 	// First pass starts the worker
 	res, err := orch.Reconcile(ctx, req)
 	if err != nil {
@@ -1530,15 +1594,20 @@ func TestOrchestrator_Working_SharedTurnBudget(t *testing.T) {
 		MaxTurns:     3,
 	})
 
+	var hr herorunv1alpha1.HeroRun
+	if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: harness.Namespace(), Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
+		t.Fatalf("getting HeroRun: %v", err)
+	}
+
 	// 1. Session 1 runs turn worker: uses 1 turn and finishes normally.
-	outcome1 := orch.runTurnWorker(ctx, repo, run)
+	outcome1 := orch.runTurnWorker(ctx, repo, run, &hr)
 	if outcome1.Err != nil {
 		t.Fatalf("session 1 turnErr: %v", outcome1.Err)
 	}
 
 	// 2. Session 2 for the same run runs turn worker: uses remaining 2 turns and hits max turns.
 	run.SessionID = "session2"
-	outcome2 := orch.runTurnWorker(ctx, repo, run)
+	outcome2 := orch.runTurnWorker(ctx, repo, run, &hr)
 	if !errors.Is(outcome2.Err, session.ErrMaxTurns) {
 		t.Fatalf("session 2 expected ErrMaxTurns, got %v", outcome2.Err)
 	}
@@ -1552,7 +1621,7 @@ func TestOrchestrator_Working_SharedTurnBudget(t *testing.T) {
 	}
 
 	// 4. Session 2's next turn also immediately ends with ErrMaxTurns without additional LLM calls
-	outcome3 := orch.runTurnWorker(ctx, repo, run)
+	outcome3 := orch.runTurnWorker(ctx, repo, run, &hr)
 	if !errors.Is(outcome3.Err, session.ErrMaxTurns) {
 		t.Fatalf("session 2 next turn expected ErrMaxTurns, got %v", outcome3.Err)
 	}
@@ -1563,7 +1632,7 @@ func TestOrchestrator_Working_SharedTurnBudget(t *testing.T) {
 		t.Fatalf("AppendMessages: %v", err)
 	}
 	run.SessionID = "session1"
-	outcome4 := orch.runTurnWorker(ctx, repo, run)
+	outcome4 := orch.runTurnWorker(ctx, repo, run, &hr)
 	if !errors.Is(outcome4.Err, session.ErrMaxTurns) {
 		t.Fatalf("session 1 next turn expected ErrMaxTurns, got %v", outcome4.Err)
 	}
@@ -2570,6 +2639,24 @@ func startReconcileDriver(t *testing.T, orch *Orchestrator) *reconcileDriver {
 		orch.workerWG.Wait()
 	})
 
+	if orch.store != nil && orch.kubeClient != nil {
+		repos, _ := orch.store.ListRepos(ctx)
+		for _, repo := range repos {
+			runs, _ := orch.store.ListRuns(ctx, repo.Key())
+			for _, r := range runs {
+				name := sandboxNameForRun(r.ID)
+				var hr herorunv1alpha1.HeroRun
+				if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: orch.namespace(), Name: name}, &hr); k8serrors.IsNotFound(err) {
+					newHR := HeroRunFromRun(r)
+					newHR.Namespace = orch.namespace()
+					newHR.Spec.Repository = repo.URL
+					_ = orch.kubeClient.Create(ctx, newHR)
+					_ = orch.kubeClient.Status().Update(ctx, newHR)
+				}
+			}
+		}
+	}
+
 	go func() {
 		_ = orch.Start(ctx)
 	}()
@@ -2723,7 +2810,7 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := newTestFakeClientBuilder(scheme).Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -2897,7 +2984,7 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := newTestFakeClientBuilder(scheme).Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:             store,
@@ -3616,7 +3703,7 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := newTestFakeClientBuilder(scheme).Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -3709,7 +3796,7 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := newTestFakeClientBuilder(scheme).Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -3789,7 +3876,7 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := newTestFakeClientBuilder(scheme).Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -3957,8 +4044,7 @@ func TestHeroRunGenerationChangedPredicate(t *testing.T) {
 	}
 }
 
-func TestRunForRequest_ResolvesThroughIndex(t *testing.T) {
-	ctx := t.Context()
+func TestOrchestrator_Notify_PopulatesRunIndex(t *testing.T) {
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
 	orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -3970,34 +4056,42 @@ func TestRunForRequest_ResolvesThroughIndex(t *testing.T) {
 	runID := "20261030T120000Z-index"
 	orch.Notify(repoKey, runID)
 
-	req := reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Namespace: harness.Namespace(),
-			Name:      sandboxNameForRun(runID),
-		},
+	reqName := sandboxNameForRun(runID)
+	orch.runIndexMu.RLock()
+	entry, ok := orch.runIndex[reqName]
+	orch.runIndexMu.RUnlock()
+	if !ok {
+		t.Fatalf("expected runIndex to be populated after Notify")
 	}
-	gotRepo, gotRunID, ok, err := orch.runForRequest(ctx, req)
-	if err != nil || !ok {
-		t.Fatalf("expected runForRequest to resolve through index, got ok=%v err=%v", ok, err)
+	if entry.repo != repoKey {
+		t.Errorf("got repo %+v, want %+v", entry.repo, repoKey)
 	}
-	if gotRepo != repoKey {
-		t.Errorf("got repo %+v, want %+v", gotRepo, repoKey)
-	}
-	if gotRunID != runID {
-		t.Errorf("got runID %q, want %q", gotRunID, runID)
+	if entry.runID != runID {
+		t.Errorf("got runID %q, want %q", entry.runID, runID)
 	}
 }
 
-func TestRunForRequest_ResolvesThroughHeroRunOnIndexMiss(t *testing.T) {
+func TestGetRunForReconcile_ResolvesThroughHeroRunOnIndexMiss(t *testing.T) {
 	ctx := t.Context()
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
 
 	scheme, err := NewScheme()
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := newTestFakeClientBuilder(scheme).Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -4016,9 +4110,10 @@ func TestRunForRequest_ResolvesThroughHeroRunOnIndexMiss(t *testing.T) {
 			Labels: map[string]string{
 				LabelRun: runID,
 			},
-			Annotations: map[string]string{
-				AnnotationRepo: repoKey.String(),
-			},
+		},
+		Spec: herorunv1alpha1.HeroRunSpec{
+			RunID:      runID,
+			Repository: "https://github.com/gke-labs/test-repo",
 		},
 	}
 	if err := fakeClient.Create(ctx, hr); err != nil {
@@ -4030,7 +4125,7 @@ func TestRunForRequest_ResolvesThroughHeroRunOnIndexMiss(t *testing.T) {
 	_, foundBefore := orch.runIndex[hrName]
 	orch.runIndexMu.RUnlock()
 	if foundBefore {
-		t.Fatal("expected index to miss before runForRequest")
+		t.Fatal("expected index to miss before getRunForReconcile")
 	}
 
 	req := reconcile.Request{
@@ -4039,15 +4134,15 @@ func TestRunForRequest_ResolvesThroughHeroRunOnIndexMiss(t *testing.T) {
 			Name:      hrName,
 		},
 	}
-	gotRepo, gotRunID, ok, err := orch.runForRequest(ctx, req)
-	if err != nil || !ok {
-		t.Fatalf("expected runForRequest to resolve through HeroRun on index miss, got ok=%v err=%v", ok, err)
+	gotRun, gotRepo, _, err := orch.getRunForReconcile(ctx, req)
+	if err != nil || gotRun == nil {
+		t.Fatalf("expected getRunForReconcile to resolve through HeroRun on index miss, got run=%v err=%v", gotRun, err)
 	}
-	if gotRepo != repoKey {
-		t.Errorf("got repo %+v, want %+v", gotRepo, repoKey)
+	if gotRepo.Key() != repoKey {
+		t.Errorf("got repo %+v, want %+v", gotRepo.Key(), repoKey)
 	}
-	if gotRunID != runID {
-		t.Errorf("got runID %q, want %q", gotRunID, runID)
+	if gotRun.ID != runID {
+		t.Errorf("got runID %q, want %q", gotRun.ID, runID)
 	}
 
 	// Verify index is now populated
@@ -4055,7 +4150,7 @@ func TestRunForRequest_ResolvesThroughHeroRunOnIndexMiss(t *testing.T) {
 	cached, foundAfter := orch.runIndex[hrName]
 	orch.runIndexMu.RUnlock()
 	if !foundAfter {
-		t.Fatal("expected index to be populated after runForRequest miss")
+		t.Fatal("expected index to be populated after getRunForReconcile miss")
 	}
 	if cached.repo != repoKey || cached.runID != runID {
 		t.Errorf("cached entry %+v, want repo %+v runID %s", cached, repoKey, runID)
@@ -4067,28 +4162,26 @@ func TestOrchestrator_Reconcile_UnknownNameDroppedWithoutError(t *testing.T) {
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
 	scheme, _ := NewScheme()
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
 
-	for _, c := range []client.Client{nil, fakeClient} {
-		orch := newTestOrchestrator(t, OrchestratorOptions{
-			Store:      store,
-			Harness:    harness,
-			KubeClient: c,
-		})
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: fakeClient,
+	})
 
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Namespace: harness.Namespace(),
-				Name:      "unknown-hero-run-name",
-			},
-		}
-		res, err := orch.Reconcile(ctx, req)
-		if err != nil {
-			t.Fatalf("expected unknown request to be dropped without error, got: %v", err)
-		}
-		if res != (reconcile.Result{}) {
-			t.Errorf("expected empty reconcile.Result, got: %+v", res)
-		}
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: harness.Namespace(),
+			Name:      "unknown-hero-run-name",
+		},
+	}
+	res, err := orch.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("expected unknown request to be dropped without error, got: %v", err)
+	}
+	if res != (reconcile.Result{}) {
+		t.Errorf("expected empty reconcile.Result, got: %+v", res)
 	}
 }
 
@@ -4150,8 +4243,14 @@ func TestOrchestrator_FinishedRunHasNoIndexEntry(t *testing.T) {
 	if err := store.PutRun(ctx, run); err != nil {
 		t.Fatalf("PutRun: %v", err)
 	}
-	_ = orch.publishHeroRun(ctx, repo, run)
-	orch.finishRun(ctx, repo, run, runEnd{Phase: state.PhaseNoImprovement, Kind: "finished"})
+	hr := HeroRunFromRun(run)
+	hr.Namespace = harness.Namespace()
+	hr.Spec.Repository = repo.URL
+	_ = fakeClient.Create(ctx, hr)
+	var hrObj herorunv1alpha1.HeroRun
+	_ = fakeClient.Get(ctx, client.ObjectKey{Namespace: harness.Namespace(), Name: hrName}, &hrObj)
+	_ = orch.saveHeroRun(ctx, &hrObj, run)
+	_ = orch.finishRun(ctx, repo, run, &hrObj, runEnd{Phase: state.PhaseNoImprovement, Kind: "finished"})
 
 	orch.runIndexMu.RLock()
 	_, found := orch.runIndex[hrName]
@@ -4206,7 +4305,7 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := newTestFakeClientBuilder(scheme).Build()
 
 	fixedTime := time.Date(2026, 10, 30, 12, 1, 0, 0, time.UTC)
 	orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -4263,12 +4362,6 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 	if hr.Spec.BaseCommit != "commit-base123" {
 		t.Errorf("expected spec.baseCommit %q, got %q", "commit-base123", hr.Spec.BaseCommit)
 	}
-	if hr.Labels[LabelRun] != runID {
-		t.Errorf("expected label %s=%q, got %q", LabelRun, runID, hr.Labels[LabelRun])
-	}
-	if hr.Annotations[AnnotationRepo] != repo.Key().String() {
-		t.Errorf("expected annotation %s=%q, got %q", AnnotationRepo, repo.Key().String(), hr.Annotations[AnnotationRepo])
-	}
 
 	// Verify the Sandbox was created with exactly one owner reference to the HeroRun
 	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, expectedName, metav1.GetOptions{})
@@ -4296,7 +4389,7 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 	}
 }
 
-func TestOrchestrator_PublishHeroRun_Resume(t *testing.T) {
+func TestOrchestrator_Resume_EnqueuesNonTerminalRuns(t *testing.T) {
 	ctx := t.Context()
 	store := state.NewFileStore(t.TempDir())
 
@@ -4311,87 +4404,61 @@ func TestOrchestrator_PublishHeroRun_Resume(t *testing.T) {
 		t.Fatalf("PutRepo: %v", err)
 	}
 
-	// Run 0: non-terminal (Pending), no HeroRun exists -> Resume publishes for Pending runs too
-	runPending := &state.Run{
-		ID:         "20261030T120000Z-runpending",
+	// Legacy disk run with no HeroRun should NOT be imported
+	legacyDiskRun := &state.Run{
+		ID:         "20261030T120000Z-diskonly",
 		Repo:       repo.Key(),
-		GoalName:   "goal-pending",
-		Phase:      state.PhasePending,
-		BaseCommit: "",
+		GoalName:   "goal-disk",
+		Phase:      state.PhaseWorking,
+		BaseCommit: "commit1",
 	}
-	if err := store.PutRun(ctx, runPending); err != nil {
-		t.Fatalf("PutRun runPending: %v", err)
-	}
-
-	// Run 1: non-terminal (Working), no HeroRun exists
-	run1 := &state.Run{
-		ID:          "20261030T120000Z-run1",
-		Repo:        repo.Key(),
-		GoalName:    "goal1",
-		Phase:       state.PhaseWorking,
-		BaseCommit:  "commit1",
-		SandboxName: "run-20261030t120000z-run1",
-	}
-	if err := store.PutRun(ctx, run1); err != nil {
-		t.Fatalf("PutRun run1: %v", err)
-	}
-
-	// Run 2: non-terminal (Preparing), already has existing HeroRun
-	run2 := &state.Run{
-		ID:          "20261030T120000Z-run2",
-		Repo:        repo.Key(),
-		GoalName:    "goal2",
-		Phase:       state.PhasePreparing,
-		BaseCommit:  "commit2",
-		SandboxName: "run-20261030t120000z-run2",
-	}
-	if err := store.PutRun(ctx, run2); err != nil {
-		t.Fatalf("PutRun run2: %v", err)
-	}
-
-	// Run 3: terminal (NoImprovement), no HeroRun exists
-	run3 := &state.Run{
-		ID:          "20261030T120000Z-run3",
-		Repo:        repo.Key(),
-		GoalName:    "goal3",
-		Phase:       state.PhaseNoImprovement,
-		BaseCommit:  "commit3",
-		SandboxName: "run-20261030t120000z-run3",
-	}
-	if err := store.PutRun(ctx, run3); err != nil {
-		t.Fatalf("PutRun run3: %v", err)
+	if err := store.PutRun(ctx, legacyDiskRun); err != nil {
+		t.Fatalf("PutRun: %v", err)
 	}
 
 	harness, _, _ := setupTestHarness(t, nil)
-
 	scheme, err := NewScheme()
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	// Pre-create HeroRun for run2 with existing marker
-	existingHR := &herorunv1alpha1.HeroRun{
+	// Pre-create HeroRun 1 (non-terminal: Working)
+	hr1 := &herorunv1alpha1.HeroRun{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "run-20261030t120000z-run2",
+			Name:      "run-20261030t120000z-hr1",
 			Namespace: "ao-sandboxes",
-			Annotations: map[string]string{
-				"custom-annotation": "untouched",
-			},
 		},
 		Spec: herorunv1alpha1.HeroRunSpec{
-			Repository: "https://github.com/gke-labs/original",
-			Goal:       "original-goal",
-			RunID:      run2.ID,
-			BaseCommit: "original-commit",
+			Repository: repo.URL,
+			Goal:       "goal-working",
+			RunID:      "20261030T120000Z-hr1",
+			BaseCommit: "commit1",
 		},
 		Status: herorunv1alpha1.HeroRunStatus{
-			Phase: "ExistingPhase",
+			Phase: string(state.PhaseWorking),
 		},
 	}
-	if err := fakeClient.Create(ctx, existingHR); err != nil {
-		t.Fatalf("fakeClient.Create existingHR: %v", err)
+
+	// Pre-create HeroRun 2 (terminal: Succeeded)
+	hr2 := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "run-20261030t120000z-hr2",
+			Namespace: "ao-sandboxes",
+		},
+		Spec: herorunv1alpha1.HeroRunSpec{
+			Repository: repo.URL,
+			Goal:       "goal-succeeded",
+			RunID:      "20261030T120000Z-hr2",
+			BaseCommit: "commit2",
+		},
+		Status: herorunv1alpha1.HeroRunStatus{
+			Phase: string(state.PhaseSucceeded),
+		},
 	}
+
+	fakeClient := newTestFakeClientBuilder(scheme).
+		WithObjects(hr1, hr2).
+		Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -4403,51 +4470,31 @@ func TestOrchestrator_PublishHeroRun_Resume(t *testing.T) {
 		t.Fatalf("orch.Resume: %v", err)
 	}
 
-	// Check runPending: Pending run has HeroRun created during Resume
-	var hrPending herorunv1alpha1.HeroRun
-	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: "run-20261030t120000z-runpending"}, &hrPending); err != nil {
-		t.Fatalf("getting hrPending: %v", err)
+	// hr1 is non-terminal, so it should be indexed
+	orch.runIndexMu.RLock()
+	_, found1 := orch.runIndex["run-20261030t120000z-hr1"]
+	_, found2 := orch.runIndex["run-20261030t120000z-hr2"]
+	_, foundDisk := orch.runIndex["run-20261030t120000z-diskonly"]
+	orch.runIndexMu.RUnlock()
+
+	if !found1 {
+		t.Errorf("expected non-terminal run hr1 to be indexed")
 	}
-	if hrPending.Spec.Repository != repo.URL || hrPending.Spec.Goal != "goal-pending" || hrPending.Spec.RunID != runPending.ID {
-		t.Errorf("hrPending spec mismatch: %+v", hrPending.Spec)
+	if found2 {
+		t.Errorf("expected terminal run hr2 NOT to be indexed")
+	}
+	if foundDisk {
+		t.Errorf("expected disk-only run NOT to be indexed or imported")
 	}
 
-	// Check run1: HeroRun created
-	var hr1 herorunv1alpha1.HeroRun
-	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: "run-20261030t120000z-run1"}, &hr1); err != nil {
-		t.Fatalf("getting hr1: %v", err)
-	}
-	if hr1.Spec.Repository != repo.URL || hr1.Spec.Goal != "goal1" || hr1.Spec.RunID != run1.ID || hr1.Spec.BaseCommit != "commit1" {
-		t.Errorf("hr1 spec mismatch: %+v", hr1.Spec)
-	}
-	if hr1.Labels[LabelRun] != run1.ID {
-		t.Errorf("hr1 label %s = %q, want %q", LabelRun, hr1.Labels[LabelRun], run1.ID)
-	}
-
-	// Check run2: Existing HeroRun was untouched
-	var hr2 herorunv1alpha1.HeroRun
-	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: "run-20261030t120000z-run2"}, &hr2); err != nil {
-		t.Fatalf("getting hr2: %v", err)
-	}
-	if hr2.Annotations["custom-annotation"] != "untouched" {
-		t.Errorf("expected custom-annotation 'untouched', got %q", hr2.Annotations["custom-annotation"])
-	}
-	if hr2.Spec.Goal != "original-goal" {
-		t.Errorf("expected hr2 original goal, got %q", hr2.Spec.Goal)
-	}
-	if hr2.Status.Phase != "ExistingPhase" {
-		t.Errorf("expected hr2 original phase 'ExistingPhase', got %q", hr2.Status.Phase)
-	}
-
-	// Check run3: Terminal run has no HeroRun created
-	var hr3 herorunv1alpha1.HeroRun
-	err = fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: "run-20261030t120000z-run3"}, &hr3)
-	if !k8serrors.IsNotFound(err) {
-		t.Errorf("expected NotFound for terminal run HeroRun, got: %v", err)
+	// Verify disk-only run was NOT imported into kubeClient
+	var hrDisk herorunv1alpha1.HeroRun
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: "run-20261030t120000z-diskonly"}, &hrDisk); err == nil {
+		t.Errorf("expected disk-only run NOT to have HeroRun created in kubeClient")
 	}
 }
 
-func TestOrchestrator_PublishHeroRun_NilKubeClient(t *testing.T) {
+func TestOrchestrator_SaveHeroRunFailureFailsReconcile(t *testing.T) {
 	ctx := t.Context()
 	store := state.NewFileStore(t.TempDir())
 
@@ -4474,80 +4521,25 @@ func TestOrchestrator_PublishHeroRun_NilKubeClient(t *testing.T) {
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	harness, agentsCS, _ := setupTestHarness(t, nil)
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:      store,
-		Harness:    harness,
-		KubeClient: nil,
-	})
-
-	// Run leaves Pending in prepareRun with nil KubeClient
-	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
-	if err != nil {
-		t.Fatalf("orch.Reconcile: %v", err)
-	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("expected RequeueAfter > 0, got %v", res.RequeueAfter)
-	}
-
-	// Verify run proceeded to Preparing
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
-	if err != nil {
-		t.Fatalf("GetRun: %v", err)
-	}
-	if gotRun.Phase != state.PhasePreparing {
-		t.Errorf("expected phase %s, got %s", state.PhasePreparing, gotRun.Phase)
-	}
-
-	// Verify Sandbox was created without owner references
-	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
-	}
-	if len(sb.OwnerReferences) != 0 {
-		t.Errorf("expected 0 owner references on sandbox with nil KubeClient, got %d", len(sb.OwnerReferences))
-	}
-}
-
-func TestOrchestrator_PublishHeroRun_FailureDoesNotFailRun(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-
-	repo := &state.Repo{
-		URL:           "https://github.com/gke-labs/test-repo",
-		Host:          "github.com",
-		Owner:         "gke-labs",
-		Name:          "test-repo",
-		DefaultBranch: "main",
-	}
-	if err := store.PutRepo(ctx, repo); err != nil {
-		t.Fatalf("PutRepo: %v", err)
-	}
-
-	runID := "20261030T120000Z-abcd"
-	run := &state.Run{
-		ID:         runID,
-		Repo:       repo.Key(),
-		GoalName:   "optimize-search",
-		Phase:      state.PhasePending,
-		BaseCommit: "commit-base123",
-	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
-
-	harness, agentsCS, _ := setupTestHarness(t, nil)
+	harness, _, _ := setupTestHarness(t, nil)
 
 	scheme, err := NewScheme()
 	if err != nil {
 		t.Fatalf("NewScheme: %v", err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
-		Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			return errors.New("simulated publish failure")
-		},
-	}).Build()
+
+	hr := HeroRunFromRun(run)
+	hr.Namespace = harness.Namespace()
+	hr.Spec.Repository = repo.URL
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&herorunv1alpha1.HeroRun{}).
+		WithObjects(hr).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, client client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				return errors.New("simulated save status failure")
+			},
+		}).Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -4555,119 +4547,9 @@ func TestOrchestrator_PublishHeroRun_FailureDoesNotFailRun(t *testing.T) {
 		KubeClient: fakeClient,
 	})
 
-	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
-	if err != nil {
-		t.Fatalf("orch.Reconcile failed unexpectedly: %v", err)
-	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("expected RequeueAfter > 0, got %v", res.RequeueAfter)
-	}
-
-	// Verify run proceeded to Preparing despite publish failure
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
-	if err != nil {
-		t.Fatalf("GetRun: %v", err)
-	}
-	if gotRun.Phase != state.PhasePreparing {
-		t.Errorf("expected phase %s, got %s", state.PhasePreparing, gotRun.Phase)
-	}
-
-	// Verify Sandbox was created without owner references when publish failed
-	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
-	}
-	if len(sb.OwnerReferences) != 0 {
-		t.Errorf("expected 0 owner references on sandbox on publish failure, got %d", len(sb.OwnerReferences))
-	}
-}
-
-func TestOrchestrator_SandboxOwnerReference_NilKubeClientReachesWorking(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-
-	repo := &state.Repo{
-		URL:           "https://github.com/gke-labs/test-repo",
-		Host:          "github.com",
-		Owner:         "gke-labs",
-		Name:          "test-repo",
-		DefaultBranch: "main",
-	}
-	if err := store.PutRepo(ctx, repo); err != nil {
-		t.Fatalf("PutRepo: %v", err)
-	}
-
-	runID := "20261030T120000Z-nowork"
-	run := &state.Run{
-		ID:         runID,
-		Repo:       repo.Key(),
-		GoalName:   "optimize-search",
-		Phase:      state.PhasePending,
-		BaseCommit: "commit-base123",
-	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
-
-	procSrv := &mockProcessServer{
-		exitCode: 0,
-		stdout:   "Cloned successfully\n",
-	}
-	harness, agentsCS, _ := setupTestHarness(t, procSrv)
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:      store,
-		Harness:    harness,
-		KubeClient: nil,
-	})
-
-	// Step 1: Reconcile Pending -> Preparing
-	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
-	if err != nil {
-		t.Fatalf("orch.Reconcile step 1: %v", err)
-	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("expected RequeueAfter > 0, got %v", res.RequeueAfter)
-	}
-
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
-	if err != nil {
-		t.Fatalf("GetRun: %v", err)
-	}
-	if gotRun.Phase != state.PhasePreparing {
-		t.Fatalf("expected phase Preparing, got %s", gotRun.Phase)
-	}
-
-	// Sandbox has no owner references
-	sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, gotRun.SandboxName, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("agentsCS.Sandboxes.Get: %v", err)
-	}
-	if len(sb.OwnerReferences) != 0 {
-		t.Errorf("expected 0 owner references on sandbox, got %d", len(sb.OwnerReferences))
-	}
-
-	// Step 2: Mark sandbox Ready and reconcile Preparing -> Working
-	sb.Status.Conditions = []metav1.Condition{
-		{
-			Type:   string(sandboxv1beta1.SandboxConditionReady),
-			Status: metav1.ConditionTrue,
-		},
-	}
-	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Update(ctx, sb, metav1.UpdateOptions{}); err != nil {
-		t.Fatalf("updating fake sandbox to Ready: %v", err)
-	}
-
-	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-		t.Fatalf("orch.Reconcile step 2: %v", err)
-	}
-
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
-	if err != nil {
-		t.Fatalf("GetRun: %v", err)
-	}
-	if gotRun.Phase != state.PhaseWorking {
-		t.Errorf("expected phase %s, got %s", state.PhaseWorking, gotRun.Phase)
+	_, err = orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
+	if err == nil {
+		t.Fatal("expected orch.Reconcile to fail when saveHeroRun fails, got nil")
 	}
 }
 
@@ -4719,8 +4601,15 @@ func TestOrchestrator_SandboxOwnerReference_PreExistingHeroRunHasUID(t *testing.
 			RunID:      runID,
 			BaseCommit: "commit-base123",
 		},
+		Status: herorunv1alpha1.HeroRunStatus{
+			Phase: string(state.PhasePending),
+		},
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(preExistingHR).Build()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&herorunv1alpha1.HeroRun{}).
+		WithObjects(preExistingHR).
+		Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -6748,12 +6637,14 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 		}
 
 		currentTime := time.Date(2026, 11, 10, 10, 0, 0, 0, time.UTC)
+		wantDeadline := currentTime.Add(30 * time.Minute)
 		runID := "20261110T100000Z-budget30m"
 		run := &state.Run{
 			ID:       runID,
 			Repo:     repo.Key(),
 			GoalName: "budget-30m",
 			Phase:    state.PhasePending,
+			Deadline: &wantDeadline,
 			Goal: &goals.Goal{
 				Name: "budget-30m",
 				Budget: &goals.Budget{
@@ -6787,7 +6678,6 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 			t.Errorf("expected phase %s, got %s", state.PhasePreparing, gotRun.Phase)
 		}
 
-		wantDeadline := currentTime.Add(30 * time.Minute)
 		if gotRun.Deadline == nil || !gotRun.Deadline.Equal(wantDeadline) {
 			t.Errorf("expected Deadline %v, got %v", wantDeadline, gotRun.Deadline)
 		}
@@ -6819,12 +6709,14 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 		}
 
 		currentTime := time.Date(2026, 11, 10, 10, 0, 0, 0, time.UTC)
+		wantDeadline := currentTime.Add(DefaultMaxDuration)
 		runID := "20261110T100000Z-nobudget"
 		run := &state.Run{
 			ID:       runID,
 			Repo:     repo.Key(),
 			GoalName: "no-budget",
 			Phase:    state.PhasePending,
+			Deadline: &wantDeadline,
 			Goal: &goals.Goal{
 				Name: "no-budget",
 			},
@@ -6855,7 +6747,6 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 			t.Errorf("expected phase %s, got %s", state.PhasePreparing, gotRun.Phase)
 		}
 
-		wantDeadline := currentTime.Add(DefaultMaxDuration)
 		if gotRun.Deadline == nil || !gotRun.Deadline.Equal(wantDeadline) {
 			t.Errorf("expected Deadline %v, got %v", wantDeadline, gotRun.Deadline)
 		}
@@ -6886,21 +6777,17 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 			t.Fatalf("PutRepo: %v", err)
 		}
 
-		runID := "20261110T100000Z-invalid-budget"
-		run := &state.Run{
-			ID:       runID,
-			Repo:     repo.Key(),
-			GoalName: "bad-budget",
-			Phase:    state.PhasePending,
+		goalRec := &state.GoalRecord{
 			Goal: &goals.Goal{
 				Name: "bad-budget",
 				Budget: &goals.Budget{
 					MaxDuration: "invalid-duration-value",
 				},
 			},
+			BaseCommit: "commit-base123",
 		}
-		if err := store.PutRun(ctx, run); err != nil {
-			t.Fatalf("PutRun: %v", err)
+		if err := store.PutGoal(ctx, repo.Key(), goalRec); err != nil {
+			t.Fatalf("PutGoal: %v", err)
 		}
 
 		harness, agentsCS, _ := setupTestHarness(t, nil)
@@ -6910,34 +6797,17 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 			Harness:      harness,
 		})
 
-		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-			t.Fatalf("orch.Reconcile: %v", err)
+		scheduler, err := NewScheduler(SchedulerOptions{
+			Store:        store,
+			Orchestrator: orch,
+		})
+		if err != nil {
+			t.Fatalf("NewScheduler: %v", err)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
-		if err != nil {
-			t.Fatalf("GetRun: %v", err)
-		}
-		if gotRun.Phase != state.PhaseFailed {
-			t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
-		}
-		if !strings.Contains(gotRun.Error, "invalid budget.maxDuration") {
-			t.Errorf("expected error containing 'invalid budget.maxDuration', got %q", gotRun.Error)
-		}
-
-		events, err := store.ReadEvents(ctx, repo.Key(), runID)
-		if err != nil {
-			t.Fatalf("ReadEvents: %v", err)
-		}
-		foundFailedEvent := false
-		for _, e := range events {
-			if e.Phase == state.PhaseFailed && strings.Contains(e.Message, "invalid budget.maxDuration") {
-				foundFailedEvent = true
-				break
-			}
-		}
-		if !foundFailedEvent {
-			t.Errorf("expected failure event with clear message, got events: %+v", events)
+		_, err = scheduler.StartRun(ctx, repo, "bad-budget", StartOptions{Reason: "test"})
+		if err == nil || !strings.Contains(err.Error(), "invalid budget.maxDuration") {
+			t.Fatalf("expected error containing 'invalid budget.maxDuration', got %v", err)
 		}
 
 		// Ensure sandbox was not created
@@ -7359,9 +7229,6 @@ func TestOrchestratorOptions_Defaults(t *testing.T) {
 	if opts.ReadyTimeout != DefaultReadyTimeout {
 		t.Errorf("ReadyTimeout = %v, want %v", opts.ReadyTimeout, DefaultReadyTimeout)
 	}
-	if opts.HeroRunStatusInterval != DefaultHeroRunStatusInterval {
-		t.Errorf("HeroRunStatusInterval = %v, want %v", opts.HeroRunStatusInterval, DefaultHeroRunStatusInterval)
-	}
 	if opts.VerifyTimeout != DefaultVerifyTimeout {
 		t.Errorf("VerifyTimeout = %v, want %v", opts.VerifyTimeout, DefaultVerifyTimeout)
 	}
@@ -7382,7 +7249,6 @@ func TestOrchestratorOptions_Defaults(t *testing.T) {
 		MaxTurns:              15,
 		MaxConcurrentRuns:     2,
 		ReadyTimeout:          10 * time.Second,
-		HeroRunStatusInterval: 5 * time.Second,
 		VerifyTimeout:         2 * time.Minute,
 		DefaultMaxDuration:    20 * time.Minute,
 		WorkspaceStorageClass: "custom-sc",
@@ -7400,9 +7266,6 @@ func TestOrchestratorOptions_Defaults(t *testing.T) {
 	}
 	if customOpts.ReadyTimeout != 10*time.Second {
 		t.Errorf("custom ReadyTimeout was overwritten: %v", customOpts.ReadyTimeout)
-	}
-	if customOpts.HeroRunStatusInterval != 5*time.Second {
-		t.Errorf("custom HeroRunStatusInterval was overwritten: %v", customOpts.HeroRunStatusInterval)
 	}
 	if customOpts.VerifyTimeout != 2*time.Minute {
 		t.Errorf("custom VerifyTimeout was overwritten: %v", customOpts.VerifyTimeout)
@@ -7466,10 +7329,14 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
 
+	scheme, _ := NewScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+
 	baseValid := func() OrchestratorOptions {
 		opts := OrchestratorOptions{
 			Store:           store,
 			Harness:         harness,
+			KubeClient:      fakeClient,
 			MaxSessionDepth: DefaultMaxSessionDepth,
 		}
 		opts.InitDefaults()
@@ -7499,6 +7366,13 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 				o.Harness = nil
 			},
 			wantErrSubstr: "harness",
+		},
+		{
+			name: "missing kube client",
+			mutate: func(o *OrchestratorOptions) {
+				o.KubeClient = nil
+			},
+			wantErrSubstr: "kube client",
 		},
 		{
 			name: "negative MaxTurns",
@@ -7534,13 +7408,6 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 				o.ReadyTimeout = -1 * time.Second
 			},
 			wantErrSubstr: "ReadyTimeout",
-		},
-		{
-			name: "negative HeroRunStatusInterval",
-			mutate: func(o *OrchestratorOptions) {
-				o.HeroRunStatusInterval = -1 * time.Second
-			},
-			wantErrSubstr: "HeroRunStatusInterval",
 		},
 		{
 			name: "negative VerifyTimeout",
@@ -7605,6 +7472,7 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 		_, err := NewOrchestrator(OrchestratorOptions{
 			Store:           store,
 			Harness:         harness,
+			KubeClient:      fakeClient,
 			MaxSessionDepth: DefaultMaxSessionDepth,
 			ReadyTimeout:    -1 * time.Minute,
 		})
@@ -8662,7 +8530,7 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
 			t.Fatalf("PutRun: %v", err)
 		}
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeClient := newTestFakeClientBuilder(scheme).Build()
 		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store: store, Harness: harness, KubeClient: fakeClient,
 			WorkspaceStorageClass: "standard", WorkspaceSize: "20Gi",
@@ -8751,7 +8619,7 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},
 			},
 		}
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingClaim).Build()
+		fakeClient := newTestFakeClientBuilder(scheme).WithObjects(existingClaim).Build()
 		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store: store, Harness: harness, KubeClient: fakeClient,
 			WorkspaceStorageClass: "standard",
@@ -8787,7 +8655,7 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
 			t.Fatalf("PutRun: %v", err)
 		}
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeClient := newTestFakeClientBuilder(scheme).Build()
 		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store: store, Harness: harness, KubeClient: fakeClient,
 		})
@@ -8850,14 +8718,22 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
 			t.Fatalf("PutRun: %v", err)
 		}
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
-			Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-				if _, ok := obj.(*herorunv1alpha1.HeroRun); ok {
-					return errors.New("simulated HeroRun creation failure")
-				}
-				return client.Create(ctx, obj, opts...)
+		name := sandboxNameForRun(runID)
+		hrWithoutUID := &herorunv1alpha1.HeroRun{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "ao-sandboxes",
+				UID:       "", // No UID means heroRunOwnerReferences returns nil (unowned)
 			},
-		}).Build()
+			Spec: herorunv1alpha1.HeroRunSpec{
+				RunID:      runID,
+				Repository: repo.URL,
+			},
+			Status: herorunv1alpha1.HeroRunStatus{
+				Phase: string(state.PhasePending),
+			},
+		}
+		fakeClient := newTestFakeClientBuilder(scheme).WithObjects(hrWithoutUID).Build()
 		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:                 store,
 			Harness:               harness,
@@ -8879,7 +8755,6 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			t.Errorf("expected run.Error containing 'HeroRun owner', got %q", gotRun.Error)
 		}
 
-		name := sandboxNameForRun(runID)
 		var claim corev1.PersistentVolumeClaim
 		if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: name}, &claim); !k8serrors.IsNotFound(err) {
 			t.Errorf("expected claim not found, got %v", err)
@@ -9360,11 +9235,14 @@ func TestOrchestrator_Working_ChildrenStopWhenTopLevelFinishes(t *testing.T) {
 func TestOrchestratorOptions_Validate_MaxSessionDepth(t *testing.T) {
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
+	scheme, _ := NewScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
 
 	for _, d := range []int{-2, -1, 0} {
 		opts := OrchestratorOptions{
 			Store:             store,
 			Harness:           harness,
+			KubeClient:        fakeClient,
 			MaxTurns:          30,
 			MaxConcurrentRuns: 4,
 			MaxSessionDepth:   d,
@@ -9704,11 +9582,85 @@ func TestOrchestrator_PostMessage_Validation(t *testing.T) {
 
 	// 3. Terminal run
 	run.SetPhase(state.PhaseSucceeded, time.Now().UTC())
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
+	var hr herorunv1alpha1.HeroRun
+	if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: harness.Namespace(), Name: sandboxNameForRun(runID)}, &hr); err != nil {
+		t.Fatalf("getting HeroRun: %v", err)
+	}
+	if err := orch.saveHeroRun(ctx, &hr, run); err != nil {
+		t.Fatalf("saveHeroRun: %v", err)
 	}
 	if err := orch.PostMessage(ctx, repo.Key(), runID, "hello"); !errors.Is(err, ErrRunNotWorking) {
 		t.Errorf("expected ErrRunNotWorking for terminal run, got %v", err)
+	}
+}
+
+func TestOrchestrator_PostMessage_RunJSONDeletedSucceeds(t *testing.T) {
+	ctx := t.Context()
+	runID := "20261123T120000Z-postnojson"
+	tempDir := t.TempDir()
+	store := state.NewFileStore(tempDir)
+	sessionStore := session.NewFileStore(tempDir)
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	harness, _, _ := setupTestHarness(t, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxNameForRun(runID),
+			Namespace: harness.Namespace(),
+			UID:       types.UID("uid-" + runID),
+		},
+		Spec: herorunv1alpha1.HeroRunSpec{
+			RunID:      runID,
+			Repository: repo.URL,
+			Goal:       "optimize-latency",
+			BaseCommit: "commit-base123",
+		},
+		Status: herorunv1alpha1.HeroRunStatus{
+			Phase: string(state.PhaseWorking),
+		},
+	}
+
+	fakeClient := newTestFakeClientBuilder(scheme).
+		WithObjects(hr).
+		Build()
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		KubeClient:   fakeClient,
+	})
+
+	// Ensure run.json does NOT exist on disk
+	runJSONPath := filepath.Join(tempDir, "repos", repo.Host, repo.Owner, repo.Name, "runs", runID, "run.json")
+	if _, err := os.Stat(runJSONPath); !os.IsNotExist(err) {
+		t.Fatalf("expected run.json to not exist on disk")
+	}
+
+	// PostMessage must succeed by reading the phase from HeroRun rather than run.json
+	customMsg := "Instruction delivered with deleted run.json"
+	if err := orch.PostMessage(ctx, repo.Key(), runID, customMsg); err != nil {
+		t.Fatalf("PostMessage failed with deleted run.json: %v", err)
+	}
+
+	// Verify pending message was persisted
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
+	if err != nil || len(pending) != 1 || pending[0] != customMsg {
+		t.Fatalf("expected pending message %q on disk, got %v (err: %v)", customMsg, pending, err)
 	}
 }
 

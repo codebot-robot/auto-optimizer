@@ -1056,18 +1056,60 @@ func TestServer_ReposAndRuns(t *testing.T) {
 	}
 }
 
+type fakeRunStarter struct {
+	store state.Store
+}
+
+func (f *fakeRunStarter) StartRun(ctx context.Context, repo *state.Repo, goalName string, opts run.StartOptions) (*state.Run, error) {
+	goalRec, err := f.store.GetGoal(ctx, repo.Key(), goalName)
+	if err != nil || goalRec == nil {
+		return nil, run.ErrGoalNotFound
+	}
+
+	runs, _ := f.store.ListRuns(ctx, repo.Key())
+	for _, r := range runs {
+		if r.GoalName == goalName && !r.Phase.IsTerminal() {
+			return nil, fmt.Errorf("%w: goal has active run", run.ErrActiveRun)
+		}
+	}
+
+	now := time.Now().UTC()
+	runID, err := state.NewRunIDAt(now)
+	if err != nil {
+		return nil, err
+	}
+	r := &state.Run{
+		ID:       runID,
+		Repo:     repo.Key(),
+		GoalName: goalName,
+		Phase:    state.PhasePending,
+	}
+	if err := f.store.PutRun(ctx, r); err != nil {
+		return nil, err
+	}
+	eventData := map[string]any{"reason": opts.Reason}
+	if opts.StartedByUser != "" {
+		eventData["by"] = opts.StartedByUser
+	}
+	event := state.Event{
+		Time:    now,
+		Phase:   state.PhasePending,
+		Kind:    "created",
+		Message: "Run created: manual: run again",
+		Data:    eventData,
+	}
+	if err := f.store.AppendEvent(ctx, repo.Key(), runID, event); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
 func TestRunAgain(t *testing.T) {
 	ctx := t.Context()
 	stateStore := state.NewFileStore(t.TempDir())
 
-	scheduler, err := run.NewScheduler(run.SchedulerOptions{
-		Store: stateStore,
-	})
-	if err != nil {
-		t.Fatalf("run.NewScheduler: %v", err)
-	}
-
-	webServer, err := NewServer(&fakeSessionService{}, stateStore, scheduler, ServerOptions{})
+	starter := &fakeRunStarter{store: stateStore}
+	webServer, err := NewServer(&fakeSessionService{}, stateStore, starter, ServerOptions{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

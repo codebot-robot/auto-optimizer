@@ -82,24 +82,17 @@ Under this architecture, they become one type: `HeroRun`.
   background summary publisher that this design eliminates), are removed.
 - The legacy `state.Run` struct is phased out.
 
-### Role of run.json and existing runs on disk
+### Role of run.json on disk
 
-With `HeroRun` in the `kube-apiserver` serving as the source of truth:
-1. **`run.json` is strictly an export for a person to read:**
-   `run.json` on disk is not a database and is not read by the controller, the
-   CLI, or the web UI. Because the export is written after the save and is
-   optional, it can be stale or missing. If the web UI or CLI read `run.json`,
-   they would risk displaying a state that the controller does not have.
-   Therefore, **the web UI and CLI read `HeroRun` exclusively through the
-   Kubernetes client**. The disk export exists solely for a person inspecting a
-   run directory with command-line tools (`cat`, `jq`, text editors).
-2. **Handling existing runs on disk:**
-   On orchestrator startup or during `Resume`, the orchestrator inspects the
-   state directory for legacy runs. If a run exists in `run.json` on disk but
-   has no corresponding `HeroRun` custom resource in the `kube-apiserver`, the
-   orchestrator imports it by creating the `HeroRun` object in `kube-apiserver`
-   with spec and status populated from the file. Once imported, `HeroRun` in the
-   `kube-apiserver` is the sole source of truth.
+With `HeroRun` in the `kube-apiserver` serving as the source of truth, `run.json`
+on disk is strictly an export for a person to read:
+`run.json` on disk is not a database and is not read by the controller, the
+CLI, or the web UI. Because the export is written after the save and is
+optional, it can be stale or missing. If the web UI or CLI read `run.json`,
+they would risk displaying a state that the controller does not have.
+Therefore, **the web UI and CLI read `HeroRun` exclusively through the
+Kubernetes client**. The disk export exists solely for a person inspecting a
+run directory with command-line tools (`cat`, `jq`, text editors).
 
 ## Storage separation: what stays on the state volume and why
 
@@ -412,8 +405,7 @@ reconciler onto `Run`:
    including `ActiveOperation`, and inputs to `HeroRunSpec`), regenerates
    deepcopy methods and CRD manifests, and updates the existing reconciler in
    `pkg/run/orchestrator.go` to read and write `HeroRun` in `kube-apiserver`
-   across all phases as the single source of truth. Imports any legacy runs
-   found on disk on startup into `kube-apiserver`. Keeps `run.json` only as an
+   across all phases as the single source of truth. Keeps `run.json` only as an
    optional disk export for human inspection. Tested in `pkg/run` with
    `controller-runtime/pkg/client/fake`. Changes the store in one step,
    preventing dual-store divergence.

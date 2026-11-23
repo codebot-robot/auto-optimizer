@@ -26,6 +26,14 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
+// HeroRunPhase returns the phase of a HeroRun, defaulting an empty phase to PhasePending.
+func HeroRunPhase(hr *herorunv1alpha1.HeroRun) state.RunPhase {
+	if hr.Status.Phase == "" {
+		return state.PhasePending
+	}
+	return state.RunPhase(hr.Status.Phase)
+}
+
 // HeroRunToRun converts a HeroRun custom resource into a state.Run.
 // This conversion is temporary scaffolding while run state is migrated from
 // state.Run in run.json to the HeroRun custom resource in kube-apiserver,
@@ -34,7 +42,7 @@ func HeroRunToRun(hr *herorunv1alpha1.HeroRun) (*state.Run, error) {
 	run := &state.Run{
 		ID:                 hr.Spec.RunID,
 		GoalName:           hr.Spec.Goal,
-		Phase:              state.RunPhase(hr.Status.Phase),
+		Phase:              HeroRunPhase(hr),
 		BaseCommit:         hr.Spec.BaseCommit,
 		Branch:             hr.Status.Branch,
 		PRTitle:            hr.Status.PRTitle,

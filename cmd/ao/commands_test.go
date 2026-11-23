@@ -25,7 +25,6 @@ import (
 
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
-	"github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
@@ -551,13 +550,16 @@ func TestRunListCommand_Execution(t *testing.T) {
 		t.Fatalf("PutGoal: %v", err)
 	}
 
-	// Run scheduler tick to produce a Pending run
-	scheduler, err := run.NewScheduler(run.SchedulerOptions{Store: stateStore})
-	if err != nil {
-		t.Fatalf("NewScheduler: %v", err)
+	// Create a Pending run
+	pendingRun := &state.Run{
+		ID:         "20261030T120000Z-0001",
+		Repo:       repo.Key(),
+		GoalName:   "latency-reduction",
+		Phase:      state.PhasePending,
+		BaseCommit: "commit-abc1234",
 	}
-	if err := scheduler.Tick(ctx); err != nil {
-		t.Fatalf("Tick: %v", err)
+	if err := stateStore.PutRun(ctx, pendingRun); err != nil {
+		t.Fatalf("PutRun: %v", err)
 	}
 
 	// Start test gRPC server
