@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -97,6 +98,34 @@ type SessionSummary struct {
 	Name         string
 	Metadata     Metadata
 	MessageCount int
+}
+
+// ListRunSessions returns all sessions in the store belonging to runID,
+// ordered by depth, creation time, and name.
+func ListRunSessions(ctx context.Context, store Store, runID string) ([]SessionSummary, error) {
+	all, err := store.ListSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []SessionSummary
+	for _, sum := range all {
+		if sum.Metadata.RunID == runID {
+			result = append(result, sum)
+		}
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Metadata.Depth() != result[j].Metadata.Depth() {
+			return result[i].Metadata.Depth() < result[j].Metadata.Depth()
+		}
+		if !result[i].Metadata.CreatedAt.Equal(result[j].Metadata.CreatedAt) {
+			return result[i].Metadata.CreatedAt.Before(result[j].Metadata.CreatedAt)
+		}
+		return result[i].Name < result[j].Name
+	})
+
+	return result, nil
 }
 
 // Store defines the interface for chat session persistence.

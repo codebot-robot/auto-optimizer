@@ -469,3 +469,72 @@ func TestMetadataChild(t *testing.T) {
 		t.Errorf("standaloneChild.Depth() = %d, want 1", standaloneChild.Depth())
 	}
 }
+
+func TestListRunSessions(t *testing.T) {
+	ctx := t.Context()
+	store := NewFileStore(t.TempDir())
+
+	t0 := time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)
+
+	// Create root session for run-1
+	if err := store.NewSession(ctx, "root1", Metadata{
+		RunID:     "run-1",
+		CreatedAt: t0,
+	}); err != nil {
+		t.Fatalf("NewSession root1: %v", err)
+	}
+
+	// Create child session for run-1 (depth 1)
+	if err := store.NewSession(ctx, "child1b", Metadata{
+		RunID:     "run-1",
+		Parent:    "root1",
+		Ancestors: []string{"root1"},
+		CreatedAt: t0.Add(2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("NewSession child1b: %v", err)
+	}
+
+	if err := store.NewSession(ctx, "child1a", Metadata{
+		RunID:     "run-1",
+		Parent:    "root1",
+		Ancestors: []string{"root1"},
+		CreatedAt: t0.Add(1 * time.Minute),
+	}); err != nil {
+		t.Fatalf("NewSession child1a: %v", err)
+	}
+
+	// Create session for another run
+	if err := store.NewSession(ctx, "otherrun", Metadata{
+		RunID:     "run-2",
+		CreatedAt: t0,
+	}); err != nil {
+		t.Fatalf("NewSession otherrun: %v", err)
+	}
+
+	// Test ListRunSessions for run-1
+	sessions, err := ListRunSessions(ctx, store, "run-1")
+	if err != nil {
+		t.Fatalf("ListRunSessions(run-1): %v", err)
+	}
+	if len(sessions) != 3 {
+		t.Fatalf("got %d sessions, want 3", len(sessions))
+	}
+	if sessions[0].Name != "root1" {
+		t.Errorf("sessions[0].Name = %q, want 'root1'", sessions[0].Name)
+	}
+	if sessions[1].Name != "child1a" {
+		t.Errorf("sessions[1].Name = %q, want 'child1a'", sessions[1].Name)
+	}
+	if sessions[2].Name != "child1b" {
+		t.Errorf("sessions[2].Name = %q, want 'child1b'", sessions[2].Name)
+	}
+
+	// Test ListRunSessions for nonexistent run
+	unknown, err := ListRunSessions(ctx, store, "nonexistent")
+	if err != nil {
+		t.Fatalf("ListRunSessions(nonexistent): %v", err)
+	}
+	if len(unknown) != 0 {
+		t.Errorf("got %d sessions, want 0", len(unknown))
+	}
+}
