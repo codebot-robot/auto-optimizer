@@ -362,6 +362,10 @@ func (s *Server) SendMessage(req *sessionv1.SendMessageRequest, stream sessionv1
 		return status.Errorf(codes.Internal, "%v", err)
 	}
 
+	if err := checkCanPostMessage(sess); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+
 	// If this is a new session without messages, ensure the system prompt is set and stream it.
 	if len(sess.Messages()) == 0 {
 		if err := harness.EnsureSystemPrompt(ctx, sess); err != nil {
@@ -955,6 +959,13 @@ func (s *Server) StartTurn(ctx context.Context, name, text string) error {
 		return err
 	}
 
+	if err := checkCanPostMessage(sess); err != nil {
+		s.mu.Lock()
+		delete(s.busySessions, name)
+		s.mu.Unlock()
+		return err
+	}
+
 	go func() {
 		defer func() {
 			s.mu.Lock()
@@ -978,6 +989,15 @@ func (s *Server) StartTurn(ctx context.Context, name, text string) error {
 		}
 	}()
 
+	return nil
+}
+
+// checkCanPostMessage reports whether a message can be posted to sess.
+// Messages to child sessions are refused because their turns are driven by the orchestrator.
+func checkCanPostMessage(sess *session.Session) error {
+	if sess.Metadata.Parent != "" {
+		return fmt.Errorf("session %q is a child session; cannot post messages to child sessions", sess.Name)
+	}
 	return nil
 }
 

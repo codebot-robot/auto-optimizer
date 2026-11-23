@@ -26,8 +26,8 @@ goal the PR is a proposal and the maintainer is the judge.
   A run ends in a PR, or in a recorded reason why there is none.
 - A **session** is one LLM conversation with tools. In phase 1 a run has one
   session. Later a run has a tree of sessions.
-- A **sandbox** is a `Sandbox` object from kubernetes-sigs/agent-sandbox. Each
-  session has its own sandbox.
+- A **sandbox** is a `Sandbox` object from kubernetes-sigs/agent-sandbox. A run
+  has a sandbox, shared across sessions in the run.
 - The **workspace** is the sandbox's `/workspace` volume. It holds the clone
   of the repository and the agent's working state.
 - The **control plane** is the `ao serve` Deployment. It watches GitHub, runs
@@ -296,15 +296,31 @@ written for maintainers.
 | `measure` | control plane, which executes commands in the sandbox | Runs `verify` and `metric` on the current tree, records a measurement in the run, and returns a compact result next to the baseline. |
 | `open_pull_request(title, body)` | control plane | Commits any uncommitted changes, pushes the branch `ao/<goal>/<run-id>` through the portal, and hands over to the orchestrator's select step. The tool result tells the model whether a PR was opened, and if not, why. |
 | `finish(summary)` | control plane | Ends the session without a PR. |
-| `start_session(personality, task, branch)` | control plane, phase 2 | Starts an inner session and returns its summary and branch. |
+| `start_session(task)` | control plane | Starts a child session in the same run to work on a task in the background and returns its name immediately. |
 
-### Inner sessions and personalities for phase 2
+### Child sessions
 
-The outer session is a planner with a small context budget. It delegates to
-inner sessions. Each inner session has its own sandbox and workspace volume,
-cloned from the repository at a branch the outer session names. An inner
-session hands work back as a pushed branch plus a short summary. The outer
-session measures and decides what to submit.
+The top-level session of a run can delegate part of its work to another session
+by calling the `start_session` tool with a task. The control plane creates a child
+session of the caller in the same run, starts it on that task in the background,
+and returns immediately with the child's name without waiting for the child to finish.
+
+The child shares the run's workspace volume and Sandbox with its parent: both see
+the same files, so the task can refer to files by path and the child can leave
+results in files. The tree has a depth limit configured by `--max-session-depth`
+(default 3); a call that would exceed the limit fails with an error the model can
+read, and starts nothing.
+
+The run's deadline and turn budget bound the children too. When the run ends, its
+child sessions stop. A session that belongs to no run cannot call the tool.
+When the control plane restarts while a run is in `Working`, the top-level session
+resumes execution on its next turn. Child sessions are ephemeral and do not
+automatically restart; any in-flight child session remains stopped at its last
+recorded turn in the session store. Later phases will introduce session listing
+and status checking so the parent can inspect whether a child is still running or
+has stopped.
+
+### Personalities for phase 2
 
 There are two kinds of personality.
 
