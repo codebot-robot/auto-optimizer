@@ -23,6 +23,9 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
@@ -70,6 +73,9 @@ func (o *SchedulerOptions) Validate() error {
 	}
 	if o.Store == nil {
 		return errors.New("state store is required")
+	}
+	if o.Orchestrator == nil {
+		return errors.New("orchestrator is required")
 	}
 	if o.Interval <= 0 {
 		return errors.New("Interval must be positive")
@@ -176,7 +182,7 @@ func (s *Scheduler) tickRepo(ctx context.Context, repo *state.Repo) error {
 		return fmt.Errorf("listing goals: %w", err)
 	}
 
-	runs, err := s.Store.ListRuns(ctx, key)
+	runs, err := s.listRuns(ctx, repo)
 	if err != nil {
 		return fmt.Errorf("listing runs: %w", err)
 	}
@@ -297,7 +303,7 @@ func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName str
 		return nil, fmt.Errorf("goal %q has no base commit", goalName)
 	}
 
-	runs, err := s.Store.ListRuns(ctx, key)
+	runs, err := s.listRuns(ctx, repo)
 	if err != nil {
 		return nil, fmt.Errorf("listing runs: %w", err)
 	}
@@ -320,17 +326,40 @@ func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName str
 	}
 
 	frozenGoal := cloneGoal(goalRec.Goal)
+	runDeadline := now.Add(DefaultMaxDuration)
+	if frozenGoal != nil && frozenGoal.Budget != nil && frozenGoal.Budget.MaxDuration != "" {
+		d, err := time.ParseDuration(frozenGoal.Budget.MaxDuration)
+		if err != nil || d <= 0 {
+			msg := fmt.Sprintf("invalid budget.maxDuration %q: %v", frozenGoal.Budget.MaxDuration, err)
+			if err == nil {
+				msg = fmt.Sprintf("invalid budget.maxDuration %q: duration must be positive", frozenGoal.Budget.MaxDuration)
+			}
+			return nil, errors.New(msg)
+		}
+		runDeadline = now.Add(d)
+	} else if s.Orchestrator.defaultMaxDuration > 0 {
+		runDeadline = now.Add(s.Orchestrator.defaultMaxDuration)
+	}
+
 	run := &state.Run{
 		ID:         runID,
 		Repo:       key,
 		GoalName:   goalName,
 		BaseCommit: goalRec.BaseCommit,
+		Deadline:   &runDeadline,
 		Goal:       frozenGoal,
 	}
 	run.SetPhase(state.PhasePending, now)
 
+	hr := HeroRunFromRun(run)
+	hr.Namespace = s.Orchestrator.namespace()
+	hr.Spec.Repository = repo.URL
+	if err := s.Orchestrator.kubeClient.Create(ctx, hr); err != nil {
+		return nil, fmt.Errorf("creating HeroRun %s: %w", hr.Name, err)
+	}
+
 	if err := s.Store.PutRun(ctx, run); err != nil {
-		return nil, fmt.Errorf("creating run %s for goal %s: %w", runID, goalName, err)
+		scoped.Log(ctx).V(2).Info("exporting run.json failed", "run", runID, "error", err)
 	}
 
 	eventData := map[string]any{"reason": opts.Reason}
@@ -349,12 +378,34 @@ func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName str
 	}
 
 	scoped.Log(ctx).Info("created pending run", "repo", repo.URL, "goal", goalName, "run", runID, "reason", opts.Reason)
-	if s.Orchestrator != nil {
-		s.Orchestrator.publishHeroRun(ctx, repo, run)
-		s.Orchestrator.Notify(key, runID)
-	}
+	s.Orchestrator.Notify(key, runID)
 
 	return run, nil
+}
+
+func (s *Scheduler) listRuns(ctx context.Context, repo *state.Repo) ([]*state.Run, error) {
+	var hrList herorunv1alpha1.HeroRunList
+	if err := s.Orchestrator.kubeClient.List(ctx, &hrList, client.InNamespace(s.Orchestrator.namespace())); err != nil {
+		return nil, fmt.Errorf("listing HeroRuns: %w", err)
+	}
+
+	var runs []*state.Run
+	for i := range hrList.Items {
+		hr := &hrList.Items[i]
+		if hr.Spec.Repository != repo.URL {
+			continue
+		}
+		run, err := HeroRunToRun(hr)
+		if err != nil {
+			scoped.Log(ctx).Error(err, "failed to convert HeroRun to run", "heroRun", hr.Name)
+			continue
+		}
+		runs = append(runs, run)
+	}
+	slices.SortFunc(runs, func(a, b *state.Run) int {
+		return strings.Compare(a.ID, b.ID)
+	})
+	return runs, nil
 }
 
 func (s *Scheduler) findOpenPullRequest(ctx context.Context, repo *state.Repo, goalName string) (*forge.PullRequest, error) {

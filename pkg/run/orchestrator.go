@@ -80,9 +80,6 @@ const (
 	// DefaultReadyTimeout is the default duration to wait for a Sandbox to become ready.
 	DefaultReadyTimeout = 3 * time.Minute
 
-	// DefaultHeroRunStatusInterval is the default period between HeroRun status flushes.
-	DefaultHeroRunStatusInterval = 3 * time.Second
-
 	// DefaultVerifyTimeout is the default duration to wait for a goal's verify command to complete.
 	DefaultVerifyTimeout = 10 * time.Minute
 
@@ -126,12 +123,7 @@ type OrchestratorOptions struct {
 
 	ReadyTimeout time.Duration
 
-	// HeroRunStatusInterval is the interval at which dirty HeroRun status records are flushed.
-	// When unset or <= 0, defaults to DefaultHeroRunStatusInterval (3 seconds).
-	HeroRunStatusInterval time.Duration
-
-	// KubeClient is the controller-runtime client used to publish HeroRun custom resources.
-	// When nil, as in most unit tests, publishing is skipped and logged once at startup.
+	// KubeClient is the controller-runtime client used to store and reconcile HeroRun custom resources.
 	KubeClient client.Client
 
 	// VerifyTimeout is the maximum duration for running a goal's verify command.
@@ -182,9 +174,6 @@ func (o *OrchestratorOptions) InitDefaults() {
 	if o.ReadyTimeout == 0 {
 		o.ReadyTimeout = DefaultReadyTimeout
 	}
-	if o.HeroRunStatusInterval == 0 {
-		o.HeroRunStatusInterval = DefaultHeroRunStatusInterval
-	}
 	if o.VerifyTimeout == 0 {
 		o.VerifyTimeout = DefaultVerifyTimeout
 	}
@@ -221,6 +210,9 @@ func (o *OrchestratorOptions) Validate() error {
 	if o.Harness == nil {
 		return errors.New("harness is required")
 	}
+	if o.KubeClient == nil {
+		return errors.New("kube client is required")
+	}
 	if o.MaxTurns < 1 {
 		return errors.New("MaxTurns must be at least 1")
 	}
@@ -232,9 +224,6 @@ func (o *OrchestratorOptions) Validate() error {
 	}
 	if o.ReadyTimeout <= 0 {
 		return errors.New("ReadyTimeout must be positive")
-	}
-	if o.HeroRunStatusInterval <= 0 {
-		return errors.New("HeroRunStatusInterval must be positive")
 	}
 	if o.VerifyTimeout <= 0 {
 		return errors.New("VerifyTimeout must be positive")
@@ -274,8 +263,6 @@ type Orchestrator struct {
 	publicURL          string
 	readyTimeout       time.Duration
 	kubeClient         client.Client
-	logNoKubeClient    sync.Once
-	statusPublisher    *heroRunStatusPublisher
 	verifyTimeout      time.Duration
 	defaultMaxDuration time.Duration
 	forgeFor           func(repoURL string) (forge.Forge, error)
@@ -386,7 +373,6 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		notifyCh:              make(chan event.TypedGenericEvent[reconcile.Request], 1024),
 		runStates:             make(map[string]*runState),
 	}
-	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, opts.Clock, opts.HeroRunStatusInterval, opts.Harness.Namespace(), orch.publishHeroRun)
 	return orch, nil
 }
 
@@ -423,47 +409,6 @@ func (o *Orchestrator) deleteRunIndex(name string) {
 	o.runIndexMu.Lock()
 	defer o.runIndexMu.Unlock()
 	delete(o.runIndex, name)
-}
-
-func (o *Orchestrator) runForRequest(ctx context.Context, req reconcile.Request) (repo state.RepoKey, runID string, ok bool, err error) {
-	o.runIndexMu.RLock()
-	entry, found := o.runIndex[req.Name]
-	o.runIndexMu.RUnlock()
-	if found {
-		return entry.repo, entry.runID, true, nil
-	}
-
-	if o.kubeClient == nil {
-		scoped.Log(ctx).V(2).Info("request does not resolve to a run; dropping", "request", req.String())
-		return state.RepoKey{}, "", false, nil
-	}
-
-	ns := req.Namespace
-	if ns == "" && o.harness != nil {
-		ns = o.harness.Namespace()
-	}
-	var hr herorunv1alpha1.HeroRun
-	if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: req.Name}, &hr); err != nil {
-		if !k8serrors.IsNotFound(err) {
-			return state.RepoKey{}, "", false, fmt.Errorf("getting HeroRun %s: %w", req.Name, err)
-		}
-		scoped.Log(ctx).V(2).Info("request does not resolve to a run; dropping", "request", req.String())
-		return state.RepoKey{}, "", false, nil
-	}
-
-	repoStr := hr.Annotations[AnnotationRepo]
-	repoKey, err := state.ParseRepoKey(repoStr)
-	id := hr.Labels[LabelRun]
-	if err == nil && id != "" {
-		o.recordRunIndex(req.Name, repoKey, id)
-		return repoKey, id, true, nil
-	}
-	if repoStr != "" && err != nil {
-		scoped.Log(ctx).V(2).Info("failed to parse repo key from HeroRun annotation", "repo", repoStr, "error", err)
-	}
-
-	scoped.Log(ctx).V(2).Info("request does not resolve to a run; dropping", "request", req.String())
-	return state.RepoKey{}, "", false, nil
 }
 
 // RunPageURL returns the public URL for a run's detail page, or empty when unset.
@@ -531,53 +476,64 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 	o.managerCtxMu.Lock()
 	o.managerCtx = ctx
 	o.managerCtxMu.Unlock()
-	if o.kubeClient == nil {
-		o.logNoKubeClient.Do(func() {
-			scoped.Log(ctx).Info("HeroRun publishing skipped: no Kubernetes client configured")
-		})
-	}
 	if err := o.Resume(ctx); err != nil {
 		scoped.Log(ctx).Error(err, "failed to resume interrupted runs on startup")
-	}
-	if o.statusPublisher != nil {
-		go func() {
-			if err := o.statusPublisher.Run(ctx); err != nil {
-				scoped.Log(ctx).Error(err, "heroRunStatusPublisher stopped with error")
-			}
-		}()
 	}
 	<-ctx.Done()
 	return nil
 }
 
-// Resume inspects existing runs across all repositories on startup.
-// Every non-terminal run is enqueued for reconciliation.
+// Resume inspects existing HeroRuns across the cluster on startup.
+// Non-terminal runs in the kube-apiserver are enqueued for reconciliation.
 func (o *Orchestrator) Resume(ctx context.Context) error {
-	log := scoped.Log(ctx)
-	repos, err := o.store.ListRepos(ctx)
-	if err != nil {
-		return fmt.Errorf("listing repositories for resume: %w", err)
+	var hrList herorunv1alpha1.HeroRunList
+	if err := o.kubeClient.List(ctx, &hrList, client.InNamespace(o.namespace())); err != nil {
+		return fmt.Errorf("listing HeroRuns during resume: %w", err)
 	}
 
-	for _, repo := range repos {
-		runs, err := o.store.ListRuns(ctx, repo.Key())
+	for i := range hrList.Items {
+		hr := &hrList.Items[i]
+		run, err := HeroRunToRun(hr)
 		if err != nil {
-			log.Error(err, "failed to list runs during resume", "repo", repo.URL)
+			scoped.Log(ctx).Error(err, "failed to convert HeroRun during resume", "heroRun", hr.Name)
 			continue
 		}
-
-		for _, r := range runs {
-			if o.statusPublisher != nil {
-				o.statusPublisher.MarkDirty(repo.Key(), r.ID)
-			}
-			if !r.Phase.IsTerminal() {
-				o.recordRunIndex(sandboxNameForRun(r.ID), repo.Key(), r.ID)
-				o.publishHeroRun(ctx, repo, r)
-				o.Notify(repo.Key(), r.ID)
-			}
+		if !run.Phase.IsTerminal() {
+			o.recordRunIndex(sandboxNameForRun(run.ID), run.Repo, run.ID)
+			o.Notify(run.Repo, run.ID)
 		}
 	}
 	return nil
+}
+
+func (o *Orchestrator) getRunForReconcile(ctx context.Context, req reconcile.Request) (*state.Run, *state.Repo, *herorunv1alpha1.HeroRun, error) {
+	ns := req.Namespace
+	if ns == "" {
+		ns = o.namespace()
+	}
+
+	var hr herorunv1alpha1.HeroRun
+	if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: req.Name}, &hr); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil, nil, nil, nil
+		}
+		return nil, nil, nil, fmt.Errorf("getting HeroRun %s: %w", req.Name, err)
+	}
+
+	run, err := HeroRunToRun(&hr)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("converting HeroRun %s: %w", req.Name, err)
+	}
+
+	repo, err := o.store.GetRepo(ctx, run.Repo)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return nil, nil, nil, nil
+		}
+		return nil, nil, nil, fmt.Errorf("getting repo %s: %w", run.Repo, err)
+	}
+	o.recordRunIndex(req.Name, run.Repo, run.ID)
+	return run, repo, &hr, nil
 }
 
 // Reconcile loads the run and the repository, dispatches on the phase to
@@ -585,35 +541,19 @@ func (o *Orchestrator) Resume(ctx context.Context) error {
 func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
-	repoKey, runID, ok, err := o.runForRequest(ctx, req)
+	run, repo, hr, err := o.getRunForReconcile(ctx, req)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	if !ok {
+	if run == nil {
 		return reconcile.Result{}, nil
-	}
-
-	run, err := o.store.GetRun(ctx, repoKey, runID)
-	if err != nil {
-		if errors.Is(err, state.ErrNotFound) {
-			return reconcile.Result{}, nil
-		}
-		return reconcile.Result{}, fmt.Errorf("getting run %s: %w", runID, err)
-	}
-
-	repo, err := o.store.GetRepo(ctx, repoKey)
-	if err != nil {
-		if errors.Is(err, state.ErrNotFound) {
-			return reconcile.Result{}, nil
-		}
-		return reconcile.Result{}, fmt.Errorf("getting repo %s: %w", repoKey, err)
 	}
 
 	if run.Phase.IsTerminal() {
 		o.deleteRunIndex(req.Name)
 		o.deleteTurnBudget(run.ID)
 		if outcome, ok := o.popTurnOutcome(run.ID); ok {
-			if err := o.handleTurnOutcome(ctx, repo, run, outcome); err != nil {
+			if err := o.handleTurnOutcome(ctx, repo, run, hr, outcome); err != nil {
 				log.V(2).Info("error handling leftover outcome for terminal run", "run", run.ID, "error", err)
 			}
 		}
@@ -622,34 +562,43 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 
 	switch run.Phase {
 	case state.PhasePending:
-		if err := o.prepareRun(ctx, repo, run); err != nil {
+		res, err := o.prepareRun(ctx, repo, run, hr)
+		if err != nil {
 			log.Error(err, "preparing run failed", "repo", repo.URL, "run", run.ID)
-			// prepareRun transitions to PhaseFailed on error; do not requeue terminal runs.
-			return reconcile.Result{}, nil
-		}
-		requeueAfter := readySafetyRequeueInterval
-		if run.ReadyDeadline != nil {
-			rem := run.ReadyDeadline.Sub(o.clock().UTC())
-			if rem < requeueAfter {
-				requeueAfter = rem
+			if run.Phase.IsTerminal() {
+				return reconcile.Result{}, nil
 			}
+			return reconcile.Result{}, err
 		}
-		if requeueAfter <= 0 {
-			requeueAfter = time.Millisecond
+		if res.IsZero() {
+			requeueAfter := readySafetyRequeueInterval
+			if run.ReadyDeadline != nil {
+				rem := run.ReadyDeadline.Sub(o.clock().UTC())
+				if rem < requeueAfter {
+					requeueAfter = rem
+				}
+			}
+			if requeueAfter <= 0 {
+				requeueAfter = time.Millisecond
+			}
+			res = reconcile.Result{RequeueAfter: requeueAfter}
 		}
-		return reconcile.Result{RequeueAfter: requeueAfter}, nil
+		return res, nil
 
 	case state.PhasePreparing:
-		res, err := o.reconcilePreparing(ctx, repo, run)
+		res, err := o.reconcilePreparing(ctx, repo, run, hr)
 		if err != nil {
 			log.Error(err, "reconciling preparing run failed", "repo", repo.URL, "run", run.ID)
-			return reconcile.Result{}, nil
+			if run.Phase.IsTerminal() {
+				return reconcile.Result{}, nil
+			}
+			return reconcile.Result{}, err
 		}
 		return res, nil
 
 	case state.PhaseWorking:
 		if o.sessionStore != nil && o.harness != nil && o.harness.LLMClient() != nil {
-			res, err := o.workRun(ctx, repo, run)
+			res, err := o.workRun(ctx, repo, run, hr)
 			if err != nil {
 				log.Error(err, "working run failed", "repo", repo.URL, "run", run.ID)
 				if run.Phase.IsTerminal() {
@@ -661,17 +610,23 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 		}
 
 	case state.PhaseSelecting:
-		res, err := o.reconcileSelecting(ctx, repo, run)
+		res, err := o.reconcileSelecting(ctx, repo, run, hr)
 		if err != nil {
 			log.Error(err, "reconciling selecting run failed", "repo", repo.URL, "run", run.ID)
-			return reconcile.Result{}, nil
+			if run.Phase.IsTerminal() {
+				return reconcile.Result{}, nil
+			}
+			return reconcile.Result{}, err
 		}
 		return res, nil
 
 	case state.PhaseOpeningPR:
-		if err := o.openPullRequest(ctx, repo, run); err != nil {
+		if err := o.openPullRequest(ctx, repo, run, hr); err != nil {
 			log.Error(err, "opening pull request failed", "repo", repo.URL, "run", run.ID)
-			return reconcile.Result{}, nil
+			if run.Phase.IsTerminal() {
+				return reconcile.Result{}, nil
+			}
+			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, nil
 	}
@@ -680,10 +635,9 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 }
 
 // prepareRun executes the first step of Preparing: publishes the HeroRun,
-// creates the Sandbox with an owner reference to the HeroRun (or unowned if
-// HeroRun is unavailable), records SandboxName and ReadyDeadline, moves the
-// run to Preparing, appends a phase event, and returns.
-func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *state.Run) error {
+// creates the Sandbox with an owner reference to the HeroRun, records SandboxName
+// and ReadyDeadline, moves the run to Preparing, appends a phase event, and returns.
+func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 	now := o.clock().UTC()
 
@@ -694,85 +648,57 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		run.SandboxName = sandboxName
 	}
 
-	// 2. Set deadline on the run
-	maxDuration := o.defaultMaxDuration
-	if run.Goal != nil && run.Goal.Budget != nil && run.Goal.Budget.MaxDuration != "" {
-		d, err := time.ParseDuration(run.Goal.Budget.MaxDuration)
-		if err != nil || d <= 0 {
-			msg := fmt.Sprintf("invalid budget.maxDuration %q: %v", run.Goal.Budget.MaxDuration, err)
-			if err == nil {
-				msg = fmt.Sprintf("invalid budget.maxDuration %q: duration must be positive", run.Goal.Budget.MaxDuration)
-			}
-			return o.failRunWithEvent(ctx, repo, run, msg)
-		}
-		maxDuration = d
-	}
-	runDeadline := now.Add(maxDuration)
-	run.Deadline = &runDeadline
-
+	// 2. Set ready deadline
 	readyDeadline := now.Add(o.readyTimeout)
 	run.ReadyDeadline = &readyDeadline
 
 	log.Info("preparing run: creating sandbox", "repo", repo.URL, "run", run.ID, "sandbox", sandboxName)
 
 	// 3. Build sandbox options (including HeroRun owner reference) and workspace claim if configured
-	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run)
+	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run, hr)
 
 	if o.workspaceStorageClass != "" {
 		if len(sbOpts.OwnerReferences) == 0 {
-			msg := "cannot create workspace claim: HeroRun owner is required"
 			run.ReadyDeadline = nil
-			o.finishRun(ctx, repo, run, runEnd{
-				Phase:   state.PhaseFailed,
-				Kind:    "failed",
-				Message: msg,
-			})
-			return errors.New(msg)
+			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, "cannot create workspace claim: HeroRun owner is required")
 		}
 		claimName := sandboxNameForRun(run.ID)
 		if err := o.ensureWorkspaceClaim(ctx, claimName, sbOpts.OwnerReferences); err != nil {
 			run.ReadyDeadline = nil
-			msg := fmt.Sprintf("creating workspace claim: %v", err)
-			o.finishRun(ctx, repo, run, runEnd{
-				Phase:   state.PhaseFailed,
-				Kind:    "failed",
-				Message: msg,
-			})
-			return errors.New(msg)
+			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("creating workspace claim: %v", err))
 		}
 		run.WorkspaceClaimName = claimName
 		sbOpts.WorkspaceClaimName = claimName
 	}
 
-	// 4. Create sandbox with a label naming the run, annotation naming the repository, owner reference, and shutdown time
+	// 4. Create sandbox with a label naming the run, annotation naming the repository, owner reference, and shutdown time.
+	// On AlreadyExists, read the existing Sandbox and reuse it if its owner is this HeroRun.
 	if _, err := o.harness.CreateSandboxWithOptions(ctx, sbOpts); err != nil {
-		prev := run.Phase
-		failTime := o.clock().UTC()
-		run.SetPhase(state.PhaseFailed, failTime)
-		run.Error = fmt.Sprintf("creating sandbox: %v", err)
-		run.ReadyDeadline = nil
-		if putErr := o.putRun(ctx, repo, run, prev); putErr != nil {
-			log.Error(putErr, "failed to update run to Failed", "run", run.ID)
+		reused := false
+		if k8serrors.IsAlreadyExists(err) {
+			existing, getErr := o.harness.SandboxClient().AgentsClient().AgentsV1beta1().Sandboxes(o.namespace()).Get(ctx, sandboxName, metav1.GetOptions{})
+			if getErr != nil {
+				return reconcile.Result{}, fmt.Errorf("getting existing sandbox %s: %w", sandboxName, getErr)
+			}
+			for _, ref := range existing.OwnerReferences {
+				if ref.Kind == "HeroRun" && ref.UID == hr.UID {
+					reused = true
+					o.harness.GetOrAttachSandbox(sandboxName)
+					break
+				}
+			}
 		}
-
-		if appendErr := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-			Time:    failTime,
-			Phase:   state.PhaseFailed,
-			Kind:    "phase",
-			Message: fmt.Sprintf("Run %s failed: creating sandbox: %v", run.ID, err),
-			Error:   run.Error,
-		}); appendErr != nil {
-			log.Error(appendErr, "failed to append Failed phase event", "run", run.ID)
+		if !reused {
+			run.ReadyDeadline = nil
+			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("creating sandbox: %v", err))
 		}
-
-		return fmt.Errorf("creating sandbox: %w", err)
 	}
 
 	// 5. Transition to Preparing
 	prev := run.Phase
 	run.SetPhase(state.PhasePreparing, now)
-	if err := o.putRun(ctx, repo, run, prev); err != nil {
-		return fmt.Errorf("updating run to Preparing: %w", err)
+	if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
+		return reconcile.Result{}, fmt.Errorf("updating run to Preparing: %w", err)
 	}
 
 	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
@@ -784,7 +710,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 		log.Error(err, "failed to append Preparing phase event", "run", run.ID)
 	}
 
-	return nil
+	return reconcile.Result{}, nil
 }
 
 // sandboxNameForRun returns the canonical name for a run's Sandbox and HeroRun objects.
@@ -794,7 +720,7 @@ func sandboxNameForRun(runID string) string {
 
 // heroRunOwnerReferences constructs an metav1.OwnerReference slice pointing to the HeroRun.
 func heroRunOwnerReferences(heroRun *herorunv1alpha1.HeroRun) []metav1.OwnerReference {
-	if heroRun == nil {
+	if heroRun == nil || heroRun.UID == "" {
 		return nil
 	}
 	isController := true
@@ -811,18 +737,13 @@ func heroRunOwnerReferences(heroRun *herorunv1alpha1.HeroRun) []metav1.OwnerRefe
 
 // buildCreateSandboxOptions builds the session.CreateSandboxOptions for a run,
 // including labels, annotations, HeroRun owner reference, shutdown time, and workspace claim.
-func (o *Orchestrator) buildCreateSandboxOptions(ctx context.Context, repo *state.Repo, run *state.Run) session.CreateSandboxOptions {
+func (o *Orchestrator) buildCreateSandboxOptions(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) session.CreateSandboxOptions {
 	sandboxName := run.SandboxName
 	if sandboxName == "" {
 		sandboxName = sandboxNameForRun(run.ID)
 	}
 
-	heroRun := o.publishHeroRun(ctx, repo, run)
-	ownerRefs := heroRunOwnerReferences(heroRun)
-	if heroRun == nil {
-		scoped.Log(ctx).Info("creating unowned sandbox: no HeroRun available", "run", run.ID, "sandbox", sandboxName)
-	}
-
+	ownerRefs := heroRunOwnerReferences(hr)
 	labels := map[string]string{
 		LabelRun: run.ID,
 	}
@@ -848,13 +769,7 @@ func (o *Orchestrator) buildCreateSandboxOptions(ctx context.Context, repo *stat
 
 // ensureWorkspaceClaim creates a PersistentVolumeClaim for the run's workspace if it does not already exist.
 func (o *Orchestrator) ensureWorkspaceClaim(ctx context.Context, name string, ownerRefs []metav1.OwnerReference) error {
-	if o.kubeClient == nil {
-		return errors.New("cannot create workspace claim: no Kubernetes client configured")
-	}
-	namespace := ""
-	if o.harness != nil {
-		namespace = o.harness.Namespace()
-	}
+	namespace := o.namespace()
 
 	storageQty, err := resource.ParseQuantity(o.workspaceSize)
 	if err != nil {
@@ -886,78 +801,6 @@ func (o *Orchestrator) ensureWorkspaceClaim(ctx context.Context, name string, ow
 	return nil
 }
 
-// publishHeroRun publishes a thin HeroRun custom resource for run in the sandbox namespace.
-// It creates the object if it does not already exist; if it exists, it leaves it alone.
-// It returns the published or existing object, or nil if there is no KubeClient or publishing failed.
-// A publish failure never fails the run; it is logged and the next reconcile or restart retries.
-func (o *Orchestrator) publishHeroRun(ctx context.Context, repo *state.Repo, run *state.Run) *herorunv1alpha1.HeroRun {
-	if o.kubeClient == nil {
-		o.logNoKubeClient.Do(func() {
-			scoped.Log(ctx).Info("HeroRun publishing skipped: no Kubernetes client configured")
-		})
-		return nil
-	}
-	if repo == nil || run == nil {
-		return nil
-	}
-
-	name := sandboxNameForRun(run.ID)
-	namespace := ""
-	if o.harness != nil {
-		namespace = o.harness.Namespace()
-	}
-
-	log := scoped.Log(ctx)
-
-	var existing herorunv1alpha1.HeroRun
-	err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &existing)
-	if err == nil {
-		// Already exists; leave it alone (status handling is part 4).
-		return &existing
-	}
-	if !k8serrors.IsNotFound(err) {
-		log.Error(err, "failed to get HeroRun", "run", run.ID, "heroRun", name)
-		return nil
-	}
-
-	goal := run.GoalName
-	if goal == "" && run.Goal != nil {
-		goal = run.Goal.Name
-	}
-
-	hr := &herorunv1alpha1.HeroRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			Labels: map[string]string{
-				LabelRun: run.ID,
-			},
-			Annotations: map[string]string{
-				AnnotationRepo: repo.Key().String(),
-			},
-		},
-		Spec: herorunv1alpha1.HeroRunSpec{
-			Repository: repo.URL,
-			Goal:       goal,
-			RunID:      run.ID,
-			BaseCommit: run.BaseCommit,
-		},
-	}
-
-	if err := o.kubeClient.Create(ctx, hr); err != nil {
-		if !k8serrors.IsAlreadyExists(err) {
-			log.Error(err, "failed to create HeroRun", "run", run.ID, "heroRun", name)
-			return nil
-		}
-		if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &existing); err != nil {
-			log.Error(err, "failed to get existing HeroRun after already-exists", "run", run.ID, "heroRun", name)
-			return nil
-		}
-		return &existing
-	}
-	return hr
-}
-
 // isSandboxFailed inspects sandbox status conditions to detect failure before readiness.
 func isSandboxFailed(sb *sandboxv1beta1.Sandbox) (string, bool) {
 	return session.IsSandboxFailed(sb)
@@ -970,7 +813,7 @@ func isSandboxFailed(sb *sandboxv1beta1.Sandbox) (string, bool) {
 // reconcile.Result with RequeueAfter.
 // If the Sandbox is ready, it records the sandbox_ready event, attaches the sandbox handle,
 // sets its pod info, and returns the handle.
-func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo, run *state.Run) (*session.Sandbox, reconcile.Result, error) {
+func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (*session.Sandbox, reconcile.Result, error) {
 	log := scoped.Log(ctx)
 	now := o.clock().UTC()
 
@@ -983,7 +826,7 @@ func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			run.ReadyDeadline = nil
-			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s was deleted before becoming ready", run.SandboxName))
+			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("sandbox %s was deleted before becoming ready", run.SandboxName))
 		}
 		return nil, reconcile.Result{}, fmt.Errorf("getting sandbox %s: %w", run.SandboxName, err)
 	}
@@ -994,7 +837,7 @@ func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo
 			log.V(2).Info("error deleting failed sandbox", "sandbox", run.SandboxName, "error", delErr)
 		}
 		run.ReadyDeadline = nil
-		return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s failed: %s", run.SandboxName, failMsg))
+		return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("sandbox %s failed: %s", run.SandboxName, failMsg))
 	}
 
 	sb := o.harness.GetOrAttachSandbox(run.SandboxName)
@@ -1004,7 +847,7 @@ func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo
 				log.V(2).Info("error deleting failed sandbox", "sandbox", run.SandboxName, "error", delErr)
 			}
 			run.ReadyDeadline = nil
-			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s pod image pull failed: %v", run.SandboxName, pullErr))
+			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("sandbox %s pod image pull failed: %v", run.SandboxName, pullErr))
 		}
 	}
 
@@ -1026,7 +869,7 @@ func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo
 				}
 			}
 			run.ReadyDeadline = nil
-			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "sandbox not ready before deadline")
+			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, "sandbox not ready before deadline")
 		}
 
 		// Otherwise return RequeueAfter with a slow safety interval capped at the deadline.
@@ -1059,7 +902,7 @@ func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo
 	}
 	if sb == nil {
 		run.ReadyDeadline = nil
-		return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "failed to get sandbox handle")
+		return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, "failed to get sandbox handle")
 	}
 
 	podIP := ""
@@ -1280,7 +1123,7 @@ func (o *Orchestrator) prepareSandbox(ctx context.Context, repo *state.Repo, run
 // policy if configured, clones or reuses the repo, and configures the git identity.
 // If portal binding fails before the ready deadline, it returns a reconcile.Result with RequeueAfter.
 // If any command fails or deadline expires, it cleans up and marks the run failed.
-func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox) (reconcile.Result, error) {
+func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, sb *session.Sandbox) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 	now := o.clock().UTC()
 
@@ -1289,7 +1132,7 @@ func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo
 	}
 	if sb == nil {
 		run.ReadyDeadline = nil
-		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "failed to get sandbox handle")
+		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, "failed to get sandbox handle")
 	}
 
 	err := o.prepareSandbox(ctx, repo, run, sb)
@@ -1299,12 +1142,14 @@ func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo
 			log.Error(pErr.err, "failed to bind portal egress policy", "run", run.ID, "sandbox", run.SandboxName)
 			if run.ReadyDeadline != nil && !now.Before(*run.ReadyDeadline) {
 				run.ReadyDeadline = nil
-				o.finishRun(ctx, repo, run, runEnd{
+				if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
 					Phase:   state.PhaseFailed,
 					Kind:    "portal_bind_failed",
 					Message: pErr.err.Error(),
 					Sandbox: sb,
-				})
+				}); finishErr != nil {
+					return reconcile.Result{}, finishErr
+				}
 				return reconcile.Result{}, pErr.err
 			}
 
@@ -1327,14 +1172,14 @@ func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo
 		}
 
 		run.ReadyDeadline = nil
-		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, err.Error())
+		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, err.Error())
 	}
 
 	if o.portalBinder != nil && run.PortalBoundAt == nil {
 		nowBound := o.clock().UTC()
 		run.PortalBoundAt = &nowBound
-		if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
-			log.Error(err, "failed to update run with PortalBoundAt", "run", run.ID)
+		if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
+			return reconcile.Result{}, fmt.Errorf("updating run with PortalBoundAt: %w", err)
 		}
 	}
 
@@ -1344,15 +1189,15 @@ func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo
 // reconcilePreparing executes the second step of Preparing: reads the Sandbox,
 // checks failure conditions / deletion / deadline expiration, clones the repository,
 // moves the run to Working, and enqueues it.
-func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
+func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
-	sb, res, err := o.waitForSandboxReady(ctx, repo, run)
+	sb, res, err := o.waitForSandboxReady(ctx, repo, run, hr)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
 
-	res, err = o.prepareReadySandbox(ctx, repo, run, sb)
+	res, err = o.prepareReadySandbox(ctx, repo, run, hr, sb)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
@@ -1362,7 +1207,7 @@ func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo,
 	workTime := o.clock().UTC()
 	run.SetPhase(state.PhaseWorking, workTime)
 	run.ReadyDeadline = nil
-	if err := o.putRun(ctx, repo, run, prev); err != nil {
+	if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
 		return reconcile.Result{}, fmt.Errorf("updating run to Working: %w", err)
 	}
 
@@ -1538,19 +1383,22 @@ func (o *Orchestrator) PostMessage(ctx context.Context, repo state.RepoKey, runI
 		return errors.New("message text is required")
 	}
 
-	run, err := o.store.GetRun(ctx, repo, runID)
-	if err != nil {
-		return fmt.Errorf("getting run %s: %w", runID, err)
+	name := sandboxNameForRun(runID)
+	var hr herorunv1alpha1.HeroRun
+	if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: o.namespace(), Name: name}, &hr); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return fmt.Errorf("run %s not found", runID)
+		}
+		return fmt.Errorf("getting HeroRun %s: %w", name, err)
 	}
-	if run == nil {
-		return fmt.Errorf("run %s not found", runID)
-	}
-	if run.Phase != state.PhaseWorking && run.Phase != state.PhasePending && run.Phase != state.PhasePreparing {
-		return fmt.Errorf("%w: run %s is in phase %s", ErrRunNotWorking, runID, run.Phase)
+
+	phase := HeroRunPhase(&hr)
+	if phase != state.PhaseWorking && phase != state.PhasePending && phase != state.PhasePreparing {
+		return fmt.Errorf("%w: run %s is in phase %s", ErrRunNotWorking, runID, phase)
 	}
 
 	o.pendingMessagesMu.Lock()
-	err = o.store.AppendPendingMessage(ctx, repo, runID, text)
+	err := o.store.AppendPendingMessage(ctx, repo, runID, text)
 	o.pendingMessagesMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("appending pending message: %w", err)
@@ -1560,13 +1408,9 @@ func (o *Orchestrator) PostMessage(ctx context.Context, repo state.RepoKey, runI
 	return nil
 }
 
-func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.Repo, run *state.Run, initialSb *session.Sandbox) *session.SandboxOwner {
+func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, initialSb *session.Sandbox) *session.SandboxOwner {
 	o.runStatesMu.Lock()
 	rs := o.runStates[run.ID]
-	if rs == nil {
-		o.runStatesMu.Unlock()
-		return nil
-	}
 	if rs.sandboxOwner == nil {
 		rs.sandboxOwner = session.NewSandboxOwner(o.harness)
 	}
@@ -1576,7 +1420,7 @@ func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.
 	if initialSb != nil && owner.ActiveSandbox() == nil {
 		owner.SetActiveSandbox(initialSb)
 	}
-	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run)
+	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run, hr)
 	owner.SetCreateSandboxOptions(sbOpts)
 	// Set preparer each time a turn worker starts so it uses the current turn's repo and run.
 	owner.SetSandboxPreparer(func(ctx context.Context, s *session.Sandbox) error {
@@ -1605,31 +1449,33 @@ func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.
 	return owner
 }
 
-// putRun writes a run record to the state store and updates HeroRun status:
-// critical transitions are published synchronously via PublishNow, while
-// progress updates are marked dirty and coalesced by the publisher loop.
-func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.Run, prev state.RunPhase) error {
-	if err := o.store.PutRun(ctx, run); err != nil {
+func (o *Orchestrator) namespace() string {
+	return o.harness.Namespace()
+}
+
+// saveHeroRun writes the run status to the HeroRun custom resource in kube-apiserver,
+// updating the object held by the reconciler directly so that concurrent changes result
+// in an API conflict error and a clean retry.
+func (o *Orchestrator) saveHeroRun(ctx context.Context, hr *herorunv1alpha1.HeroRun, run *state.Run) error {
+	hr.Status = HeroRunFromRun(run).Status
+	if err := o.kubeClient.Status().Update(ctx, hr); err != nil {
+		return fmt.Errorf("updating HeroRun %s status: %w", hr.Name, err)
+	}
+	return nil
+}
+
+// putRun writes a run record to the HeroRun custom resource in kube-apiserver
+// and exports a snapshot to run.json on disk for human inspection.
+func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, prev state.RunPhase) error {
+	if err := o.saveHeroRun(ctx, hr, run); err != nil {
 		return err
+	}
+	if err := o.store.PutRun(ctx, run); err != nil {
+		scoped.Log(ctx).V(2).Info("exporting run.json failed", "run", run.ID, "error", err)
 	}
 	if run != nil && run.Phase.IsTerminal() {
 		o.deleteRunIndex(sandboxNameForRun(run.ID))
 		o.deleteTurnBudget(run.ID)
-	}
-	if o.statusPublisher != nil {
-		var key state.RepoKey
-		if repo != nil {
-			key = repo.Key()
-		} else if run != nil {
-			key = run.Repo
-		}
-		if statusTier(prev, run.Phase) == tierCritical {
-			if err := o.statusPublisher.PublishNow(ctx, repo, run); err != nil {
-				scoped.Log(ctx).V(2).Info("synchronous HeroRun status publish failed, deferred to next tick", "run", run.ID, "error", err)
-			}
-		} else {
-			o.statusPublisher.MarkDirty(key, run.ID)
-		}
 	}
 	return nil
 }
@@ -1678,9 +1524,9 @@ func isCanceled(err error) bool {
 	return false
 }
 
-func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *state.Run, end runEnd) {
+func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, end runEnd) error {
 	if ctx.Err() != nil || o.isManagerCanceled() {
-		return
+		return nil
 	}
 
 	prev := run.Phase
@@ -1689,8 +1535,8 @@ func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *sta
 	if end.Phase == state.PhaseFailed {
 		run.Error = end.Message
 	}
-	if err := o.putRun(ctx, repo, run, prev); err != nil {
-		scoped.Log(ctx).Error(err, "failed to update run phase", "phase", end.Phase, "run", run.ID)
+	if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
+		return fmt.Errorf("updating terminal run state: %w", err)
 	}
 
 	msg := end.Message
@@ -1719,14 +1565,17 @@ func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *sta
 			scoped.Log(ctx).V(2).Info("error deleting sandbox after run ended", "sandbox", run.SandboxName, "error", delErr)
 		}
 	}
+	return nil
 }
 
-func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, errMsg string) error {
-	o.finishRun(ctx, repo, run, runEnd{
+func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, errMsg string) error {
+	if err := o.finishRun(ctx, repo, run, hr, runEnd{
 		Phase:   state.PhaseFailed,
 		Kind:    "failed",
 		Message: errMsg,
-	})
+	}); err != nil {
+		return err
+	}
 	return errors.New(errMsg)
 }
 
@@ -1745,7 +1594,7 @@ func runStartTime(run *state.Run) time.Time {
 	return time.Time{}
 }
 
-func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
+func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
 	if ctx.Err() != nil {
@@ -1753,7 +1602,7 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	}
 
 	if outcome, ok := o.popTurnOutcome(run.ID); ok {
-		return reconcile.Result{}, o.handleTurnOutcome(ctx, repo, run, outcome)
+		return reconcile.Result{}, o.handleTurnOutcome(ctx, repo, run, hr, outcome)
 	}
 
 	if o.isManagerCanceled() {
@@ -1773,7 +1622,7 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 			}
 		}
 		o.cancelWorker(run.ID)
-		o.finishRun(ctx, repo, run, runEnd{
+		if err := o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "deadline_exceeded",
 			Message: "deadline exceeded",
@@ -1782,7 +1631,9 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 				"elapsed":  elapsed.String(),
 			},
 			Sandbox: sb,
-		})
+		}); err != nil {
+			return reconcile.Result{}, err
+		}
 		return reconcile.Result{}, nil
 	}
 
@@ -1796,24 +1647,27 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 		return reconcile.Result{RequeueAfter: requeueAfter}, nil
 	}
 
-	o.startTurn(ctx, repo, run)
+	if err := o.startTurn(ctx, repo, run, hr); err != nil {
+		return reconcile.Result{}, err
+	}
 	return reconcile.Result{RequeueAfter: requeueAfter}, nil
 }
 
-func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *state.Run) {
+func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) error {
 	if o.isManagerCanceled() {
-		return
+		return nil
 	}
 
 	o.ensureRunState(run.ID)
 	if !o.setRunActive(run.ID, true) {
-		return
+		return nil
 	}
 
 	if run.SessionID == "" {
 		run.SessionID = generateSessionID(run.ID)
-		if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
-			scoped.Log(ctx).Error(err, "updating run with session ID", "run", run.ID)
+		if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
+			o.setRunActive(run.ID, false)
+			return fmt.Errorf("updating run with session ID: %w", err)
 		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    o.clock().UTC(),
@@ -1834,13 +1688,14 @@ func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *sta
 		defer o.workerWG.Done()
 		defer cancel()
 		defer o.setRunActive(run.ID, false)
-		outcome := o.runTurnWorker(workerCtx, repo, run)
+		outcome := o.runTurnWorker(workerCtx, repo, run, hr)
 		o.storeTurnOutcome(run.ID, outcome)
 		o.Notify(repo.Key(), run.ID)
 	}()
+	return nil
 }
 
-func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run *state.Run) turnOutcome {
+func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) turnOutcome {
 	o.ensureRunState(run.ID)
 
 	sandboxName := run.SandboxName
@@ -1891,10 +1746,7 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	}
 
 	// Bind sandbox owner to session
-	owner := o.getOrCreateSandboxOwner(ctx, repo, run, sb)
-	if owner != nil {
-		sess.SetSandboxOwner(owner)
-	}
+	sess.SetSandboxOwner(o.getOrCreateSandboxOwner(ctx, repo, run, hr, sb))
 
 	// Seed system prompt if new session
 	if len(sess.Messages()) == 0 {
@@ -1969,7 +1821,7 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	}
 }
 
-func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, run *state.Run, outcome turnOutcome) error {
+func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, outcome turnOutcome) error {
 	log := scoped.Log(ctx)
 
 	if run.Phase.IsTerminal() {
@@ -1984,7 +1836,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		prev := run.Phase
 		now := o.clock().UTC()
 		run.SetPhase(state.PhaseSelecting, now)
-		if err := o.putRun(ctx, repo, run, prev); err != nil {
+		if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
 			return fmt.Errorf("updating run to Selecting: %w", err)
 		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
@@ -2007,13 +1859,12 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 
 	if errors.Is(turnErr, session.ErrSessionFinished) {
 		run.Summary = outcome.Summary
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseNoImprovement,
 			Kind:    "finished",
 			Message: outcome.Summary,
 			Sandbox: sb,
 		})
-		return nil
 	}
 
 	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
@@ -2025,13 +1876,12 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 			o.Notify(repo.Key(), run.ID)
 			return nil
 		}
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseNoImprovement,
 			Kind:    "no_improvement",
 			Message: "session ended without a pull request",
 			Sandbox: sb,
 		})
-		return nil
 	}
 
 	if ctx.Err() != nil || o.isManagerCanceled() || isCanceled(turnErr) {
@@ -2039,16 +1889,18 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 	}
 
 	errMsg := fmt.Sprintf("session error: %v", turnErr)
-	o.finishRun(ctx, repo, run, runEnd{
+	if err := o.finishRun(ctx, repo, run, hr, runEnd{
 		Phase:   state.PhaseFailed,
 		Kind:    "failed",
 		Message: errMsg,
 		Sandbox: sb,
-	})
+	}); err != nil {
+		return err
+	}
 	return errors.New(errMsg)
 }
 
-func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
+func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
 	if o.harness == nil {
@@ -2057,21 +1909,25 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 
 	sandboxName := run.SandboxName
 	if sandboxName == "" {
-		o.finishRun(ctx, repo, run, runEnd{
+		if err := o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "failed",
 			Message: "sandbox name is empty for selecting run",
-		})
+		}); err != nil {
+			return reconcile.Result{}, err
+		}
 		return reconcile.Result{}, nil
 	}
 
 	sb := o.harness.GetOrAttachSandbox(sandboxName)
 	if sb == nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		if err := o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "failed",
 			Message: "failed to get sandbox handle",
-		})
+		}); err != nil {
+			return reconcile.Result{}, err
+		}
 		return reconcile.Result{}, nil
 	}
 
@@ -2098,26 +1954,30 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 
 		if err != nil {
 			if timedOut {
-				o.finishRun(ctx, repo, run, runEnd{
+				if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
 					Phase:   state.PhaseNoImprovement,
 					Kind:    "verify_failed",
 					Message: fmt.Sprintf("verify command timed out after %s", o.verifyTimeout),
 					Sandbox: sb,
-				})
+				}); finishErr != nil {
+					return reconcile.Result{}, finishErr
+				}
 				return reconcile.Result{}, nil
 			}
-			o.finishRun(ctx, repo, run, runEnd{
+			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
 				Phase:   state.PhaseFailed,
 				Kind:    "verify_error",
 				Message: fmt.Sprintf("running verify command: %v", err),
 				Sandbox: sb,
-			})
+			}); finishErr != nil {
+				return reconcile.Result{}, finishErr
+			}
 			return reconcile.Result{}, nil
 		}
 
 		if res.ExitCode != 0 {
 			msg := fmt.Sprintf("verify command failed with exit code %d", res.ExitCode)
-			o.finishRun(ctx, repo, run, runEnd{
+			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
 				Phase:   state.PhaseNoImprovement,
 				Kind:    "verify_failed",
 				Message: msg,
@@ -2126,7 +1986,9 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 					"tail":     res.Tail,
 				},
 				Sandbox: sb,
-			})
+			}); finishErr != nil {
+				return reconcile.Result{}, finishErr
+			}
 			return reconcile.Result{}, nil
 		}
 
@@ -2142,12 +2004,14 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 
 	destDir, err := os.MkdirTemp("", "ao-export-*")
 	if err != nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "failed",
 			Message: fmt.Sprintf("creating temp dir for export: %v", err),
 			Sandbox: sb,
-		})
+		}); finishErr != nil {
+			return reconcile.Result{}, finishErr
+		}
 		return reconcile.Result{}, nil
 	}
 	defer func() {
@@ -2163,46 +2027,54 @@ func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo,
 	})
 	if err != nil {
 		if errors.Is(err, session.ErrNoChanges) {
-			o.finishRun(ctx, repo, run, runEnd{
+			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
 				Phase:   state.PhaseNoImprovement,
 				Kind:    "no_changes",
 				Message: "no changes against base commit",
 				Sandbox: sb,
-			})
+			}); finishErr != nil {
+				return reconcile.Result{}, finishErr
+			}
 			return reconcile.Result{}, nil
 		}
 		if errors.Is(err, session.ErrGoalsChanged) {
-			o.finishRun(ctx, repo, run, runEnd{
+			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
 				Phase:   state.PhaseNoImprovement,
 				Kind:    "refused",
 				Message: "changes under .goals/",
 				Sandbox: sb,
-			})
+			}); finishErr != nil {
+				return reconcile.Result{}, finishErr
+			}
 			return reconcile.Result{}, nil
 		}
 		if errors.Is(err, session.ErrUncommittedChanges) {
-			o.finishRun(ctx, repo, run, runEnd{
+			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
 				Phase:   state.PhaseFailed,
 				Kind:    "failed",
 				Message: err.Error(),
 				Sandbox: sb,
-			})
+			}); finishErr != nil {
+				return reconcile.Result{}, finishErr
+			}
 			return reconcile.Result{}, nil
 		}
-		o.finishRun(ctx, repo, run, runEnd{
+		if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "failed",
 			Message: fmt.Sprintf("export commits: %v", err),
 			Sandbox: sb,
-		})
+		}); finishErr != nil {
+			return reconcile.Result{}, finishErr
+		}
 		return reconcile.Result{}, nil
 	}
 
 	log.V(2).Info("commits exported successfully", "run", run.ID, "tip", res.Tip)
-	return reconcile.Result{}, o.exportSuccess(ctx, repo, run, sb, res)
+	return reconcile.Result{}, o.exportSuccess(ctx, repo, run, hr, sb, res)
 }
 
-func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox, res *session.ExportResult) error {
+func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, sb *session.Sandbox, res *session.ExportResult) error {
 	if res.PackfilePath != "" {
 		defer func() {
 			if err := os.Remove(res.PackfilePath); err != nil && !os.IsNotExist(err) {
@@ -2223,44 +2095,40 @@ func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run 
 	}
 
 	if o.forgeFor == nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "push_failed",
 			Message: fmt.Sprintf("no forge configured for repository %s", repo.URL),
 			Sandbox: sb,
 		})
-		return nil
 	}
 
 	f, err := o.forgeFor(repo.URL)
 	if err != nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "push_failed",
 			Message: fmt.Sprintf("selecting forge for %s: %v", repo.URL, err),
 			Sandbox: sb,
 		})
-		return nil
 	}
 	if f == nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "push_failed",
 			Message: fmt.Sprintf("no forge configured for repository %s", repo.URL),
 			Sandbox: sb,
 		})
-		return nil
 	}
 
 	packFile, err := os.Open(res.PackfilePath)
 	if err != nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "push_failed",
 			Message: fmt.Sprintf("opening packfile: %v", err),
 			Sandbox: sb,
 		})
-		return nil
 	}
 	defer func() {
 		if closeErr := packFile.Close(); closeErr != nil {
@@ -2284,21 +2152,19 @@ func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run 
 	})
 	if pushErr != nil {
 		if errors.Is(pushErr, forge.ErrBranchMoved) {
-			o.finishRun(ctx, repo, run, runEnd{
+			return o.finishRun(ctx, repo, run, hr, runEnd{
 				Phase:   state.PhaseFailed,
 				Kind:    "branch_moved",
 				Message: "remote branch is not at base commit",
 				Sandbox: sb,
 			})
-			return nil
 		}
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "push_failed",
 			Message: fmt.Sprintf("push packfile: %v", pushErr),
 			Sandbox: sb,
 		})
-		return nil
 	}
 
 	run.Branch = branchName
@@ -2317,61 +2183,57 @@ func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run 
 		scoped.Log(ctx).Error(err, "failed to append branch_pushed event", "run", run.ID)
 	}
 
+	prev := run.Phase
+	run.SetPhase(state.PhaseOpeningPR, pushTime)
+	if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
+		return fmt.Errorf("updating run to OpeningPR: %w", err)
+	}
+
 	if sb != nil {
 		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
 			scoped.Log(ctx).V(2).Info("error deleting sandbox after run left selecting", "sandbox", run.SandboxName, "error", delErr)
 		}
 	}
 
-	prev := run.Phase
-	run.SetPhase(state.PhaseOpeningPR, pushTime)
-	if err := o.putRun(ctx, repo, run, prev); err != nil {
-		scoped.Log(ctx).Error(err, "failed to update run to OpeningPR", "run", run.ID)
-	}
-
-	return o.openPullRequest(ctx, repo, run)
+	return o.openPullRequest(ctx, repo, run, hr)
 }
 
-func (o *Orchestrator) openPullRequest(ctx context.Context, repo *state.Repo, run *state.Run) error {
+func (o *Orchestrator) openPullRequest(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) error {
 	if ctx.Err() != nil {
 		return nil
 	}
 
 	if o.forgeFor == nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "pull_request_failed",
 			Message: fmt.Sprintf("no forge configured for repository %s", repo.URL),
 		})
-		return nil
 	}
 
 	f, err := o.forgeFor(repo.URL)
 	if err != nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "pull_request_failed",
 			Message: fmt.Sprintf("selecting forge for %s: %v", repo.URL, err),
 		})
-		return nil
 	}
 	if f == nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "pull_request_failed",
 			Message: fmt.Sprintf("no forge configured for repository %s", repo.URL),
 		})
-		return nil
 	}
 
 	cr, ok := f.(forge.ChangeRequestCreator)
 	if !ok {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseSucceeded,
 			Kind:    "pull_request_not_opened",
 			Message: "forge cannot open pull requests",
 		})
-		return nil
 	}
 
 	branch := run.BranchName()
@@ -2381,24 +2243,22 @@ func (o *Orchestrator) openPullRequest(ctx context.Context, repo *state.Repo, ru
 
 	prs, err := cr.ListPullRequests(ctx, repo.URL, branch)
 	if err != nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "pull_request_failed",
 			Message: fmt.Sprintf("listing pull requests: %v", err),
 		})
-		return nil
 	}
 
 	for _, pr := range prs {
 		if pr.State == "open" && pr.Head == branch {
 			run.PRURL = pr.URL
-			o.finishRun(ctx, repo, run, runEnd{
+			return o.finishRun(ctx, repo, run, hr, runEnd{
 				Phase:   state.PhaseSucceeded,
 				Kind:    "pull_request_reused",
 				Message: pr.URL,
 				Data:    map[string]any{"url": pr.URL},
 			})
-			return nil
 		}
 	}
 
@@ -2414,22 +2274,20 @@ func (o *Orchestrator) openPullRequest(ctx context.Context, repo *state.Repo, ru
 
 	pr, err := cr.OpenPullRequest(ctx, repo.URL, branch, base, title, body)
 	if err != nil {
-		o.finishRun(ctx, repo, run, runEnd{
+		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "pull_request_failed",
 			Message: err.Error(),
 		})
-		return nil
 	}
 
 	run.PRURL = pr.URL
-	o.finishRun(ctx, repo, run, runEnd{
+	return o.finishRun(ctx, repo, run, hr, runEnd{
 		Phase:   state.PhaseSucceeded,
 		Kind:    "pull_request_opened",
 		Message: pr.URL,
 		Data:    map[string]any{"url": pr.URL},
 	})
-	return nil
 }
 
 func (o *Orchestrator) buildPRBody(repo *state.Repo, run *state.Run) string {

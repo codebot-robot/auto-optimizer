@@ -524,8 +524,7 @@ This unifies `state.Run` and `HeroRun` into a single custom resource type:
 - The web UI and CLI read `HeroRun` through the Kubernetes client. `run.json` on
   disk becomes an optional exported snapshot strictly for a person to read with
   UNIX tools (`cat`, `jq`); the controller, CLI, and web UI must not read the
-  export. On startup or resumption, legacy runs found on disk without a
-  corresponding `HeroRun` in the API server are imported into `kube-apiserver`.
+  export.
 - Finished `HeroRun` objects are retained while their pull request is open or
   until their retention window passes. Deleting a `HeroRun` triggers Kubernetes
   cascading garbage collection of its child `Sandbox` and workspace PVC, and
@@ -545,7 +544,6 @@ To implement `HeroRun`, we will:
    `controller: true`.
 4. Keep session transcripts, tool outputs, and events on the state volume,
    exporting a `run.json` snapshot strictly for human inspection.
-5. Import legacy disk runs into `kube-apiserver` on startup.
 
 ### Workflow abstraction
 
