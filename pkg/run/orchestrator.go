@@ -28,7 +28,6 @@ import (
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -537,7 +536,7 @@ func (o *Orchestrator) getRunForReconcile(ctx context.Context, req reconcile.Req
 }
 
 // Reconcile loads the run and the repository, dispatches on the phase to
-// RunWorkflow.Run (for Pending), reconcilePreparing, or workRun, and returns.
+// runWorkflow.Run (for Pending), reconcilePreparing, or workRun, and returns.
 func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
@@ -562,49 +561,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 
 	switch run.Phase {
 	case state.PhasePending:
-		wf := NewRunWorkflow(o, repo, run, hr)
-		res, err := wf.Run(ctx)
-		if err != nil {
-			log.Error(err, "workflow run failed", "repo", repo.URL, "run", run.ID)
-			if run.Phase.IsTerminal() {
-				return reconcile.Result{}, nil
-			}
-			return reconcile.Result{}, err
-		}
-		prev := state.PhasePending
-		if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
-			return reconcile.Result{}, fmt.Errorf("updating run: %w", err)
-		}
-		if run.Phase != prev {
-			kind := "phase"
-			msg := fmt.Sprintf("Run %s entered %s phase", run.ID, run.Phase)
-			if run.Phase == state.PhaseFailed {
-				kind = "failed"
-				msg = fmt.Sprintf("Run failed: %s", run.Error)
-			}
-			eventTime := o.clock().UTC()
-			if t, ok := run.PhaseTimestamps[run.Phase]; ok {
-				eventTime = t
-			}
-			event := state.Event{
-				Time:    eventTime,
-				Phase:   run.Phase,
-				Kind:    kind,
-				Message: msg,
-			}
-			if run.Phase == state.PhaseFailed {
-				event.Error = run.Error
-			}
-			if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, event); err != nil {
-				log.Error(err, "failed to append event", "run", run.ID)
-			}
-		}
-		if run.Phase.IsTerminal() {
-			o.cancelWorker(run.ID)
-			o.deleteRunState(run.ID)
-			return reconcile.Result{}, nil
-		}
-		return reconcile.Result{Requeue: res.Requeue, RequeueAfter: res.RequeueAfter}, nil
+		return o.reconcileWorkflow(ctx, newRunWorkflow(o, repo, run, hr))
 
 	case state.PhasePreparing:
 		res, err := o.reconcilePreparing(ctx, repo, run, hr)
@@ -655,6 +612,62 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 	return reconcile.Result{}, nil
 }
 
+// reconcileWorkflow executes one step of wf, saves the resulting state, records any
+// phase-change event, and cleans up when the run reaches a terminal phase.
+func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (reconcile.Result, error) {
+	log := scoped.Log(ctx)
+	prev := wf.run.Phase
+
+	res, err := wf.Run(ctx)
+	if err != nil {
+		log.Error(err, "workflow run failed", "repo", wf.repo.URL, "run", wf.run.ID)
+		return reconcile.Result{}, err
+	}
+
+	if res.done {
+		if ctx.Err() != nil || o.isManagerCanceled() {
+			return reconcile.Result{}, nil
+		}
+		eventTime := o.clock().UTC()
+		if t, ok := wf.run.PhaseTimestamps[wf.run.Phase]; ok {
+			eventTime = t
+		}
+		end := runEnd{
+			Phase: wf.run.Phase,
+		}
+		if wf.run.Phase == state.PhaseFailed {
+			end.Kind = "failed"
+			end.Message = wf.run.Error
+		}
+		if err := o.saveTerminalRun(ctx, wf.repo, wf.run, wf.hr, prev, eventTime, end); err != nil {
+			return reconcile.Result{}, err
+		}
+		if wf.run.Phase == state.PhaseFailed {
+			log.Error(errors.New(wf.run.Error), "run failed", "repo", wf.repo.URL, "run", wf.run.ID)
+		}
+		return reconcile.Result{}, nil
+	}
+
+	if err := o.putRun(ctx, wf.repo, wf.run, wf.hr, prev); err != nil {
+		return reconcile.Result{}, fmt.Errorf("updating run: %w", err)
+	}
+	if wf.run.Phase != prev {
+		eventTime := o.clock().UTC()
+		if t, ok := wf.run.PhaseTimestamps[wf.run.Phase]; ok {
+			eventTime = t
+		}
+		if err := o.store.AppendEvent(ctx, wf.repo.Key(), wf.run.ID, state.Event{
+			Time:    eventTime,
+			Phase:   wf.run.Phase,
+			Kind:    "phase",
+			Message: fmt.Sprintf("Run %s entered %s phase", wf.run.ID, wf.run.Phase),
+		}); err != nil {
+			log.Error(err, "failed to append phase event", "phase", wf.run.Phase, "run", wf.run.ID)
+		}
+	}
+	return reconcile.Result{RequeueAfter: res.requeueAfter}, nil
+}
+
 // sandboxNameForRun returns the canonical name for a run's Sandbox and HeroRun objects.
 func sandboxNameForRun(runID string) string {
 	return fmt.Sprintf("run-%s", strings.ToLower(runID))
@@ -675,72 +688,6 @@ func heroRunOwnerReferences(heroRun *herorunv1alpha1.HeroRun) []metav1.OwnerRefe
 			Controller: &isController,
 		},
 	}
-}
-
-// buildCreateSandboxOptions builds the session.CreateSandboxOptions for a run,
-// including labels, annotations, HeroRun owner reference, shutdown time, and workspace claim.
-func (o *Orchestrator) buildCreateSandboxOptions(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) session.CreateSandboxOptions {
-	sandboxName := run.SandboxName
-	if sandboxName == "" {
-		sandboxName = sandboxNameForRun(run.ID)
-	}
-
-	ownerRefs := heroRunOwnerReferences(hr)
-	labels := map[string]string{
-		LabelRun: run.ID,
-	}
-	annotations := map[string]string{
-		AnnotationRepo: repo.Key().String(),
-	}
-	var sbShutdown time.Time
-	if run.Deadline != nil {
-		sbShutdown = run.Deadline.Add(SandboxShutdownGrace)
-	}
-
-	return session.CreateSandboxOptions{
-		Name:               sandboxName,
-		Labels:             labels,
-		Annotations:        annotations,
-		OwnerReferences:    ownerRefs,
-		ShutdownTime:       sbShutdown,
-		WorkspaceClaimName: run.WorkspaceClaimName,
-		PortalIntercept:    o.portalBinder != nil,
-		ExtendLifecycle:    false,
-	}
-}
-
-// ensureWorkspaceClaim creates a PersistentVolumeClaim for the run's workspace if it does not already exist.
-func (o *Orchestrator) ensureWorkspaceClaim(ctx context.Context, name string, ownerRefs []metav1.OwnerReference) error {
-	namespace := o.namespace()
-
-	storageQty, err := resource.ParseQuantity(o.workspaceSize)
-	if err != nil {
-		return fmt.Errorf("parsing workspace size %q: %w", o.workspaceSize, err)
-	}
-
-	claim := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            name,
-			Namespace:       namespace,
-			OwnerReferences: ownerRefs,
-		},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{
-				corev1.ReadWriteOncePod,
-			},
-			StorageClassName: &o.workspaceStorageClass,
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: storageQty,
-				},
-			},
-		},
-	}
-
-	if err := o.kubeClient.Create(ctx, claim); err != nil && !k8serrors.IsAlreadyExists(err) {
-		return fmt.Errorf("creating workspace claim %s: %w", name, err)
-	}
-	return nil
 }
 
 // isSandboxFailed inspects sandbox status conditions to detect failure before readiness.
@@ -1362,7 +1309,7 @@ func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.
 	if initialSb != nil && owner.ActiveSandbox() == nil {
 		owner.SetActiveSandbox(initialSb)
 	}
-	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run, hr)
+	sbOpts := newRunWorkflow(o, repo, run, hr).buildCreateSandboxOptions()
 	owner.SetCreateSandboxOptions(sbOpts)
 	// Set preparer each time a turn worker starts so it uses the current turn's repo and run.
 	owner.SetSandboxPreparer(func(ctx context.Context, s *session.Sandbox) error {
@@ -1477,6 +1424,10 @@ func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *sta
 	if end.Phase == state.PhaseFailed {
 		run.Error = end.Message
 	}
+	return o.saveTerminalRun(ctx, repo, run, hr, prev, endTime, end)
+}
+
+func (o *Orchestrator) saveTerminalRun(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, prev state.RunPhase, endTime time.Time, end runEnd) error {
 	if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
 		return fmt.Errorf("updating terminal run state: %w", err)
 	}

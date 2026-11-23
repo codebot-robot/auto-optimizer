@@ -19,7 +19,9 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
@@ -28,53 +30,47 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
-// Result instructs the caller how and when to invoke Run again.
-// It directly mirrors controller-runtime's reconcile.Result.
-type Result struct {
-	// Requeue tells the controller to requeue the reconciliation request immediately.
-	Requeue bool
-	// RequeueAfter tells the controller to requeue the reconciliation request after a duration.
-	RequeueAfter time.Duration
+// workflowResult instructs the caller how and when to invoke Run again.
+type workflowResult struct {
+	// done reports that the workflow has reached a terminal phase and should not be called again.
+	done bool
+	// requeueAfter tells the caller to invoke Run again after a duration.
+	requeueAfter time.Duration
 }
 
-// IsZero returns true if the Result is empty.
-func (r Result) IsZero() bool {
-	return !r.Requeue && r.RequeueAfter == 0
+// runWorkflow drives a run through its reconciliation loop.
+type runWorkflow struct {
+	orch *Orchestrator
+	repo *state.Repo
+	run  *state.Run
+	hr   *herorunv1alpha1.HeroRun
 }
 
-// RunWorkflow is the concrete runner that drives a run through its reconciliation loop.
-type RunWorkflow struct {
-	orch    *Orchestrator
-	Repo    *state.Repo
-	run     *state.Run
-	HeroRun *herorunv1alpha1.HeroRun
-}
-
-// NewRunWorkflow creates a new RunWorkflow for the given orchestrator, repo, run, and HeroRun.
-func NewRunWorkflow(orch *Orchestrator, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) *RunWorkflow {
-	return &RunWorkflow{
-		orch:    orch,
-		Repo:    repo,
-		run:     run,
-		HeroRun: hr,
+// newRunWorkflow creates a runWorkflow for the given orchestrator, repo, run, and HeroRun.
+func newRunWorkflow(orch *Orchestrator, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) *runWorkflow {
+	return &runWorkflow{
+		orch: orch,
+		repo: repo,
+		run:  run,
+		hr:   hr,
 	}
 }
 
 // Run executes one unit of work for the run, advancing its state in memory,
-// and returns a Result instructing the caller how and when to invoke Run again.
-func (w *RunWorkflow) Run(ctx context.Context) (Result, error) {
+// and returns a workflowResult instructing the caller how and when to invoke Run again.
+func (w *runWorkflow) Run(ctx context.Context) (workflowResult, error) {
 	switch w.run.Phase {
 	case state.PhasePending:
 		return w.runPending(ctx)
 	default:
-		return Result{}, fmt.Errorf("unsupported workflow phase: %s", w.run.Phase)
+		return workflowResult{}, fmt.Errorf("unsupported workflow phase: %s", w.run.Phase)
 	}
 }
 
 // runPending executes the Pending phase: assigns a sandbox name, sets the ready deadline,
 // ensures the workspace claim exists (if configured), creates the Sandbox (or reuses it
 // if already created by this run), and advances the phase to Preparing.
-func (w *RunWorkflow) runPending(ctx context.Context) (Result, error) {
+func (w *runWorkflow) runPending(ctx context.Context) (workflowResult, error) {
 	log := scoped.Log(ctx)
 	now := w.orch.clock().UTC()
 
@@ -89,10 +85,10 @@ func (w *RunWorkflow) runPending(ctx context.Context) (Result, error) {
 	readyDeadline := now.Add(w.orch.readyTimeout)
 	w.run.ReadyDeadline = &readyDeadline
 
-	log.Info("preparing run: creating sandbox", "repo", w.Repo.URL, "run", w.run.ID, "sandbox", sandboxName)
+	log.Info("preparing run: creating sandbox", "repo", w.repo.URL, "run", w.run.ID, "sandbox", sandboxName)
 
 	// 3. Build sandbox options (including HeroRun owner reference) and workspace claim if configured
-	sbOpts := w.buildCreateSandboxOptions(ctx)
+	sbOpts := w.buildCreateSandboxOptions()
 
 	if w.orch.workspaceStorageClass != "" {
 		if len(sbOpts.OwnerReferences) == 0 {
@@ -113,10 +109,10 @@ func (w *RunWorkflow) runPending(ctx context.Context) (Result, error) {
 		if k8serrors.IsAlreadyExists(err) {
 			existing, getErr := w.orch.harness.SandboxClient().AgentsClient().AgentsV1beta1().Sandboxes(w.orch.namespace()).Get(ctx, sandboxName, metav1.GetOptions{})
 			if getErr != nil {
-				return Result{}, fmt.Errorf("getting existing sandbox %s: %w", sandboxName, getErr)
+				return workflowResult{}, fmt.Errorf("getting existing sandbox %s: %w", sandboxName, getErr)
 			}
 			for _, ref := range existing.OwnerReferences {
-				if ref.Kind == "HeroRun" && ref.UID == w.HeroRun.UID {
+				if ref.Kind == "HeroRun" && ref.UID == w.hr.UID {
 					reused = true
 					w.orch.harness.GetOrAttachSandbox(sandboxName)
 					break
@@ -130,33 +126,81 @@ func (w *RunWorkflow) runPending(ctx context.Context) (Result, error) {
 
 	// 5. Advance phase to Preparing
 	w.run.SetPhase(state.PhasePreparing, now)
-	w.HeroRun.Status = HeroRunFromRun(w.run).Status
 
-	requeueAfter := readySafetyRequeueInterval
-	if w.run.ReadyDeadline != nil {
-		rem := w.run.ReadyDeadline.Sub(now)
-		if rem < requeueAfter {
-			requeueAfter = rem
-		}
-	}
+	requeueAfter := min(readySafetyRequeueInterval, w.orch.readyTimeout)
 	if requeueAfter <= 0 {
 		requeueAfter = time.Millisecond
 	}
-	return Result{RequeueAfter: requeueAfter}, nil
+	return workflowResult{requeueAfter: requeueAfter}, nil
 }
 
-func (w *RunWorkflow) buildCreateSandboxOptions(ctx context.Context) session.CreateSandboxOptions {
-	return w.orch.buildCreateSandboxOptions(ctx, w.Repo, w.run, w.HeroRun)
+// buildCreateSandboxOptions builds the session.CreateSandboxOptions for the run,
+// including labels, annotations, HeroRun owner reference, shutdown time, and workspace claim.
+func (w *runWorkflow) buildCreateSandboxOptions() session.CreateSandboxOptions {
+	sandboxName := w.run.SandboxName
+	if sandboxName == "" {
+		sandboxName = sandboxNameForRun(w.run.ID)
+	}
+
+	ownerRefs := heroRunOwnerReferences(w.hr)
+	labels := map[string]string{
+		LabelRun: w.run.ID,
+	}
+	annotations := map[string]string{
+		AnnotationRepo: w.repo.Key().String(),
+	}
+	var sbShutdown time.Time
+	if w.run.Deadline != nil {
+		sbShutdown = w.run.Deadline.Add(SandboxShutdownGrace)
+	}
+
+	return session.CreateSandboxOptions{
+		Name:               sandboxName,
+		Labels:             labels,
+		Annotations:        annotations,
+		OwnerReferences:    ownerRefs,
+		ShutdownTime:       sbShutdown,
+		WorkspaceClaimName: w.run.WorkspaceClaimName,
+		PortalIntercept:    w.orch.portalBinder != nil,
+		ExtendLifecycle:    false,
+	}
 }
 
-func (w *RunWorkflow) ensureWorkspaceClaim(ctx context.Context, name string, ownerRefs []metav1.OwnerReference) error {
-	return w.orch.ensureWorkspaceClaim(ctx, name, ownerRefs)
+// ensureWorkspaceClaim creates a PersistentVolumeClaim for the run's workspace if it does not already exist.
+func (w *runWorkflow) ensureWorkspaceClaim(ctx context.Context, name string, ownerRefs []metav1.OwnerReference) error {
+	storageQty, err := resource.ParseQuantity(w.orch.workspaceSize)
+	if err != nil {
+		return fmt.Errorf("parsing workspace size %q: %w", w.orch.workspaceSize, err)
+	}
+
+	claim := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       w.orch.namespace(),
+			OwnerReferences: ownerRefs,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOncePod,
+			},
+			StorageClassName: &w.orch.workspaceStorageClass,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: storageQty,
+				},
+			},
+		},
+	}
+
+	if err := w.orch.kubeClient.Create(ctx, claim); err != nil && !k8serrors.IsAlreadyExists(err) {
+		return fmt.Errorf("creating workspace claim %s: %w", name, err)
+	}
+	return nil
 }
 
-func (w *RunWorkflow) failRun(now time.Time, errMsg string) Result {
+func (w *runWorkflow) failRun(now time.Time, errMsg string) workflowResult {
 	w.run.ReadyDeadline = nil
 	w.run.SetPhase(state.PhaseFailed, now)
 	w.run.Error = errMsg
-	w.HeroRun.Status = HeroRunFromRun(w.run).Status
-	return Result{}
+	return workflowResult{done: true}
 }

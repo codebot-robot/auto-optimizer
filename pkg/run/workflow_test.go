@@ -15,30 +15,19 @@
 package run
 
 import (
+	"context"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
-
-func TestResult_IsZero(t *testing.T) {
-	if !(Result{}).IsZero() {
-		t.Errorf("expected Result{}.IsZero() to be true")
-	}
-	if (Result{Requeue: true}).IsZero() {
-		t.Errorf("expected Result{Requeue: true}.IsZero() to be false")
-	}
-	if (Result{RequeueAfter: 5 * time.Second}).IsZero() {
-		t.Errorf("expected Result{RequeueAfter: 5s}.IsZero() to be false")
-	}
-}
 
 func TestRunWorkflow_Pending_Success(t *testing.T) {
 	ctx := t.Context()
@@ -93,20 +82,23 @@ func TestRunWorkflow_Pending_Success(t *testing.T) {
 		Phase: state.PhasePending,
 	}
 
-	wf := NewRunWorkflow(orch, repo, run, hr)
+	wf := newRunWorkflow(orch, repo, run, hr)
 	res, err := wf.Run(ctx)
 	if err != nil {
 		t.Fatalf("wf.Run failed: %v", err)
 	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("expected res.RequeueAfter > 0, got %v", res.RequeueAfter)
+	if res.done {
+		t.Errorf("expected res.done to be false")
+	}
+	if res.requeueAfter <= 0 {
+		t.Errorf("expected res.requeueAfter > 0, got %v", res.requeueAfter)
 	}
 
 	if wf.run.Phase != state.PhasePreparing {
 		t.Errorf("expected run phase %s, got %s", state.PhasePreparing, wf.run.Phase)
 	}
-	if wf.HeroRun.Status.Phase != string(state.PhasePreparing) {
-		t.Errorf("expected HeroRun status phase %s, got %s", state.PhasePreparing, wf.HeroRun.Status.Phase)
+	if wf.hr.Status.Phase != string(state.PhasePending) {
+		t.Errorf("expected HeroRun status to remain unchanged until caller saves, got %s", wf.hr.Status.Phase)
 	}
 	if wf.run.SandboxName != hrName {
 		t.Errorf("expected SandboxName %s, got %s", hrName, wf.run.SandboxName)
@@ -180,13 +172,16 @@ func TestRunWorkflow_Pending_WithWorkspaceClaim(t *testing.T) {
 		Phase: state.PhasePending,
 	}
 
-	wf := NewRunWorkflow(orch, repo, run, hr)
+	wf := newRunWorkflow(orch, repo, run, hr)
 	res, err := wf.Run(ctx)
 	if err != nil {
 		t.Fatalf("wf.Run failed: %v", err)
 	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("expected res.RequeueAfter > 0, got %v", res.RequeueAfter)
+	if res.done {
+		t.Errorf("expected res.done to be false")
+	}
+	if res.requeueAfter <= 0 {
+		t.Errorf("expected res.requeueAfter > 0, got %v", res.requeueAfter)
 	}
 	if wf.run.WorkspaceClaimName != hrName {
 		t.Errorf("expected WorkspaceClaimName %s, got %s", hrName, wf.run.WorkspaceClaimName)
@@ -279,13 +274,16 @@ func TestRunWorkflow_Pending_ReuseExistingSandbox(t *testing.T) {
 		Phase: state.PhasePending,
 	}
 
-	wf := NewRunWorkflow(orch, repo, run, hr)
+	wf := newRunWorkflow(orch, repo, run, hr)
 	res, err := wf.Run(ctx)
 	if err != nil {
 		t.Fatalf("wf.Run failed: %v", err)
 	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("expected res.RequeueAfter > 0, got %v", res.RequeueAfter)
+	if res.done {
+		t.Errorf("expected res.done to be false")
+	}
+	if res.requeueAfter <= 0 {
+		t.Errorf("expected res.requeueAfter > 0, got %v", res.requeueAfter)
 	}
 	if wf.run.Phase != state.PhasePreparing {
 		t.Errorf("expected phase %s, got %s", state.PhasePreparing, wf.run.Phase)
@@ -374,19 +372,95 @@ func TestRunWorkflow_Pending_SandboxAlreadyExists_DifferentOwnerFails(t *testing
 		Phase: state.PhasePending,
 	}
 
-	wf := NewRunWorkflow(orch, repo, run, hr)
+	wf := newRunWorkflow(orch, repo, run, hr)
 	res, err := wf.Run(ctx)
 	if err != nil {
 		t.Fatalf("expected nil err, got %v", err)
 	}
-	if !res.IsZero() {
-		t.Errorf("expected empty result on terminal failure, got %+v", res)
+	if !res.done {
+		t.Errorf("expected res.done to be true on terminal failure")
+	}
+	if res.requeueAfter != 0 {
+		t.Errorf("expected zero requeueAfter on terminal failure, got %v", res.requeueAfter)
 	}
 	if wf.run.Phase != state.PhaseFailed {
 		t.Errorf("expected phase %s, got %s", state.PhaseFailed, wf.run.Phase)
 	}
 	if wf.run.Error == "" {
 		t.Errorf("expected error message on run")
+	}
+}
+
+func TestReconcileWorkflow_CanceledContextDoesNotPersistFailure(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	harness, _, _ := setupTestHarness(t, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	runID := "20261123T120000Z-wfcancel"
+	hrName := sandboxNameForRun(runID)
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hrName,
+			Namespace: harness.Namespace(),
+			UID:       "", // triggers workspace claim owner error
+		},
+		Spec: herorunv1alpha1.HeroRunSpec{
+			RunID:      runID,
+			Repository: repo.URL,
+			Goal:       "optimize-latency",
+			BaseCommit: "base123",
+		},
+		Status: herorunv1alpha1.HeroRunStatus{
+			Phase: string(state.PhasePending),
+		},
+	}
+
+	fakeClient := newTestFakeClientBuilder(scheme).WithObjects(hr).Build()
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:                 store,
+		Harness:               harness,
+		KubeClient:            fakeClient,
+		WorkspaceStorageClass: "standard",
+	})
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	run := &state.Run{
+		ID:    runID,
+		Repo:  repo.Key(),
+		Phase: state.PhasePending,
+	}
+	res, err := orch.reconcileWorkflow(cancelCtx, newRunWorkflow(orch, repo, run, hr))
+	if err != nil {
+		t.Fatalf("expected nil error on canceled context, got %v", err)
+	}
+	if (res != reconcile.Result{}) {
+		t.Errorf("expected empty reconcile.Result, got %+v", res)
+	}
+
+	var gotHR herorunv1alpha1.HeroRun
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: harness.Namespace(), Name: hrName}, &gotHR); err != nil {
+		t.Fatalf("getting HeroRun: %v", err)
+	}
+	if gotHR.Status.Phase != string(state.PhasePending) {
+		t.Errorf("expected HeroRun phase to remain %s on canceled context, got %s", state.PhasePending, gotHR.Status.Phase)
 	}
 }
 
@@ -412,7 +486,7 @@ func TestRunWorkflow_UnsupportedPhase(t *testing.T) {
 		Phase: state.PhaseSucceeded,
 	}
 
-	wf := NewRunWorkflow(nil, repo, run, hr)
+	wf := newRunWorkflow(nil, repo, run, hr)
 	_, err := wf.Run(ctx)
 	if err == nil {
 		t.Fatalf("expected error for unsupported phase, got nil")
