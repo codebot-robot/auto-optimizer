@@ -537,7 +537,7 @@ func (o *Orchestrator) getRunForReconcile(ctx context.Context, req reconcile.Req
 }
 
 // Reconcile loads the run and the repository, dispatches on the phase to
-// prepareRun, reconcilePreparing, or workRun, and returns.
+// RunWorkflow.Run (for Pending), reconcilePreparing, or workRun, and returns.
 func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
@@ -562,28 +562,49 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 
 	switch run.Phase {
 	case state.PhasePending:
-		res, err := o.prepareRun(ctx, repo, run, hr)
+		wf := NewRunWorkflow(o, repo, run, hr)
+		res, err := wf.Run(ctx)
 		if err != nil {
-			log.Error(err, "preparing run failed", "repo", repo.URL, "run", run.ID)
+			log.Error(err, "workflow run failed", "repo", repo.URL, "run", run.ID)
 			if run.Phase.IsTerminal() {
 				return reconcile.Result{}, nil
 			}
 			return reconcile.Result{}, err
 		}
-		if res.IsZero() {
-			requeueAfter := readySafetyRequeueInterval
-			if run.ReadyDeadline != nil {
-				rem := run.ReadyDeadline.Sub(o.clock().UTC())
-				if rem < requeueAfter {
-					requeueAfter = rem
-				}
-			}
-			if requeueAfter <= 0 {
-				requeueAfter = time.Millisecond
-			}
-			res = reconcile.Result{RequeueAfter: requeueAfter}
+		prev := state.PhasePending
+		if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
+			return reconcile.Result{}, fmt.Errorf("updating run: %w", err)
 		}
-		return res, nil
+		if run.Phase != prev {
+			kind := "phase"
+			msg := fmt.Sprintf("Run %s entered %s phase", run.ID, run.Phase)
+			if run.Phase == state.PhaseFailed {
+				kind = "failed"
+				msg = fmt.Sprintf("Run failed: %s", run.Error)
+			}
+			eventTime := o.clock().UTC()
+			if t, ok := run.PhaseTimestamps[run.Phase]; ok {
+				eventTime = t
+			}
+			event := state.Event{
+				Time:    eventTime,
+				Phase:   run.Phase,
+				Kind:    kind,
+				Message: msg,
+			}
+			if run.Phase == state.PhaseFailed {
+				event.Error = run.Error
+			}
+			if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, event); err != nil {
+				log.Error(err, "failed to append event", "run", run.ID)
+			}
+		}
+		if run.Phase.IsTerminal() {
+			o.cancelWorker(run.ID)
+			o.deleteRunState(run.ID)
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{Requeue: res.Requeue, RequeueAfter: res.RequeueAfter}, nil
 
 	case state.PhasePreparing:
 		res, err := o.reconcilePreparing(ctx, repo, run, hr)
@@ -629,85 +650,6 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, nil
-	}
-
-	return reconcile.Result{}, nil
-}
-
-// prepareRun executes the first step of Preparing: publishes the HeroRun,
-// creates the Sandbox with an owner reference to the HeroRun, records SandboxName
-// and ReadyDeadline, moves the run to Preparing, appends a phase event, and returns.
-func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (reconcile.Result, error) {
-	log := scoped.Log(ctx)
-	now := o.clock().UTC()
-
-	// 1. Assign sandbox name if not already assigned
-	sandboxName := run.SandboxName
-	if sandboxName == "" {
-		sandboxName = sandboxNameForRun(run.ID)
-		run.SandboxName = sandboxName
-	}
-
-	// 2. Set ready deadline
-	readyDeadline := now.Add(o.readyTimeout)
-	run.ReadyDeadline = &readyDeadline
-
-	log.Info("preparing run: creating sandbox", "repo", repo.URL, "run", run.ID, "sandbox", sandboxName)
-
-	// 3. Build sandbox options (including HeroRun owner reference) and workspace claim if configured
-	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run, hr)
-
-	if o.workspaceStorageClass != "" {
-		if len(sbOpts.OwnerReferences) == 0 {
-			run.ReadyDeadline = nil
-			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, "cannot create workspace claim: HeroRun owner is required")
-		}
-		claimName := sandboxNameForRun(run.ID)
-		if err := o.ensureWorkspaceClaim(ctx, claimName, sbOpts.OwnerReferences); err != nil {
-			run.ReadyDeadline = nil
-			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("creating workspace claim: %v", err))
-		}
-		run.WorkspaceClaimName = claimName
-		sbOpts.WorkspaceClaimName = claimName
-	}
-
-	// 4. Create sandbox with a label naming the run, annotation naming the repository, owner reference, and shutdown time.
-	// On AlreadyExists, read the existing Sandbox and reuse it if its owner is this HeroRun.
-	if _, err := o.harness.CreateSandboxWithOptions(ctx, sbOpts); err != nil {
-		reused := false
-		if k8serrors.IsAlreadyExists(err) {
-			existing, getErr := o.harness.SandboxClient().AgentsClient().AgentsV1beta1().Sandboxes(o.namespace()).Get(ctx, sandboxName, metav1.GetOptions{})
-			if getErr != nil {
-				return reconcile.Result{}, fmt.Errorf("getting existing sandbox %s: %w", sandboxName, getErr)
-			}
-			for _, ref := range existing.OwnerReferences {
-				if ref.Kind == "HeroRun" && ref.UID == hr.UID {
-					reused = true
-					o.harness.GetOrAttachSandbox(sandboxName)
-					break
-				}
-			}
-		}
-		if !reused {
-			run.ReadyDeadline = nil
-			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("creating sandbox: %v", err))
-		}
-	}
-
-	// 5. Transition to Preparing
-	prev := run.Phase
-	run.SetPhase(state.PhasePreparing, now)
-	if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
-		return reconcile.Result{}, fmt.Errorf("updating run to Preparing: %w", err)
-	}
-
-	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-		Time:    now,
-		Phase:   state.PhasePreparing,
-		Kind:    "phase",
-		Message: fmt.Sprintf("Run %s entered Preparing phase", run.ID),
-	}); err != nil {
-		log.Error(err, "failed to append Preparing phase event", "run", run.ID)
 	}
 
 	return reconcile.Result{}, nil
