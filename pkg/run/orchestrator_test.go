@@ -9658,8 +9658,9 @@ func TestOrchestrator_PostMessage_RunJSONDeletedSucceeds(t *testing.T) {
 	}
 
 	// Verify pending message was persisted
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
-	if err != nil || len(pending) != 1 || pending[0] != customMsg {
+	targetSessID := topLevelSessionID(runID, "")
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
+	if err != nil || len(pending) != 1 || pending[0].Text != customMsg {
 		t.Fatalf("expected pending message %q on disk, got %v (err: %v)", customMsg, pending, err)
 	}
 }
@@ -9802,8 +9803,10 @@ func TestOrchestrator_PostMessage_DeliveredBeforeNextModelCall(t *testing.T) {
 		t.Fatalf("PostMessage: %v", err)
 	}
 
+	targetSessID := generateSessionID(runID)
+
 	// Verify pending message is persisted on disk
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("expected 1 pending message on disk, got %v (err: %v)", pending, err)
 	}
@@ -9851,7 +9854,7 @@ func TestOrchestrator_PostMessage_DeliveredBeforeNextModelCall(t *testing.T) {
 	}
 
 	// Verify pending message on disk was consumed/cleared
-	pendingAfter, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
+	pendingAfter, err := store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
 	if err != nil || len(pendingAfter) != 0 {
 		t.Errorf("expected 0 pending messages on disk after delivery, got %v", pendingAfter)
 	}
@@ -9868,14 +9871,15 @@ func TestOrchestrator_PostMessage_SurvivesRestart(t *testing.T) {
 		Harness:      harness,
 	})
 
+	targetSessID := generateSessionID(runID)
 	surviveMsg := "Instruction that survives restart"
 	if err := orch1.PostMessage(ctx, repo.Key(), runID, surviveMsg); err != nil {
 		t.Fatalf("PostMessage: %v", err)
 	}
 
 	// Message is on disk in pending_messages.jsonl
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
-	if err != nil || len(pending) != 1 || pending[0] != surviveMsg {
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
+	if err != nil || len(pending) != 1 || pending[0].Text != surviveMsg {
 		t.Fatalf("expected pending message on disk, got %v (err: %v)", pending, err)
 	}
 
@@ -9914,7 +9918,7 @@ func TestOrchestrator_PostMessage_SurvivesRestart(t *testing.T) {
 	}
 
 	// Pending file is cleared after delivery
-	pending, err = store.ReadPendingMessages(ctx, repo.Key(), runID)
+	pending, err = store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
 	if err != nil || len(pending) != 0 {
 		t.Errorf("expected pending messages cleared after delivery, got %v", pending)
 	}
@@ -9931,22 +9935,27 @@ func TestOrchestrator_PostMessage_SessionWriteFails_RemainsPending(t *testing.T)
 		Harness:      harness,
 	})
 
-	pendingText := "critical instruction that must not be lost"
-	if err := orch.PostMessage(ctx, repo.Key(), runID, pendingText); err != nil {
-		t.Fatalf("PostMessage: %v", err)
-	}
-
 	// Create a session backed by a failing session store.
 	failingStore := &failingSessionStore{
 		Store:     sessionStore,
 		appendErr: errors.New("simulated disk full error on session store"),
 	}
-	failingSess, err := harness.NewSession(ctx, failingStore, "failingsess", session.Metadata{
+	topSessID := topLevelSessionID(runID, "")
+	failingSess, err := harness.NewSession(ctx, failingStore, topSessID, session.Metadata{
 		Repo:  repo.Key().String(),
 		RunID: run.ID,
 	})
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
+	}
+	run.SessionID = failingSess.Name
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	pendingText := "critical instruction that must not be lost"
+	if err := orch.PostMessage(ctx, repo.Key(), runID, pendingText); err != nil {
+		t.Fatalf("PostMessage: %v", err)
 	}
 
 	// Attempt delivery; it should fail because session.AddMessages fails.
@@ -9956,11 +9965,11 @@ func TestOrchestrator_PostMessage_SessionWriteFails_RemainsPending(t *testing.T)
 	}
 
 	// Verify that the message is STILL pending in store and was not lost!
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, failingSess.Name)
 	if err != nil {
 		t.Fatalf("ReadPendingMessages: %v", err)
 	}
-	if len(pending) != 1 || pending[0] != pendingText {
+	if len(pending) != 1 || pending[0].Text != pendingText {
 		t.Fatalf("expected message to remain pending on disk after failed session write, got %+v", pending)
 	}
 }
@@ -10100,5 +10109,472 @@ func TestOrchestrator_PostMessage_WhileTurnActive_DeliveredOnSubsequentTurn(t *t
 	}
 	if msgs[3].Role != "user" || msgs[3].Content == nil || *msgs[3].Content != userMsg {
 		t.Errorf("msg[3] = %+v, want %q", msgs[3], userMsg)
+	}
+}
+
+func TestOrchestrator_SendMessage_Validation(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-msgval", "run-msgval"
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootval", session.Metadata{
+		RunID: runID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	run.SessionID = root.Name
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+
+	// 1. Session without a run
+	sessNoRun, err := harness.NewSession(ctx, sessionStore, "norun", session.Metadata{})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := orch.sendMessage(ctx, children, repo, run, sessNoRun, "other", "hello"); err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
+		t.Errorf("expected 'session belongs to no run' error, got %v", err)
+	}
+
+	// 2. Send to self
+	if err := orch.sendMessage(ctx, children, repo, run, root, "rootval", "hello self"); err == nil || !strings.Contains(err.Error(), "cannot send message to self") {
+		t.Errorf("expected 'cannot send message to self' error, got %v", err)
+	}
+
+	// 3. Non-existent recipient
+	if err := orch.sendMessage(ctx, children, repo, run, root, "nonexistent", "hello"); err == nil || !strings.Contains(err.Error(), "recipient session \"nonexistent\" not found") {
+		t.Errorf("expected not found error, got %v", err)
+	}
+
+	// 4. Recipient belongs to another run
+	otherRunSess, err := harness.NewSession(ctx, sessionStore, "otherrunsess", session.Metadata{
+		RunID: "different-run",
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := orch.sendMessage(ctx, children, repo, run, root, otherRunSess.Name, "hello"); err == nil || !strings.Contains(err.Error(), "not in the same run") {
+		t.Errorf("expected 'not in the same run' error, got %v", err)
+	}
+
+	// 5. Stopped child session (not running)
+	validChild, err := harness.NewSession(ctx, sessionStore, "validchild", session.Metadata{
+		RunID:  runID,
+		Parent: "rootval",
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := orch.sendMessage(ctx, children, repo, run, root, validChild.Name, "hello"); err == nil || !strings.Contains(err.Error(), "is not running") {
+		t.Errorf("expected 'is not running' error for stopped child session, got %v", err)
+	}
+}
+
+func TestOrchestrator_SendMessage_ParentToChild_And_ChildToParent(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-msgexchange", "run-msgexchange"
+
+	childStarted := make(chan struct{})
+	childRelease := make(chan struct{})
+
+	// Scripted LLM for child session:
+	// Call 1: Wait until parent posts message, then return assistant answer
+	childLLM := &customCallbackLLM{
+		fn: func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+			select {
+			case childStarted <- struct{}{}:
+			default:
+			}
+			<-childRelease
+			msg := "child finished task"
+			return &llm.ChatCompletionResponse{
+				Choices: []llm.Choice{{Message: llm.Message{Role: "assistant", Content: &msg}}},
+			}, nil
+		},
+	}
+
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, childLLM)
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootparent", session.Metadata{
+		RunID: runID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession root: %v", err)
+	}
+	run.SessionID = root.Name
+	orch.ensureRunState(run.ID)
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+
+	childName, err := orch.startChildSession(ctx, children, repo, run, root, "analyze logs")
+	if err != nil {
+		t.Fatalf("startChildSession: %v", err)
+	}
+
+	// 1. Parent sends a message to the child session while child is running
+	parentMsg := "focus on auth.log"
+	if err := orch.sendMessage(ctx, children, repo, run, root, childName, parentMsg); err != nil {
+		t.Fatalf("sendMessage parent->child: %v", err)
+	}
+
+	// 2. Child sends a message back to the parent session
+	childSess, err := harness.LoadSession(ctx, sessionStore, childName)
+	if err != nil {
+		t.Fatalf("LoadSession child: %v", err)
+	}
+	childMsg := "found 3 anomalies in auth.log"
+	if err := orch.sendMessage(ctx, children, repo, run, childSess, root.Name, childMsg); err != nil {
+		t.Fatalf("sendMessage child->parent: %v", err)
+	}
+
+	// Release child LLM call
+	close(childRelease)
+	children.wg.Wait()
+
+	// Verify child session received parent's message before its LLM call
+	childLoaded, err := harness.LoadSession(ctx, sessionStore, childName)
+	if err != nil {
+		t.Fatalf("LoadSession childLoaded: %v", err)
+	}
+	var childSawParentMsg bool
+	for _, m := range childLoaded.Messages() {
+		if m.Role == "user" && m.Content != nil && *m.Content == "Message from rootparent: focus on auth.log" {
+			childSawParentMsg = true
+			break
+		}
+	}
+	if !childSawParentMsg {
+		t.Errorf("child session transcript missing parent message: %+v", childLoaded.Messages())
+	}
+
+	// Now deliver to parent session (e.g. before parent's next model call)
+	if err := orch.deliverPendingMessages(ctx, repo.Key(), runID, root); err != nil {
+		t.Fatalf("deliverPendingMessages parent: %v", err)
+	}
+
+	rootLoaded, err := harness.LoadSession(ctx, sessionStore, root.Name)
+	if err != nil {
+		t.Fatalf("LoadSession rootLoaded: %v", err)
+	}
+	var parentSawChildMsg bool
+	for _, m := range rootLoaded.Messages() {
+		if m.Role == "user" && m.Content != nil && *m.Content == "Message from "+childName+": found 3 anomalies in auth.log" {
+			parentSawChildMsg = true
+			break
+		}
+	}
+	if !parentSawChildMsg {
+		t.Errorf("parent session transcript missing child message: %+v", rootLoaded.Messages())
+	}
+
+	// Pending files for both sessions should now be cleared
+	pendingChild, err := store.ReadPendingMessages(ctx, repo.Key(), runID, childName)
+	if err != nil || len(pendingChild) != 0 {
+		t.Errorf("expected 0 pending messages for child after delivery, got %v", pendingChild)
+	}
+	pendingRoot, err := store.ReadPendingMessages(ctx, repo.Key(), runID, root.Name)
+	if err != nil || len(pendingRoot) != 0 {
+		t.Errorf("expected 0 pending messages for root after delivery, got %v", pendingRoot)
+	}
+}
+
+func TestOrchestrator_SendMessage_OrderPreserved(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-msgorder", "run-msgorder"
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	s1, err := harness.NewSession(ctx, sessionStore, "sess1", session.Metadata{RunID: runID})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	run.SessionID = s1.Name
+
+	s2, err := harness.NewSession(ctx, sessionStore, "sess2", session.Metadata{RunID: runID, Parent: s1.Name})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+	children.setRunning(s2.Name, true)
+
+	// Send 3 messages in order
+	for i := 1; i <= 3; i++ {
+		text := fmt.Sprintf("step %d", i)
+		if err := orch.sendMessage(ctx, children, repo, run, s1, s2.Name, text); err != nil {
+			t.Fatalf("sendMessage %d: %v", i, err)
+		}
+	}
+
+	// Deliver to s2
+	if err := orch.deliverPendingMessages(ctx, repo.Key(), runID, s2); err != nil {
+		t.Fatalf("deliverPendingMessages: %v", err)
+	}
+
+	s2Loaded, err := harness.LoadSession(ctx, sessionStore, s2.Name)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+
+	msgs := s2Loaded.Messages()
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d: %+v", len(msgs), msgs)
+	}
+	for i := 1; i <= 3; i++ {
+		want := fmt.Sprintf("Message from sess1: step %d", i)
+		if msgs[i-1].Role != "user" || msgs[i-1].Content == nil || *msgs[i-1].Content != want {
+			t.Errorf("msg[%d] = %v, want %q", i-1, msgs[i-1], want)
+		}
+	}
+}
+
+func TestOrchestrator_SendMessage_SurvivesRestart(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-msgsurvive", "run-msgsurvive"
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch1 := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	s1, err := harness.NewSession(ctx, sessionStore, "s1", session.Metadata{RunID: runID})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	run.SessionID = s1.Name
+
+	s2, err := harness.NewSession(ctx, sessionStore, "s2", session.Metadata{RunID: runID, Parent: s1.Name})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+	children.setRunning(s2.Name, true)
+
+	surviveText := "persistent message across control plane restarts"
+	if err := orch1.sendMessage(ctx, children, repo, run, s1, s2.Name, surviveText); err != nil {
+		t.Fatalf("sendMessage: %v", err)
+	}
+
+	// Verify pending message is persisted on disk in s2's file
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, s2.Name)
+	if err != nil || len(pending) != 1 || pending[0].Text != surviveText || pending[0].From != "s1" {
+		t.Fatalf("expected pending message on disk, got %v (err: %v)", pending, err)
+	}
+
+	// Simulate control plane restart
+	orch2 := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	if err := orch2.deliverPendingMessages(ctx, repo.Key(), runID, s2); err != nil {
+		t.Fatalf("deliverPendingMessages on orch2: %v", err)
+	}
+
+	s2Loaded, err := harness.LoadSession(ctx, sessionStore, s2.Name)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	msgs := s2Loaded.Messages()
+	if len(msgs) != 1 || msgs[0].Content == nil || *msgs[0].Content != "Message from s1: "+surviveText {
+		t.Fatalf("unexpected delivered message: %+v", msgs)
+	}
+
+	pendingAfter, err := store.ReadPendingMessages(ctx, repo.Key(), runID, s2.Name)
+	if err != nil || len(pendingAfter) != 0 {
+		t.Errorf("expected 0 pending messages after restart delivery, got %v", pendingAfter)
+	}
+}
+
+func TestOrchestrator_SendMessage_IdleRecipient_RefusedOrWoken(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-msgidle", "run-msgidle"
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootidle", session.Metadata{RunID: runID})
+	if err != nil {
+		t.Fatalf("NewSession root: %v", err)
+	}
+	run.SessionID = root.Name
+
+	child, err := harness.NewSession(ctx, sessionStore, "childidle", session.Metadata{RunID: runID, Parent: "rootidle"})
+	if err != nil {
+		t.Fatalf("NewSession child: %v", err)
+	}
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+
+	// 1. Sending to stopped/idle child session is refused
+	err = orch.sendMessage(ctx, children, repo, run, root, child.Name, "instruction to stopped child")
+	if err == nil || !strings.Contains(err.Error(), "is not running") {
+		t.Fatalf("expected 'is not running' error, got %v", err)
+	}
+
+	// 2. Sending to top-level session (which is idle between turns) is accepted and retained
+	idleMsg := "result reported to idle parent"
+	if err := orch.sendMessage(ctx, children, repo, run, child, root.Name, idleMsg); err != nil {
+		t.Fatalf("sendMessage to parent: %v", err)
+	}
+
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, root.Name)
+	if err != nil || len(pending) != 1 || pending[0].Text != idleMsg {
+		t.Fatalf("expected pending message on disk for root, got %v (err: %v)", pending, err)
+	}
+
+	if err := orch.deliverPendingMessages(ctx, repo.Key(), runID, root); err != nil {
+		t.Fatalf("deliverPendingMessages root: %v", err)
+	}
+
+	pendingFinal, err := store.ReadPendingMessages(ctx, repo.Key(), runID, root.Name)
+	if err != nil || len(pendingFinal) != 0 {
+		t.Fatalf("expected message to be consumed, got %v", pendingFinal)
+	}
+}
+
+type customCallbackLLM struct {
+	fn func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error)
+}
+
+func (c *customCallbackLLM) CreateChatCompletion(_ context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	if c.fn != nil {
+		return c.fn(req)
+	}
+	return &llm.ChatCompletionResponse{}, nil
+}
+
+func TestOrchestrator_Working_SendMessage_ToolCall(t *testing.T) {
+	ctx := t.Context()
+	var toolResultContent string
+
+	childLLM := &customCallbackLLM{
+		fn: func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+			for _, m := range req.Messages {
+				if m.Role == "tool" && m.ToolCallID == "call-send-msg-1" && m.Content != nil {
+					toolResultContent = *m.Content
+					finishArgs, _ := json.Marshal(map[string]string{"summary": "done"})
+					return &llm.ChatCompletionResponse{
+						Choices: []llm.Choice{{
+							Message: llm.Message{
+								Role: "assistant",
+								ToolCalls: []llm.ToolCall{{
+									ID:   "call-finish-1",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "finish",
+										Arguments: string(finishArgs),
+									},
+								}},
+							},
+						}},
+					}, nil
+				}
+			}
+			args, _ := json.Marshal(map[string]string{
+				"recipient": "rootparent",
+				"message":   "please read report.txt",
+			})
+			return &llm.ChatCompletionResponse{
+				Choices: []llm.Choice{{
+					Message: llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{{
+							ID:   "call-send-msg-1",
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "send_message",
+								Arguments: string(args),
+							},
+						}},
+					},
+				}},
+			}, nil
+		},
+	}
+
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarnessWithLLM(t, nil, childLLM)
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+	run := &state.Run{ID: "runsendtool", SessionID: "rootparent", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sbsendtool", Goal: &goals.Goal{Name: "g1", Body: "task"}}
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootparent", session.Metadata{
+		RunID: run.ID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession rootparent: %v", err)
+	}
+
+	orch.ensureRunState(run.ID)
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+
+	childName, err := orch.startChildSession(ctx, children, repo, run, root, "send message task")
+	if err != nil {
+		t.Fatalf("startChildSession: %v", err)
+	}
+
+	children.wg.Wait()
+
+	if toolResultContent == "" || !strings.Contains(toolResultContent, "rootparent") {
+		t.Fatalf("expected confirmation containing rootparent, got %q", toolResultContent)
+	}
+
+	// Verify message is pending on disk for rootparent
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), run.ID, "rootparent")
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("expected 1 pending message on disk, got %v (err: %v)", pending, err)
+	}
+	if pending[0].From != childName || pending[0].Text != "please read report.txt" {
+		t.Errorf("unexpected pending message: %+v", pending[0])
 	}
 }

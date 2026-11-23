@@ -853,9 +853,11 @@ func TestFileStore_PendingMessages(t *testing.T) {
 
 	repoKey := RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
 	runID := "20261123T100000Z-0001"
+	sessA := "sessiona"
+	sessB := "sessionb"
 
 	// Initially empty
-	msgs, err := store.ReadPendingMessages(ctx, repoKey, runID)
+	msgs, err := store.ReadPendingMessages(ctx, repoKey, runID, sessA)
 	if err != nil {
 		t.Fatalf("ReadPendingMessages on empty: %v", err)
 	}
@@ -863,28 +865,47 @@ func TestFileStore_PendingMessages(t *testing.T) {
 		t.Fatalf("expected 0 pending messages, got %d", len(msgs))
 	}
 
-	// Append messages
-	if err := store.AppendPendingMessage(ctx, repoKey, runID, "first message"); err != nil {
+	// Append messages to sessA and sessB
+	if err := store.AppendPendingMessage(ctx, repoKey, runID, sessA, PendingMessage{From: "sessroot", Text: "first message"}); err != nil {
 		t.Fatalf("AppendPendingMessage: %v", err)
 	}
-	if err := store.AppendPendingMessage(ctx, repoKey, runID, "second message"); err != nil {
+	if err := store.AppendPendingMessage(ctx, repoKey, runID, sessA, PendingMessage{Text: "second message"}); err != nil {
 		t.Fatalf("AppendPendingMessage: %v", err)
+	}
+	if err := store.AppendPendingMessage(ctx, repoKey, runID, sessB, PendingMessage{From: "sessroot", Text: "message for b"}); err != nil {
+		t.Fatalf("AppendPendingMessage for b: %v", err)
 	}
 
-	msgs, err = store.ReadPendingMessages(ctx, repoKey, runID)
+	// Reading sessA only returns sessA's messages
+	msgs, err = store.ReadPendingMessages(ctx, repoKey, runID, sessA)
 	if err != nil {
 		t.Fatalf("ReadPendingMessages: %v", err)
 	}
-	if len(msgs) != 2 || msgs[0] != "first message" || msgs[1] != "second message" {
-		t.Fatalf("unexpected pending messages: %+v", msgs)
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 pending messages for sessA, got %d", len(msgs))
+	}
+	if msgs[0].From != "sessroot" || msgs[0].Text != "first message" {
+		t.Fatalf("unexpected msgs[0]: %+v", msgs[0])
+	}
+	if msgs[1].From != "" || msgs[1].Text != "second message" {
+		t.Fatalf("unexpected msgs[1]: %+v", msgs[1])
 	}
 
-	// Clear messages
-	if err := store.ClearPendingMessages(ctx, repoKey, runID); err != nil {
+	// Reading sessB returns sessB's message
+	msgsB, err := store.ReadPendingMessages(ctx, repoKey, runID, sessB)
+	if err != nil {
+		t.Fatalf("ReadPendingMessages sessB: %v", err)
+	}
+	if len(msgsB) != 1 || msgsB[0].Text != "message for b" {
+		t.Fatalf("unexpected msgsB: %+v", msgsB)
+	}
+
+	// Clear messages for sessA
+	if err := store.ClearPendingMessages(ctx, repoKey, runID, sessA); err != nil {
 		t.Fatalf("ClearPendingMessages: %v", err)
 	}
 
-	msgs, err = store.ReadPendingMessages(ctx, repoKey, runID)
+	msgs, err = store.ReadPendingMessages(ctx, repoKey, runID, sessA)
 	if err != nil {
 		t.Fatalf("ReadPendingMessages after clear: %v", err)
 	}
@@ -892,8 +913,17 @@ func TestFileStore_PendingMessages(t *testing.T) {
 		t.Fatalf("expected 0 pending messages after clear, got %d", len(msgs))
 	}
 
+	// sessB still has its pending message
+	msgsB, err = store.ReadPendingMessages(ctx, repoKey, runID, sessB)
+	if err != nil {
+		t.Fatalf("ReadPendingMessages sessB after sessA cleared: %v", err)
+	}
+	if len(msgsB) != 1 || msgsB[0].Text != "message for b" {
+		t.Fatalf("expected sessB pending message to remain, got %+v", msgsB)
+	}
+
 	// Clear on non-existent is a no-op
-	if err := store.ClearPendingMessages(ctx, repoKey, runID); err != nil {
+	if err := store.ClearPendingMessages(ctx, repoKey, runID, sessA); err != nil {
 		t.Fatalf("ClearPendingMessages on non-existent: %v", err)
 	}
 }

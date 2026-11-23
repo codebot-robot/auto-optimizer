@@ -171,3 +171,9 @@ type Event struct {
 	Error   string    `json:"error,omitempty"`
 	Data    any       `json:"data,omitempty"`
 }
+
+// PendingMessage represents a message pending delivery to a session in a run.
+type PendingMessage struct {
+	From string `json:"from,omitempty"`
+	Text string `json:"text"`
+}

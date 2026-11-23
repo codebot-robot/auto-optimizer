@@ -83,14 +83,14 @@ type Store interface {
 	// ReadEvents reads all events from events.jsonl for a run in append order.
 	ReadEvents(ctx context.Context, key RepoKey, runID string) ([]Event, error)
 
-	// AppendPendingMessage appends a message to pending_messages.jsonl for a run.
-	AppendPendingMessage(ctx context.Context, key RepoKey, runID string, msg string) error
+	// AppendPendingMessage appends a message to pending_messages for a session in a run.
+	AppendPendingMessage(ctx context.Context, key RepoKey, runID string, sessionID string, msg PendingMessage) error
 
-	// ReadPendingMessages reads all pending messages for a run in append order.
-	ReadPendingMessages(ctx context.Context, key RepoKey, runID string) ([]string, error)
+	// ReadPendingMessages reads all pending messages for a session in a run in append order.
+	ReadPendingMessages(ctx context.Context, key RepoKey, runID string, sessionID string) ([]PendingMessage, error)
 
-	// ClearPendingMessages deletes pending_messages.jsonl for a run.
-	ClearPendingMessages(ctx context.Context, key RepoKey, runID string) error
+	// ClearPendingMessages deletes the pending_messages file for a session in a run.
+	ClearPendingMessages(ctx context.Context, key RepoKey, runID string, sessionID string) error
 }
 
 // FileStore is the disk-backed implementation of Store.
@@ -129,8 +129,8 @@ func (s *FileStore) eventsPath(key RepoKey, runID string) string {
 	return filepath.Join(s.repoDir(key), "runs", runID, "events.jsonl")
 }
 
-func (s *FileStore) pendingMessagesPath(key RepoKey, runID string) string {
-	return filepath.Join(s.repoDir(key), "runs", runID, "pending_messages.jsonl")
+func (s *FileStore) pendingMessagesPath(key RepoKey, runID string, sessionID string) string {
+	return filepath.Join(s.repoDir(key), "runs", runID, "pending_messages", sessionID+".jsonl")
 }
 
 // writeJSONAtomically writes a JSON object atomically using a temporary file in the same
@@ -650,32 +650,38 @@ func (s *FileStore) ReadEvents(ctx context.Context, key RepoKey, runID string) (
 	return events, nil
 }
 
-// AppendPendingMessage appends a message to pending_messages.jsonl for a run.
-func (s *FileStore) AppendPendingMessage(ctx context.Context, key RepoKey, runID string, msg string) error {
+// AppendPendingMessage appends a message to pending_messages for a session in a run.
+func (s *FileStore) AppendPendingMessage(ctx context.Context, key RepoKey, runID string, sessionID string, msg PendingMessage) error {
 	if err := ValidateRepoKey(key); err != nil {
 		return err
 	}
 	if runID == "" {
 		return errors.New("run id cannot be empty")
 	}
-	if msg == "" {
+	if sessionID == "" {
+		return errors.New("session id cannot be empty")
+	}
+	if msg.Text == "" {
 		return errors.New("message cannot be empty")
 	}
 
-	return appendJSONL(s.pendingMessagesPath(key, runID), msg)
+	return appendJSONL(s.pendingMessagesPath(key, runID, sessionID), msg)
 }
 
-// ReadPendingMessages reads all pending messages from pending_messages.jsonl for a run.
-func (s *FileStore) ReadPendingMessages(ctx context.Context, key RepoKey, runID string) ([]string, error) {
+// ReadPendingMessages reads all pending messages for a session in a run in append order.
+func (s *FileStore) ReadPendingMessages(ctx context.Context, key RepoKey, runID string, sessionID string) ([]PendingMessage, error) {
 	if err := ValidateRepoKey(key); err != nil {
 		return nil, err
 	}
 	if runID == "" {
 		return nil, errors.New("run id cannot be empty")
 	}
+	if sessionID == "" {
+		return nil, errors.New("session id cannot be empty")
+	}
 
-	p := s.pendingMessagesPath(key, runID)
-	msgs, err := jsonl.Read[string](ctx, p)
+	p := s.pendingMessagesPath(key, runID, sessionID)
+	msgs, err := jsonl.Read[PendingMessage](ctx, p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -686,16 +692,19 @@ func (s *FileStore) ReadPendingMessages(ctx context.Context, key RepoKey, runID 
 	return msgs, nil
 }
 
-// ClearPendingMessages deletes pending_messages.jsonl for a run.
-func (s *FileStore) ClearPendingMessages(ctx context.Context, key RepoKey, runID string) error {
+// ClearPendingMessages deletes the pending_messages file for a session in a run.
+func (s *FileStore) ClearPendingMessages(ctx context.Context, key RepoKey, runID string, sessionID string) error {
 	if err := ValidateRepoKey(key); err != nil {
 		return err
 	}
 	if runID == "" {
 		return errors.New("run id cannot be empty")
 	}
+	if sessionID == "" {
+		return errors.New("session id cannot be empty")
+	}
 
-	p := s.pendingMessagesPath(key, runID)
+	p := s.pendingMessagesPath(key, runID, sessionID)
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("clearing pending messages file %s: %w", p, err)
 	}

@@ -1338,7 +1338,7 @@ func (o *Orchestrator) deliverPendingMessages(ctx context.Context, repo state.Re
 	o.pendingMessagesMu.Lock()
 	defer o.pendingMessagesMu.Unlock()
 
-	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID)
+	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID, session.Name)
 	if err != nil {
 		return err
 	}
@@ -1347,11 +1347,14 @@ func (o *Orchestrator) deliverPendingMessages(ctx context.Context, repo state.Re
 	}
 
 	var toAdd []llm.Message
-	for _, text := range msgs {
-		t := text
+	for _, pm := range msgs {
+		text := pm.Text
+		if pm.From != "" {
+			text = fmt.Sprintf("Message from %s: %s", pm.From, pm.Text)
+		}
 		toAdd = append(toAdd, llm.Message{
 			Role:    "user",
-			Content: &t,
+			Content: &text,
 		})
 	}
 
@@ -1360,17 +1363,28 @@ func (o *Orchestrator) deliverPendingMessages(ctx context.Context, repo state.Re
 		return fmt.Errorf("adding pending messages to session: %w", err)
 	}
 
-	// Remove from pending messages file only after AddMessages succeeds.
-	if err := o.store.ClearPendingMessages(ctx, repo, runID); err != nil {
+	// Remove pending messages file only after AddMessages succeeds.
+	if err := o.store.ClearPendingMessages(ctx, repo, runID, session.Name); err != nil {
 		return fmt.Errorf("clearing pending messages: %w", err)
 	}
 	return nil
 }
 
-func (o *Orchestrator) hasPendingMessages(ctx context.Context, repo state.RepoKey, runID string) (bool, error) {
+// topLevelSessionID returns the top-level session ID for a run.
+// Because the top-level session ID is derived deterministically from the run ID
+// via generateSessionID, it is known before the session is created or recorded on the run.
+func topLevelSessionID(runID string, sessionID string) string {
+	if sessionID != "" {
+		return sessionID
+	}
+	return generateSessionID(runID)
+}
+
+func (o *Orchestrator) hasPendingMessages(ctx context.Context, repo state.RepoKey, runID string, sessionID string) (bool, error) {
+	sessionID = topLevelSessionID(runID, sessionID)
 	o.pendingMessagesMu.Lock()
 	defer o.pendingMessagesMu.Unlock()
-	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID)
+	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID, sessionID)
 	if err != nil {
 		return false, err
 	}
@@ -1397,14 +1411,55 @@ func (o *Orchestrator) PostMessage(ctx context.Context, repo state.RepoKey, runI
 		return fmt.Errorf("%w: run %s is in phase %s", ErrRunNotWorking, runID, phase)
 	}
 
+	sessionID := topLevelSessionID(runID, hr.Status.SessionID)
+
 	o.pendingMessagesMu.Lock()
-	err := o.store.AppendPendingMessage(ctx, repo, runID, text)
+	err := o.store.AppendPendingMessage(ctx, repo, runID, sessionID, state.PendingMessage{
+		Text: text,
+	})
 	o.pendingMessagesMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("appending pending message: %w", err)
 	}
 
 	o.Notify(repo, runID)
+	return nil
+}
+
+func (o *Orchestrator) sendMessage(ctx context.Context, children *childGroup, repo *state.Repo, run *state.Run, senderSession *session.Session, recipient string, message string) error {
+	if senderSession.Metadata.RunID == "" {
+		return errors.New("cannot call send_message: session belongs to no run")
+	}
+	if recipient == senderSession.Name {
+		return errors.New("cannot send message to self")
+	}
+
+	_, recipientMeta, err := o.sessionStore.LoadSession(ctx, recipient)
+	if err != nil {
+		if errors.Is(err, session.ErrNotFound) {
+			return fmt.Errorf("recipient session %q not found", recipient)
+		}
+		return fmt.Errorf("loading recipient session %q: %w", recipient, err)
+	}
+	if recipientMeta == nil || recipientMeta.RunID != run.ID {
+		return fmt.Errorf("cannot send message to session %q: not in the same run", recipient)
+	}
+
+	if recipient != run.SessionID && !children.isRunning(recipient) {
+		return fmt.Errorf("recipient session %q is not running", recipient)
+	}
+
+	o.pendingMessagesMu.Lock()
+	err = o.store.AppendPendingMessage(ctx, repo.Key(), run.ID, recipient, state.PendingMessage{
+		From: senderSession.Name,
+		Text: message,
+	})
+	o.pendingMessagesMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("appending pending message: %w", err)
+	}
+
+	o.Notify(repo.Key(), run.ID)
 	return nil
 }
 
@@ -1664,7 +1719,7 @@ func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *sta
 	}
 
 	if run.SessionID == "" {
-		run.SessionID = generateSessionID(run.ID)
+		run.SessionID = topLevelSessionID(run.ID, "")
 		if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
 			o.setRunActive(run.ID, false)
 			return fmt.Errorf("updating run with session ID: %w", err)
@@ -1796,11 +1851,14 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	listSessionsTool := ao.NewListSessionsTool(func(toolCtx context.Context) ([]ao.SessionInfo, error) {
 		return o.listRunSessions(toolCtx, run, children)
 	})
+	sendMessageTool := ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
+		return o.sendMessage(toolCtx, children, repo, run, sess, recipient, message)
+	})
 	budget := o.turnBudget(run.ID)
 	messageSource := func(ctx context.Context, session *session.Session) error {
 		return o.deliverPendingMessages(ctx, repo.Key(), run.ID, session)
 	}
-	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool, listSessionsTool).WithMessageSource(messageSource)
+	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool, listSessionsTool, sendMessageTool).WithMessageSource(messageSource)
 
 	var turnErr error
 	if hasUserMessage {
@@ -1868,7 +1926,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 	}
 
 	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
-		hasPending, err := o.hasPendingMessages(ctx, repo.Key(), run.ID)
+		hasPending, err := o.hasPendingMessages(ctx, repo.Key(), run.ID, run.SessionID)
 		if err != nil {
 			return fmt.Errorf("checking pending messages: %w", err)
 		}
@@ -2430,7 +2488,13 @@ func (o *Orchestrator) startChildSession(ctx context.Context, children *childGro
 	childListTool := ao.NewListSessionsTool(func(toolCtx context.Context) ([]ao.SessionInfo, error) {
 		return o.listRunSessions(toolCtx, run, children)
 	})
-	childHarness := o.harness.WithTurnBudget(budget).WithExtraTools(childStartTool, childListTool, ao.NewFinishTool())
+	childSendTool := ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
+		return o.sendMessage(toolCtx, children, repo, run, childSess, recipient, message)
+	})
+	childMessageSource := func(ctx context.Context, session *session.Session) error {
+		return o.deliverPendingMessages(ctx, repo.Key(), run.ID, session)
+	}
+	childHarness := o.harness.WithTurnBudget(budget).WithExtraTools(childStartTool, childListTool, childSendTool, ao.NewFinishTool()).WithMessageSource(childMessageSource)
 
 	children.setRunning(childName, true)
 	children.wg.Add(1)

@@ -298,6 +298,7 @@ written for maintainers.
 | `finish(summary)` | control plane | Ends the session without a PR. |
 | `start_session(task)` | control plane | Starts a child session in the same run to work on a task in the background and returns its name immediately. |
 | `list_sessions` | control plane | Lists the sessions of the calling run: each one's name, its parent, and whether it is running or stopped. |
+| `send_message(recipient, message)` | control plane | Sends a text message to another session of the calling run by name. |
 
 ### Child sessions
 
@@ -319,6 +320,9 @@ resumes execution on its next turn. Child sessions are ephemeral and do not
 automatically restart; any in-flight child session remains stopped at its last
 recorded turn in the session store. Sessions can call `list_sessions`
 to inspect whether other sessions in the run are running or stopped.
+Sessions in the same run can also communicate by calling `send_message` with a
+recipient session's name and a message. Because sessions share the workspace
+volume, a message can refer to a file path instead of copying its contents.
 
 ### Personalities for phase 2
 
