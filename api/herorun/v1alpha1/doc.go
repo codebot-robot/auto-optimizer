@@ -17,4 +17,4 @@
 // +groupName=auto-optimizer.labs.gke.io
 package v1alpha1
 
-//go:generate go run sigs.k8s.io/controller-tools/cmd/controller-gen object:headerFile=../../../hack/boilerplate.go.txt crd paths=./... output:crd:dir=../../../k8s/crds
+//go:generate go run sigs.k8s.io/controller-tools/cmd/controller-gen object:headerFile=../../../hack/boilerplate.go.txt crd:allowDangerousTypes=true paths=./... output:crd:dir=../../../k8s/crds
