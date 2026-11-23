@@ -1537,7 +1537,10 @@ func TestPostMessage_AppendsEvent(t *testing.T) {
 			},
 		},
 	}
-	webServer, err := NewServer(fakeSvc, stateStore, nil, ServerOptions{})
+	fakeOrch := &fakeOrchestrator{}
+	webServer, err := NewServer(fakeSvc, stateStore, nil, ServerOptions{
+		Orchestrator: fakeOrch,
+	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -1583,5 +1586,183 @@ func TestPostMessage_AppendsEvent(t *testing.T) {
 	// 3. Standalone session without run
 	if rec := post("", "standalone", "hi"); rec.Code != http.StatusSeeOther {
 		t.Fatalf("POST standalone status = %d, want 303", rec.Code)
+	}
+
+	// Verify run session messages were delivered through orchestrator, not StartTurn
+	if len(fakeOrch.posted) != 2 {
+		t.Fatalf("expected 2 messages delivered to orchestrator, got %d", len(fakeOrch.posted))
+	}
+	if fakeOrch.posted[0].text != secretBody || fakeOrch.posted[1].text != "anon body" || fakeOrch.posted[0].repo != repoKey {
+		t.Errorf("unexpected messages delivered to orchestrator: %+v", fakeOrch.posted)
+	}
+	if len(fakeSvc.startTurnCalls) != 1 || fakeSvc.startTurnCalls[0].Name != "standalone" {
+		t.Errorf("expected 1 StartTurn call for standalone, got %+v", fakeSvc.startTurnCalls)
+	}
+}
+
+type fakeOrchestrator struct {
+	postErr error
+	posted  []struct {
+		repo  state.RepoKey
+		runID string
+		text  string
+	}
+}
+
+func (f *fakeOrchestrator) PostMessage(_ context.Context, repo state.RepoKey, runID string, text string) error {
+	if f.postErr != nil {
+		return f.postErr
+	}
+	f.posted = append(f.posted, struct {
+		repo  state.RepoKey
+		runID string
+		text  string
+	}{repo: repo, runID: runID, text: text})
+	return nil
+}
+
+func TestPostMessage_RunNotWorking_Returns409Conflict(t *testing.T) {
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	runID, sessionID := "20261123T100000Z-0001", "runsession1"
+
+	fakeSvc := &fakeSessionService{
+		details: map[string]*sessionapi.SessionDetail{
+			sessionID: {
+				Summary: sessionapi.SessionSummary{
+					Name:  sessionID,
+					Repo:  repoKey.String(),
+					RunID: runID,
+				},
+			},
+		},
+	}
+	fakeOrch := &fakeOrchestrator{
+		postErr: fmt.Errorf("%w: run %s is in phase Succeeded", run.ErrRunNotWorking, runID),
+	}
+	webServer, err := NewServer(fakeSvc, nil, nil, ServerOptions{
+		Orchestrator: fakeOrch,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/sessions/"+sessionID+"/messages", strings.NewReader(url.Values{"text": {"please optimize this"}, "csrf": {"csrf-val"}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf-val"})
+	rec := httptest.NewRecorder()
+	webServer.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("POST status = %d, want 409 Conflict", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Run is no longer working. Start a new run to continue.") {
+		t.Errorf("unexpected response body: %q", rec.Body.String())
+	}
+}
+
+func TestPostMessage_GetSessionDetailError_Returns500(t *testing.T) {
+	sessionID := "runsession1"
+	fakeSvc := &fakeSessionService{
+		detailErr: errors.New("simulated internal storage error"),
+	}
+	webServer, err := NewServer(fakeSvc, nil, nil, ServerOptions{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/sessions/"+sessionID+"/messages", strings.NewReader(url.Values{"text": {"hello"}, "csrf": {"csrf-val"}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf-val"})
+	rec := httptest.NewRecorder()
+	webServer.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("POST status = %d, want 500 InternalServerError", rec.Code)
+	}
+}
+
+func TestPostMessage_RunSession_DeliversThroughOrchestrator(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	stateStore := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	repo := &state.Repo{Host: repoKey.Host, Owner: repoKey.Owner, Name: repoKey.Name, DefaultBranch: "main"}
+	if err := stateStore.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID, sessionID := "20261123T100000Z-0001", "runsession1"
+	if err := stateStore.PutRun(ctx, &state.Run{
+		ID:        runID,
+		Repo:      repoKey,
+		GoalName:  "test-goal",
+		SessionID: sessionID,
+		Phase:     state.PhaseWorking,
+	}); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	if err := sessionStore.NewSession(ctx, sessionID, session.Metadata{
+		Toolset: "basic",
+		Repo:    repoKey.String(),
+		RunID:   runID,
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
+		Store:          sessionStore,
+		StateStore:     stateStore,
+		DefaultToolset: "basic",
+		HarnessFactory: func(_ string) (*session.Harness, error) {
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("sessionapi.NewServer: %v", err)
+	}
+
+	fakeOrch := &fakeOrchestrator{}
+	webServer, err := NewServer(srv, stateStore, nil, ServerOptions{
+		Orchestrator: fakeOrch,
+	})
+	if err != nil {
+		t.Fatalf("web.NewServer: %v", err)
+	}
+
+	// Post message to the run's session
+	req := httptest.NewRequest(http.MethodPost, "/sessions/"+sessionID+"/messages", strings.NewReader(url.Values{"text": {"please optimize this"}, "csrf": {"csrf-val"}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf-val"})
+	rec := httptest.NewRecorder()
+	webServer.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST status = %d, want 303", rec.Code)
+	}
+
+	// Message was delivered to orchestrator
+	if len(fakeOrch.posted) != 1 {
+		t.Fatalf("expected 1 message to orchestrator, got %d", len(fakeOrch.posted))
+	}
+	if fakeOrch.posted[0].text != "please optimize this" || fakeOrch.posted[0].runID != runID || fakeOrch.posted[0].repo != repoKey {
+		t.Errorf("unexpected message to orchestrator: %+v", fakeOrch.posted[0])
+	}
+
+	// Session server never ran a turn (session is not busy)
+	detail, err := srv.GetSessionDetail(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetSessionDetail: %v", err)
+	}
+	if detail.Summary.InFlight {
+		t.Error("expected session server InFlight to be false")
+	}
+
+	// Direct StartTurn on run session must be rejected
+	err = srv.StartTurn(ctx, sessionID, "direct message")
+	if !errors.Is(err, sessionapi.ErrSessionBelongsToRun) {
+		t.Errorf("expected ErrSessionBelongsToRun, got %v", err)
 	}
 }

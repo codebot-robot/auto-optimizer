@@ -9680,3 +9680,473 @@ func TestOrchestrator_Working_ChildSession_CanCallListSessions(t *testing.T) {
 		t.Errorf("parsed[1] = %+v, want name=%q parent='rootparent' state='running'", parsed[1], childName)
 	}
 }
+
+func TestOrchestrator_PostMessage_Validation(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-postval", "run-postval"
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	// 1. Empty message text
+	if err := orch.PostMessage(ctx, repo.Key(), runID, "   "); err == nil {
+		t.Error("expected error for empty message text, got nil")
+	}
+
+	// 2. Non-existent run
+	if err := orch.PostMessage(ctx, repo.Key(), "non-existent-run", "hello"); err == nil {
+		t.Error("expected error for non-existent run, got nil")
+	}
+
+	// 3. Terminal run
+	run.SetPhase(state.PhaseSucceeded, time.Now().UTC())
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+	if err := orch.PostMessage(ctx, repo.Key(), runID, "hello"); !errors.Is(err, ErrRunNotWorking) {
+		t.Errorf("expected ErrRunNotWorking for terminal run, got %v", err)
+	}
+}
+
+func TestOrchestrator_PostMessage_DeliveredOnNextTurn(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-postnext", "run-postnext"
+	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	customMsg := "Please optimize the database queries."
+	if err := orch.PostMessage(ctx, repo.Key(), runID, customMsg); err != nil {
+		t.Fatalf("PostMessage: %v", err)
+	}
+
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
+	}
+
+	msgs, _, err := sessionStore.LoadSession(ctx, gotRun.SessionID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if len(msgs) < 3 {
+		t.Fatalf("expected at least 3 messages (system, user, assistant), got %d: %+v", len(msgs), msgs)
+	}
+	var foundCustomMsg bool
+	for _, m := range msgs {
+		if m.Role == "user" && m.Content != nil && *m.Content == customMsg {
+			foundCustomMsg = true
+			break
+		}
+	}
+	if !foundCustomMsg {
+		t.Errorf("expected user message %q in session messages: %+v", customMsg, msgs)
+	}
+}
+
+func TestOrchestrator_PostMessage_DeliveredBeforeNextModelCall(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-postcall", "run-postcall"
+
+	var modelCalls []llm.ChatCompletionRequest
+	var mu sync.Mutex
+
+	toolStarted := make(chan struct{})
+	toolRelease := make(chan struct{})
+
+	// LLM mock that records incoming requests:
+	// Call 1: returns tool call to "run_command"
+	// Call 2: returns final assistant reply
+	mockLLM := &mockMultiCallLLM{
+		callFn: func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+			mu.Lock()
+			callNum := len(modelCalls) + 1
+			modelCalls = append(modelCalls, req)
+			mu.Unlock()
+
+			if callNum == 1 {
+				return &llm.ChatCompletionResponse{
+					Choices: []llm.Choice{
+						{
+							Message: llm.Message{
+								Role: "assistant",
+								ToolCalls: []llm.ToolCall{
+									{
+										ID:   "call-1",
+										Type: "function",
+										Function: llm.FunctionCall{
+											Name:      "run_command",
+											Arguments: `{"command":"uname -a"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			done := "done after user instruction"
+			return &llm.ChatCompletionResponse{
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role:    "assistant",
+							Content: &done,
+						},
+						FinishReason: "stop",
+					},
+				},
+			}, nil
+		},
+	}
+
+	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, mockLLM)
+
+	// Override sandbox to block on tool call
+	fakeSB := &blockingToolSandbox{
+		started: toolStarted,
+		release: toolRelease,
+	}
+	harness.SetSandboxOverride(fakeSB)
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	req := runRequest(orch, repo.Key(), runID)
+
+	// Step 1: Start turn worker
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile pass 1: %v", err)
+	}
+
+	// Wait until sandbox tool executes and blocks
+	select {
+	case <-toolStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for sandbox tool to start")
+	}
+
+	// Step 2: Post message while tool is executing
+	interruptedMsg := "stop, do this instead"
+	if err := orch.PostMessage(ctx, repo.Key(), runID, interruptedMsg); err != nil {
+		t.Fatalf("PostMessage: %v", err)
+	}
+
+	// Verify pending message is persisted on disk
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("expected 1 pending message on disk, got %v (err: %v)", pending, err)
+	}
+
+	// Step 3: Unblock sandbox tool
+	close(toolRelease)
+
+	// Wait for turn worker to finish
+	deadline := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(runID) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for worker to complete")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Step 4: Reconcile pass 2 consumes outcome
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile pass 2: %v", err)
+	}
+
+	// Verify model call 2 received the posted message before running!
+	mu.Lock()
+	callsCount := len(modelCalls)
+	var call2Msgs []llm.Message
+	if callsCount >= 2 {
+		call2Msgs = modelCalls[1].Messages
+	}
+	mu.Unlock()
+
+	if callsCount != 2 {
+		t.Fatalf("expected 2 model calls in this turn, got %d", callsCount)
+	}
+
+	// In Call 2: verify the posted user message was delivered before the model call
+	var foundPostedMsg bool
+	for _, m := range call2Msgs {
+		if m.Role == "user" && m.Content != nil && *m.Content == interruptedMsg {
+			foundPostedMsg = true
+			break
+		}
+	}
+	if !foundPostedMsg {
+		t.Fatalf("model call 2 did not contain posted user message; messages = %+v", call2Msgs)
+	}
+
+	// Verify pending message on disk was consumed/cleared
+	pendingAfter, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
+	if err != nil || len(pendingAfter) != 0 {
+		t.Errorf("expected 0 pending messages on disk after delivery, got %v", pendingAfter)
+	}
+}
+
+func TestOrchestrator_PostMessage_SurvivesRestart(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-postres", "run-postres"
+	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch1 := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	surviveMsg := "Instruction that survives restart"
+	if err := orch1.PostMessage(ctx, repo.Key(), runID, surviveMsg); err != nil {
+		t.Fatalf("PostMessage: %v", err)
+	}
+
+	// Message is on disk in pending_messages.jsonl
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
+	if err != nil || len(pending) != 1 || pending[0] != surviveMsg {
+		t.Fatalf("expected pending message on disk, got %v (err: %v)", pending, err)
+	}
+
+	// Simulate control plane restart by creating a new Orchestrator instance
+	orch2 := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	if _, err := reconcileWorkingRun(ctx, orch2, runRequest(orch2, repo.Key(), runID)); err != nil {
+		t.Fatalf("reconcileWorkingRun on orch2: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
+	}
+
+	msgs, _, err := sessionStore.LoadSession(ctx, gotRun.SessionID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	var sawMsg bool
+	for _, m := range msgs {
+		if m.Role == "user" && m.Content != nil && *m.Content == surviveMsg {
+			sawMsg = true
+			break
+		}
+	}
+	if !sawMsg {
+		t.Fatalf("expected session transcript to contain survived message, got %+v", msgs)
+	}
+
+	// Pending file is cleared after delivery
+	pending, err = store.ReadPendingMessages(ctx, repo.Key(), runID)
+	if err != nil || len(pending) != 0 {
+		t.Errorf("expected pending messages cleared after delivery, got %v", pending)
+	}
+}
+
+func TestOrchestrator_PostMessage_SessionWriteFails_RemainsPending(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-postfail", "run-postfail"
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	pendingText := "critical instruction that must not be lost"
+	if err := orch.PostMessage(ctx, repo.Key(), runID, pendingText); err != nil {
+		t.Fatalf("PostMessage: %v", err)
+	}
+
+	// Create a session backed by a failing session store.
+	failingStore := &failingSessionStore{
+		Store:     sessionStore,
+		appendErr: errors.New("simulated disk full error on session store"),
+	}
+	failingSess, err := harness.NewSession(ctx, failingStore, "failingsess", session.Metadata{
+		Repo:  repo.Key().String(),
+		RunID: run.ID,
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// Attempt delivery; it should fail because session.AddMessages fails.
+	err = orch.deliverPendingMessages(ctx, repo.Key(), runID, failingSess)
+	if err == nil {
+		t.Fatal("expected error from deliverPendingMessages, got nil")
+	}
+
+	// Verify that the message is STILL pending in store and was not lost!
+	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadPendingMessages: %v", err)
+	}
+	if len(pending) != 1 || pending[0] != pendingText {
+		t.Fatalf("expected message to remain pending on disk after failed session write, got %+v", pending)
+	}
+}
+
+type failingSessionStore struct {
+	session.Store
+	appendErr error
+}
+
+func (f *failingSessionStore) AppendMessages(ctx context.Context, sessionID string, messages ...llm.Message) error {
+	if f.appendErr != nil {
+		return f.appendErr
+	}
+	return f.Store.AppendMessages(ctx, sessionID, messages...)
+}
+
+type mockMultiCallLLM struct {
+	callFn func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error)
+}
+
+func (m *mockMultiCallLLM) CreateChatCompletion(_ context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	return m.callFn(req)
+}
+
+type blockingToolSandbox struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingToolSandbox) ExecCommand(_ context.Context, _ tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return &tools.ExecCommandResult{
+		Stdout:   "Linux mock-node\n",
+		ExitCode: 0,
+	}, nil
+}
+
+func TestOrchestrator_PostMessage_WhileTurnActive_DeliveredOnSubsequentTurn(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-postmid", "run-postmid"
+
+	blockingLLM := newMidTurnBlockingLLM()
+	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, blockingLLM)
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	req := runRequest(orch, repo.Key(), runID)
+
+	// Step 1: Reconcile pass 1 starts the turn worker (turn 1).
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile pass 1: %v", err)
+	}
+
+	// Wait until turn worker starts and blocks in LLM.
+	select {
+	case <-blockingLLM.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for turn 1 to start")
+	}
+
+	if !orch.isRunActive(runID) {
+		t.Fatal("expected run to be active during turn 1")
+	}
+
+	// Step 2: Post message while turn 1 is active.
+	userMsg := "Please check performance afterwards."
+	if err := orch.PostMessage(ctx, repo.Key(), runID, userMsg); err != nil {
+		t.Fatalf("PostMessage while turn active: %v", err)
+	}
+
+	// Step 3: Unblock turn 1.
+	close(blockingLLM.release)
+
+	// Wait for turn 1 worker to finish.
+	deadline := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(runID) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for turn 1 worker to complete")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Step 4: Reconcile pass 2 consumes turn 1 outcome.
+	// Since there is a pending message, run must stay Working and not finish.
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile pass 2: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseWorking {
+		t.Fatalf("expected run to remain in PhaseWorking due to pending message, got %s", gotRun.Phase)
+	}
+
+	// Step 5: Second turn worker starts for the pending message.
+	// For turn 2, configure a second response so LLM can finish.
+	blockingLLM.release = make(chan struct{})
+	close(blockingLLM.release) // instantly unblocked for turn 2
+
+	if _, err := reconcileWorkingRun(ctx, orch, req); err != nil {
+		t.Fatalf("reconcileWorkingRun for turn 2: %v", err)
+	}
+
+	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun after turn 2: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s after turn 2, got %s", state.PhaseNoImprovement, gotRun.Phase)
+	}
+
+	// Verify transcript has:
+	// 0: system
+	// 1: user ("Please work on the goal.")
+	// 2: assistant ("done")
+	// 3: user ("Please check performance afterwards.")
+	// 4: assistant ("done")
+	msgs, _, err := sessionStore.LoadSession(ctx, gotRun.SessionID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if len(msgs) != 5 {
+		t.Fatalf("expected 5 messages in transcript, got %d: %+v", len(msgs), msgs)
+	}
+	if msgs[1].Role != "user" || msgs[1].Content == nil || *msgs[1].Content != "Please work on the goal." {
+		t.Errorf("msg[1] = %+v, want 'Please work on the goal.'", msgs[1])
+	}
+	if msgs[3].Role != "user" || msgs[3].Content == nil || *msgs[3].Content != userMsg {
+		t.Errorf("msg[3] = %+v, want %q", msgs[3], userMsg)
+	}
+}

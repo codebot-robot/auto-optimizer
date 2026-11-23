@@ -37,6 +37,10 @@ import (
 // ErrBusy is returned when a turn is already in flight for the session.
 var ErrBusy = errors.New("session is busy")
 
+// ErrSessionBelongsToRun indicates that a turn cannot be started on the session
+// server because the session belongs to a run and its turns are managed by the orchestrator.
+var ErrSessionBelongsToRun = errors.New("cannot start turn: session belongs to a run")
+
 // SessionSummary summarizes an agent session for in-process consumers such as the web UI.
 type SessionSummary struct {
 	Name         string
@@ -328,6 +332,22 @@ func (s *Server) ListMessages(ctx context.Context, req *sessionv1.ListMessagesRe
 	return &sessionv1.ListMessagesResponse{Messages: pbMessages}, nil
 }
 
+// checkCanStartTurn checks whether a turn can be started for the named session.
+// Sessions that belong to a run are rejected with ErrSessionBelongsToRun.
+func (s *Server) checkCanStartTurn(ctx context.Context, name string) error {
+	meta, err := s.sessionMetadata(ctx, name)
+	if err != nil {
+		if status.Code(err) == codes.NotFound || errors.Is(err, session.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if meta != nil && meta.RunID != "" {
+		return ErrSessionBelongsToRun
+	}
+	return nil
+}
+
 // SendMessage appends a user message and runs one turn of the agentic loop.
 func (s *Server) SendMessage(req *sessionv1.SendMessageRequest, stream sessionv1.SessionService_SendMessageServer) error {
 	ctx := stream.Context()
@@ -340,6 +360,13 @@ func (s *Server) SendMessage(req *sessionv1.SendMessageRequest, stream sessionv1
 	text := req.GetText()
 	if text == "" {
 		return status.Errorf(codes.InvalidArgument, "message text is required")
+	}
+
+	if err := s.checkCanStartTurn(ctx, name); err != nil {
+		if errors.Is(err, ErrSessionBelongsToRun) {
+			return status.Errorf(codes.FailedPrecondition, "cannot start turn: session %q belongs to a run", name)
+		}
+		return err
 	}
 
 	// Only one turn at a time per session.
@@ -360,10 +387,6 @@ func (s *Server) SendMessage(req *sessionv1.SendMessageRequest, stream sessionv1
 	sess, harness, err := s.getOrLoadSession(ctx, name)
 	if err != nil {
 		return status.Errorf(codes.Internal, "%v", err)
-	}
-
-	if err := checkCanPostMessage(sess); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 
 	// If this is a new session without messages, ensure the system prompt is set and stream it.
@@ -940,6 +963,10 @@ func (s *Server) StartTurn(ctx context.Context, name, text string) error {
 		return errors.New("message text is required")
 	}
 
+	if err := s.checkCanStartTurn(ctx, name); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	if s.busySessions[name] {
 		s.mu.Unlock()
@@ -950,13 +977,6 @@ func (s *Server) StartTurn(ctx context.Context, name, text string) error {
 
 	sess, harness, err := s.getOrLoadSession(ctx, name)
 	if err != nil {
-		s.mu.Lock()
-		delete(s.busySessions, name)
-		s.mu.Unlock()
-		return err
-	}
-
-	if err := checkCanPostMessage(sess); err != nil {
 		s.mu.Lock()
 		delete(s.busySessions, name)
 		s.mu.Unlock()
@@ -986,15 +1006,6 @@ func (s *Server) StartTurn(ctx context.Context, name, text string) error {
 		}
 	}()
 
-	return nil
-}
-
-// checkCanPostMessage reports whether a message can be posted to sess.
-// Messages to child sessions are refused because their turns are driven by the orchestrator.
-func checkCanPostMessage(sess *session.Session) error {
-	if sess.Metadata.Parent != "" {
-		return fmt.Errorf("session %q is a child session; cannot post messages to child sessions", sess.Name)
-	}
 	return nil
 }
 

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
+	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
@@ -58,8 +59,10 @@ func assertGolden(t *testing.T, filename string, actual string) {
 }
 
 type fakeSessionService struct {
-	summaries []sessionapi.SessionSummary
-	details   map[string]*sessionapi.SessionDetail
+	summaries      []sessionapi.SessionSummary
+	details        map[string]*sessionapi.SessionDetail
+	detailErr      error
+	startTurnCalls []struct{ Name, Text string }
 }
 
 func (f *fakeSessionService) ListSessionSummaries(_ context.Context) ([]sessionapi.SessionSummary, error) {
@@ -67,17 +70,21 @@ func (f *fakeSessionService) ListSessionSummaries(_ context.Context) ([]sessiona
 }
 
 func (f *fakeSessionService) GetSessionDetail(_ context.Context, name string) (*sessionapi.SessionDetail, error) {
+	if f.detailErr != nil {
+		return nil, f.detailErr
+	}
 	if d, ok := f.details[name]; ok {
 		return d, nil
 	}
-	return nil, os.ErrNotExist
+	return nil, session.ErrNotFound
 }
 
 func (f *fakeSessionService) CreateNewSession(_ context.Context, _, _ string) error {
 	return nil
 }
 
-func (f *fakeSessionService) StartTurn(_ context.Context, _, _ string) error {
+func (f *fakeSessionService) StartTurn(_ context.Context, name, text string) error {
+	f.startTurnCalls = append(f.startTurnCalls, struct{ Name, Text string }{name, text})
 	return nil
 }
 

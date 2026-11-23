@@ -1898,7 +1898,13 @@ type Harness struct {
 
 	// extraTools holds run-scoped tools attached to this harness instance.
 	extraTools []tools.Tool
+
+	// messageSource delivers pending messages to the session before each model call.
+	messageSource MessageSource
 }
+
+// MessageSource delivers pending messages to a session before each model call.
+type MessageSource func(ctx context.Context, session *Session) error
 
 // SetSandboxOverride allows setting a custom tools.Sandbox implementation
 // (e.g. for testing without a Kubernetes cluster or network).
@@ -1945,6 +1951,13 @@ func (h *Harness) TurnBudget() *TurnBudget {
 func (h *Harness) WithExtraTools(extra ...tools.Tool) *Harness {
 	c := *h
 	c.extraTools = slices.Clone(extra)
+	return &c
+}
+
+// WithMessageSource returns a shallow copy of the harness with the given message source.
+func (h *Harness) WithMessageSource(source MessageSource) *Harness {
+	c := *h
+	c.messageSource = source
 	return &c
 }
 
@@ -2141,11 +2154,6 @@ func (h *Harness) ContinueTurn(ctx context.Context, session *Session, events Tur
 		return nil
 	}
 
-	lastMsg := msgs[len(msgs)-1]
-	if lastMsg.Role == "assistant" && len(lastMsg.ToolCalls) == 0 {
-		return nil
-	}
-
 	var lastAssistant *llm.Message
 	lastAssistantIdx := -1
 	for i := len(msgs) - 1; i >= 0; i-- {
@@ -2193,6 +2201,20 @@ func (h *Harness) runLoop(ctx context.Context, session *Session, events TurnEven
 	}
 
 	for {
+		if h.messageSource != nil {
+			if err := h.messageSource(ctx, session); err != nil {
+				return err
+			}
+		}
+
+		msgs := session.Messages()
+		if len(msgs) > 0 {
+			last := msgs[len(msgs)-1]
+			if last.Role == "assistant" && len(last.ToolCalls) == 0 {
+				return nil
+			}
+		}
+
 		if !budget.Take() {
 			log.Info("maximum turns reached", "maxTurns", budget.MaxTurns())
 			return ErrMaxTurns
@@ -2200,7 +2222,7 @@ func (h *Harness) runLoop(ctx context.Context, session *Session, events TurnEven
 
 		req := llm.ChatCompletionRequest{
 			Model:    h.opts.ModelName,
-			Messages: session.Messages(),
+			Messages: msgs,
 			Tools:    h.tools(),
 		}
 

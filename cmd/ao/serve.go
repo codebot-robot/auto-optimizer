@@ -457,6 +457,7 @@ func runServe(ctx context.Context, opts serveOptions) error {
 		webHandler, err := web.NewServer(srv, stateStore, scheduler, web.ServerOptions{
 			RequireSignIn: opts.github.ClientID != "",
 			SessionKey:    sessionKey,
+			Orchestrator:  orchestrator,
 		})
 		if err != nil {
 			return fmt.Errorf("initializing web server: %w", err)

@@ -82,6 +82,15 @@ type Store interface {
 
 	// ReadEvents reads all events from events.jsonl for a run in append order.
 	ReadEvents(ctx context.Context, key RepoKey, runID string) ([]Event, error)
+
+	// AppendPendingMessage appends a message to pending_messages.jsonl for a run.
+	AppendPendingMessage(ctx context.Context, key RepoKey, runID string, msg string) error
+
+	// ReadPendingMessages reads all pending messages for a run in append order.
+	ReadPendingMessages(ctx context.Context, key RepoKey, runID string) ([]string, error)
+
+	// ClearPendingMessages deletes pending_messages.jsonl for a run.
+	ClearPendingMessages(ctx context.Context, key RepoKey, runID string) error
 }
 
 // FileStore is the disk-backed implementation of Store.
@@ -118,6 +127,10 @@ func (s *FileStore) runPath(key RepoKey, runID string) string {
 
 func (s *FileStore) eventsPath(key RepoKey, runID string) string {
 	return filepath.Join(s.repoDir(key), "runs", runID, "events.jsonl")
+}
+
+func (s *FileStore) pendingMessagesPath(key RepoKey, runID string) string {
+	return filepath.Join(s.repoDir(key), "runs", runID, "pending_messages.jsonl")
 }
 
 // writeJSONAtomically writes a JSON object atomically using a temporary file in the same
@@ -546,6 +559,46 @@ func (s *FileStore) FindRun(ctx context.Context, runID string) (*Run, error) {
 	return nil, fmt.Errorf("run %q: %w", runID, ErrNotFound)
 }
 
+// appendJSONL appends records to a JSONL file, writing a leading newline before each batch.
+func appendJSONL[T any](filePath string, records ...T) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("creating directory %s: %w", dir, err)
+	}
+
+	var buf bytes.Buffer
+	buf.WriteByte('\n')
+	enc := json.NewEncoder(&buf)
+	for i := range records {
+		if err := enc.Encode(records[i]); err != nil {
+			return fmt.Errorf("marshaling record: %w", err)
+		}
+	}
+
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("opening file %s: %w", filePath, err)
+	}
+
+	if _, err := buf.WriteTo(f); err != nil {
+		closeErr := f.Close()
+		return errors.Join(fmt.Errorf("writing to %s: %w", filePath, err), closeErr)
+	}
+	if err := f.Sync(); err != nil {
+		closeErr := f.Close()
+		return errors.Join(fmt.Errorf("syncing file %s: %w", filePath, err), closeErr)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing file %s: %w", filePath, err)
+	}
+
+	return nil
+}
+
 // AppendEvent appends one or more events to events.jsonl.
 // Each append writes a leading newline followed by newline-delimited JSON records.
 // This ensures any trailing fragment from an interrupted previous append is closed
@@ -561,44 +614,16 @@ func (s *FileStore) AppendEvent(ctx context.Context, key RepoKey, runID string, 
 		return nil
 	}
 
-	log := scoped.Log(ctx)
-	p := s.eventsPath(key, runID)
-	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("creating directory %s: %w", dir, err)
-	}
-
-	var buf bytes.Buffer
-	buf.WriteByte('\n')
-	enc := json.NewEncoder(&buf)
 	for i := range events {
 		if events[i].Time.IsZero() {
 			events[i].Time = time.Now().UTC()
 		}
-		if err := enc.Encode(events[i]); err != nil {
-			return fmt.Errorf("marshaling event: %w", err)
-		}
 	}
 
+	log := scoped.Log(ctx)
+	p := s.eventsPath(key, runID)
 	log.V(2).Info("appending events", "repo", key.String(), "run", runID, "count", len(events))
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-	if err != nil {
-		return fmt.Errorf("opening events file %s: %w", p, err)
-	}
-
-	if _, err := buf.WriteTo(f); err != nil {
-		closeErr := f.Close()
-		return errors.Join(fmt.Errorf("writing events to %s: %w", p, err), closeErr)
-	}
-	if err := f.Sync(); err != nil {
-		closeErr := f.Close()
-		return errors.Join(fmt.Errorf("syncing events file %s: %w", p, err), closeErr)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("closing events file %s: %w", p, err)
-	}
-
-	return nil
+	return appendJSONL(p, events...)
 }
 
 // ReadEvents reads all events from events.jsonl for the given run in append order.
@@ -623,4 +648,56 @@ func (s *FileStore) ReadEvents(ctx context.Context, key RepoKey, runID string) (
 	}
 
 	return events, nil
+}
+
+// AppendPendingMessage appends a message to pending_messages.jsonl for a run.
+func (s *FileStore) AppendPendingMessage(ctx context.Context, key RepoKey, runID string, msg string) error {
+	if err := ValidateRepoKey(key); err != nil {
+		return err
+	}
+	if runID == "" {
+		return errors.New("run id cannot be empty")
+	}
+	if msg == "" {
+		return errors.New("message cannot be empty")
+	}
+
+	return appendJSONL(s.pendingMessagesPath(key, runID), msg)
+}
+
+// ReadPendingMessages reads all pending messages from pending_messages.jsonl for a run.
+func (s *FileStore) ReadPendingMessages(ctx context.Context, key RepoKey, runID string) ([]string, error) {
+	if err := ValidateRepoKey(key); err != nil {
+		return nil, err
+	}
+	if runID == "" {
+		return nil, errors.New("run id cannot be empty")
+	}
+
+	p := s.pendingMessagesPath(key, runID)
+	msgs, err := jsonl.Read[string](ctx, p)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading pending messages file %s: %w", p, err)
+	}
+
+	return msgs, nil
+}
+
+// ClearPendingMessages deletes pending_messages.jsonl for a run.
+func (s *FileStore) ClearPendingMessages(ctx context.Context, key RepoKey, runID string) error {
+	if err := ValidateRepoKey(key); err != nil {
+		return err
+	}
+	if runID == "" {
+		return errors.New("run id cannot be empty")
+	}
+
+	p := s.pendingMessagesPath(key, runID)
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clearing pending messages file %s: %w", p, err)
+	}
+	return nil
 }
