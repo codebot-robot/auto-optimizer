@@ -82,6 +82,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
+	"github.com/gke-labs/auto-optimizer/pkg/toolsets/ao"
 )
 
 type mockProcessServer struct {
@@ -9046,8 +9047,8 @@ func TestOrchestrator_StartSession_SharesSandboxOwnerAndTurnBudget(t *testing.T)
 	rs := orch.ensureRunState(run.ID)
 	rs.sandboxOwner = owner
 
-	var childWG sync.WaitGroup
-	childName, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, root, "check sb")
+	children := newChildGroup(ctx)
+	childName, err := orch.startChildSession(ctx, children, repo, run, root, "check sb")
 	if err != nil {
 		t.Fatalf("startChildSession: %v", err)
 	}
@@ -9101,10 +9102,10 @@ func TestOrchestrator_StartSession_DepthLimit(t *testing.T) {
 
 	orch.ensureRunState(run.ID)
 
-	var childWG sync.WaitGroup
+	children := newChildGroup(ctx)
 
 	// 1. Root starts child (depth 1) - allowed
-	child1Name, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, root, "task 1")
+	child1Name, err := orch.startChildSession(ctx, children, repo, run, root, "task 1")
 	if err != nil {
 		t.Fatalf("startChildSession (child1): %v", err)
 	}
@@ -9117,7 +9118,7 @@ func TestOrchestrator_StartSession_DepthLimit(t *testing.T) {
 	}
 
 	// 2. Child1 starts child2 (depth 2) - allowed
-	child2Name, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, child1, "task 2")
+	child2Name, err := orch.startChildSession(ctx, children, repo, run, child1, "task 2")
 	if err != nil {
 		t.Fatalf("startChildSession (child2): %v", err)
 	}
@@ -9130,7 +9131,7 @@ func TestOrchestrator_StartSession_DepthLimit(t *testing.T) {
 	}
 
 	// 3. Child2 starts child3 (depth 3) - allowed
-	child3Name, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, child2, "task 3")
+	child3Name, err := orch.startChildSession(ctx, children, repo, run, child2, "task 3")
 	if err != nil {
 		t.Fatalf("startChildSession (child3): %v", err)
 	}
@@ -9143,7 +9144,7 @@ func TestOrchestrator_StartSession_DepthLimit(t *testing.T) {
 	}
 
 	// 4. Child3 (depth 3) attempts to start child4 - exceeds limit 3, fails and starts nothing
-	child4Name, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, child3, "task 4")
+	child4Name, err := orch.startChildSession(ctx, children, repo, run, child3, "task 4")
 	if err == nil {
 		t.Fatalf("expected error for exceeding depth limit, got childName=%q", child4Name)
 	}
@@ -9159,13 +9160,13 @@ func TestOrchestrator_StartSession_DepthLimit(t *testing.T) {
 		MaxSessionDepth: 1,
 	})
 	orch1.ensureRunState(run.ID)
-	var childWG1 sync.WaitGroup
-	cName, err := orch1.startChildSession(ctx, ctx, &childWG1, repo, run, root, "subtask")
+	children1 := newChildGroup(ctx)
+	cName, err := orch1.startChildSession(ctx, children1, repo, run, root, "subtask")
 	if err != nil {
 		t.Fatalf("orch1 start child: %v", err)
 	}
 	c1, _ := harness.LoadSession(ctx, sessionStore, cName)
-	_, err = orch1.startChildSession(ctx, ctx, &childWG1, repo, run, c1, "subsubtask")
+	_, err = orch1.startChildSession(ctx, children1, repo, run, c1, "subsubtask")
 	if err == nil || !strings.Contains(err.Error(), "depth limit of 1 reached") {
 		t.Errorf("expected depth limit 1 error, got %v", err)
 	}
@@ -9187,8 +9188,8 @@ func TestOrchestrator_StartSession_NoRun(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 
-	var childWG sync.WaitGroup
-	_, err = orch.startChildSession(ctx, ctx, &childWG, nil, nil, sessWithoutRun, "do something")
+	children := newChildGroup(ctx)
+	_, err = orch.startChildSession(ctx, children, nil, nil, sessWithoutRun, "do something")
 	if err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
 		t.Errorf("expected 'session belongs to no run' error, got %v", err)
 	}
@@ -9218,8 +9219,8 @@ func TestOrchestrator_StartSession_NoLLMClient(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 
-	var childWG sync.WaitGroup
-	_, err = orch.startChildSession(ctx, ctx, &childWG, repo, run, root, "task")
+	children := newChildGroup(ctx)
+	_, err = orch.startChildSession(ctx, children, repo, run, root, "task")
 	if err == nil || !strings.Contains(err.Error(), "no LLM client configured") {
 		t.Errorf("expected 'no LLM client configured' error, got %v", err)
 	}
@@ -9250,8 +9251,8 @@ func TestOrchestrator_StartSession_NoTurnBudget(t *testing.T) {
 	}
 
 	// runStates does not have runID, so turnBudget returns nil
-	var childWG sync.WaitGroup
-	_, err = orch.startChildSession(ctx, ctx, &childWG, repo, run, root, "task")
+	children := newChildGroup(ctx)
+	_, err = orch.startChildSession(ctx, children, repo, run, root, "task")
 	if err == nil || !strings.Contains(err.Error(), "run has no turn budget") {
 		t.Errorf("expected 'run has no turn budget' error, got %v", err)
 	}
@@ -9283,10 +9284,10 @@ func TestOrchestrator_StartSession_RunBounds_ChildStopsWhenRunEnds(t *testing.T)
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	childCtx, cancelChildren := context.WithCancel(workerCtx)
 	defer cancelChildren()
-	var childWG sync.WaitGroup
+	children := newChildGroup(childCtx)
 
 	// Start child session with blocking LLM
-	_, err = orch.startChildSession(ctx, childCtx, &childWG, repo, run, root, "blocking work")
+	_, err = orch.startChildSession(ctx, children, repo, run, root, "blocking work")
 	if err != nil {
 		t.Fatalf("startChildSession: %v", err)
 	}
@@ -9306,7 +9307,7 @@ func TestOrchestrator_StartSession_RunBounds_ChildStopsWhenRunEnds(t *testing.T)
 	}
 
 	cancelChildren()
-	childWG.Wait()
+	children.wg.Wait()
 }
 
 func TestOrchestrator_Working_ChildrenStopWhenTopLevelFinishes(t *testing.T) {
@@ -9333,9 +9334,9 @@ func TestOrchestrator_Working_ChildrenStopWhenTopLevelFinishes(t *testing.T) {
 
 	childCtx, cancelChildren := context.WithCancel(ctx)
 	defer cancelChildren()
-	var childWG sync.WaitGroup
+	children := newChildGroup(childCtx)
 
-	_, err = orch.startChildSession(ctx, childCtx, &childWG, repo, run, root, "child task")
+	_, err = orch.startChildSession(ctx, children, repo, run, root, "child task")
 	if err != nil {
 		t.Fatalf("startChildSession: %v", err)
 	}
@@ -9347,7 +9348,7 @@ func TestOrchestrator_Working_ChildrenStopWhenTopLevelFinishes(t *testing.T) {
 	}
 
 	cancelChildren()
-	childWG.Wait()
+	children.wg.Wait()
 
 	select {
 	case <-blockingLLM.cancelled:
@@ -9372,5 +9373,310 @@ func TestOrchestratorOptions_Validate_MaxSessionDepth(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "MaxSessionDepth must be at least 1") {
 			t.Errorf("Validate with MaxSessionDepth=%d: got %v, want error containing 'MaxSessionDepth must be at least 1'", d, err)
 		}
+	}
+}
+
+type scriptedListSessionsLLM struct {
+	afterResult func(toolMsg llm.Message)
+	callCount   atomic.Int32
+}
+
+func (s *scriptedListSessionsLLM) CreateChatCompletion(_ context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	n := s.callCount.Add(1)
+	if n == 1 {
+		return &llm.ChatCompletionResponse{
+			ID: "list-sess-llm",
+			Choices: []llm.Choice{{
+				Message: llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{{
+						ID:   "call-list-sess-1",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "list_sessions",
+							Arguments: "{}",
+						},
+					}},
+				},
+			}},
+		}, nil
+	}
+	for _, m := range req.Messages {
+		if m.Role == "tool" && m.ToolCallID == "call-list-sess-1" {
+			if s.afterResult != nil {
+				s.afterResult(m)
+			}
+		}
+	}
+	finishArgs, _ := json.Marshal(map[string]string{"summary": "listing completed"})
+	return &llm.ChatCompletionResponse{
+		ID: "list-sess-finish",
+		Choices: []llm.Choice{{
+			Message: llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{{
+					ID:   "call-finish-1",
+					Type: "function",
+					Function: llm.FunctionCall{
+						Name:      "finish",
+						Arguments: string(finishArgs),
+					},
+				}},
+			},
+		}},
+	}, nil
+}
+
+func TestOrchestrator_Working_ListSessions_RootAndChildren(t *testing.T) {
+	ctx := t.Context()
+	var toolResultContent string
+	listLLM := &scriptedListSessionsLLM{
+		afterResult: func(toolMsg llm.Message) {
+			if toolMsg.Content != nil {
+				toolResultContent = *toolMsg.Content
+			}
+		},
+	}
+
+	orch, store, _, repo, run := setupSelectingRun(t, state.PhaseWorking, "base-sha", &mockProcessServer{}, listLLM)
+
+	// Ensure run has a session ID
+	run.SessionID = generateSessionID(run.ID)
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	// Pre-create a stopped child session
+	_, err := orch.harness.NewSession(ctx, orch.sessionStore, "childstopped", session.Metadata{
+		RunID:     run.ID,
+		Parent:    run.SessionID,
+		CreatedAt: time.Now().Add(-2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("NewSession childstopped: %v", err)
+	}
+
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), run.ID)); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
+	}
+
+	if toolResultContent == "" {
+		t.Fatal("expected non-empty toolResultContent from list_sessions call")
+	}
+
+	var parsed []ao.SessionInfo
+	if err := json.Unmarshal([]byte(toolResultContent), &parsed); err != nil {
+		t.Fatalf("failed to unmarshal list_sessions content %q: %v", toolResultContent, err)
+	}
+
+	if len(parsed) != 2 {
+		t.Fatalf("expected 2 sessions, got %d: %+v", len(parsed), parsed)
+	}
+
+	// 1. Root session (calling session) is running
+	if parsed[0].Name != run.SessionID || parsed[0].Parent != "" || parsed[0].State != "running" {
+		t.Errorf("unexpected root session in list: %+v, want name=%q parent='' state='running'", parsed[0], run.SessionID)
+	}
+
+	// 2. Child stopped
+	if parsed[1].Name != "childstopped" || parsed[1].Parent != run.SessionID || parsed[1].State != "stopped" {
+		t.Errorf("unexpected child in list: %+v, want name='childstopped' parent=%q state='stopped'", parsed[1], run.SessionID)
+	}
+}
+
+func TestOrchestrator_ListSessions_RunningChild(t *testing.T) {
+	ctx := t.Context()
+	blockingLLM := newMidTurnBlockingLLM()
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, "run-list-running", "sb-list-running", nil, blockingLLM)
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        time.Now,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootrunning", session.Metadata{
+		RunID: run.ID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	orch.ensureRunState(run.ID)
+
+	workerCtx, cancelWorker := context.WithCancel(ctx)
+	defer cancelWorker()
+	childCtx, cancelChildren := context.WithCancel(workerCtx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+
+	childName, err := orch.startChildSession(ctx, children, repo, run, root, "blocking task")
+	if err != nil {
+		t.Fatalf("startChildSession: %v", err)
+	}
+
+	select {
+	case <-blockingLLM.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for child worker to start LLM call")
+	}
+
+	sessions, err := orch.listRunSessions(ctx, run, children)
+	if err != nil {
+		t.Fatalf("listRunSessions: %v", err)
+	}
+
+	var foundChild bool
+	for _, s := range sessions {
+		if s.Name == childName {
+			foundChild = true
+			if s.State != "running" {
+				t.Errorf("child session %s state = %q, want 'running'", childName, s.State)
+			}
+			if s.Parent != "rootrunning" {
+				t.Errorf("child session %s parent = %q, want 'rootrunning'", childName, s.Parent)
+			}
+		}
+	}
+	if !foundChild {
+		t.Errorf("expected child session %s in listRunSessions", childName)
+	}
+
+	close(blockingLLM.release)
+	cancelChildren()
+	children.wg.Wait()
+
+	// After child worker stops, it should be stopped
+	sessionsAfter, err := orch.listRunSessions(ctx, run, children)
+	if err != nil {
+		t.Fatalf("listRunSessions after stop: %v", err)
+	}
+	for _, s := range sessionsAfter {
+		if s.Name == childName && s.State != "stopped" {
+			t.Errorf("child session %s state after stop = %q, want 'stopped'", childName, s.State)
+		}
+	}
+}
+
+func TestOrchestrator_ListSessions_IsolatesRuns(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	run1 := &state.Run{ID: "run-alpha"}
+	run2 := &state.Run{ID: "run-beta"}
+
+	// Create sessions in Run 1
+	if _, err := harness.NewSession(ctx, sessionStore, "run1sess", session.Metadata{
+		RunID: "run-alpha",
+	}); err != nil {
+		t.Fatalf("NewSession run1sess: %v", err)
+	}
+
+	// Create sessions in Run 2
+	if _, err := harness.NewSession(ctx, sessionStore, "run2sess", session.Metadata{
+		RunID: "run-beta",
+	}); err != nil {
+		t.Fatalf("NewSession run2sess: %v", err)
+	}
+
+	// Listing run-alpha sees run1sess but never run2sess
+	list1, err := orch.listRunSessions(ctx, run1, newChildGroup(ctx))
+	if err != nil {
+		t.Fatalf("listRunSessions(run-alpha): %v", err)
+	}
+	if len(list1) != 1 || list1[0].Name != "run1sess" {
+		t.Errorf("list1 = %+v, want exactly [run1sess]", list1)
+	}
+
+	// Listing run-beta sees run2sess but never run1sess
+	list2, err := orch.listRunSessions(ctx, run2, newChildGroup(ctx))
+	if err != nil {
+		t.Fatalf("listRunSessions(run-beta): %v", err)
+	}
+	if len(list2) != 1 || list2[0].Name != "run2sess" {
+		t.Errorf("list2 = %+v, want exactly [run2sess]", list2)
+	}
+}
+
+func TestOrchestrator_ListSessions_NoRun(t *testing.T) {
+	ctx := t.Context()
+	tool := ao.NewListSessionsTool(nil)
+	_, err := tool.Run(ctx, nil)
+	if err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
+		t.Errorf("expected 'session belongs to no run' error, got %v", err)
+	}
+}
+
+func TestOrchestrator_Working_ChildSession_CanCallListSessions(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	var childToolResult string
+	childLLM := &scriptedListSessionsLLM{
+		afterResult: func(toolMsg llm.Message) {
+			if toolMsg.Content != nil {
+				childToolResult = *toolMsg.Content
+			}
+		},
+	}
+
+	harness, _, _ := setupTestHarnessWithLLM(t, nil, childLLM)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        time.Now,
+	})
+
+	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+	run := &state.Run{ID: "runchildlist", SessionID: "rootparent", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sbchildlist", Goal: &goals.Goal{Name: "g1", Body: "task"}}
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootparent", session.Metadata{
+		RunID: run.ID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession rootparent: %v", err)
+	}
+
+	orch.ensureRunState(run.ID)
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+
+	childName, err := orch.startChildSession(ctx, children, repo, run, root, "list sessions task")
+	if err != nil {
+		t.Fatalf("startChildSession: %v", err)
+	}
+
+	children.wg.Wait()
+
+	if childToolResult == "" {
+		t.Fatal("expected non-empty childToolResult from list_sessions call")
+	}
+
+	var parsed []ao.SessionInfo
+	if err := json.Unmarshal([]byte(childToolResult), &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(parsed) != 2 {
+		t.Fatalf("expected 2 sessions, got %d: %+v", len(parsed), parsed)
+	}
+	if parsed[0].Name != "rootparent" || parsed[0].State != "running" {
+		t.Errorf("parsed[0] = %+v, want name='rootparent' state='running'", parsed[0])
+	}
+	if parsed[1].Name != childName || parsed[1].Parent != "rootparent" || parsed[1].State != "running" {
+		t.Errorf("parsed[1] = %+v, want name=%q parent='rootparent' state='running'", parsed[1], childName)
 	}
 }
