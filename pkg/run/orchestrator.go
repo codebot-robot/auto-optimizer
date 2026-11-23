@@ -715,7 +715,7 @@ func (o *Orchestrator) prepareRun(ctx context.Context, repo *state.Repo, run *st
 
 // sandboxNameForRun returns the canonical name for a run's Sandbox and HeroRun objects.
 func sandboxNameForRun(runID string) string {
-	return fmt.Sprintf("run-%s", strings.ToLower(runID))
+	return SandboxNameForRun(runID)
 }
 
 // heroRunOwnerReferences constructs an metav1.OwnerReference slice pointing to the HeroRun.

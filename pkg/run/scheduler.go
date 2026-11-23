@@ -23,9 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
@@ -384,28 +381,7 @@ func (s *Scheduler) StartRun(ctx context.Context, repo *state.Repo, goalName str
 }
 
 func (s *Scheduler) listRuns(ctx context.Context, repo *state.Repo) ([]*state.Run, error) {
-	var hrList herorunv1alpha1.HeroRunList
-	if err := s.Orchestrator.kubeClient.List(ctx, &hrList, client.InNamespace(s.Orchestrator.namespace())); err != nil {
-		return nil, fmt.Errorf("listing HeroRuns: %w", err)
-	}
-
-	var runs []*state.Run
-	for i := range hrList.Items {
-		hr := &hrList.Items[i]
-		if hr.Spec.Repository != repo.URL {
-			continue
-		}
-		run, err := HeroRunToRun(hr)
-		if err != nil {
-			scoped.Log(ctx).Error(err, "failed to convert HeroRun to run", "heroRun", hr.Name)
-			continue
-		}
-		runs = append(runs, run)
-	}
-	slices.SortFunc(runs, func(a, b *state.Run) int {
-		return strings.Compare(a.ID, b.ID)
-	})
-	return runs, nil
+	return ListRuns(ctx, s.Orchestrator.kubeClient, s.Orchestrator.namespace(), repo.URL)
 }
 
 func (s *Scheduler) findOpenPullRequest(ctx context.Context, repo *state.Repo, goalName string) (*forge.PullRequest, error) {

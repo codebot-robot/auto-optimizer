@@ -427,6 +427,8 @@ func runServe(ctx context.Context, opts serveOptions) error {
 		StateStore:     stateStore,
 		DefaultToolset: opts.toolset,
 		HarnessFactory: harnessFactory,
+		KubeClient:     mgr.GetClient(),
+		Namespace:      opts.sandbox.Namespace,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing session service server: %w", err)
@@ -458,6 +460,8 @@ func runServe(ctx context.Context, opts serveOptions) error {
 			RequireSignIn: opts.github.ClientID != "",
 			SessionKey:    sessionKey,
 			Orchestrator:  orchestrator,
+			KubeClient:    mgr.GetClient(),
+			Namespace:     opts.sandbox.Namespace,
 		})
 		if err != nil {
 			return fmt.Errorf("initializing web server: %w", err)

@@ -28,6 +28,8 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -64,6 +66,8 @@ type ServerOptions struct {
 	RequireSignIn bool
 	SessionKey    []byte
 	Orchestrator  Orchestrator
+	KubeClient    client.Client
+	Namespace     string
 }
 
 // Server handles HTTP requests for the web UI.
@@ -72,6 +76,8 @@ type Server struct {
 	stateStore    state.Store
 	starter       RunStarter
 	orchestrator  Orchestrator
+	kubeClient    client.Client
+	namespace     string
 	requireSignIn bool
 	sessionKey    []byte
 }
@@ -85,14 +91,35 @@ func NewServer(service SessionService, stateStore state.Store, starter RunStarte
 		return nil, fmt.Errorf("session key must be at least %d bytes when sign-in is enabled: %w", auth.MinKeyLength, auth.ErrKeyTooShort)
 	}
 
+	ns := opts.Namespace
+	if ns == "" {
+		ns = session.DefaultNamespace
+	}
+
 	return &Server{
 		service:       service,
 		stateStore:    stateStore,
 		starter:       starter,
 		orchestrator:  opts.Orchestrator,
+		kubeClient:    opts.KubeClient,
+		namespace:     ns,
 		requireSignIn: opts.RequireSignIn,
 		sessionKey:    opts.SessionKey,
 	}, nil
+}
+
+func (s *Server) getRun(ctx context.Context, runID string) (*state.Run, error) {
+	if s.kubeClient == nil {
+		return nil, state.ErrNotFound
+	}
+	return run.GetRun(ctx, s.kubeClient, s.namespace, runID)
+}
+
+func (s *Server) listRuns(ctx context.Context, repo *state.Repo) ([]*state.Run, error) {
+	if s.kubeClient == nil {
+		return nil, nil
+	}
+	return run.ListRuns(ctx, s.kubeClient, s.namespace, repo.URL)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -284,7 +311,7 @@ func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request, host, own
 	for _, g := range goals {
 		var latestPhase state.RunPhase
 		if g.LastRunID != "" {
-			run, err := s.stateStore.GetRun(r.Context(), key, g.LastRunID)
+			run, err := s.getRun(r.Context(), g.LastRunID)
 			if err != nil {
 				if !errors.Is(err, state.ErrNotFound) {
 					scoped.Log(r.Context()).V(2).Info("getting latest run for goal", "run", g.LastRunID, "error", err)
@@ -299,7 +326,7 @@ func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request, host, own
 		})
 	}
 
-	runs, err := s.stateStore.ListRuns(r.Context(), key)
+	runs, err := s.listRuns(r.Context(), repo)
 	if err != nil {
 		scoped.Log(r.Context()).Error(err, "listing runs", "repo", key)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -322,17 +349,12 @@ func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request, host, own
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request, runID string) {
-	if s.stateStore == nil {
-		s.render404(w, r, "Run not found")
-		return
-	}
-
 	if err := state.ValidateRunID(runID); err != nil {
 		s.render404(w, r, fmt.Sprintf("Invalid run ID %q: %v", runID, err))
 		return
 	}
 
-	run, err := s.stateStore.FindRun(r.Context(), runID)
+	run, err := s.getRun(r.Context(), runID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.render404(w, r, fmt.Sprintf("Run %q not found", runID))
@@ -343,11 +365,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request, runID stri
 		return
 	}
 
-	events, err := s.stateStore.ReadEvents(r.Context(), run.Repo, run.ID)
-	if err != nil {
-		scoped.Log(r.Context()).Error(err, "reading events for run", "run", runID)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	var events []state.Event
+	if s.stateStore != nil {
+		events, err = s.stateStore.ReadEvents(r.Context(), run.Repo, run.ID)
+		if err != nil {
+			scoped.Log(r.Context()).Error(err, "reading events for run", "run", runID)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	if err := RenderRunPage(r.Context(), w, RunPageData{
@@ -369,17 +394,12 @@ func (s *Server) handlePostRun(w http.ResponseWriter, r *http.Request, runID str
 		return
 	}
 
-	if s.stateStore == nil {
-		s.render404(w, r, "Run not found")
-		return
-	}
-
 	if err := state.ValidateRunID(runID); err != nil {
 		s.render404(w, r, fmt.Sprintf("Invalid run ID %q: %v", runID, err))
 		return
 	}
 
-	runRec, err := s.stateStore.FindRun(r.Context(), runID)
+	runRec, err := s.getRun(r.Context(), runID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.render404(w, r, fmt.Sprintf("Run %q not found", runID))
@@ -579,7 +599,7 @@ func (s *Server) recordMessagePosted(ctx context.Context, sessionName string) {
 	}
 
 	var phase state.RunPhase
-	run, err := s.stateStore.GetRun(ctx, repoKey, detail.Summary.RunID)
+	run, err := s.getRun(ctx, detail.Summary.RunID)
 	if err != nil {
 		scoped.Log(ctx).V(4).Info("getting run for session event", "run", detail.Summary.RunID, "error", err)
 	} else if run != nil {

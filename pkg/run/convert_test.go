@@ -16,10 +16,13 @@ package run_test
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
@@ -373,5 +376,101 @@ func TestTimestampTruncation(t *testing.T) {
 	}
 	if back.PhaseTimestamps[state.PhasePending] != expectedTime {
 		t.Errorf("state.Run phase timestamp not truncated: got %v, want %v", back.PhaseTimestamps[state.PhasePending], expectedTime)
+	}
+}
+
+func TestGetRun_And_ListRuns(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = herorunv1alpha1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+
+	const ns = "test-sandboxes"
+
+	// Non-existent run returns ErrNotFound
+	if _, err := run.GetRun(ctx, fakeClient, ns, "nonexistent"); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("GetRun nonexistent = %v, want state.ErrNotFound", err)
+	}
+
+	repoURL1 := "https://github.com/example/repo1"
+	repoURL2 := "https://github.com/example/repo2"
+
+	r1 := &state.Run{
+		ID:       "20261123T100000Z-0001",
+		GoalName: "goal-1",
+		Phase:    state.PhaseWorking,
+	}
+	hr1 := run.HeroRunFromRun(r1)
+	hr1.Namespace = ns
+	hr1.Spec.Repository = repoURL1
+	if err := fakeClient.Create(ctx, hr1); err != nil {
+		t.Fatalf("Create hr1: %v", err)
+	}
+
+	r2 := &state.Run{
+		ID:       "20261123T110000Z-0002",
+		GoalName: "goal-2",
+		Phase:    state.PhasePending,
+	}
+	hr2 := run.HeroRunFromRun(r2)
+	hr2.Namespace = ns
+	hr2.Spec.Repository = repoURL1
+	if err := fakeClient.Create(ctx, hr2); err != nil {
+		t.Fatalf("Create hr2: %v", err)
+	}
+
+	r3 := &state.Run{
+		ID:       "20261123T090000Z-0003",
+		GoalName: "goal-3",
+		Phase:    state.PhaseSucceeded,
+	}
+	hr3 := run.HeroRunFromRun(r3)
+	hr3.Namespace = ns
+	hr3.Spec.Repository = repoURL2
+	if err := fakeClient.Create(ctx, hr3); err != nil {
+		t.Fatalf("Create hr3: %v", err)
+	}
+
+	// Test GetRun for existing run
+	got1, err := run.GetRun(ctx, fakeClient, ns, r1.ID)
+	if err != nil {
+		t.Fatalf("GetRun r1: %v", err)
+	}
+	if got1.ID != r1.ID || got1.GoalName != r1.GoalName || got1.Phase != r1.Phase {
+		t.Errorf("GetRun r1 mismatch: got %+v, want %+v", got1, r1)
+	}
+
+	// Test ListRuns for repo1
+	runs1, err := run.ListRuns(ctx, fakeClient, ns, repoURL1)
+	if err != nil {
+		t.Fatalf("ListRuns repo1: %v", err)
+	}
+	if len(runs1) != 2 {
+		t.Fatalf("ListRuns repo1 count = %d, want 2", len(runs1))
+	}
+	// Verify ascending order by run ID
+	if runs1[0].ID != r1.ID || runs1[1].ID != r2.ID {
+		t.Errorf("ListRuns ordering: got [%s, %s], want [%s, %s]", runs1[0].ID, runs1[1].ID, r1.ID, r2.ID)
+	}
+
+	// Test ListRuns for repo2
+	runs2, err := run.ListRuns(ctx, fakeClient, ns, repoURL2)
+	if err != nil {
+		t.Fatalf("ListRuns repo2: %v", err)
+	}
+	if len(runs2) != 1 || runs2[0].ID != r3.ID {
+		t.Errorf("ListRuns repo2 mismatch: got %+v", runs2)
+	}
+
+	// Test ListRuns all repos (empty repoURL)
+	allRuns, err := run.ListRuns(ctx, fakeClient, ns, "")
+	if err != nil {
+		t.Fatalf("ListRuns all: %v", err)
+	}
+	if len(allRuns) != 3 {
+		t.Fatalf("ListRuns all count = %d, want 3", len(allRuns))
+	}
+	if allRuns[0].ID != r3.ID || allRuns[1].ID != r1.ID || allRuns[2].ID != r2.ID {
+		t.Errorf("ListRuns all ordering: got [%s, %s, %s], want [%s, %s, %s]", allRuns[0].ID, allRuns[1].ID, allRuns[2].ID, r3.ID, r1.ID, r2.ID)
 	}
 }

@@ -15,16 +15,96 @@
 package run
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
+
+// SandboxNameForRun returns the canonical name for a run's Sandbox and HeroRun objects.
+func SandboxNameForRun(runID string) string {
+	return fmt.Sprintf("run-%s", strings.ToLower(runID))
+}
+
+// GetRun reads a HeroRun custom resource from kube-apiserver by run ID and converts it to a state.Run.
+// If the HeroRun is not found, it returns state.ErrNotFound.
+func GetRun(ctx context.Context, c client.Client, namespace, runID string) (*state.Run, error) {
+	if c == nil {
+		return nil, errors.New("kube client is not configured")
+	}
+	name := SandboxNameForRun(runID)
+	var hr herorunv1alpha1.HeroRun
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &hr); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil, state.ErrNotFound
+		}
+		return nil, fmt.Errorf("getting HeroRun %s: %w", name, err)
+	}
+	run, err := HeroRunToRun(&hr)
+	if err != nil {
+		return nil, fmt.Errorf("converting HeroRun %s: %w", name, err)
+	}
+	if run.ID == "" {
+		run.ID = runID
+	}
+	return run, nil
+}
+
+// ListRuns reads HeroRun custom resources from kube-apiserver for a repository and converts them to state.Runs.
+// If repoURL is empty, all HeroRuns in the namespace are returned.
+// Returned runs are sorted by ID in ascending order.
+func ListRuns(ctx context.Context, c client.Client, namespace, repoURL string) ([]*state.Run, error) {
+	if c == nil {
+		return nil, errors.New("kube client is not configured")
+	}
+	var hrList herorunv1alpha1.HeroRunList
+	if err := c.List(ctx, &hrList, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("listing HeroRuns: %w", err)
+	}
+
+	var targetKey state.RepoKey
+	if repoURL != "" {
+		var err error
+		targetKey, err = state.ParseRepoURL(repoURL)
+		if err != nil {
+			return nil, fmt.Errorf("parsing repo URL %q: %w", repoURL, err)
+		}
+	}
+
+	var runs []*state.Run
+	for i := range hrList.Items {
+		hr := &hrList.Items[i]
+		if repoURL != "" {
+			if hr.Spec.Repository != repoURL {
+				hrKey, err := state.ParseRepoURL(hr.Spec.Repository)
+				if err != nil || hrKey != targetKey {
+					continue
+				}
+			}
+		}
+		run, err := HeroRunToRun(hr)
+		if err != nil {
+			scoped.Log(ctx).Error(err, "failed to convert HeroRun to run", "heroRun", hr.Name)
+			continue
+		}
+		runs = append(runs, run)
+	}
+	slices.SortFunc(runs, func(a, b *state.Run) int {
+		return strings.Compare(a.ID, b.ID)
+	})
+	return runs, nil
+}
 
 // HeroRunPhase returns the phase of a HeroRun, defaulting an empty phase to PhasePending.
 func HeroRunPhase(hr *herorunv1alpha1.HeroRun) state.RunPhase {

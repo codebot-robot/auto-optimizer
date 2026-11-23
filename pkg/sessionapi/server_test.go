@@ -39,6 +39,11 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
+	runpkg "github.com/gke-labs/auto-optimizer/pkg/run"
 )
 
 type recordingSandbox struct {
@@ -722,10 +727,15 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 	stateStore := state.NewFileStore(t.TempDir())
 	sessionStore := session.NewFileStore(t.TempDir())
 
+	scheme := runtime.NewScheme()
+	_ = herorunv1alpha1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+
 	srv, err := NewServer(ServerOptions{
 		Store:          sessionStore,
 		StateStore:     stateStore,
 		DefaultToolset: "basic",
+		KubeClient:     fakeClient,
 		HarnessFactory: func(_ string) (*session.Harness, error) {
 			return nil, nil
 		},
@@ -845,7 +855,7 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 		t.Fatalf("expected 0 runs, got %d", len(runsResp.Runs))
 	}
 
-	// Create a run in stateStore
+	// Create a run in fakeClient as HeroRun
 	runID := "20261029T120000Z-abcd"
 	run := &state.Run{
 		ID:         runID,
@@ -854,8 +864,11 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "c0ffee",
 	}
-	if err := stateStore.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
+	hr := runpkg.HeroRunFromRun(run)
+	hr.Namespace = session.DefaultNamespace
+	hr.Spec.Repository = repo.URL
+	if err := fakeClient.Create(ctx, hr); err != nil {
+		t.Fatalf("Create HeroRun: %v", err)
 	}
 
 	runsResp, err = client.ListRuns(ctx, &sessionv1.ListRunsRequest{RepoUrl: repo.URL})
