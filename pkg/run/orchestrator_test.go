@@ -29,6 +29,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -208,6 +209,9 @@ func (o *Orchestrator) cancelWorkers() {
 
 func newTestOrchestrator(t *testing.T, opts OrchestratorOptions) *Orchestrator {
 	t.Helper()
+	if opts.MaxSessionDepth == 0 {
+		opts.MaxSessionDepth = DefaultMaxSessionDepth
+	}
 	orch, err := NewOrchestrator(opts)
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
@@ -7463,8 +7467,9 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 
 	baseValid := func() OrchestratorOptions {
 		opts := OrchestratorOptions{
-			Store:   store,
-			Harness: harness,
+			Store:           store,
+			Harness:         harness,
+			MaxSessionDepth: DefaultMaxSessionDepth,
 		}
 		opts.InitDefaults()
 		return opts
@@ -7565,6 +7570,20 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 			},
 			wantErrSubstr: "WorkspaceSize",
 		},
+		{
+			name: "MaxSessionDepth zero rejected",
+			mutate: func(o *OrchestratorOptions) {
+				o.MaxSessionDepth = 0
+			},
+			wantErrSubstr: "MaxSessionDepth must be at least 1",
+		},
+		{
+			name: "MaxSessionDepth negative rejected",
+			mutate: func(o *OrchestratorOptions) {
+				o.MaxSessionDepth = -1
+			},
+			wantErrSubstr: "MaxSessionDepth must be at least 1",
+		},
 	}
 
 	for _, tc := range tests {
@@ -7583,9 +7602,10 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 
 	t.Run("NewOrchestrator propagates validation error", func(t *testing.T) {
 		_, err := NewOrchestrator(OrchestratorOptions{
-			Store:        store,
-			Harness:      harness,
-			ReadyTimeout: -1 * time.Minute,
+			Store:           store,
+			Harness:         harness,
+			MaxSessionDepth: DefaultMaxSessionDepth,
+			ReadyTimeout:    -1 * time.Minute,
 		})
 		if err == nil || !strings.Contains(err.Error(), "ReadyTimeout") {
 			t.Fatalf("expected ReadyTimeout error from NewOrchestrator, got: %v", err)
@@ -7895,13 +7915,10 @@ func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T)
 	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, &deadline, &llm.ElizaClient{})
 
 	currentTime := startTime
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store: store, SessionStore: sessionStore, Harness: harness,
 		Clock: func() time.Time { return currentTime },
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Store an outcome that finished before the deadline
 	orch.ensureRunState(runID)
@@ -8010,16 +8027,13 @@ func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
 		factoryCalls = append(factoryCalls, req)
 		return portal.HostListPolicyFactory(egressHosts)(ctx, req)
 	}
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:         store,
 		Harness:       harness,
 		Clock:         func() time.Time { return fixedTime },
 		PortalBinder:  binder,
 		PolicyFactory: policyFactory,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Reconcile Pending -> Preparing
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -8220,16 +8234,13 @@ func TestOrchestrator_PortalBinder_FailsAfterDeadline(t *testing.T) {
 		return currentTime
 	}
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:         store,
 		Harness:       harness,
 		Clock:         getClock,
 		PortalBinder:  binder,
 		PolicyFactory: portal.HostListPolicyFactory(nil),
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Pending -> Preparing (sets ReadyDeadline)
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -8379,16 +8390,13 @@ func TestOrchestrator_PortalBinder_FactoryErrorFailsAfterDeadline(t *testing.T) 
 		return currentTime
 	}
 
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:         store,
 		Harness:       harness,
 		Clock:         getClock,
 		PortalBinder:  binder,
 		PolicyFactory: policyFactory,
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Pending -> Preparing (sets ReadyDeadline)
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -8534,15 +8542,12 @@ func TestOrchestrator_PortalBinder_DisabledWithoutBinder(t *testing.T) {
 	harness, agentsCS, coreCS := setupTestHarness(t, procSrv)
 
 	fixedTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
-	orch, err := NewOrchestrator(OrchestratorOptions{
+	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 		PortalBinder: nil, // disabled
 	})
-	if err != nil {
-		t.Fatalf("NewOrchestrator: %v", err)
-	}
 
 	// Step 1: Reconcile Pending -> Preparing
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -8879,4 +8884,493 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			t.Errorf("expected claim not found, got %v", err)
 		}
 	})
+}
+
+type scriptedStartSessionLLM struct {
+	task        string
+	afterResult func(toolMsg llm.Message)
+	callCount   atomic.Int32
+}
+
+func (s *scriptedStartSessionLLM) CreateChatCompletion(_ context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	n := s.callCount.Add(1)
+	if n == 1 {
+		args, _ := json.Marshal(map[string]string{
+			"task": s.task,
+		})
+		return &llm.ChatCompletionResponse{
+			ID: "start-sess-llm",
+			Choices: []llm.Choice{{
+				Message: llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{{
+						ID:   "call-start-sess-1",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "start_session",
+							Arguments: string(args),
+						},
+					}},
+				},
+			}},
+		}, nil
+	}
+	for _, m := range req.Messages {
+		if m.Role == "tool" && m.ToolCallID == "call-start-sess-1" {
+			if s.afterResult != nil {
+				s.afterResult(m)
+			}
+		}
+	}
+	finishArgs, _ := json.Marshal(map[string]string{"summary": "child started successfully"})
+	return &llm.ChatCompletionResponse{
+		ID: "start-sess-finish",
+		Choices: []llm.Choice{{
+			Message: llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{{
+					ID:   "call-finish-1",
+					Type: "function",
+					Function: llm.FunctionCall{
+						Name:      "finish",
+						Arguments: string(finishArgs),
+					},
+				}},
+			},
+		}},
+	}, nil
+}
+
+func TestOrchestrator_Working_StartSession_CreatesChildSession(t *testing.T) {
+	ctx := t.Context()
+	var toolResultContent string
+	startLLM := &scriptedStartSessionLLM{
+		task: "check disk usage and record findings",
+		afterResult: func(toolMsg llm.Message) {
+			if toolMsg.Content != nil {
+				toolResultContent = *toolMsg.Content
+			}
+		},
+	}
+
+	orch, store, _, repo, run := setupSelectingRun(t, state.PhaseWorking, "base-sha", &mockProcessServer{}, startLLM)
+
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), run.ID)); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
+	}
+
+	if !strings.Contains(toolResultContent, "Started child session") {
+		t.Errorf("toolResultContent = %q, want containing 'Started child session'", toolResultContent)
+	}
+
+	parts := strings.Fields(toolResultContent)
+	if len(parts) < 4 {
+		t.Fatalf("unexpected toolResultContent format: %q", toolResultContent)
+	}
+	childName := strings.TrimSuffix(parts[3], ".")
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	expectedParent := gotRun.SessionID
+	if expectedParent == "" {
+		t.Fatalf("expected non-empty SessionID on run")
+	}
+
+	childSess, err := orch.harness.LoadSession(ctx, orch.sessionStore, childName)
+	if err != nil {
+		t.Fatalf("LoadSession(childName=%q): %v", childName, err)
+	}
+	if childSess.Metadata.Parent != expectedParent {
+		t.Errorf("child Parent = %q, want %q", childSess.Metadata.Parent, expectedParent)
+	}
+	if len(childSess.Metadata.Ancestors) != 1 || childSess.Metadata.Ancestors[0] != expectedParent {
+		t.Errorf("child Ancestors = %v, want [%s]", childSess.Metadata.Ancestors, expectedParent)
+	}
+	if childSess.Metadata.RunID != run.ID {
+		t.Errorf("child RunID = %q, want %q", childSess.Metadata.RunID, run.ID)
+	}
+	if childSess.Metadata.Depth() != 1 {
+		t.Errorf("child Depth = %d, want 1", childSess.Metadata.Depth())
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundChildEvent bool
+	for _, e := range events {
+		if e.Kind == "session_started" && strings.Contains(e.Message, childName) {
+			foundChildEvent = true
+			if m, ok := e.Data.(map[string]any); ok {
+				if m["session_id"] != childName || m["parent"] != expectedParent {
+					t.Errorf("unexpected event Data: %+v", m)
+				}
+			}
+		}
+	}
+	if !foundChildEvent {
+		t.Errorf("expected session_started event for child session %s", childName)
+	}
+}
+
+func TestOrchestrator_StartSession_SharesSandboxOwnerAndTurnBudget(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+	_ = store.PutRepo(ctx, repo)
+	run := &state.Run{ID: "run-sb-owner", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-owner"}
+	_ = store.PutRun(ctx, run)
+
+	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		MaxTurns:     5,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootsb", session.Metadata{
+		RunID: run.ID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession root: %v", err)
+	}
+
+	owner := session.NewSandboxOwner(harness)
+	root.SetSandboxOwner(owner)
+
+	rs := orch.ensureRunState(run.ID)
+	rs.sandboxOwner = owner
+
+	var childWG sync.WaitGroup
+	childName, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, root, "check sb")
+	if err != nil {
+		t.Fatalf("startChildSession: %v", err)
+	}
+
+	childSess, err := harness.LoadSession(ctx, sessionStore, childName)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if childSess.Metadata.Parent != "rootsb" {
+		t.Errorf("child Parent = %q, want 'rootsb'", childSess.Metadata.Parent)
+	}
+
+	tb := orch.turnBudget(run.ID)
+	if tb == nil {
+		t.Fatal("expected non-nil turn budget for run")
+	}
+	for i := 0; i < 5; i++ {
+		if !tb.Take() {
+			t.Fatalf("take turn %d failed", i+1)
+		}
+	}
+	if tb.Take() {
+		t.Errorf("expected budget exhausted on 6th turn")
+	}
+}
+
+func TestOrchestrator_StartSession_DepthLimit(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+	_ = store.PutRepo(ctx, repo)
+	run := &state.Run{ID: "run-depth-test", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-depth"}
+	_ = store.PutRun(ctx, run)
+
+	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:           store,
+		SessionStore:    sessionStore,
+		Harness:         harness,
+		MaxSessionDepth: 3,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "root", session.Metadata{
+		RunID: run.ID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession root: %v", err)
+	}
+
+	orch.ensureRunState(run.ID)
+
+	var childWG sync.WaitGroup
+
+	// 1. Root starts child (depth 1) - allowed
+	child1Name, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, root, "task 1")
+	if err != nil {
+		t.Fatalf("startChildSession (child1): %v", err)
+	}
+	child1, err := harness.LoadSession(ctx, sessionStore, child1Name)
+	if err != nil {
+		t.Fatalf("LoadSession(child1): %v", err)
+	}
+	if child1.Metadata.Depth() != 1 {
+		t.Errorf("child1 depth = %d, want 1", child1.Metadata.Depth())
+	}
+
+	// 2. Child1 starts child2 (depth 2) - allowed
+	child2Name, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, child1, "task 2")
+	if err != nil {
+		t.Fatalf("startChildSession (child2): %v", err)
+	}
+	child2, err := harness.LoadSession(ctx, sessionStore, child2Name)
+	if err != nil {
+		t.Fatalf("LoadSession(child2): %v", err)
+	}
+	if child2.Metadata.Depth() != 2 {
+		t.Errorf("child2 depth = %d, want 2", child2.Metadata.Depth())
+	}
+
+	// 3. Child2 starts child3 (depth 3) - allowed
+	child3Name, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, child2, "task 3")
+	if err != nil {
+		t.Fatalf("startChildSession (child3): %v", err)
+	}
+	child3, err := harness.LoadSession(ctx, sessionStore, child3Name)
+	if err != nil {
+		t.Fatalf("LoadSession(child3): %v", err)
+	}
+	if child3.Metadata.Depth() != 3 {
+		t.Errorf("child3 depth = %d, want 3", child3.Metadata.Depth())
+	}
+
+	// 4. Child3 (depth 3) attempts to start child4 - exceeds limit 3, fails and starts nothing
+	child4Name, err := orch.startChildSession(ctx, ctx, &childWG, repo, run, child3, "task 4")
+	if err == nil {
+		t.Fatalf("expected error for exceeding depth limit, got childName=%q", child4Name)
+	}
+	if !strings.Contains(err.Error(), "depth limit of 3 reached") {
+		t.Errorf("err = %q, want containing 'depth limit of 3 reached'", err.Error())
+	}
+
+	// Verify custom depth limit of 1
+	orch1 := newTestOrchestrator(t, OrchestratorOptions{
+		Store:           store,
+		SessionStore:    sessionStore,
+		Harness:         harness,
+		MaxSessionDepth: 1,
+	})
+	orch1.ensureRunState(run.ID)
+	var childWG1 sync.WaitGroup
+	cName, err := orch1.startChildSession(ctx, ctx, &childWG1, repo, run, root, "subtask")
+	if err != nil {
+		t.Fatalf("orch1 start child: %v", err)
+	}
+	c1, _ := harness.LoadSession(ctx, sessionStore, cName)
+	_, err = orch1.startChildSession(ctx, ctx, &childWG1, repo, run, c1, "subsubtask")
+	if err == nil || !strings.Contains(err.Error(), "depth limit of 1 reached") {
+		t.Errorf("expected depth limit 1 error, got %v", err)
+	}
+}
+
+func TestOrchestrator_StartSession_NoRun(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	sessWithoutRun, err := harness.NewSession(ctx, sessionStore, "norunsess", session.Metadata{})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	var childWG sync.WaitGroup
+	_, err = orch.startChildSession(ctx, ctx, &childWG, nil, nil, sessWithoutRun, "do something")
+	if err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
+		t.Errorf("expected 'session belongs to no run' error, got %v", err)
+	}
+}
+
+func TestOrchestrator_StartSession_NoLLMClient(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+	_ = store.PutRepo(ctx, repo)
+	run := &state.Run{ID: "run-no-llm", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-no-llm"}
+	_ = store.PutRun(ctx, run)
+
+	harness, _, _ := setupTestHarness(t, nil)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootnollm", session.Metadata{
+		RunID: run.ID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	var childWG sync.WaitGroup
+	_, err = orch.startChildSession(ctx, ctx, &childWG, repo, run, root, "task")
+	if err == nil || !strings.Contains(err.Error(), "no LLM client configured") {
+		t.Errorf("expected 'no LLM client configured' error, got %v", err)
+	}
+}
+
+func TestOrchestrator_StartSession_NoTurnBudget(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+	_ = store.PutRepo(ctx, repo)
+	run := &state.Run{ID: "run-no-budget", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-no-budget"}
+	_ = store.PutRun(ctx, run)
+
+	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootnobudget", session.Metadata{
+		RunID: run.ID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// runStates does not have runID, so turnBudget returns nil
+	var childWG sync.WaitGroup
+	_, err = orch.startChildSession(ctx, ctx, &childWG, repo, run, root, "task")
+	if err == nil || !strings.Contains(err.Error(), "run has no turn budget") {
+		t.Errorf("expected 'run has no turn budget' error, got %v", err)
+	}
+}
+
+func TestOrchestrator_StartSession_RunBounds_ChildStopsWhenRunEnds(t *testing.T) {
+	ctx := t.Context()
+	blockingLLM := newMidTurnBlockingLLM()
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, "run-child-bound", "sb-bound", nil, blockingLLM)
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        time.Now,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootbound", session.Metadata{
+		RunID: run.ID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// Ensure runState exists with turn budget
+	orch.ensureRunState(run.ID)
+
+	workerCtx, cancelWorker := context.WithCancel(ctx)
+	childCtx, cancelChildren := context.WithCancel(workerCtx)
+	defer cancelChildren()
+	var childWG sync.WaitGroup
+
+	// Start child session with blocking LLM
+	_, err = orch.startChildSession(ctx, childCtx, &childWG, repo, run, root, "blocking work")
+	if err != nil {
+		t.Fatalf("startChildSession: %v", err)
+	}
+
+	select {
+	case <-blockingLLM.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for child worker to start LLM call")
+	}
+
+	cancelWorker()
+
+	select {
+	case <-blockingLLM.cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for child worker to be cancelled after cancelWorker")
+	}
+
+	cancelChildren()
+	childWG.Wait()
+}
+
+func TestOrchestrator_Working_ChildrenStopWhenTopLevelFinishes(t *testing.T) {
+	ctx := t.Context()
+	blockingLLM := newMidTurnBlockingLLM()
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, "run-child-topfinish", "sb-topfinish", nil, blockingLLM)
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        time.Now,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "roottopfinish", session.Metadata{
+		RunID: run.ID,
+		Repo:  repo.Key().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	orch.ensureRunState(run.ID)
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	var childWG sync.WaitGroup
+
+	_, err = orch.startChildSession(ctx, childCtx, &childWG, repo, run, root, "child task")
+	if err != nil {
+		t.Fatalf("startChildSession: %v", err)
+	}
+
+	select {
+	case <-blockingLLM.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for child to start")
+	}
+
+	cancelChildren()
+	childWG.Wait()
+
+	select {
+	case <-blockingLLM.cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for child to stop after top-level session finished work")
+	}
+}
+
+func TestOrchestratorOptions_Validate_MaxSessionDepth(t *testing.T) {
+	store := state.NewFileStore(t.TempDir())
+	harness, _, _ := setupTestHarness(t, nil)
+
+	for _, d := range []int{-2, -1, 0} {
+		opts := OrchestratorOptions{
+			Store:             store,
+			Harness:           harness,
+			MaxTurns:          30,
+			MaxConcurrentRuns: 4,
+			MaxSessionDepth:   d,
+		}
+		err := opts.Validate()
+		if err == nil || !strings.Contains(err.Error(), "MaxSessionDepth must be at least 1") {
+			t.Errorf("Validate with MaxSessionDepth=%d: got %v, want error containing 'MaxSessionDepth must be at least 1'", d, err)
+		}
+	}
 }

@@ -1078,6 +1078,38 @@ func TestRunSessionsTreeAndSideBySideRuns(t *testing.T) {
 	if len(unknown) != 0 {
 		t.Errorf("expected 0 sessions for nonexistent run, got %d", len(unknown))
 	}
+
+	// 8. Verify SendMessage and StartTurn are refused for child sessions, but permitted for a run's top-level session.
+	if err := srv.StartTurn(ctx, child1a, "test message"); err == nil || !strings.Contains(err.Error(), "cannot post messages to child sessions") {
+		t.Errorf("StartTurn on child1a: got %v, want error containing 'cannot post messages to child sessions'", err)
+	}
+
+	mockStream := &mockSendMessageServer{ctx: ctx}
+	err = srv.SendMessage(&sessionv1.SendMessageRequest{
+		Name: child1a,
+		Text: "test message",
+	}, mockStream)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "cannot post messages to child sessions") {
+		t.Errorf("SendMessage on child1a: got %v, want FailedPrecondition with 'cannot post messages to child sessions'", err)
+	}
+
+	// Top-level session in a run (parent1, which has Parent == "" and RunID != "") allows StartTurn.
+	if err := srv.StartTurn(ctx, parent1, "message to run top-level session"); err != nil {
+		t.Errorf("StartTurn on parent1: got %v, want nil", err)
+	}
+}
+
+type mockSendMessageServer struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (m *mockSendMessageServer) Context() context.Context {
+	return m.ctx
+}
+
+func (m *mockSendMessageServer) Send(*sessionv1.SessionEvent) error {
+	return nil
 }
 
 func TestCreateSessionAndSessionDepth_Errors(t *testing.T) {

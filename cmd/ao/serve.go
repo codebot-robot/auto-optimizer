@@ -165,6 +165,15 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 			if opts.orchestrator.MaxTurns <= 0 {
 				return fmt.Errorf("max-turns must be positive, got %d", opts.orchestrator.MaxTurns)
 			}
+			if envMaxDepth := os.Getenv("AO_MAX_SESSION_DEPTH"); envMaxDepth != "" {
+				v, err := strconv.Atoi(envMaxDepth)
+				if err != nil {
+					return fmt.Errorf("parsing AO_MAX_SESSION_DEPTH: %w", err)
+				}
+				if !cmd.Flags().Changed("max-session-depth") {
+					opts.orchestrator.MaxSessionDepth = v
+				}
+			}
 			if err := opts.git.Validate(); err != nil {
 				return fmt.Errorf("invalid --git-author: %w", err)
 			}

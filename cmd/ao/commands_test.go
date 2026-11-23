@@ -112,6 +112,12 @@ func TestServeFlags(t *testing.T) {
 	if cmd.Flag("max-turns") == nil {
 		t.Error("expected --max-turns flag on ao serve")
 	}
+	maxSessionDepthFlag := cmd.Flag("max-session-depth")
+	if maxSessionDepthFlag == nil {
+		t.Error("expected --max-session-depth flag on ao serve")
+	} else if maxSessionDepthFlag.DefValue != "3" {
+		t.Errorf("expected default max-session-depth to be 3, got %s", maxSessionDepthFlag.DefValue)
+	}
 	flag := cmd.Flag("max-concurrent-runs")
 	if flag == nil {
 		t.Error("expected --max-concurrent-runs flag on ao serve")
@@ -436,6 +442,30 @@ func TestServeMaxTurnsValidation(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "parsing AO_MAX_TURNS") {
 			t.Errorf("error = %q, want containing 'parsing AO_MAX_TURNS'", err.Error())
+		}
+	})
+
+	t.Run("flag overrides AO_MAX_SESSION_DEPTH", func(t *testing.T) {
+		t.Setenv("AO_MAX_SESSION_DEPTH", "1")
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{"--max-session-depth", "5"}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+	})
+
+	t.Run("execute context aborts before run on invalid AO_MAX_SESSION_DEPTH", func(t *testing.T) {
+		t.Setenv("AO_MAX_SESSION_DEPTH", "invalid")
+		cmd := newServeCommand()
+		cmd.SetArgs([]string{})
+		err := cmd.ExecuteContext(t.Context())
+		if err == nil {
+			t.Fatal("expected error from ExecuteContext, got nil")
+		}
+		if !strings.Contains(err.Error(), "parsing AO_MAX_SESSION_DEPTH") {
+			t.Errorf("error = %q, want containing 'parsing AO_MAX_SESSION_DEPTH'", err.Error())
 		}
 	})
 }

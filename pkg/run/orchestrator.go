@@ -16,6 +16,7 @@ package run
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -73,6 +74,9 @@ const (
 	// DefaultMaxConcurrentRuns is the default maximum number of concurrent runs.
 	DefaultMaxConcurrentRuns = 4
 
+	// DefaultMaxSessionDepth is the default maximum depth of child sessions in a session tree.
+	DefaultMaxSessionDepth = 3
+
 	// DefaultReadyTimeout is the default duration to wait for a Sandbox to become ready.
 	DefaultReadyTimeout = 3 * time.Minute
 
@@ -111,6 +115,7 @@ type OrchestratorOptions struct {
 	Clock             func() time.Time
 	MaxTurns          int
 	MaxConcurrentRuns int
+	MaxSessionDepth   int
 
 	// GitAuthor is the identity configured as git user.name and user.email in
 	// each run's sandbox, as `Name <email>`.
@@ -171,6 +176,9 @@ func (o *OrchestratorOptions) InitDefaults() {
 	if o.MaxConcurrentRuns == 0 {
 		o.MaxConcurrentRuns = DefaultMaxConcurrentRuns
 	}
+	if o.MaxSessionDepth == 0 {
+		o.MaxSessionDepth = DefaultMaxSessionDepth
+	}
 	if o.ReadyTimeout == 0 {
 		o.ReadyTimeout = DefaultReadyTimeout
 	}
@@ -193,6 +201,7 @@ func (o *OrchestratorOptions) AddFlags(fs *pflag.FlagSet) {
 	o.InitDefaults()
 	fs.IntVar(&o.MaxTurns, "max-turns", o.MaxTurns, "Maximum number of session turns before ending a run")
 	fs.IntVar(&o.MaxConcurrentRuns, "max-concurrent-runs", o.MaxConcurrentRuns, "Maximum number of concurrent runs reconciled")
+	fs.IntVar(&o.MaxSessionDepth, "max-session-depth", o.MaxSessionDepth, "Maximum depth of child sessions in the session tree")
 	fs.StringVar(&o.PublicURL, "public-url", o.PublicURL, "Public base URL of this server, used for links in pull request bodies, for example https://ao.example.com")
 	fs.DurationVar(&o.ReadyTimeout, "ready-timeout", o.ReadyTimeout, "Maximum duration to wait for a sandbox to become ready")
 	fs.DurationVar(&o.VerifyTimeout, "verify-timeout", o.VerifyTimeout, "Maximum duration for running a goal's verify command")
@@ -217,6 +226,9 @@ func (o *OrchestratorOptions) Validate() error {
 	}
 	if o.MaxConcurrentRuns < 1 {
 		return errors.New("MaxConcurrentRuns must be at least 1")
+	}
+	if o.MaxSessionDepth < 1 {
+		return errors.New("MaxSessionDepth must be at least 1")
 	}
 	if o.ReadyTimeout <= 0 {
 		return errors.New("ReadyTimeout must be positive")
@@ -257,6 +269,7 @@ type Orchestrator struct {
 	clock              func() time.Time
 	maxTurns           int
 	maxConcurrentRuns  int
+	maxSessionDepth    int
 	gitAuthor          string
 	publicURL          string
 	readyTimeout       time.Duration
@@ -352,6 +365,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		clock:                 opts.Clock,
 		maxTurns:              opts.MaxTurns,
 		maxConcurrentRuns:     opts.MaxConcurrentRuns,
+		maxSessionDepth:       opts.MaxSessionDepth,
 		gitAuthor:             opts.GitAuthor,
 		publicURL:             strings.TrimRight(opts.PublicURL, "/"),
 		readyTimeout:          opts.ReadyTimeout,
@@ -1831,6 +1845,10 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	var childWG sync.WaitGroup
+
 	events := &orchestratorTurnEvents{
 		orch:    o,
 		repoKey: repo.Key(),
@@ -1841,8 +1859,11 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		Repository: repo.URL,
 		Branch:     run.BranchName(),
 	})
+	startSessionTool := ao.NewStartSessionTool(func(toolCtx context.Context, task string) (string, error) {
+		return o.startChildSession(toolCtx, childCtx, &childWG, repo, run, sess, task)
+	})
 	budget := o.turnBudget(run.ID)
-	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool)
+	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool)
 
 	var turnErr error
 	if hasUserMessage {
@@ -1850,6 +1871,9 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	} else {
 		turnErr = harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
 	}
+
+	cancelChildren()
+	childWG.Wait()
 
 	return turnOutcome{
 		Err:      turnErr,
@@ -2386,6 +2410,102 @@ func generateSessionID(runID string) string {
 		id = id[:40]
 	}
 	return id
+}
+
+// generateChildSessionName derives a child session name from parent, ensuring
+// the result is at most 40 alphanumeric characters.
+func (o *Orchestrator) generateChildSessionName(parent string) (string, error) {
+	prefix := parent
+	if len(prefix) > 28 {
+		prefix = prefix[:28]
+	}
+	b := make([]byte, 4)
+	if _, err := cryptorand.Read(b); err != nil {
+		return "", fmt.Errorf("generating random session ID suffix: %w", err)
+	}
+	return fmt.Sprintf("%sc%x", prefix, b), nil
+}
+
+// startChildSession creates and starts a child session for parentSession within run.
+func (o *Orchestrator) startChildSession(ctx, childCtx context.Context, childWG *sync.WaitGroup, repo *state.Repo, run *state.Run, parentSession *session.Session, task string) (string, error) {
+	if parentSession.Metadata.RunID == "" {
+		return "", errors.New("cannot call start_session: session belongs to no run")
+	}
+
+	if o.harness.LLMClient() == nil {
+		return "", errors.New("cannot call start_session: no LLM client configured")
+	}
+
+	budget := o.turnBudget(run.ID)
+	if budget == nil {
+		return "", errors.New("cannot call start_session: run has no turn budget")
+	}
+
+	if parentSession.Metadata.Depth() >= o.maxSessionDepth {
+		return "", fmt.Errorf("depth limit of %d reached; cannot start child session", o.maxSessionDepth)
+	}
+
+	childName, err := o.generateChildSessionName(parentSession.Name)
+	if err != nil {
+		return "", err
+	}
+
+	childMeta := parentSession.Metadata.Child(parentSession.Name)
+	childMeta.Toolset = parentSession.Metadata.Toolset
+	childMeta.CreatedAt = o.clock().UTC()
+	childSess, err := o.harness.NewSession(ctx, o.sessionStore, childName, childMeta)
+	if err != nil {
+		return "", fmt.Errorf("creating child session: %w", err)
+	}
+
+	childSess.SetSandboxOwner(parentSession.SandboxOwner())
+
+	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+		Time:    o.clock().UTC(),
+		Phase:   state.PhaseWorking,
+		Kind:    "session_started",
+		Message: fmt.Sprintf("Started session %s", childName),
+		Data: map[string]any{
+			"session_id": childName,
+			"parent":     parentSession.Name,
+		},
+	}); err != nil {
+		scoped.Log(ctx).Error(err, "failed to append session_started event", "run", run.ID, "session", childName)
+	}
+
+	childStartTool := ao.NewStartSessionTool(func(toolCtx context.Context, subTask string) (string, error) {
+		return o.startChildSession(toolCtx, childCtx, childWG, repo, run, childSess, subTask)
+	})
+	childHarness := o.harness.WithTurnBudget(budget).WithExtraTools(childStartTool, ao.NewFinishTool())
+
+	childWG.Add(1)
+	o.workerWG.Add(1)
+	go func() {
+		defer o.workerWG.Done()
+		defer childWG.Done()
+
+		if len(childSess.Messages()) == 0 {
+			sysPrompt := buildSystemPrompt(o.harness.RunOptions().SystemPrompt, repo, run, task)
+			if err := childSess.AddMessages(childCtx, llm.Message{
+				Role:    "system",
+				Content: &sysPrompt,
+			}); err != nil {
+				scoped.Log(childCtx).Error(err, "failed to seed system prompt", "session", childName)
+				return
+			}
+		}
+
+		events := &orchestratorTurnEvents{
+			orch:    o,
+			repoKey: repo.Key(),
+			runID:   run.ID,
+		}
+		if err := childHarness.RunTurn(childCtx, childSess, task, events); err != nil {
+			scoped.Log(childCtx).Info("child session finished with error", "session", childName, "error", err)
+		}
+	}()
+
+	return childName, nil
 }
 
 type orchestratorTurnEvents struct {
