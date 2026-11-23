@@ -28,6 +28,8 @@ import (
 func TestHeroRun_JSONRoundTrip(t *testing.T) {
 	now := metav1.NewTime(time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
 	later := metav1.NewTime(time.Date(2026, 11, 5, 12, 30, 0, 0, time.UTC))
+	baselineVal := 100.0
+	candidateVal := 80.0
 
 	original := &herorunv1alpha1.HeroRun{
 		TypeMeta: metav1.TypeMeta{
@@ -43,9 +45,33 @@ func TestHeroRun_JSONRoundTrip(t *testing.T) {
 			Goal:       "optimize-latency",
 			RunID:      "20261105T120000Z-abcd",
 			BaseCommit: "0123456789abcdef0123456789abcdef01234567",
+			GoalDefinition: &herorunv1alpha1.GoalDefinition{
+				Body:   "# Optimize latency\nMake things faster.",
+				Hash:   "hash123",
+				Verify: "go test ./...",
+				Metric: &herorunv1alpha1.MetricSpec{
+					Command:        "go test -bench=.",
+					Direction:      "lower",
+					Unit:           "ns/op",
+					MinImprovement: "5%",
+					Runs:           3,
+					Timeout:        "30s",
+				},
+				Budget: &herorunv1alpha1.BudgetSpec{
+					MaxDuration: "2h",
+					MaxCostUSD:  5.0,
+				},
+				Schedule: "on-change",
+				Agents:   []string{"coder"},
+			},
+			Deadline: &later,
 		},
 		Status: herorunv1alpha1.HeroRunStatus{
 			Phase: "Working",
+			PhaseTimestamps: map[string]metav1.Time{
+				"Pending": now,
+				"Working": now,
+			},
 			Conditions: []metav1.Condition{
 				{
 					Type:               "Ready",
@@ -55,12 +81,22 @@ func TestHeroRun_JSONRoundTrip(t *testing.T) {
 					Message:            "run session is in progress",
 				},
 			},
-			SandboxName:    "run-sandbox-abcd",
-			Branch:         "ao/optimize-latency/20261105T120000Z-abcd",
-			PullRequestURL: "https://github.com/gke-labs/test-repo/pull/1",
-			StartedAt:      &now,
-			FinishedAt:     &later,
-			ObservedAt:     &now,
+			ActiveOperation:    "turn-1",
+			SandboxName:        "run-sandbox-abcd",
+			WorkspaceClaimName: "run-sandbox-abcd",
+			SessionID:          "sess-1",
+			Branch:             "ao/optimize-latency/20261105T120000Z-abcd",
+			PRTitle:            "optimize latency",
+			PRBody:             "body text",
+			PullRequestURL:     "https://github.com/gke-labs/test-repo/pull/1",
+			Turns:              3,
+			Baseline:           &baselineVal,
+			Candidate:          &candidateVal,
+			CostUSD:            0.50,
+			Summary:            "working on optimization",
+			StartedAt:          &now,
+			FinishedAt:         &later,
+			ObservedAt:         &now,
 		},
 	}
 
@@ -81,6 +117,7 @@ func TestHeroRun_JSONRoundTrip(t *testing.T) {
 
 func TestHeroRun_DeepCopy(t *testing.T) {
 	now := metav1.NewTime(time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
+	baselineVal := 100.0
 	original := &herorunv1alpha1.HeroRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-run",
@@ -91,9 +128,26 @@ func TestHeroRun_DeepCopy(t *testing.T) {
 			Goal:       "optimize-latency",
 			RunID:      "20261105T120000Z-abcd",
 			BaseCommit: "0123456789abcdef0123456789abcdef01234567",
+			GoalDefinition: &herorunv1alpha1.GoalDefinition{
+				Body: "# Optimize latency",
+				Hash: "hash123",
+				Metric: &herorunv1alpha1.MetricSpec{
+					Command:   "go test",
+					Direction: "lower",
+				},
+				Budget: &herorunv1alpha1.BudgetSpec{
+					MaxDuration: "1h",
+					MaxCostUSD:  10.0,
+				},
+				Agents: []string{"coder"},
+			},
+			Deadline: &now,
 		},
 		Status: herorunv1alpha1.HeroRunStatus{
 			Phase: "Working",
+			PhaseTimestamps: map[string]metav1.Time{
+				"Pending": now,
+			},
 			Conditions: []metav1.Condition{
 				{
 					Type:               "Ready",
@@ -102,6 +156,7 @@ func TestHeroRun_DeepCopy(t *testing.T) {
 					Reason:             "Started",
 				},
 			},
+			Baseline:   &baselineVal,
 			ObservedAt: &now,
 		},
 	}
@@ -113,11 +168,28 @@ func TestHeroRun_DeepCopy(t *testing.T) {
 
 	// Mutate the copy and verify independence
 	copied.Spec.Goal = "new-goal"
+	copied.Spec.GoalDefinition.Body = "mutated body"
+	copied.Spec.GoalDefinition.Metric.Command = "new command"
+	copied.Spec.GoalDefinition.Agents[0] = "mutated coder"
 	copied.Status.Conditions[0].Reason = "Updated"
+	*copied.Status.Baseline = 50.0
+
 	if original.Spec.Goal == copied.Spec.Goal {
 		t.Errorf("mutating copy modified original Spec.Goal")
 	}
+	if original.Spec.GoalDefinition.Body == copied.Spec.GoalDefinition.Body {
+		t.Errorf("mutating copy modified original Spec.GoalDefinition.Body")
+	}
+	if original.Spec.GoalDefinition.Metric.Command == copied.Spec.GoalDefinition.Metric.Command {
+		t.Errorf("mutating copy modified original Spec.GoalDefinition.Metric.Command")
+	}
+	if original.Spec.GoalDefinition.Agents[0] == copied.Spec.GoalDefinition.Agents[0] {
+		t.Errorf("mutating copy modified original Spec.GoalDefinition.Agents[0]")
+	}
 	if original.Status.Conditions[0].Reason == copied.Status.Conditions[0].Reason {
 		t.Errorf("mutating copy modified original Status.Conditions")
+	}
+	if *original.Status.Baseline == *copied.Status.Baseline {
+		t.Errorf("mutating copy modified original Status.Baseline")
 	}
 }
