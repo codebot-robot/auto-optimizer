@@ -297,6 +297,7 @@ var ErrRunNotWorking = errors.New("run is no longer working")
 type runState struct {
 	sandboxOwner *session.SandboxOwner
 	turnBudget   *session.TurnBudget
+	children     *childGroup
 }
 
 // turnWorkerHandle tracks a live in-process turn worker goroutine.
@@ -1624,6 +1625,12 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	childCtx, cancelChildren := context.WithCancel(ctx)
 	defer cancelChildren()
 	children := newChildGroup(childCtx)
+	children.setRunning(sessionID, true)
+	o.setRunChildren(run.ID, children)
+	defer func() {
+		children.setRunning(sessionID, false)
+		o.setRunChildren(run.ID, nil)
+	}()
 
 	events := &orchestratorTurnEvents{
 		orch:    o,
@@ -2430,6 +2437,44 @@ func (g *childGroup) isRunning(name string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.running[name]
+}
+
+func (g *childGroup) runningSnapshot() map[string]bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.running) == 0 {
+		return nil
+	}
+	snap := make(map[string]bool, len(g.running))
+	for name, active := range g.running {
+		if active {
+			snap[name] = true
+		}
+	}
+	return snap
+}
+
+func (o *Orchestrator) setRunChildren(runID string, children *childGroup) {
+	o.runStatesMu.Lock()
+	defer o.runStatesMu.Unlock()
+	if rs := o.runStates[runID]; rs != nil {
+		rs.children = children
+	}
+}
+
+// RunningSessions returns the names of sessions currently running for runID.
+func (o *Orchestrator) RunningSessions(runID string) map[string]bool {
+	o.runStatesMu.Lock()
+	rs := o.runStates[runID]
+	var children *childGroup
+	if rs != nil {
+		children = rs.children
+	}
+	o.runStatesMu.Unlock()
+	if children == nil {
+		return nil
+	}
+	return children.runningSnapshot()
 }
 
 type orchestratorTurnEvents struct {

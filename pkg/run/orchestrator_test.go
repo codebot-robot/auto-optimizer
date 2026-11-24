@@ -11325,3 +11325,66 @@ func TestOrchestrator_ActiveOperation_SaveFailureDoesNotLaunchWorker(t *testing.
 		t.Error("expected no live worker handle to remain after failed startTurn save")
 	}
 }
+
+func TestOrchestrator_RunningSessions(t *testing.T) {
+	ctx := t.Context()
+	blockingLLM := newMidTurnBlockingLLM()
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, "run-live-status", "sb-live-status", nil, blockingLLM)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		KubeClient:   fakeClient,
+	})
+	orch.ensureRunState(run.ID)
+
+	if got := orch.RunningSessions(run.ID); len(got) != 0 {
+		t.Fatalf("RunningSessions before turn = %v, want empty", got)
+	}
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootlive", session.Metadata{
+		RunID:   run.ID,
+		Repo:    repo.Key().String(),
+		Toolset: "basic",
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	run.SessionID = root.Name
+
+	workerCtx, cancelWorker := context.WithCancel(ctx)
+	defer cancelWorker()
+	children := newChildGroup(workerCtx)
+	children.setRunning(root.Name, true)
+	orch.setRunChildren(run.ID, children)
+
+	childName, err := orch.startChildSession(ctx, children, repo, run, root, "blocking task")
+	if err != nil {
+		t.Fatalf("startChildSession: %v", err)
+	}
+
+	select {
+	case <-blockingLLM.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for child worker to start LLM call")
+	}
+
+	running := orch.RunningSessions(run.ID)
+	if !running[root.Name] || !running[childName] {
+		t.Errorf("RunningSessions = %v, want both %q and %q running", running, root.Name, childName)
+	}
+
+	close(blockingLLM.release)
+	cancelWorker()
+	children.wg.Wait()
+
+	runningAfterChild := orch.RunningSessions(run.ID)
+	if !runningAfterChild[root.Name] || runningAfterChild[childName] {
+		t.Errorf("RunningSessions after child stop = %v, want only %q running", runningAfterChild, root.Name)
+	}
+
+	orch.setRunChildren(run.ID, nil)
+	if got := orch.RunningSessions(run.ID); len(got) != 0 {
+		t.Errorf("RunningSessions after clearing children = %v, want empty", got)
+	}
+}
