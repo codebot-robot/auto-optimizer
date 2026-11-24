@@ -1,0 +1,117 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: sessionmessages.auto-optimizer.labs.gke.io
+spec:
+  group: auto-optimizer.labs.gke.io
+  names:
+    kind: SessionMessage
+    listKind: SessionMessageList
+    plural: sessionmessages
+    shortNames:
+    - smsg
+    singular: sessionmessage
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.sessionName
+      name: Session
+      type: string
+    - jsonPath: .spec.runID
+      name: Run
+      type: string
+    - jsonPath: .spec.from
+      name: From
+      type: string
+    - jsonPath: .status.deliveredAt
+      name: Delivered
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          SessionMessage is the Schema for the sessionmessages API.
+          Each SessionMessage represents an immutable message addressed to a Session.
+          Callers label each message with Spec.Labels() and set a controller owner reference
+          pointing to the target Session so the Session controller wakes via Owns(&SessionMessage{})
+          and Kubernetes garbage collection deletes messages with their session.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              SessionMessageSpec defines the immutable payload of a message sent to a Session.
+              Callers write Spec once when creating the resource, and the Session controller never mutates it.
+            properties:
+              from:
+                description: |-
+                  From identifies the message sender, such as another Session name or a user.
+                  Empty when the sender is an anonymous user.
+                type: string
+              runID:
+                description: RunID is the unique identifier of the HeroRun the target
+                  session belongs to, if any.
+                type: string
+              sessionName:
+                description: SessionName is the name of the target Session resource
+                  in the same namespace.
+                type: string
+              text:
+                description: Text is the message content to deliver to the target
+                  session.
+                type: string
+            required:
+            - sessionName
+            - text
+            type: object
+          status:
+            description: SessionMessageStatus records the observed delivery state
+              of a SessionMessage.
+            properties:
+              deliveredAt:
+                description: |-
+                  DeliveredAt is the time when the Session controller appended this message
+                  to the target session transcript.
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
