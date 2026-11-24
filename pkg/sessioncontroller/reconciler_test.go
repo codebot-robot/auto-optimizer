@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	crconfig "sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -52,6 +53,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
+	"github.com/gke-labs/auto-optimizer/pkg/toolsets/ao"
 )
 
 type fakeSandbox struct {
@@ -788,7 +790,7 @@ func TestReconcile_SandboxOwnerHookAndStandaloneDefault(t *testing.T) {
 		})
 
 		var seenSandboxes []string
-		for _, name := range []string{"runroot", "runchild"} {
+		for _, name := range []string{"runchild", "runroot"} {
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: name}}
 			if _, err := env.reconciler.Reconcile(t.Context(), req); err != nil {
 				t.Fatalf("Reconcile(%s): %v", name, err)
@@ -808,8 +810,8 @@ func TestReconcile_SandboxOwnerHookAndStandaloneDefault(t *testing.T) {
 			}
 		}
 
-		if !slices.Equal(hookSessions, []string{"runroot", "runchild"}) {
-			t.Errorf("SandboxOwnerFor called for %v, want [runroot runchild]", hookSessions)
+		if !slices.Equal(hookSessions, []string{"runchild", "runroot"}) {
+			t.Errorf("SandboxOwnerFor called for %v, want [runchild runroot]", hookSessions)
 		}
 		if prepareCalls != 1 {
 			t.Errorf("prepareCalls = %d, want 1 (shared across root and child)", prepareCalls)
@@ -1869,13 +1871,665 @@ func TestReconcile_SendMessage(t *testing.T) {
 			t.Errorf("sendMessage to Waiting peer failed: %v", err)
 		}
 
-		// Standalone session must not advertise send_message tool.
+		// Standalone session must not advertise run-only tools.
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: standalone.Name}}
 		if _, err := env.reconciler.Reconcile(t.Context(), req); err != nil {
 			t.Fatalf("Reconcile standalone: %v", err)
 		}
-		if slices.Contains(standaloneTools, "send_message") {
-			t.Errorf("standalone session should not expose send_message tool, got tools: %v", standaloneTools)
+		for _, forbidden := range []string{"send_message", "start_session", "list_sessions", "wait"} {
+			if slices.Contains(standaloneTools, forbidden) {
+				t.Errorf("standalone session should not expose %s tool, got tools: %v", forbidden, standaloneTools)
+			}
+		}
+	})
+}
+
+func TestReconcile_StartSessionAndDepthLimit(t *testing.T) {
+	t.Run("start_session creates owned child with AllowPullRequest false and records event", func(t *testing.T) {
+		const runID = "20261124T120000Z-child1"
+		const repoURL = "https://github.com/gke-labs/test-repo"
+		stateStore := state.NewFileStore(t.TempDir())
+		deadline := metav1.NewTime(time.Date(2026, 11, 24, 13, 0, 0, 0, time.UTC))
+
+		root := pendingSession("rootstart", herorunv1alpha1.SessionSpec{
+			RunID:              runID,
+			HeroRunName:        "run-child1",
+			Repository:         repoURL,
+			Branch:             "ao/goal/child1",
+			Toolset:            "basic",
+			Model:              "custom-model",
+			SystemPrompt:       "Be fast.",
+			InitialPrompt:      "Delegate profiling.",
+			SandboxName:        "sb-child1",
+			WorkspaceClaimName: "ws-child1",
+			MaxTurns:           10,
+			MaxDepth:           2,
+			Deadline:           &deadline,
+			AllowPullRequest:   true,
+		})
+		root.UID = "root-uid-1"
+
+		var startReply string
+		var childTools []string
+		fakeLLM := &scriptedLLM{handlers: []func(context.Context, llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error){
+			toolCallReply("call-start-1", "start_session", map[string]any{"task": "profile parser"}),
+			func(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+				for _, m := range req.Messages {
+					if m.Role == "tool" && m.ToolCallID == "call-start-1" && m.Content != nil {
+						startReply = *m.Content
+					}
+				}
+				// Wait for the child to finish before root terminates so cascading cancel does not cancel it.
+				return toolCallReply("call-wait-1", "wait", map[string]any{"timeout": "5s"})(ctx, req)
+			},
+			textReply("Root finished after child."),
+		}}
+
+		childLLM := &scriptedLLM{handlers: []func(context.Context, llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error){
+			func(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+				for _, tool := range req.Tools {
+					childTools = append(childTools, tool.Function.Name)
+				}
+				return textReply("Profiled parser.")(ctx, req)
+			},
+		}}
+
+		var mu sync.Mutex
+		childStarted := make(chan string, 1)
+		env := newTestEnv(t, fakeLLM, []client.Object{root}, func(o *Options) {
+			o.StateStore = stateStore
+			o.HarnessFactory = func(_ string) (*session.Harness, error) {
+				mu.Lock()
+				var clientLLM llm.ChatClient = fakeLLM
+				select {
+				case <-childStarted:
+					clientLLM = childLLM
+				default:
+				}
+				mu.Unlock()
+				reg := tools.NewRegistry()
+				reg.Add(&tools.RunCommand{})
+				var runOpts session.RunOptions
+				runOpts.InitDefaults()
+				runOpts.ModelName = "default-model"
+				runOpts.SystemPrompt = "default system prompt"
+				h := session.NewHarness(clientLLM, nil, reg, runOpts)
+				h.SetSandboxOverride(&fakeSandbox{})
+				return h, nil
+			}
+		})
+
+		rootDone := make(chan error, 1)
+		go func() {
+			_, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+				NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: root.Name},
+			})
+			rootDone <- err
+		}()
+
+		// Wait until child Session is created by root's start_session call.
+		var child herorunv1alpha1.Session
+		deadlineWait := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadlineWait) {
+			var list herorunv1alpha1.SessionList
+			if err := env.client.List(t.Context(), &list, client.InNamespace("ao-sandboxes")); err == nil {
+				for i := range list.Items {
+					if list.Items[i].Spec.Parent == root.Name {
+						child = list.Items[i]
+						break
+					}
+				}
+			}
+			if child.Name != "" {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if child.Name == "" {
+			t.Fatal("timed out waiting for child Session to be created")
+		}
+
+		// Verify child Session metadata, owner ref, and spec.
+		if child.Labels[herorunv1alpha1.LabelRun] != runID {
+			t.Errorf("child label %s = %q, want %q", herorunv1alpha1.LabelRun, child.Labels[herorunv1alpha1.LabelRun], runID)
+		}
+		if len(child.OwnerReferences) != 1 {
+			t.Fatalf("child OwnerReferences = %+v, want 1 controller ref", child.OwnerReferences)
+		}
+		ref := child.OwnerReferences[0]
+		if ref.Kind != "Session" || ref.Name != root.Name || ref.UID != root.UID || ref.Controller == nil || !*ref.Controller {
+			t.Errorf("child OwnerReference = %+v, want controller ref to %s (%s)", ref, root.Name, root.UID)
+		}
+		if child.Spec.AllowPullRequest {
+			t.Errorf("child AllowPullRequest = true, want false")
+		}
+		if child.Spec.Parent != root.Name || !slices.Equal(child.Spec.Ancestors, []string{root.Name}) {
+			t.Errorf("child Parent=%q Ancestors=%v, want %q and [%s]", child.Spec.Parent, child.Spec.Ancestors, root.Name, root.Name)
+		}
+		if child.Spec.InitialPrompt != "profile parser" || child.Spec.RunID != runID || child.Spec.HeroRunName != "run-child1" || child.Spec.SandboxName != "sb-child1" || child.Spec.WorkspaceClaimName != "ws-child1" || child.Spec.MaxTurns != 10 || child.Spec.MaxDepth != 2 {
+			t.Errorf("child Spec = %+v, inherited fields mismatch", child.Spec)
+		}
+		if child.Spec.Deadline == nil || !child.Spec.Deadline.Equal(&deadline) {
+			t.Errorf("child Deadline = %v, want %v", child.Spec.Deadline, deadline)
+		}
+
+		// Wait until root finishes start_session and enters Waiting before reconciling child.
+		for time.Now().Before(deadlineWait) {
+			if env.getSession(t, root.Name).Status.Phase == herorunv1alpha1.SessionPhaseWaiting {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		// Verify session_started event was appended to StateStore.
+		repoKey, err := state.ParseRepoURL(repoURL)
+		if err != nil {
+			t.Fatalf("ParseRepoURL: %v", err)
+		}
+		events, err := stateStore.ReadEvents(t.Context(), repoKey, runID)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		foundEvent := false
+		for _, ev := range events {
+			if data, ok := ev.Data.(map[string]any); ok && ev.Kind == "session_started" && data["session_id"] == child.Name && data["parent"] == root.Name {
+				foundEvent = true
+			}
+		}
+		if !foundEvent {
+			t.Errorf("expected session_started event for child %s, got %+v", child.Name, events)
+		}
+
+		// Reconcile the child session; finishing it should wake root's wait.
+		childStarted <- child.Name
+		if _, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: child.Name},
+		}); err != nil {
+			t.Fatalf("Reconcile child: %v", err)
+		}
+		if err := <-rootDone; err != nil {
+			t.Fatalf("Reconcile root: %v", err)
+		}
+
+		if startReply != fmt.Sprintf("Started child session %s.", child.Name) {
+			t.Errorf("start_session tool reply = %q, want Started child session %s.", startReply, child.Name)
+		}
+		if slices.Contains(childTools, "open_pull_request") {
+			t.Errorf("child session must not expose open_pull_request tool, got %v", childTools)
+		}
+		for _, wantTool := range []string{"start_session", "list_sessions", "send_message", "wait", "finish"} {
+			if !slices.Contains(childTools, wantTool) {
+				t.Errorf("child session missing expected tool %q (got %v)", wantTool, childTools)
+			}
+		}
+	})
+
+	t.Run("enforces Spec.MaxDepth and DefaultMaxDepth", func(t *testing.T) {
+		const runID = "run-depth"
+		root := pendingSession("depthroot", herorunv1alpha1.SessionSpec{RunID: runID, MaxDepth: 2})
+		root.UID = "depthroot-uid"
+
+		env := newTestEnv(t, &scriptedLLM{}, []client.Object{root}, func(o *Options) {
+			o.DefaultMaxDepth = 1
+		})
+
+		// Depth 0 -> depth 1 succeeds.
+		c1Name, err := env.reconciler.startChildSession(t.Context(), root, "level 1")
+		if err != nil {
+			t.Fatalf("startChildSession level 1: %v", err)
+		}
+		c1 := env.getSession(t, c1Name)
+		c1.UID = "c1-uid"
+		if c1.Spec.Depth() != 1 {
+			t.Fatalf("c1 Depth = %d, want 1", c1.Spec.Depth())
+		}
+
+		// Depth 1 -> depth 2 succeeds (MaxDepth=2).
+		c2Name, err := env.reconciler.startChildSession(t.Context(), c1, "level 2")
+		if err != nil {
+			t.Fatalf("startChildSession level 2: %v", err)
+		}
+		c2 := env.getSession(t, c2Name)
+		if c2.Spec.Depth() != 2 || !slices.Equal(c2.Spec.Ancestors, []string{root.Name, c1.Name}) {
+			t.Fatalf("c2 Depth=%d Ancestors=%v, want 2 and [%s %s]", c2.Spec.Depth(), c2.Spec.Ancestors, root.Name, c1.Name)
+		}
+
+		// Depth 2 -> depth 3 is rejected by Spec.MaxDepth=2.
+		if _, err := env.reconciler.startChildSession(t.Context(), c2, "level 3"); err == nil || !strings.Contains(err.Error(), "depth limit of 2 reached") {
+			t.Errorf("startChildSession level 3 = %v, want depth limit of 2 reached", err)
+		}
+
+		// When Spec.MaxDepth == 0, DefaultMaxDepth (1) is enforced.
+		defaultChild := pendingSession("defchild", herorunv1alpha1.SessionSpec{
+			RunID:     runID,
+			Parent:    "defroot",
+			Ancestors: []string{"defroot"},
+		})
+		if _, err := env.reconciler.startChildSession(t.Context(), defaultChild, "too deep"); err == nil || !strings.Contains(err.Error(), "depth limit of 1 reached") {
+			t.Errorf("startChildSession with DefaultMaxDepth=1 = %v, want depth limit of 1 reached", err)
+		}
+
+		// Standalone session rejected.
+		standalone := pendingSession("solodepth", herorunv1alpha1.SessionSpec{})
+		if _, err := env.reconciler.startChildSession(t.Context(), standalone, "task"); err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
+			t.Errorf("startChildSession standalone = %v, want session belongs to no run", err)
+		}
+	})
+}
+
+func TestReconcile_ListSessions(t *testing.T) {
+	const runID = "run-list"
+	t0 := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+
+	root := pendingSession("listroot", herorunv1alpha1.SessionSpec{RunID: runID, InitialPrompt: "List peers."})
+	root.CreationTimestamp = metav1.NewTime(t0)
+
+	runningChild := pendingSession("childrunning", herorunv1alpha1.SessionSpec{RunID: runID, Parent: root.Name, Ancestors: []string{root.Name}})
+	runningChild.CreationTimestamp = metav1.NewTime(t0.Add(time.Second))
+	runningChild.Status.Phase = herorunv1alpha1.SessionPhaseRunning
+
+	waitingChild := pendingSession("childwaiting", herorunv1alpha1.SessionSpec{RunID: runID, Parent: root.Name, Ancestors: []string{root.Name}})
+	waitingChild.CreationTimestamp = metav1.NewTime(t0.Add(2 * time.Second))
+	waitingChild.Status.Phase = herorunv1alpha1.SessionPhaseWaiting
+
+	succeededChild := pendingSession("childdone", herorunv1alpha1.SessionSpec{RunID: runID, Parent: root.Name, Ancestors: []string{root.Name}})
+	succeededChild.CreationTimestamp = metav1.NewTime(t0.Add(3 * time.Second))
+	succeededChild.Status.Phase = herorunv1alpha1.SessionPhaseSucceeded
+
+	canceledGrandchild := pendingSession("grandcanceled", herorunv1alpha1.SessionSpec{RunID: runID, Parent: runningChild.Name, Ancestors: []string{root.Name, runningChild.Name}})
+	canceledGrandchild.CreationTimestamp = metav1.NewTime(t0.Add(4 * time.Second))
+	canceledGrandchild.Status.Phase = herorunv1alpha1.SessionPhaseCanceled
+
+	otherRun := pendingSession("other", herorunv1alpha1.SessionSpec{RunID: "other-run"})
+
+	var toolResult string
+	fakeLLM := &scriptedLLM{handlers: []func(context.Context, llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error){
+		toolCallReply("call-ls-1", "list_sessions", map[string]any{}),
+		func(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+			for _, m := range req.Messages {
+				if m.Role == "tool" && m.ToolCallID == "call-ls-1" && m.Content != nil {
+					toolResult = *m.Content
+				}
+			}
+			return textReply("Listed sessions.")(ctx, req)
+		},
+	}}
+
+	env := newTestEnv(t, fakeLLM, []client.Object{root, runningChild, waitingChild, succeededChild, canceledGrandchild, otherRun})
+	if _, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: root.Name},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got []ao.SessionInfo
+	if err := json.Unmarshal([]byte(toolResult), &got); err != nil {
+		t.Fatalf("unmarshal list_sessions output %q: %v", toolResult, err)
+	}
+	want := []ao.SessionInfo{
+		{Name: "listroot", Parent: "", State: "running"},
+		{Name: "childrunning", Parent: "listroot", State: "running"},
+		{Name: "childwaiting", Parent: "listroot", State: "running"},
+		{Name: "childdone", Parent: "listroot", State: "stopped"},
+		{Name: "grandcanceled", Parent: "childrunning", State: "stopped"},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("list_sessions = %+v, want %+v", got, want)
+	}
+}
+
+func TestReconcile_Wait(t *testing.T) {
+	t.Run("wakes on message without spending extra model turns and sets Waiting status", func(t *testing.T) {
+		const runID = "run-wait-msg"
+		root := pendingSession("waitroot", herorunv1alpha1.SessionSpec{RunID: runID, InitialPrompt: "Wait for peer."})
+		root.UID = "waitroot-uid"
+		peer := pendingSession("waitpeer", herorunv1alpha1.SessionSpec{RunID: runID})
+
+		var waitToolResult string
+		var sawDeliveredMsg bool
+		fakeLLM := &scriptedLLM{handlers: []func(context.Context, llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error){
+			toolCallReply("call-w-1", "wait", map[string]any{"timeout": "5s"}),
+			func(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+				for _, m := range req.Messages {
+					if m.Role == "tool" && m.ToolCallID == "call-w-1" && m.Content != nil {
+						waitToolResult = *m.Content
+					}
+					if m.Role == "user" && m.Content != nil && *m.Content == "Message from waitpeer: benchmark ready" {
+						sawDeliveredMsg = true
+					}
+				}
+				return textReply("Got benchmark.")(ctx, req)
+			},
+		}}
+
+		env := newTestEnv(t, fakeLLM, []client.Object{root, peer})
+		done := make(chan error, 1)
+		go func() {
+			_, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+				NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: root.Name},
+			})
+			done <- err
+		}()
+
+		// Wait until root enters Waiting phase with WaitingUntil populated.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			cur := env.getSession(t, root.Name)
+			if cur.Status.Phase == herorunv1alpha1.SessionPhaseWaiting {
+				if cur.Status.WaitingUntil == nil {
+					t.Errorf("expected WaitingUntil to be set while Waiting")
+				}
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if cur := env.getSession(t, root.Name); cur.Status.Phase != herorunv1alpha1.SessionPhaseWaiting {
+			t.Fatalf("root phase = %q, want Waiting", cur.Status.Phase)
+		}
+
+		// Sending a SessionMessage wakes waitroot immediately.
+		if err := env.reconciler.sendMessage(t.Context(), peer, root.Name, "benchmark ready"); err != nil {
+			t.Fatalf("sendMessage: %v", err)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("Reconcile root: %v", err)
+		}
+
+		if fakeLLM.calls != 2 {
+			t.Errorf("LLM calls = %d, want 2 (no extra turns spent while waiting)", fakeLLM.calls)
+		}
+		if waitToolResult != "A message arrived." {
+			t.Errorf("wait tool result = %q, want %q", waitToolResult, "A message arrived.")
+		}
+		if !sawDeliveredMsg {
+			t.Errorf("second model call did not receive delivered SessionMessage")
+		}
+		final := env.getSession(t, root.Name)
+		if final.Status.Phase != herorunv1alpha1.SessionPhaseSucceeded || final.Status.WaitingUntil != nil {
+			t.Errorf("final status = %+v, want Succeeded with nil WaitingUntil", final.Status)
+		}
+	})
+
+	t.Run("wakes only on direct child terminal phase, reports once, and respects timeout and deadline", func(t *testing.T) {
+		const runID = "run-wait-child"
+		root := pendingSession("wparent", herorunv1alpha1.SessionSpec{RunID: runID})
+		childA := pendingSession("wchilda", herorunv1alpha1.SessionSpec{RunID: runID, Parent: root.Name, Ancestors: []string{root.Name}, InitialPrompt: "A"})
+		childB := pendingSession("wchildb", herorunv1alpha1.SessionSpec{RunID: runID, Parent: root.Name, Ancestors: []string{root.Name}, InitialPrompt: "B"})
+		grandchild := pendingSession("wgrand", herorunv1alpha1.SessionSpec{RunID: runID, Parent: childA.Name, Ancestors: []string{root.Name, childA.Name}, InitialPrompt: "G"})
+
+		fakeLLM := &scriptedLLM{handlers: []func(context.Context, llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error){
+			textReply("Done."),
+		}}
+		env := newTestEnv(t, fakeLLM, []client.Object{root, childA, childB, grandchild})
+
+		seen := make(map[string]bool)
+		type res struct {
+			out string
+			err error
+		}
+		parentRes := make(chan res, 1)
+		childARes := make(chan res, 1)
+		go func() {
+			out, err := env.reconciler.waitForEvent(t.Context(), root, seen, 5*time.Second)
+			parentRes <- res{out, err}
+		}()
+		go func() {
+			out, err := env.reconciler.waitForEvent(t.Context(), childA, make(map[string]bool), 60*time.Millisecond)
+			childARes <- res{out, err}
+		}()
+
+		// Wait briefly for both waiters to arm.
+		time.Sleep(15 * time.Millisecond)
+
+		// Reconciling childB wakes wparent (direct child) but NOT wchilda (sibling).
+		if _, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: childB.Name},
+		}); err != nil {
+			t.Fatalf("Reconcile childB: %v", err)
+		}
+		select {
+		case r := <-parentRes:
+			if r.err != nil || r.out != "Child session wchildb stopped." {
+				t.Fatalf("parent wait = (%q, %v), want Child session wchildb stopped.", r.out, r.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for wparent to wake on childB")
+		}
+		select {
+		case r := <-childARes:
+			if r.err != nil || !strings.Contains(r.out, "Timed out") {
+				t.Fatalf("childA wait = (%q, %v), want timeout", r.out, r.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for childA timeout")
+		}
+
+		// Reconciling grandchild does NOT wake wparent (not a direct child), and childB is not reported twice.
+		if _, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: grandchild.Name},
+		}); err != nil {
+			t.Fatalf("Reconcile grandchild: %v", err)
+		}
+		out, err := env.reconciler.waitForEvent(t.Context(), root, seen, 30*time.Millisecond)
+		if err != nil || !strings.Contains(out, "Timed out") {
+			t.Fatalf("second wait = (%q, %v), want timeout (no repeat of childB, no grandchild wake)", out, err)
+		}
+
+		// Deadline capping: remaining time shorter than requested timeout returns deadline message.
+		dl := metav1.NewTime(env.now.Add(30 * time.Millisecond))
+		root.Spec.Deadline = &dl
+		start := time.Now()
+		out, err = env.reconciler.waitForEvent(t.Context(), root, seen, 10*time.Second)
+		if err != nil || out != "Wait ended: run deadline passed." {
+			t.Fatalf("deadline-capped wait = (%q, %v), want Wait ended: run deadline passed.", out, err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("deadline-capped wait took %v, expected ~30ms", elapsed)
+		}
+
+		// Already-passed deadline returns immediately.
+		past := metav1.NewTime(env.now.Add(-time.Second))
+		root.Spec.Deadline = &past
+		out, err = env.reconciler.waitForEvent(t.Context(), root, seen, 10*time.Second)
+		if err != nil || out != "Wait ended: run deadline passed." {
+			t.Fatalf("past-deadline wait = (%q, %v), want Wait ended: run deadline passed.", out, err)
+		}
+	})
+
+	t.Run("watch predicates wake waiters on child terminal transition and message creation", func(t *testing.T) {
+		env := newTestEnv(t, &scriptedLLM{}, nil)
+		parentKey := types.NamespacedName{Namespace: "ao-sandboxes", Name: "predparent"}
+		childPred := env.reconciler.childSessionPredicate()
+		msgPred := env.reconciler.sessionMessagePredicate()
+
+		// Non-terminal child update does not trigger reconcile or wake parent.
+		ch := env.reconciler.waitChan(parentKey)
+		oldChild := pendingSession("predchild", herorunv1alpha1.SessionSpec{Parent: "predparent"})
+		runningChild := oldChild.DeepCopy()
+		runningChild.Status.Phase = herorunv1alpha1.SessionPhaseRunning
+		if childPred.Update(event.UpdateEvent{ObjectOld: oldChild, ObjectNew: runningChild}) {
+			t.Errorf("non-terminal child update should not pass childSessionPredicate")
+		}
+		select {
+		case <-ch:
+			t.Fatal("non-terminal child update should not wake parent")
+		default:
+		}
+
+		// Terminal child update passes predicate and wakes parent.
+		doneChild := runningChild.DeepCopy()
+		doneChild.Status.Phase = herorunv1alpha1.SessionPhaseSucceeded
+		if !childPred.Update(event.UpdateEvent{ObjectOld: runningChild, ObjectNew: doneChild}) {
+			t.Errorf("terminal child update should pass childSessionPredicate")
+		}
+		select {
+		case <-ch:
+		default:
+			t.Fatal("terminal child update did not wake parent waiter")
+		}
+
+		// Undelivered SessionMessage creation passes predicate and wakes target waiter.
+		ch = env.reconciler.waitChan(parentKey)
+		msg := newSessionMessage("predmsg", env.now, herorunv1alpha1.SessionMessageSpec{SessionName: "predparent", Text: "hi"})
+		if !msgPred.Create(event.CreateEvent{Object: msg}) {
+			t.Errorf("SessionMessage create should pass sessionMessagePredicate")
+		}
+		select {
+		case <-ch:
+		default:
+			t.Fatal("SessionMessage create did not wake target waiter")
+		}
+	})
+}
+
+func TestReconcile_CascadingCancellation(t *testing.T) {
+	t.Run("parent terminal phase cancels active, waiting, pending children and grandchildren without touching completed children", func(t *testing.T) {
+		const runID = "run-cascade"
+		parent := pendingSession("cascparent", herorunv1alpha1.SessionSpec{RunID: runID, InitialPrompt: "Finish fast."})
+		activeChild := pendingSession("cascactive", herorunv1alpha1.SessionSpec{RunID: runID, Parent: parent.Name, Ancestors: []string{parent.Name}, InitialPrompt: "Block in LLM."})
+		waitingChild := pendingSession("cascwaiting", herorunv1alpha1.SessionSpec{RunID: runID, Parent: parent.Name, Ancestors: []string{parent.Name}, InitialPrompt: "Block in wait."})
+		pendingChild := pendingSession("cascpending", herorunv1alpha1.SessionSpec{RunID: runID, Parent: parent.Name, Ancestors: []string{parent.Name}, InitialPrompt: "Never started."})
+		grandchild := pendingSession("cascgrand", herorunv1alpha1.SessionSpec{RunID: runID, Parent: activeChild.Name, Ancestors: []string{parent.Name, activeChild.Name}, InitialPrompt: "Grandchild."})
+		doneChild := pendingSession("cascdone", herorunv1alpha1.SessionSpec{RunID: runID, Parent: parent.Name, Ancestors: []string{parent.Name}})
+		doneChild.Status.Phase = herorunv1alpha1.SessionPhaseSucceeded
+		doneChild.Status.Outcome = herorunv1alpha1.SessionOutcomeCompleted
+		otherRun := pendingSession("cascother", herorunv1alpha1.SessionSpec{RunID: "unrelated-run"})
+
+		activeEntered := make(chan struct{})
+		activeCtxCanceled := make(chan struct{})
+		waitingEntered := make(chan struct{})
+
+		// Route LLM behavior by initial prompt so concurrent reconciles are deterministic.
+		routerLLM := &scriptedLLM{handlers: []func(context.Context, llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error){
+			func(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+				var prompt string
+				for _, m := range req.Messages {
+					if m.Role == "user" && m.Content != nil {
+						prompt = *m.Content
+						break
+					}
+				}
+				switch prompt {
+				case "Block in LLM.":
+					close(activeEntered)
+					<-ctx.Done()
+					close(activeCtxCanceled)
+					return nil, ctx.Err()
+				case "Block in wait.":
+					close(waitingEntered)
+					return toolCallReply("call-w-casc", "wait", map[string]any{"timeout": "30s"})(ctx, req)
+				default:
+					return textReply("Parent done.")(ctx, req)
+				}
+			},
+		}}
+
+		env := newTestEnv(t, routerLLM, []client.Object{parent, activeChild, waitingChild, pendingChild, grandchild, doneChild, otherRun})
+
+		type recRes struct {
+			res reconcile.Result
+			err error
+		}
+		activeDone := make(chan recRes, 1)
+		waitingDone := make(chan recRes, 1)
+		go func() {
+			res, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+				NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: activeChild.Name},
+			})
+			activeDone <- recRes{res, err}
+		}()
+		go func() {
+			res, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+				NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: waitingChild.Name},
+			})
+			waitingDone <- recRes{res, err}
+		}()
+
+		<-activeEntered
+		<-waitingEntered
+		// Wait until waitingChild transitions to Waiting phase.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if env.getSession(t, waitingChild.Name).Status.Phase == herorunv1alpha1.SessionPhaseWaiting {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		// Parent finishes; cascading cancellation must cancel all non-terminal descendants.
+		if _, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: parent.Name},
+		}); err != nil {
+			t.Fatalf("Reconcile parent: %v", err)
+		}
+
+		select {
+		case <-activeCtxCanceled:
+		case <-time.After(2 * time.Second):
+			t.Fatal("active child context was not canceled when parent finished")
+		}
+		for _, tc := range []struct {
+			name string
+			ch   chan recRes
+		}{
+			{name: "activeChild", ch: activeDone},
+			{name: "waitingChild", ch: waitingDone},
+		} {
+			select {
+			case r := <-tc.ch:
+				if r.err != nil || r.res != (reconcile.Result{}) {
+					t.Errorf("%s Reconcile = (%+v, %v), want empty result and nil error", tc.name, r.res, r.err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("timed out waiting for %s Reconcile to exit", tc.name)
+			}
+		}
+
+		for _, name := range []string{activeChild.Name, waitingChild.Name, pendingChild.Name, grandchild.Name} {
+			got := env.getSession(t, name)
+			if got.Status.Phase != herorunv1alpha1.SessionPhaseCanceled || got.Status.Outcome != herorunv1alpha1.SessionOutcomeCanceled {
+				t.Errorf("%s status = (%q, %q), want (Canceled, Canceled)", name, got.Status.Phase, got.Status.Outcome)
+			}
+			if got.Status.FinishedAt == nil || got.Status.WaitingUntil != nil {
+				t.Errorf("%s FinishedAt=%v WaitingUntil=%v, want non-nil FinishedAt and nil WaitingUntil", name, got.Status.FinishedAt, got.Status.WaitingUntil)
+			}
+		}
+		if got := env.getSession(t, doneChild.Name); got.Status.Phase != herorunv1alpha1.SessionPhaseSucceeded || got.Status.Outcome != herorunv1alpha1.SessionOutcomeCompleted {
+			t.Errorf("already-completed child was overwritten: %+v", got.Status)
+		}
+		if got := env.getSession(t, otherRun.Name); got.Status.Phase != herorunv1alpha1.SessionPhasePending {
+			t.Errorf("unrelated run session was modified: %+v", got.Status)
+		}
+	})
+
+	t.Run("reconciling a pending child whose parent is already terminal marks it Canceled without calling LLM", func(t *testing.T) {
+		const runID = "run-orphan"
+		parent := pendingSession("termParent", herorunv1alpha1.SessionSpec{RunID: runID})
+		parent.Status.Phase = herorunv1alpha1.SessionPhaseFailed
+		parent.Status.Outcome = herorunv1alpha1.SessionOutcomeFailed
+		child := pendingSession("orphanChild", herorunv1alpha1.SessionSpec{
+			RunID:         runID,
+			Parent:        parent.Name,
+			Ancestors:     []string{parent.Name},
+			InitialPrompt: "Should not run.",
+		})
+
+		fakeLLM := &scriptedLLM{handlers: []func(context.Context, llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error){
+			textReply("must not run"),
+		}}
+		env := newTestEnv(t, fakeLLM, []client.Object{parent, child})
+
+		if _, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: child.Name},
+		}); err != nil {
+			t.Fatalf("Reconcile orphan child: %v", err)
+		}
+		if fakeLLM.calls != 0 {
+			t.Errorf("LLM calls = %d, want 0", fakeLLM.calls)
+		}
+		got := env.getSession(t, child.Name)
+		if got.Status.Phase != herorunv1alpha1.SessionPhaseCanceled || got.Status.Outcome != herorunv1alpha1.SessionOutcomeCanceled {
+			t.Errorf("orphan child status = %+v, want Canceled/Canceled", got.Status)
 		}
 	})
 }
