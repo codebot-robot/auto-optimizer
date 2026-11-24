@@ -1466,3 +1466,391 @@ func TestReconcileWorkflow_Selecting_SavesOpeningPRBeforeDeletingSandbox(t *test
 		t.Errorf("expected sandbox deleted after OpeningPR saved, got err: %v", err)
 	}
 }
+
+func newOpeningPRWorkflowFixture(t *testing.T, forgeFor func(string) (forge.Forge, error)) (*Orchestrator, state.Store, *state.Repo, *state.Run, *herorunv1alpha1.HeroRun) {
+	t.Helper()
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	harness, _, _ := setupTestHarness(t, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	runID := "20261124T120000Z-wfopenpr"
+	hrName := sandboxNameForRun(runID)
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hrName,
+			Namespace: harness.Namespace(),
+		},
+		Spec: herorunv1alpha1.HeroRunSpec{
+			RunID:      runID,
+			Repository: repo.URL,
+			Goal:       "optimize-speed",
+			BaseCommit: "1189a319f389802669884696409ba28db20216b0",
+		},
+		Status: herorunv1alpha1.HeroRunStatus{
+			Phase: string(state.PhaseOpeningPR),
+		},
+	}
+
+	now := time.Date(2026, 11, 24, 12, 10, 0, 0, time.UTC)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: newTestFakeClientBuilder(scheme).WithObjects(hr).Build(),
+		PublicURL:  "https://ao.example.com",
+		Clock:      func() time.Time { return now },
+		ForgeFor:   forgeFor,
+	})
+
+	run := &state.Run{
+		ID:         runID,
+		Repo:       repo.Key(),
+		GoalName:   "optimize-speed",
+		Phase:      state.PhaseOpeningPR,
+		BaseCommit: "1189a319f389802669884696409ba28db20216b0",
+		Branch:     "ao/optimize-speed/" + runID,
+		PRTitle:    "Speed up queries",
+		PRBody:     "Replaced linear scan with hash map lookup.",
+	}
+	return orch, store, repo, run, hr
+}
+
+func TestRunWorkflow_OpeningPR_OpensPullRequest(t *testing.T) {
+	ctx := t.Context()
+	fakeForge := forge.NewFake()
+	orch, store, repo, run, hr := newOpeningPRWorkflowFixture(t, func(string) (forge.Forge, error) {
+		return fakeForge, nil
+	})
+	run.Branch = "" // verify default branch name is computed and recorded
+
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if !res.done || res.requeueAfter != 0 {
+		t.Fatalf("expected done=true requeueAfter=0, got %+v", res)
+	}
+
+	wantBranch := "ao/optimize-speed/" + run.ID
+	if wf.run.Branch != wantBranch {
+		t.Errorf("branch = %q, want %q", wf.run.Branch, wantBranch)
+	}
+	if wf.run.Phase != state.PhaseSucceeded {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseSucceeded)
+	}
+	if wf.hr.Status.Phase != string(state.PhaseOpeningPR) {
+		t.Errorf("expected HeroRun status unchanged until caller saves, got %s", wf.hr.Status.Phase)
+	}
+
+	prs := fakeForge.PullRequests(repo.URL)
+	if len(prs) != 1 {
+		t.Fatalf("expected 1 pull request, got %d", len(prs))
+	}
+	pr := prs[0]
+	if pr.Head != wantBranch || pr.Base != "main" || pr.Title != run.PRTitle {
+		t.Errorf("unexpected PR: %+v", pr)
+	}
+	if wf.run.PRURL != pr.URL {
+		t.Errorf("PRURL = %q, want %q", wf.run.PRURL, pr.URL)
+	}
+	for _, substr := range []string{run.GoalName, "1189a31", wantBranch, run.ID, "https://ao.example.com/runs/" + run.ID, "What the agent says", run.PRBody} {
+		if !strings.Contains(pr.Body, substr) {
+			t.Errorf("expected PR body to contain %q, got:\n%s", substr, pr.Body)
+		}
+	}
+	if wf.end == nil || wf.end.Kind != "pull_request_opened" || wf.end.Message != pr.URL {
+		t.Errorf("unexpected wf.end: %+v", wf.end)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("expected no events persisted before reconcileWorkflow saves, got %+v", events)
+	}
+}
+
+func TestRunWorkflow_OpeningPR_ReusesExistingOpenPullRequest(t *testing.T) {
+	ctx := t.Context()
+	fakeForge := forge.NewFake()
+	orch, _, repo, run, hr := newOpeningPRWorkflowFixture(t, func(string) (forge.Forge, error) {
+		return fakeForge, nil
+	})
+	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
+		{
+			Number: 1,
+			Title:  "Closed PR",
+			Head:   run.Branch,
+			Base:   "main",
+			URL:    repo.URL + "/pull/1",
+			State:  "closed",
+		},
+		{
+			Number: 2,
+			Title:  "Existing open PR",
+			Head:   run.Branch,
+			Base:   "main",
+			URL:    repo.URL + "/pull/2",
+			State:  "open",
+		},
+	})
+
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if !res.done {
+		t.Fatalf("expected res.done to be true")
+	}
+	if wf.run.Phase != state.PhaseSucceeded {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseSucceeded)
+	}
+	wantURL := repo.URL + "/pull/2"
+	if wf.run.PRURL != wantURL {
+		t.Errorf("PRURL = %q, want %q", wf.run.PRURL, wantURL)
+	}
+	if len(fakeForge.PullRequests(repo.URL)) != 2 {
+		t.Errorf("expected no new pull request opened, got %d", len(fakeForge.PullRequests(repo.URL)))
+	}
+	if wf.end == nil || wf.end.Kind != "pull_request_reused" || wf.end.Message != wantURL {
+		t.Errorf("unexpected wf.end: %+v", wf.end)
+	}
+}
+
+func TestRunWorkflow_OpeningPR_ForgeWithoutChangeRequests(t *testing.T) {
+	ctx := t.Context()
+	orch, _, repo, run, hr := newOpeningPRWorkflowFixture(t, func(string) (forge.Forge, error) {
+		return forge.NewGitRemote(), nil
+	})
+
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if !res.done {
+		t.Fatalf("expected res.done to be true")
+	}
+	if wf.run.Phase != state.PhaseSucceeded {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseSucceeded)
+	}
+	if wf.run.PRURL != "" {
+		t.Errorf("PRURL = %q, want empty", wf.run.PRURL)
+	}
+	if wf.end == nil || wf.end.Kind != "pull_request_not_opened" || wf.end.Message != "forge cannot open pull requests" {
+		t.Errorf("unexpected wf.end: %+v", wf.end)
+	}
+}
+
+func TestRunWorkflow_OpeningPR_DefaultBaseAndTitle(t *testing.T) {
+	ctx := t.Context()
+	fakeForge := forge.NewFake()
+	orch, _, repo, run, hr := newOpeningPRWorkflowFixture(t, func(string) (forge.Forge, error) {
+		return fakeForge, nil
+	})
+	repo.DefaultBranch = ""
+	run.PRTitle = ""
+
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if !res.done || wf.run.Phase != state.PhaseSucceeded {
+		t.Fatalf("expected Succeeded terminal result, got res=%+v phase=%s", res, wf.run.Phase)
+	}
+	prs := fakeForge.PullRequests(repo.URL)
+	if len(prs) != 1 {
+		t.Fatalf("expected 1 PR, got %d", len(prs))
+	}
+	if prs[0].Base != "main" {
+		t.Errorf("base = %q, want main", prs[0].Base)
+	}
+	if prs[0].Title != "Optimize optimize-speed" {
+		t.Errorf("title = %q, want %q", prs[0].Title, "Optimize optimize-speed")
+	}
+}
+
+func TestRunWorkflow_OpeningPR_Failures(t *testing.T) {
+	cases := []struct {
+		name        string
+		setupForge  func() func(string) (forge.Forge, error)
+		wantErrPart string
+	}{
+		{
+			name:        "nil forgeFor",
+			setupForge:  func() func(string) (forge.Forge, error) { return nil },
+			wantErrPart: "no forge configured for repository",
+		},
+		{
+			name: "forgeFor returns nil",
+			setupForge: func() func(string) (forge.Forge, error) {
+				return func(string) (forge.Forge, error) { return nil, nil }
+			},
+			wantErrPart: "no forge configured for repository",
+		},
+		{
+			name: "forgeFor returns error",
+			setupForge: func() func(string) (forge.Forge, error) {
+				return func(string) (forge.Forge, error) { return nil, errors.New("bad forge config") }
+			},
+			wantErrPart: "selecting forge for",
+		},
+		{
+			name: "list pull requests fails",
+			setupForge: func() func(string) (forge.Forge, error) {
+				f := forge.NewFake()
+				f.SetListPullRequestsError(errors.New("list timeout"))
+				return func(string) (forge.Forge, error) { return f, nil }
+			},
+			wantErrPart: "listing pull requests: list timeout",
+		},
+		{
+			name: "open pull request fails",
+			setupForge: func() func(string) (forge.Forge, error) {
+				f := forge.NewFake()
+				f.SetOpenPullRequestError(errors.New("API rate limit exceeded"))
+				return func(string) (forge.Forge, error) { return f, nil }
+			},
+			wantErrPart: "API rate limit exceeded",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			orch, _, repo, run, hr := newOpeningPRWorkflowFixture(t, tc.setupForge())
+
+			wf := newRunWorkflow(orch, repo, run, hr)
+			res, err := wf.Run(ctx)
+			if err != nil {
+				t.Fatalf("wf.Run: %v", err)
+			}
+			if !res.done {
+				t.Fatalf("expected res.done to be true")
+			}
+			if wf.run.Phase != state.PhaseFailed {
+				t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseFailed)
+			}
+			if wf.run.ErrorKind != "pull_request_failed" {
+				t.Errorf("errorKind = %q, want %q", wf.run.ErrorKind, "pull_request_failed")
+			}
+			if !strings.Contains(wf.run.Error, tc.wantErrPart) {
+				t.Errorf("error = %q, want substring %q", wf.run.Error, tc.wantErrPart)
+			}
+			if wf.hr.Status.Phase != string(state.PhaseOpeningPR) {
+				t.Errorf("expected HeroRun status unchanged until caller saves, got %s", wf.hr.Status.Phase)
+			}
+		})
+	}
+}
+
+func TestRunWorkflow_OpeningPR_CanceledContext(t *testing.T) {
+	ctx := t.Context()
+	fakeForge := forge.NewFake()
+	orch, _, repo, run, hr := newOpeningPRWorkflowFixture(t, func(string) (forge.Forge, error) {
+		return fakeForge, nil
+	})
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(cancelCtx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if res != (workflowResult{}) {
+		t.Errorf("expected zero workflowResult on canceled context, got %+v", res)
+	}
+	if wf.run.Phase != state.PhaseOpeningPR {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseOpeningPR)
+	}
+	if len(fakeForge.PullRequests(repo.URL)) != 0 {
+		t.Errorf("expected no pull requests opened on canceled context, got %d", len(fakeForge.PullRequests(repo.URL)))
+	}
+}
+
+func TestReconcileWorkflow_OpeningPR_SavesBeforeRecordingEvent(t *testing.T) {
+	ctx := t.Context()
+	fakeForge := forge.NewFake()
+	orch, store, repo, run, hr := newOpeningPRWorkflowFixture(t, func(string) (forge.Forge, error) {
+		return fakeForge, nil
+	})
+
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	// Build a fake client without the HeroRun so Status().Update fails.
+	failingClient := newTestFakeClientBuilder(scheme).Build()
+	orch.kubeClient = failingClient
+
+	if _, err := orch.reconcileWorkflow(ctx, newRunWorkflow(orch, repo, run, hr)); err == nil {
+		t.Fatalf("expected error when saving terminal HeroRun fails")
+	}
+	events, err := store.ReadEvents(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected no events recorded when saving HeroRun fails, got %+v", events)
+	}
+
+	// Once the HeroRun exists and saving succeeds, retry reuses the open PR and saves/records.
+	hrRetry := hr.DeepCopy()
+	hrRetry.ResourceVersion = ""
+	hrRetry.Status = herorunv1alpha1.HeroRunStatus{Phase: string(state.PhaseOpeningPR)}
+	if err := failingClient.Create(ctx, hrRetry); err != nil {
+		t.Fatalf("Create HeroRun: %v", err)
+	}
+	runRetry := &state.Run{
+		ID:         run.ID,
+		Repo:       repo.Key(),
+		GoalName:   run.GoalName,
+		Phase:      state.PhaseOpeningPR,
+		BaseCommit: run.BaseCommit,
+		Branch:     run.Branch,
+		PRTitle:    run.PRTitle,
+		PRBody:     run.PRBody,
+	}
+	if _, err := orch.reconcileWorkflow(ctx, newRunWorkflow(orch, repo, runRetry, hrRetry)); err != nil {
+		t.Fatalf("reconcileWorkflow retry: %v", err)
+	}
+
+	gotRun, err := GetRun(ctx, failingClient, orch.namespace(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	prs := fakeForge.PullRequests(repo.URL)
+	if len(prs) != 1 {
+		t.Fatalf("expected 1 pull request, got %d", len(prs))
+	}
+	if gotRun.Phase != state.PhaseSucceeded || gotRun.PRURL != prs[0].URL {
+		t.Errorf("got phase=%s PRURL=%q, want Succeeded/%q", gotRun.Phase, gotRun.PRURL, prs[0].URL)
+	}
+	events, err = store.ReadEvents(ctx, repo.Key(), run.ID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != "pull_request_reused" || events[0].Message != prs[0].URL {
+		t.Errorf("expected pull_request_reused event for %s, got %+v", prs[0].URL, events)
+	}
+}

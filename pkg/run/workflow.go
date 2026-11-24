@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -74,6 +75,8 @@ func (w *runWorkflow) Run(ctx context.Context) (workflowResult, error) {
 		return w.runPreparing(ctx)
 	case state.PhaseSelecting:
 		return w.runSelecting(ctx)
+	case state.PhaseOpeningPR:
+		return w.runOpeningPR(ctx)
 	default:
 		return workflowResult{}, fmt.Errorf("unsupported workflow phase: %s", w.run.Phase)
 	}
@@ -443,6 +446,107 @@ func (w *runWorkflow) noImprovement(now time.Time, kind, msg string, data map[st
 	w.run.SetPhase(state.PhaseNoImprovement, now)
 	w.end = &runEnd{
 		Phase:   state.PhaseNoImprovement,
+		Kind:    kind,
+		Message: msg,
+		Data:    data,
+	}
+	return workflowResult{done: true}
+}
+
+// runOpeningPR checks for an existing open pull request on the run's branch,
+// opens a new pull request when none exists, records the pull request URL,
+// and transitions the run to Succeeded. When the forge does not support change
+// requests, the run succeeds with a pull_request_not_opened outcome.
+func (w *runWorkflow) runOpeningPR(ctx context.Context) (workflowResult, error) {
+	if ctx.Err() != nil {
+		return workflowResult{}, nil
+	}
+
+	var f forge.Forge
+	if w.orch.forgeFor != nil {
+		var err error
+		f, err = w.orch.forgeFor(w.repo.URL)
+		if err != nil {
+			return w.failRunWithKind(w.orch.clock().UTC(), "pull_request_failed", fmt.Sprintf("selecting forge for %s: %v", w.repo.URL, err)), nil
+		}
+	}
+	if f == nil {
+		return w.failRunWithKind(w.orch.clock().UTC(), "pull_request_failed", fmt.Sprintf("no forge configured for repository %s", w.repo.URL)), nil
+	}
+
+	cr, ok := f.(forge.ChangeRequestCreator)
+	if !ok {
+		return w.succeedRun(w.orch.clock().UTC(), "pull_request_not_opened", "forge cannot open pull requests", nil), nil
+	}
+
+	branch := w.run.BranchName()
+	if w.run.Branch == "" {
+		w.run.Branch = branch
+	}
+
+	prs, err := cr.ListPullRequests(ctx, w.repo.URL, branch)
+	if err != nil {
+		if ctx.Err() != nil {
+			return workflowResult{}, nil
+		}
+		return w.failRunWithKind(w.orch.clock().UTC(), "pull_request_failed", fmt.Sprintf("listing pull requests: %v", err)), nil
+	}
+
+	for _, pr := range prs {
+		if pr.State == "open" && pr.Head == branch {
+			w.run.PRURL = pr.URL
+			return w.succeedRun(w.orch.clock().UTC(), "pull_request_reused", pr.URL, map[string]any{"url": pr.URL}), nil
+		}
+	}
+
+	base := w.repo.DefaultBranch
+	if base == "" {
+		base = "main"
+	}
+	title := w.run.PRTitle
+	if title == "" {
+		title = fmt.Sprintf("Optimize %s", w.run.GoalName)
+	}
+	body := w.buildPRBody()
+
+	pr, err := cr.OpenPullRequest(ctx, w.repo.URL, branch, base, title, body)
+	if err != nil {
+		if ctx.Err() != nil {
+			return workflowResult{}, nil
+		}
+		return w.failRunWithKind(w.orch.clock().UTC(), "pull_request_failed", err.Error()), nil
+	}
+
+	w.run.PRURL = pr.URL
+	return w.succeedRun(w.orch.clock().UTC(), "pull_request_opened", pr.URL, map[string]any{"url": pr.URL}), nil
+}
+
+func (w *runWorkflow) buildPRBody() string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Goal: %s\n", w.run.GoalName))
+	b.WriteString(fmt.Sprintf("Base commit: %s\n", shortCommit(w.run.BaseCommit)))
+	b.WriteString(fmt.Sprintf("Branch: %s\n", w.run.Branch))
+	b.WriteString(fmt.Sprintf("Run ID: %s\n", w.run.ID))
+	if runURL := w.orch.RunPageURL(w.repo, w.run); runURL != "" {
+		b.WriteString(fmt.Sprintf("Run page: [%s](%s)\n", runURL, runURL))
+	}
+	b.WriteString("\n## What the agent says\n\n")
+	b.WriteString(w.run.PRBody)
+	return b.String()
+}
+
+func shortCommit(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+func (w *runWorkflow) succeedRun(now time.Time, kind, msg string, data map[string]any) workflowResult {
+	w.run.ReadyDeadline = nil
+	w.run.SetPhase(state.PhaseSucceeded, now)
+	w.end = &runEnd{
+		Phase:   state.PhaseSucceeded,
 		Kind:    kind,
 		Message: msg,
 		Data:    data,
