@@ -536,8 +536,8 @@ func (o *Orchestrator) getRunForReconcile(ctx context.Context, req reconcile.Req
 }
 
 // Reconcile loads the run and the repository, dispatches on the phase to
-// runWorkflow.Run (for Pending, Preparing, and Selecting), workRun,
-// or openPullRequest, and returns.
+// runWorkflow.Run (for Pending, Preparing, Selecting, and OpeningPR) or
+// workRun, and returns.
 func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
@@ -557,7 +557,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 	}
 
 	switch run.Phase {
-	case state.PhasePending, state.PhasePreparing, state.PhaseSelecting:
+	case state.PhasePending, state.PhasePreparing, state.PhaseSelecting, state.PhaseOpeningPR:
 		return o.reconcileWorkflow(ctx, newRunWorkflow(o, repo, run, hr))
 
 	case state.PhaseWorking:
@@ -572,16 +572,6 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 			}
 			return res, nil
 		}
-
-	case state.PhaseOpeningPR:
-		if err := o.openPullRequest(ctx, repo, run, hr); err != nil {
-			log.Error(err, "opening pull request failed", "repo", repo.URL, "run", run.ID)
-			if run.Phase.IsTerminal() {
-				return reconcile.Result{}, nil
-			}
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{}, nil
 	}
 
 	return reconcile.Result{}, nil
@@ -1782,119 +1772,6 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		}
 		return errors.New(errMsg)
 	}
-}
-
-func (o *Orchestrator) openPullRequest(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) error {
-	if ctx.Err() != nil {
-		return nil
-	}
-
-	if o.forgeFor == nil {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "pull_request_failed",
-			Message: fmt.Sprintf("no forge configured for repository %s", repo.URL),
-		})
-	}
-
-	f, err := o.forgeFor(repo.URL)
-	if err != nil {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "pull_request_failed",
-			Message: fmt.Sprintf("selecting forge for %s: %v", repo.URL, err),
-		})
-	}
-	if f == nil {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "pull_request_failed",
-			Message: fmt.Sprintf("no forge configured for repository %s", repo.URL),
-		})
-	}
-
-	cr, ok := f.(forge.ChangeRequestCreator)
-	if !ok {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseSucceeded,
-			Kind:    "pull_request_not_opened",
-			Message: "forge cannot open pull requests",
-		})
-	}
-
-	branch := run.BranchName()
-	if run.Branch == "" {
-		run.Branch = branch
-	}
-
-	prs, err := cr.ListPullRequests(ctx, repo.URL, branch)
-	if err != nil {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "pull_request_failed",
-			Message: fmt.Sprintf("listing pull requests: %v", err),
-		})
-	}
-
-	for _, pr := range prs {
-		if pr.State == "open" && pr.Head == branch {
-			run.PRURL = pr.URL
-			return o.finishRun(ctx, repo, run, hr, runEnd{
-				Phase:   state.PhaseSucceeded,
-				Kind:    "pull_request_reused",
-				Message: pr.URL,
-				Data:    map[string]any{"url": pr.URL},
-			})
-		}
-	}
-
-	base := repo.DefaultBranch
-	if base == "" {
-		base = "main"
-	}
-	title := run.PRTitle
-	if title == "" {
-		title = fmt.Sprintf("Optimize %s", run.GoalName)
-	}
-	body := o.buildPRBody(repo, run)
-
-	pr, err := cr.OpenPullRequest(ctx, repo.URL, branch, base, title, body)
-	if err != nil {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "pull_request_failed",
-			Message: err.Error(),
-		})
-	}
-
-	run.PRURL = pr.URL
-	return o.finishRun(ctx, repo, run, hr, runEnd{
-		Phase:   state.PhaseSucceeded,
-		Kind:    "pull_request_opened",
-		Message: pr.URL,
-		Data:    map[string]any{"url": pr.URL},
-	})
-}
-
-func (o *Orchestrator) buildPRBody(repo *state.Repo, run *state.Run) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Goal: %s\n", run.GoalName))
-	b.WriteString(fmt.Sprintf("Base commit: %s\n", shortCommit(run.BaseCommit)))
-	b.WriteString(fmt.Sprintf("Branch: %s\n", run.Branch))
-	b.WriteString(fmt.Sprintf("Run ID: %s\n", run.ID))
-	if runURL := o.RunPageURL(repo, run); runURL != "" {
-		b.WriteString(fmt.Sprintf("Run page: [%s](%s)\n", runURL, runURL))
-	}
-	b.WriteString("\n## What the agent says\n\n")
-	b.WriteString(run.PRBody)
-	return b.String()
-}
-
-func shortCommit(sha string) string {
-	if len(sha) > 7 {
-		return sha[:7]
-	}
-	return sha
 }
 
 func buildSystemPrompt(basePrompt string, repo *state.Repo, run *state.Run, goalBody string) string {
