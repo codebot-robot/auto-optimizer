@@ -169,9 +169,42 @@ spec:
               of a HeroRun.
             properties:
               activeOperation:
-                description: ActiveOperation is the identifier of an active long-running
-                  operation in flight.
-                type: string
+                description: ActiveOperation tracks an active long-running operation
+                  in flight and its outcome once finished.
+                properties:
+                  done:
+                    description: Done reports whether the operation worker has finished
+                      executing.
+                    type: boolean
+                  error:
+                    description: Error holds the error message when Result is Failed
+                      or Canceled.
+                    type: string
+                  finishedAt:
+                    description: FinishedAt is the time when the operation finished.
+                    format: date-time
+                    type: string
+                  id:
+                    description: ID uniquely identifies this operation instance.
+                    type: string
+                  prBody:
+                    description: PRBody is the pull request description proposed by
+                      the agent when Result is PullRequest.
+                    type: string
+                  prTitle:
+                    description: PRTitle is the pull request title proposed by the
+                      agent when Result is PullRequest.
+                    type: string
+                  result:
+                    description: Result classifies the outcome once Done is true.
+                    type: string
+                  summary:
+                    description: Summary is the agent's finish summary when Result
+                      is Finished.
+                    type: string
+                required:
+                - id
+                type: object
               baseline:
                 description: Baseline holds the baseline metric measurement for metric
                   goals.

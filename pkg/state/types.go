@@ -105,6 +105,30 @@ func (p RunPhase) IsTerminal() bool {
 	}
 }
 
+// OperationResult classifies the outcome of a finished turn operation.
+type OperationResult string
+
+const (
+	OperationResultCompleted   OperationResult = "Completed"
+	OperationResultPullRequest OperationResult = "PullRequest"
+	OperationResultFinished    OperationResult = "Finished"
+	OperationResultMaxTurns    OperationResult = "MaxTurns"
+	OperationResultCanceled    OperationResult = "Canceled"
+	OperationResultFailed      OperationResult = "Failed"
+)
+
+// ActiveOperation tracks an in-flight or recently completed operation on a run.
+type ActiveOperation struct {
+	ID         string          `json:"id"`
+	Done       bool            `json:"done,omitempty"`
+	Result     OperationResult `json:"result,omitempty"`
+	PRTitle    string          `json:"prTitle,omitempty"`
+	PRBody     string          `json:"prBody,omitempty"`
+	Summary    string          `json:"summary,omitempty"`
+	Error      string          `json:"error,omitempty"`
+	FinishedAt *time.Time      `json:"finishedAt,omitempty"`
+}
+
 // Run represents a run record in run.json.
 type Run struct {
 	ID                 string                 `json:"id"`
@@ -118,6 +142,7 @@ type Run struct {
 	PRBody             string                 `json:"prBody,omitempty"`
 	PRURL              string                 `json:"prURL,omitempty"`
 	SessionID          string                 `json:"sessionId,omitempty"`
+	ActiveOperation    *ActiveOperation       `json:"activeOperation,omitempty"`
 	SandboxName        string                 `json:"sandboxName,omitempty"`
 	WorkspaceClaimName string                 `json:"workspaceClaimName,omitempty"`
 	ReadyDeadline      *time.Time             `json:"readyDeadline,omitempty"`
