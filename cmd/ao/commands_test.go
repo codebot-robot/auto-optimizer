@@ -22,9 +22,13 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
+	runpkg "github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
@@ -551,6 +555,10 @@ func TestRunListCommand_Execution(t *testing.T) {
 	}
 
 	// Create a Pending run
+	scheme := runtime.NewScheme()
+	_ = herorunv1alpha1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+
 	pendingRun := &state.Run{
 		ID:         "20261030T120000Z-0001",
 		Repo:       repo.Key(),
@@ -558,8 +566,11 @@ func TestRunListCommand_Execution(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-abc1234",
 	}
-	if err := stateStore.PutRun(ctx, pendingRun); err != nil {
-		t.Fatalf("PutRun: %v", err)
+	hr := runpkg.HeroRunFromRun(pendingRun)
+	hr.Namespace = session.DefaultNamespace
+	hr.Spec.Repository = repo.URL
+	if err := fakeClient.Create(ctx, hr); err != nil {
+		t.Fatalf("Create HeroRun: %v", err)
 	}
 
 	// Start test gRPC server
@@ -575,6 +586,8 @@ func TestRunListCommand_Execution(t *testing.T) {
 		Store:          sessionStore,
 		StateStore:     stateStore,
 		DefaultToolset: "basic",
+		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 		HarnessFactory: func(_ string) (*session.Harness, error) {
 			return nil, nil
 		},
@@ -625,6 +638,10 @@ func TestRunGetCommand_Execution(t *testing.T) {
 		t.Fatalf("PutRepo: %v", err)
 	}
 
+	scheme := runtime.NewScheme()
+	_ = herorunv1alpha1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+
 	runID := "20261030T100000Z-1234"
 	runRecord := &state.Run{
 		ID:          runID,
@@ -634,8 +651,11 @@ func TestRunGetCommand_Execution(t *testing.T) {
 		BaseCommit:  "commit-abc1234",
 		SandboxName: "run-20261030t100000z-1234",
 	}
-	if err := stateStore.PutRun(ctx, runRecord); err != nil {
-		t.Fatalf("PutRun: %v", err)
+	hr := runpkg.HeroRunFromRun(runRecord)
+	hr.Namespace = session.DefaultNamespace
+	hr.Spec.Repository = repo.URL
+	if err := fakeClient.Create(ctx, hr); err != nil {
+		t.Fatalf("Create HeroRun: %v", err)
 	}
 
 	if err := stateStore.AppendEvent(ctx, repo.Key(), runID,
@@ -668,6 +688,8 @@ func TestRunGetCommand_Execution(t *testing.T) {
 		Store:          sessionStore,
 		StateStore:     stateStore,
 		DefaultToolset: "basic",
+		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 		HarnessFactory: func(_ string) (*session.Harness, error) {
 			return nil, nil
 		},

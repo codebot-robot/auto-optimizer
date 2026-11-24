@@ -32,6 +32,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
@@ -43,6 +48,35 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
 	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
+
+func setupFakeKubeClient(t *testing.T) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = herorunv1alpha1.AddToScheme(scheme)
+	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+}
+
+func testServerOptions(t *testing.T) ServerOptions {
+	t.Helper()
+	return ServerOptions{
+		KubeClient: setupFakeKubeClient(t),
+		Namespace:  session.DefaultNamespace,
+	}
+}
+
+func createHeroRun(ctx context.Context, c client.Client, r *state.Run, repoURL string) error {
+	hr := run.HeroRunFromRun(r)
+	hr.Namespace = session.DefaultNamespace
+	if repoURL != "" {
+		hr.Spec.Repository = repoURL
+	} else if r.Repo.Host != "" {
+		hr.Spec.Repository = fmt.Sprintf("https://%s/%s/%s", r.Repo.Host, r.Repo.Owner, r.Repo.Name)
+	}
+	if err := c.Create(ctx, hr); err != nil {
+		return err
+	}
+	return c.Status().Update(ctx, hr)
+}
 
 type recordingSandbox struct {
 	mu    sync.Mutex
@@ -107,16 +141,22 @@ func setupTestWebServer(t *testing.T, sb tools.Sandbox) (*httptest.Server, *sess
 
 	store := session.NewFileStore(t.TempDir())
 
+	fakeClient := setupFakeKubeClient(t)
 	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
 		Store:          store,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("sessionapi.NewServer: %v", err)
 	}
 
-	webServer, err := NewServer(srv, nil, nil, ServerOptions{})
+	webServer, err := NewServer(srv, nil, nil, ServerOptions{
+		KubeClient: fakeClient,
+		Namespace:  session.DefaultNamespace,
+	})
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -406,6 +446,8 @@ func TestCSRFToken_RenderedInPage(t *testing.T) {
 	webServer, err := NewServer(fakeSvc, nil, nil, ServerOptions{
 		RequireSignIn: true,
 		SessionKey:    key,
+		KubeClient:    setupFakeKubeClient(t),
+		Namespace:     session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -643,7 +685,7 @@ func TestTranscriptTruncation_UTF8(t *testing.T) {
 		},
 	}
 
-	webServer, err := NewServer(fakeSvc, nil, nil, ServerOptions{})
+	webServer, err := NewServer(fakeSvc, nil, nil, testServerOptions(t))
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -721,11 +763,14 @@ func TestSessionDetail_MissingAncestorRenders(t *testing.T) {
 	opts.ModelName = "fake-eliza"
 	opts.SystemPrompt = toolset.SystemPrompt()
 
+	fakeClient := setupFakeKubeClient(t)
 	harness := session.NewHarness(llmClient, nil, toolsRegistry, opts)
 	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
 		Store:          store,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("sessionapi.NewServer: %v", err)
@@ -763,12 +808,17 @@ func TestSessionDetail_MissingAncestorRenders(t *testing.T) {
 		Store:          store,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("sessionapi.NewServer(fresh): %v", err)
 	}
 
-	webServer, err := NewServer(freshSrv, nil, nil, ServerOptions{})
+	webServer, err := NewServer(freshSrv, nil, nil, ServerOptions{
+		KubeClient: fakeClient,
+		Namespace:  session.DefaultNamespace,
+	})
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -845,17 +895,23 @@ func TestServer_ReposAndRuns(t *testing.T) {
 	opts.SystemPrompt = toolset.SystemPrompt()
 	harness := session.NewHarness(llmClient, nil, toolsRegistry, opts)
 
+	fakeClient := setupFakeKubeClient(t)
 	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
 		Store:          sessStore,
 		StateStore:     stateStore,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("sessionapi.NewServer: %v", err)
 	}
 
-	webServer, err := NewServer(srv, stateStore, nil, ServerOptions{})
+	webServer, err := NewServer(srv, stateStore, nil, ServerOptions{
+		KubeClient: fakeClient,
+		Namespace:  session.DefaultNamespace,
+	})
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
@@ -915,8 +971,8 @@ func TestServer_ReposAndRuns(t *testing.T) {
 		SessionID:  sessionID,
 		Goal:       goalRec.Goal,
 	}
-	if err := stateStore.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
+	if err := createHeroRun(ctx, fakeClient, run, repo.URL); err != nil {
+		t.Fatalf("createHeroRun: %v", err)
 	}
 
 	if err := stateStore.AppendEvent(ctx, repoKey, runID,
@@ -1057,7 +1113,8 @@ func TestServer_ReposAndRuns(t *testing.T) {
 }
 
 type fakeRunStarter struct {
-	store state.Store
+	store  state.Store
+	client client.Client
 }
 
 func (f *fakeRunStarter) StartRun(ctx context.Context, repo *state.Repo, goalName string, opts run.StartOptions) (*state.Run, error) {
@@ -1066,7 +1123,7 @@ func (f *fakeRunStarter) StartRun(ctx context.Context, repo *state.Repo, goalNam
 		return nil, run.ErrGoalNotFound
 	}
 
-	runs, _ := f.store.ListRuns(ctx, repo.Key())
+	runs, _ := run.ListRuns(ctx, f.client, session.DefaultNamespace, repo.Key())
 	for _, r := range runs {
 		if r.GoalName == goalName && !r.Phase.IsTerminal() {
 			return nil, fmt.Errorf("%w: goal has active run", run.ErrActiveRun)
@@ -1085,6 +1142,9 @@ func (f *fakeRunStarter) StartRun(ctx context.Context, repo *state.Repo, goalNam
 		Phase:    state.PhasePending,
 	}
 	if err := f.store.PutRun(ctx, r); err != nil {
+		return nil, err
+	}
+	if err := createHeroRun(ctx, f.client, r, repo.URL); err != nil {
 		return nil, err
 	}
 	eventData := map[string]any{"reason": opts.Reason}
@@ -1107,9 +1167,13 @@ func (f *fakeRunStarter) StartRun(ctx context.Context, repo *state.Repo, goalNam
 func TestRunAgain(t *testing.T) {
 	ctx := t.Context()
 	stateStore := state.NewFileStore(t.TempDir())
+	fakeClient := setupFakeKubeClient(t)
 
-	starter := &fakeRunStarter{store: stateStore}
-	webServer, err := NewServer(&fakeSessionService{}, stateStore, starter, ServerOptions{})
+	starter := &fakeRunStarter{store: stateStore, client: fakeClient}
+	webServer, err := NewServer(&fakeSessionService{}, stateStore, starter, ServerOptions{
+		KubeClient: fakeClient,
+		Namespace:  session.DefaultNamespace,
+	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -1157,6 +1221,9 @@ func TestRunAgain(t *testing.T) {
 	}
 	if err := stateStore.PutRun(ctx, failedRun); err != nil {
 		t.Fatalf("PutRun failed: %v", err)
+	}
+	if err := createHeroRun(ctx, fakeClient, failedRun, repo.URL); err != nil {
+		t.Fatalf("createHeroRun failed: %v", err)
 	}
 
 	jar, err := cookiejar.New(nil)
@@ -1277,6 +1344,9 @@ func TestRunAgain(t *testing.T) {
 	if err := stateStore.PutRun(ctx, missingRun); err != nil {
 		t.Fatalf("PutRun: %v", err)
 	}
+	if err := createHeroRun(ctx, fakeClient, missingRun, repo.URL); err != nil {
+		t.Fatalf("createHeroRun failed: %v", err)
+	}
 	missingResp, missingBody := post(client, "/runs/"+missingGoalRunID+"/rerun", tok)
 	if missingResp.StatusCode != http.StatusConflict {
 		t.Fatalf("POST missing goal status = %d, want 409 Conflict", missingResp.StatusCode)
@@ -1286,7 +1356,10 @@ func TestRunAgain(t *testing.T) {
 	}
 
 	// 7. Store / server error produces 500 Internal Server Error
-	errServer, err := NewServer(&fakeSessionService{}, stateStore, &failRunStarter{err: errors.New("simulated internal store failure")}, ServerOptions{})
+	errServer, err := NewServer(&fakeSessionService{}, stateStore, &failRunStarter{err: errors.New("simulated internal store failure")}, ServerOptions{
+		KubeClient: fakeClient,
+		Namespace:  session.DefaultNamespace,
+	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -1353,10 +1426,18 @@ func TestRunAgain_Actor(t *testing.T) {
 		t.Fatalf("PutRun: %v", err)
 	}
 
+	fakeClient := setupFakeKubeClient(t)
+	if err := createHeroRun(ctx, fakeClient, runRec, repo.URL); err != nil {
+		t.Fatalf("createHeroRun: %v", err)
+	}
+
 	starter := &recordRunStarter{
 		run: &state.Run{ID: "20261116T110000Z-newr"},
 	}
-	srv, err := NewServer(&fakeSessionService{}, stateStore, starter, ServerOptions{})
+	srv, err := NewServer(&fakeSessionService{}, stateStore, starter, ServerOptions{
+		KubeClient: fakeClient,
+		Namespace:  session.DefaultNamespace,
+	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -1398,21 +1479,28 @@ func TestRunAgain_Actor(t *testing.T) {
 
 func TestNewServer_Validation(t *testing.T) {
 	fakeSvc := &fakeSessionService{}
+	fakeClient := setupFakeKubeClient(t)
 	validKey := []byte("12345678901234567890123456789012") // 32 bytes
 
-	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: true}); err == nil {
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{Namespace: session.DefaultNamespace}); err == nil {
+		t.Error("expected error when KubeClient is missing")
+	}
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{KubeClient: fakeClient}); err == nil {
+		t.Error("expected error when Namespace is missing")
+	}
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{KubeClient: fakeClient, Namespace: session.DefaultNamespace, RequireSignIn: true}); err == nil {
 		t.Error("expected error when RequireSignIn is true and SessionKey is missing")
 	}
-	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: true, SessionKey: []byte("too-short")}); err == nil {
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{KubeClient: fakeClient, Namespace: session.DefaultNamespace, RequireSignIn: true, SessionKey: []byte("too-short")}); err == nil {
 		t.Error("expected error when RequireSignIn is true and SessionKey is shorter than MinKeyLength")
 	}
-	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: true, SessionKey: validKey}); err != nil {
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{KubeClient: fakeClient, Namespace: session.DefaultNamespace, RequireSignIn: true, SessionKey: validKey}); err != nil {
 		t.Errorf("unexpected error with valid key: %v", err)
 	}
-	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: false}); err != nil {
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{KubeClient: fakeClient, Namespace: session.DefaultNamespace, RequireSignIn: false}); err != nil {
 		t.Errorf("unexpected error when RequireSignIn is false: %v", err)
 	}
-	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{RequireSignIn: false, SessionKey: []byte("short")}); err != nil {
+	if _, err := NewServer(fakeSvc, nil, nil, ServerOptions{KubeClient: fakeClient, Namespace: session.DefaultNamespace, RequireSignIn: false, SessionKey: []byte("short")}); err != nil {
 		t.Errorf("unexpected error when RequireSignIn is false with short key: %v", err)
 	}
 }
@@ -1461,7 +1549,12 @@ func TestCSRFValidation(t *testing.T) {
 
 	t.Run("sign_in_on", func(t *testing.T) {
 		key := []byte("secret-session-signing-key-32b!!")
-		webServer, err := NewServer(&fakeSessionService{}, nil, nil, ServerOptions{RequireSignIn: true, SessionKey: key})
+		webServer, err := NewServer(&fakeSessionService{}, nil, nil, ServerOptions{
+			RequireSignIn: true,
+			SessionKey:    key,
+			KubeClient:    setupFakeKubeClient(t),
+			Namespace:     session.DefaultNamespace,
+		})
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
 		}
@@ -1506,7 +1599,12 @@ func TestCSRFValidation(t *testing.T) {
 
 	t.Run("sign_in_off_with_session_key", func(t *testing.T) {
 		key := []byte("secret-session-signing-key-32b!!")
-		webServer, err := NewServer(&fakeSessionService{}, nil, nil, ServerOptions{RequireSignIn: false, SessionKey: key})
+		webServer, err := NewServer(&fakeSessionService{}, nil, nil, ServerOptions{
+			RequireSignIn: false,
+			SessionKey:    key,
+			KubeClient:    setupFakeKubeClient(t),
+			Namespace:     session.DefaultNamespace,
+		})
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
 		}
@@ -1559,8 +1657,13 @@ func TestPostMessage_AppendsEvent(t *testing.T) {
 	}
 
 	runID, sessionID := "20261121T100000Z-0001", "sess-run-42"
-	if err := stateStore.PutRun(ctx, &state.Run{ID: runID, Repo: repoKey, GoalName: "test-goal", SessionID: sessionID}); err != nil {
+	runRec := &state.Run{ID: runID, Repo: repoKey, GoalName: "test-goal", SessionID: sessionID, Phase: state.PhaseWorking}
+	if err := stateStore.PutRun(ctx, runRec); err != nil {
 		t.Fatalf("PutRun: %v", err)
+	}
+	fakeClient := setupFakeKubeClient(t)
+	if err := createHeroRun(ctx, fakeClient, runRec, ""); err != nil {
+		t.Fatalf("createHeroRun: %v", err)
 	}
 
 	fakeSvc := &fakeSessionService{
@@ -1582,6 +1685,8 @@ func TestPostMessage_AppendsEvent(t *testing.T) {
 	fakeOrch := &fakeOrchestrator{}
 	webServer, err := NewServer(fakeSvc, stateStore, nil, ServerOptions{
 		Orchestrator: fakeOrch,
+		KubeClient:   fakeClient,
+		Namespace:    session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -1683,6 +1788,8 @@ func TestPostMessage_RunNotWorking_Returns409Conflict(t *testing.T) {
 	}
 	webServer, err := NewServer(fakeSvc, nil, nil, ServerOptions{
 		Orchestrator: fakeOrch,
+		KubeClient:   setupFakeKubeClient(t),
+		Namespace:    session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -1707,7 +1814,7 @@ func TestPostMessage_GetSessionDetailError_Returns500(t *testing.T) {
 	fakeSvc := &fakeSessionService{
 		detailErr: errors.New("simulated internal storage error"),
 	}
-	webServer, err := NewServer(fakeSvc, nil, nil, ServerOptions{})
+	webServer, err := NewServer(fakeSvc, nil, nil, testServerOptions(t))
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -1736,14 +1843,20 @@ func TestPostMessage_RunSession_DeliversThroughOrchestrator(t *testing.T) {
 	}
 
 	runID, sessionID := "20261123T100000Z-0001", "runsession1"
-	if err := stateStore.PutRun(ctx, &state.Run{
+	runRec := &state.Run{
 		ID:        runID,
 		Repo:      repoKey,
 		GoalName:  "test-goal",
 		SessionID: sessionID,
 		Phase:     state.PhaseWorking,
-	}); err != nil {
+	}
+	if err := stateStore.PutRun(ctx, runRec); err != nil {
 		t.Fatalf("PutRun: %v", err)
+	}
+
+	fakeClient := setupFakeKubeClient(t)
+	if err := createHeroRun(ctx, fakeClient, runRec, repo.URL); err != nil {
+		t.Fatalf("createHeroRun: %v", err)
 	}
 
 	if err := sessionStore.NewSession(ctx, sessionID, session.Metadata{
@@ -1758,6 +1871,8 @@ func TestPostMessage_RunSession_DeliversThroughOrchestrator(t *testing.T) {
 		Store:          sessionStore,
 		StateStore:     stateStore,
 		DefaultToolset: "basic",
+		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 		HarnessFactory: func(_ string) (*session.Harness, error) {
 			return nil, nil
 		},
@@ -1769,6 +1884,8 @@ func TestPostMessage_RunSession_DeliversThroughOrchestrator(t *testing.T) {
 	fakeOrch := &fakeOrchestrator{}
 	webServer, err := NewServer(srv, stateStore, nil, ServerOptions{
 		Orchestrator: fakeOrch,
+		KubeClient:   fakeClient,
+		Namespace:    session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)

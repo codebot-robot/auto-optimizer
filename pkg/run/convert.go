@@ -15,16 +15,67 @@
 package run
 
 import (
+	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
+
+// GetRun reads a HeroRun custom resource from kube-apiserver by run ID and converts it to a state.Run.
+// If the HeroRun is not found, it returns state.ErrNotFound.
+func GetRun(ctx context.Context, c client.Client, namespace, runID string) (*state.Run, error) {
+	name := sandboxNameForRun(runID)
+	var hr herorunv1alpha1.HeroRun
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &hr); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil, state.ErrNotFound
+		}
+		return nil, fmt.Errorf("getting HeroRun %s: %w", name, err)
+	}
+	run, err := HeroRunToRun(&hr)
+	if err != nil {
+		return nil, fmt.Errorf("converting HeroRun %s: %w", name, err)
+	}
+	return run, nil
+}
+
+// ListRuns reads HeroRun custom resources from kube-apiserver for a repository and converts them to state.Runs.
+// If repo is the zero RepoKey, all HeroRuns in the namespace are returned.
+// Returned runs are sorted by ID in ascending order.
+func ListRuns(ctx context.Context, c client.Client, namespace string, repo state.RepoKey) ([]*state.Run, error) {
+	var hrList herorunv1alpha1.HeroRunList
+	if err := c.List(ctx, &hrList, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("listing HeroRuns: %w", err)
+	}
+
+	var runs []*state.Run
+	for i := range hrList.Items {
+		hr := &hrList.Items[i]
+		run, err := HeroRunToRun(hr)
+		if err != nil {
+			scoped.Log(ctx).Error(err, "failed to convert HeroRun to run", "heroRun", hr.Name)
+			continue
+		}
+		if repo != (state.RepoKey{}) && run.Repo != repo {
+			continue
+		}
+		runs = append(runs, run)
+	}
+	slices.SortFunc(runs, func(a, b *state.Run) int {
+		return strings.Compare(a.ID, b.ID)
+	})
+	return runs, nil
+}
 
 // HeroRunPhase returns the phase of a HeroRun, defaulting an empty phase to PhasePending.
 func HeroRunPhase(hr *herorunv1alpha1.HeroRun) state.RunPhase {

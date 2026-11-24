@@ -39,7 +39,22 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
+	runpkg "github.com/gke-labs/auto-optimizer/pkg/run"
 )
+
+func newFakeKubeClient(t *testing.T) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := herorunv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+}
 
 type recordingSandbox struct {
 	mu    sync.Mutex
@@ -108,6 +123,8 @@ func setupTestServer(t *testing.T, sb tools.Sandbox) (sessionv1.SessionServiceCl
 		Store:          store,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     newFakeKubeClient(t),
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -569,6 +586,8 @@ func newTestServer(t *testing.T, sb tools.Sandbox) (*Server, *session.FileStore)
 		Store:          store,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     newFakeKubeClient(t),
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -722,10 +741,14 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 	stateStore := state.NewFileStore(t.TempDir())
 	sessionStore := session.NewFileStore(t.TempDir())
 
+	fakeClient := newFakeKubeClient(t)
+
 	srv, err := NewServer(ServerOptions{
 		Store:          sessionStore,
 		StateStore:     stateStore,
 		DefaultToolset: "basic",
+		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
 		HarnessFactory: func(_ string) (*session.Harness, error) {
 			return nil, nil
 		},
@@ -832,8 +855,13 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 	}
 
 	// ListRuns with empty repo_url should fail
-	if _, err := client.ListRuns(ctx, &sessionv1.ListRunsRequest{RepoUrl: ""}); err == nil {
-		t.Error("expected error for empty repo_url")
+	if _, err := client.ListRuns(ctx, &sessionv1.ListRunsRequest{RepoUrl: ""}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for empty repo_url, got %v", err)
+	}
+
+	// ListRuns with malformed repo_url should fail with InvalidArgument
+	if _, err := client.ListRuns(ctx, &sessionv1.ListRunsRequest{RepoUrl: "invalid://///repo"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for malformed repo_url, got %v", err)
 	}
 
 	// ListRuns should be empty initially
@@ -845,7 +873,7 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 		t.Fatalf("expected 0 runs, got %d", len(runsResp.Runs))
 	}
 
-	// Create a run in stateStore
+	// Create a run in fakeClient as HeroRun
 	runID := "20261029T120000Z-abcd"
 	run := &state.Run{
 		ID:         runID,
@@ -854,8 +882,11 @@ func TestListRepositoriesAndGoals(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "c0ffee",
 	}
-	if err := stateStore.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
+	hr := runpkg.HeroRunFromRun(run)
+	hr.Namespace = session.DefaultNamespace
+	hr.Spec.Repository = repo.URL
+	if err := fakeClient.Create(ctx, hr); err != nil {
+		t.Fatalf("Create HeroRun: %v", err)
 	}
 
 	runsResp, err = client.ListRuns(ctx, &sessionv1.ListRunsRequest{RepoUrl: repo.URL})
@@ -941,6 +972,8 @@ func TestRunSessionsTreeAndSideBySideRuns(t *testing.T) {
 		StateStore:     stateStore,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     newFakeKubeClient(t),
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -1189,6 +1222,8 @@ func TestCreateSessionAndSessionDepth_Errors(t *testing.T) {
 		Store:          sessionStore,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     newFakeKubeClient(t),
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -1261,6 +1296,8 @@ func TestSessionAncestryAndMissingAncestor(t *testing.T) {
 		Store:          sessionStore,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     newFakeKubeClient(t),
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -1401,6 +1438,8 @@ func TestSessionAncestryAndMissingAncestor(t *testing.T) {
 		Store:          sessionStore,
 		DefaultToolset: "basic",
 		Harness:        harness,
+		KubeClient:     newFakeKubeClient(t),
+		Namespace:      session.DefaultNamespace,
 	})
 	if err != nil {
 		t.Fatalf("NewServer(fromDisk): %v", err)
@@ -1497,5 +1536,26 @@ func TestSessionAncestryAndMissingAncestor(t *testing.T) {
 	}
 	if legacyTopDepth != 0 {
 		t.Errorf("SessionDepth(legacytop) = %d, want 0", legacyTopDepth)
+	}
+}
+
+func TestNewServer_RequiresKubeClientAndNamespace(t *testing.T) {
+	store := session.NewFileStore(t.TempDir())
+	factory := func(_ string) (*session.Harness, error) { return nil, nil }
+
+	if _, err := NewServer(ServerOptions{
+		Store:          store,
+		HarnessFactory: factory,
+		Namespace:      session.DefaultNamespace,
+	}); err == nil {
+		t.Error("expected error when KubeClient is nil")
+	}
+
+	if _, err := NewServer(ServerOptions{
+		Store:          store,
+		HarnessFactory: factory,
+		KubeClient:     newFakeKubeClient(t),
+	}); err == nil {
+		t.Error("expected error when Namespace is empty")
 	}
 }
