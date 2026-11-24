@@ -46,6 +46,7 @@ const csrfCookieName = "csrf_token"
 // SessionService is the interface web requires from the session backend.
 type SessionService interface {
 	ListSessionSummaries(ctx context.Context) ([]sessionapi.SessionSummary, error)
+	ListRunSessions(ctx context.Context, runID string) ([]sessionapi.SessionSummary, error)
 	GetSessionDetail(ctx context.Context, name string) (*sessionapi.SessionDetail, error)
 	CreateNewSession(ctx context.Context, name, toolset string) error
 	StartTurn(ctx context.Context, name, text string) error
@@ -56,9 +57,10 @@ type RunStarter interface {
 	StartRun(ctx context.Context, repo *state.Repo, goalName string, opts run.StartOptions) (*state.Run, error)
 }
 
-// Orchestrator delivers messages to runs.
+// Orchestrator delivers messages to runs and reports live run session state.
 type Orchestrator interface {
 	PostMessage(ctx context.Context, repo state.RepoKey, runID string, text string) error
+	RunningSessions(runID string) map[string]bool
 }
 
 // ServerOptions configures optional settings for Server.
@@ -359,12 +361,36 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request, runID stri
 		return
 	}
 
+	sessions, err := s.listRunSessions(r.Context(), runRec.ID)
+	if err != nil {
+		scoped.Log(r.Context()).Error(err, "listing sessions for run", "run", runID)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	if err := RenderRunPage(r.Context(), w, RunPageData{
-		Run:    runRec,
-		Events: events,
+		Run:      runRec,
+		Events:   events,
+		Sessions: sessions,
 	}); err != nil {
 		scoped.Log(r.Context()).Error(err, "rendering run page", "run", runID)
 	}
+}
+
+func (s *Server) listRunSessions(ctx context.Context, runID string) ([]sessionapi.SessionSummary, error) {
+	sessions, err := s.service.ListRunSessions(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if s.orchestrator != nil {
+		running := s.orchestrator.RunningSessions(runID)
+		for i := range sessions {
+			if running[sessions[i].Name] {
+				sessions[i].InFlight = true
+			}
+		}
+	}
+	return sessions, nil
 }
 
 func isConflict(err error) bool {
@@ -422,10 +448,15 @@ func (s *Server) handlePostRun(w http.ResponseWriter, r *http.Request, runID str
 			if readErr != nil {
 				scoped.Log(r.Context()).V(2).Info("reading events for run page refusal", "error", readErr)
 			}
+			sessions, listErr := s.listRunSessions(r.Context(), runRec.ID)
+			if listErr != nil {
+				scoped.Log(r.Context()).V(2).Info("listing sessions for run page refusal", "error", listErr)
+			}
 			w.WriteHeader(http.StatusConflict)
 			if renderErr := RenderRunPage(r.Context(), w, RunPageData{
 				Run:         runRec,
 				Events:      events,
+				Sessions:    sessions,
 				ActionError: err.Error(),
 			}); renderErr != nil {
 				scoped.Log(r.Context()).Error(renderErr, "rendering run page with refusal error", "run", runID)

@@ -1749,6 +1749,7 @@ func TestPostMessage_AppendsEvent(t *testing.T) {
 
 type fakeOrchestrator struct {
 	postErr error
+	running map[string]map[string]bool
 	posted  []struct {
 		repo  state.RepoKey
 		runID string
@@ -1766,6 +1767,10 @@ func (f *fakeOrchestrator) PostMessage(_ context.Context, repo state.RepoKey, ru
 		text  string
 	}{repo: repo, runID: runID, text: text})
 	return nil
+}
+
+func (f *fakeOrchestrator) RunningSessions(runID string) map[string]bool {
+	return f.running[runID]
 }
 
 func TestPostMessage_RunNotWorking_Returns409Conflict(t *testing.T) {
@@ -1923,5 +1928,162 @@ func TestPostMessage_RunSession_DeliversThroughOrchestrator(t *testing.T) {
 	err = srv.StartTurn(ctx, sessionID, "direct message")
 	if !errors.Is(err, sessionapi.ErrSessionBelongsToRun) {
 		t.Errorf("expected ErrSessionBelongsToRun, got %v", err)
+	}
+}
+
+func TestGetRun_SessionTreeWithStatusAndTranscriptLinks(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	stateStore := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repoKey := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+	repo := &state.Repo{Host: repoKey.Host, Owner: repoKey.Owner, Name: repoKey.Name, DefaultBranch: "main"}
+	if err := stateStore.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261124T120000Z-beef"
+	rootName := "root1"
+	child1Name := "child1"
+	child2Name := "child2"
+	grandchildName := "grandchild1"
+	otherRunSession := "otherrunsess"
+
+	runRec := &state.Run{
+		ID:        runID,
+		Repo:      repoKey,
+		GoalName:  "tree-goal",
+		SessionID: rootName,
+		Phase:     state.PhaseWorking,
+	}
+	fakeClient := setupFakeKubeClient(t)
+	if err := createHeroRun(ctx, fakeClient, runRec, repo.URL); err != nil {
+		t.Fatalf("createHeroRun: %v", err)
+	}
+
+	baseTime := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	rootMeta := session.Metadata{Toolset: "basic", Repo: repoKey.String(), RunID: runID, CreatedAt: baseTime}
+	if err := sessionStore.NewSession(ctx, rootName, rootMeta); err != nil {
+		t.Fatalf("NewSession(root): %v", err)
+	}
+	child1Meta := rootMeta.Child(rootName)
+	child1Meta.Toolset = "basic"
+	child1Meta.CreatedAt = baseTime.Add(time.Minute)
+	if err := sessionStore.NewSession(ctx, child1Name, child1Meta); err != nil {
+		t.Fatalf("NewSession(child1): %v", err)
+	}
+	child2Meta := rootMeta.Child(rootName)
+	child2Meta.Toolset = "basic"
+	child2Meta.CreatedAt = baseTime.Add(2 * time.Minute)
+	if err := sessionStore.NewSession(ctx, child2Name, child2Meta); err != nil {
+		t.Fatalf("NewSession(child2): %v", err)
+	}
+	grandMeta := child1Meta.Child(child1Name)
+	grandMeta.Toolset = "basic"
+	grandMeta.CreatedAt = baseTime.Add(3 * time.Minute)
+	if err := sessionStore.NewSession(ctx, grandchildName, grandMeta); err != nil {
+		t.Fatalf("NewSession(grandchild): %v", err)
+	}
+	// Session from another run must not appear on this run's page.
+	if err := sessionStore.NewSession(ctx, otherRunSession, session.Metadata{
+		Toolset:   "basic",
+		Repo:      repoKey.String(),
+		RunID:     "20261124T120000Z-cafe",
+		CreatedAt: baseTime,
+	}); err != nil {
+		t.Fatalf("NewSession(other): %v", err)
+	}
+
+	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
+		Store:          sessionStore,
+		StateStore:     stateStore,
+		DefaultToolset: "basic",
+		KubeClient:     fakeClient,
+		Namespace:      session.DefaultNamespace,
+		HarnessFactory: func(_ string) (*session.Harness, error) {
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("sessionapi.NewServer: %v", err)
+	}
+
+	fakeOrch := &fakeOrchestrator{
+		running: map[string]map[string]bool{
+			runID: {
+				rootName:   true,
+				child2Name: true,
+			},
+		},
+	}
+	webServer, err := NewServer(srv, stateStore, nil, ServerOptions{
+		Orchestrator: fakeOrch,
+		KubeClient:   fakeClient,
+		Namespace:    session.DefaultNamespace,
+	})
+	if err != nil {
+		t.Fatalf("web.NewServer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/runs/"+runID, nil)
+	rec := httptest.NewRecorder()
+	webServer.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /runs/%s status = %d, want 200\nbody: %s", runID, rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	if strings.Contains(body, otherRunSession) {
+		t.Errorf("run page should not include session %q from another run", otherRunSession)
+	}
+
+	treeStart := strings.Index(body, `<ul class="session-tree session-tree-root">`)
+	if treeStart < 0 {
+		t.Fatalf("missing session tree markup in body:\n%s", body)
+	}
+	treeHTML := body[treeStart:]
+
+	// Verify tree order: root -> child1 -> grandchild1 -> child2 (DFS pre-order).
+	idxRoot := strings.Index(treeHTML, `href="/sessions/`+rootName+`"`)
+	idxChild1 := strings.Index(treeHTML, `href="/sessions/`+child1Name+`"`)
+	idxGrand := strings.Index(treeHTML, `href="/sessions/`+grandchildName+`"`)
+	idxChild2 := strings.Index(treeHTML, `href="/sessions/`+child2Name+`"`)
+	if idxRoot < 0 || idxChild1 < 0 || idxGrand < 0 || idxChild2 < 0 {
+		t.Fatalf("missing session links in tree: root=%d child1=%d grand=%d child2=%d", idxRoot, idxChild1, idxGrand, idxChild2)
+	}
+	if !(idxRoot < idxChild1 && idxChild1 < idxGrand && idxGrand < idxChild2) {
+		t.Errorf("sessions not nested in tree order: root=%d child1=%d grand=%d child2=%d", idxRoot, idxChild1, idxGrand, idxChild2)
+	}
+
+	// Verify running vs stopped badges reflect orchestrator live state.
+	assertStatusAfter := func(name, wantBadge string) {
+		t.Helper()
+		idx := strings.Index(treeHTML, `href="/sessions/`+name+`"`)
+		if idx < 0 {
+			t.Fatalf("link for %s not found", name)
+		}
+		snippet := treeHTML[idx:min(len(treeHTML), idx+160)]
+		if !strings.Contains(snippet, wantBadge) {
+			t.Errorf("session %s snippet missing %q:\n%s", name, wantBadge, snippet)
+		}
+	}
+	assertStatusAfter(rootName, `<span class="badge badge-in-flight">running</span>`)
+	assertStatusAfter(child1Name, `<span class="badge badge-idle">stopped</span>`)
+	assertStatusAfter(grandchildName, `<span class="badge badge-idle">stopped</span>`)
+	assertStatusAfter(child2Name, `<span class="badge badge-in-flight">running</span>`)
+
+	// Verify each child transcript link resolves cleanly.
+	for _, name := range []string{rootName, child1Name, grandchildName, child2Name} {
+		tReq := httptest.NewRequest(http.MethodGet, "/sessions/"+name, nil)
+		tRec := httptest.NewRecorder()
+		webServer.ServeHTTP(tRec, tReq)
+		if tRec.Code != http.StatusOK {
+			t.Errorf("GET /sessions/%s status = %d, want 200", name, tRec.Code)
+		}
+		if !strings.Contains(tRec.Body.String(), "Session: "+name) {
+			t.Errorf("GET /sessions/%s missing session heading", name)
+		}
 	}
 }

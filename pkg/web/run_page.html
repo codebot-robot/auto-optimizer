@@ -61,6 +61,20 @@
 </div>
 
 <div class="card">
+  <h2>Sessions</h2>
+  {{$tree := .SessionTree}}
+  {{if $tree}}
+  <ul class="session-tree session-tree-root">
+    {{range $tree}}{{template "sessionNode" .}}{{end}}
+  </ul>
+  {{else}}
+  <div class="empty-state">
+    <p>No sessions recorded for this run yet.</p>
+  </div>
+  {{end}}
+</div>
+
+<div class="card">
   <h2>Phase Timeline</h2>
   {{if .Events}}
   <div class="timeline-container">
@@ -98,4 +112,21 @@
   </div>
 </div>
 {{end}}
+{{end}}
+
+{{define "sessionNode"}}
+<li class="session-tree-item">
+  <div class="session-tree-node">
+    <a href="/sessions/{{.Name}}"><code>{{.Name}}</code></a>
+    {{if .InFlight}}<span class="badge badge-in-flight">running</span>{{else}}<span class="badge badge-idle">stopped</span>{{end}}
+    {{if .Toolset}}<span class="meta-badge">{{.Toolset}}</span>{{end}}
+    <span class="session-meta">{{.MessageCount}} {{if eq .MessageCount 1}}message{{else}}messages{{end}}</span>
+    {{if not .CreatedAt.IsZero}}<span class="session-meta">{{formatTime .CreatedAt}}</span>{{end}}
+  </div>
+  {{if .Children}}
+  <ul class="session-tree">
+    {{range .Children}}{{template "sessionNode" .}}{{end}}
+  </ul>
+  {{end}}
+</li>
 {{end}}

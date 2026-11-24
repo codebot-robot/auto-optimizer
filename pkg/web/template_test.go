@@ -60,6 +60,8 @@ func assertGolden(t *testing.T, filename string, actual string) {
 
 type fakeSessionService struct {
 	summaries      []sessionapi.SessionSummary
+	runSessions    map[string][]sessionapi.SessionSummary
+	runSessionsErr error
 	details        map[string]*sessionapi.SessionDetail
 	detailErr      error
 	startTurnCalls []struct{ Name, Text string }
@@ -67,6 +69,13 @@ type fakeSessionService struct {
 
 func (f *fakeSessionService) ListSessionSummaries(_ context.Context) ([]sessionapi.SessionSummary, error) {
 	return f.summaries, nil
+}
+
+func (f *fakeSessionService) ListRunSessions(_ context.Context, runID string) ([]sessionapi.SessionSummary, error) {
+	if f.runSessionsErr != nil {
+		return nil, f.runSessionsErr
+	}
+	return f.runSessions[runID], nil
 }
 
 func (f *fakeSessionService) GetSessionDetail(_ context.Context, name string) (*sessionapi.SessionDetail, error) {
@@ -424,6 +433,43 @@ func TestGoldenFiles(t *testing.T) {
 					Schedule: "on-change",
 					Verify:   "make test",
 					Body:     "# Throughput\nIncrease request throughput by 10%.\n",
+				},
+			},
+			Sessions: []sessionapi.SessionSummary{
+				{
+					Name:         "sess-run-10",
+					RunID:        "20261024T140000Z-abcd",
+					Toolset:      "basic",
+					CreatedAt:    fixedTime.Add(1 * time.Minute),
+					MessageCount: 6,
+					InFlight:     true,
+				},
+				{
+					Name:         "sess-run-10-c1",
+					RunID:        "20261024T140000Z-abcd",
+					Parent:       "sess-run-10",
+					Toolset:      "basic",
+					CreatedAt:    fixedTime.Add(2 * time.Minute),
+					MessageCount: 4,
+					InFlight:     false,
+				},
+				{
+					Name:         "sess-run-10-c2",
+					RunID:        "20261024T140000Z-abcd",
+					Parent:       "sess-run-10",
+					Toolset:      "basic",
+					CreatedAt:    fixedTime.Add(3 * time.Minute),
+					MessageCount: 1,
+					InFlight:     true,
+				},
+				{
+					Name:         "sess-run-10-c1-g1",
+					RunID:        "20261024T140000Z-abcd",
+					Parent:       "sess-run-10-c1",
+					Toolset:      "basic",
+					CreatedAt:    fixedTime.Add(4 * time.Minute),
+					MessageCount: 2,
+					InFlight:     false,
 				},
 			},
 			Events: []state.Event{
