@@ -20,21 +20,27 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
 	"time"
 
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets/ao"
 )
@@ -45,7 +51,9 @@ const defaultMaxConcurrent = 4
 type Options struct {
 	Client          client.Client
 	SessionStore    session.Store
+	StateStore      state.Store
 	HarnessFactory  func(toolset string) (*session.Harness, error)
+	Namespace       string
 	DefaultToolset  string
 	DefaultMaxTurns int
 	MaxConcurrent   int
@@ -56,6 +64,12 @@ type Options struct {
 // Reconciler watches Session custom resources and drives each session's LLM loop.
 type Reconciler struct {
 	opts Options
+
+	notifyCh chan event.TypedGenericEvent[reconcile.Request]
+
+	msgMu             sync.Mutex
+	msgWaiters        map[string]chan struct{}
+	sessionNamespaces map[string]string
 }
 
 // NewReconciler validates opts and constructs a Session Reconciler.
@@ -69,13 +83,25 @@ func NewReconciler(opts Options) (*Reconciler, error) {
 	if opts.Clock == nil {
 		opts.Clock = time.Now
 	}
-	return &Reconciler{opts: opts}, nil
+	return &Reconciler{
+		opts:              opts,
+		notifyCh:          make(chan event.TypedGenericEvent[reconcile.Request], 1024),
+		msgWaiters:        make(map[string]chan struct{}),
+		sessionNamespaces: make(map[string]string),
+	}, nil
 }
 
 // SetupWithManager registers the Session reconciler with mgr.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	src := source.TypedChannel[reconcile.Request, reconcile.Request](
+		r.notifyCh,
+		handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req reconcile.Request) []reconcile.Request {
+			return []reconcile.Request{req}
+		}),
+	)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&herorunv1alpha1.Session{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		WatchesRawSource(src).
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.opts.MaxConcurrent}).
 		Complete(r)
 }
@@ -84,16 +110,27 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	var obj herorunv1alpha1.Session
 	if err := r.opts.Client.Get(ctx, req.NamespacedName, &obj); err != nil {
+		if k8serrors.IsNotFound(err) {
+			r.setSessionNamespace(req.Name, "")
+		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 	if obj.Status.Phase.IsTerminal() || ctx.Err() != nil {
+		if obj.Status.Phase.IsTerminal() {
+			r.setSessionNamespace(obj.Name, "")
+		}
 		return reconcile.Result{}, nil
 	}
+	r.setSessionNamespace(obj.Name, obj.Namespace)
 	if obj.Spec.Deadline != nil && !r.opts.Clock().UTC().Before(obj.Spec.Deadline.Time) {
-		return reconcile.Result{}, r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
+		err := r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
 			st.Phase, st.Outcome, st.Error = herorunv1alpha1.SessionPhaseFailed, herorunv1alpha1.SessionOutcomeDeadlineExceeded, "deadline exceeded"
 			st.FinishedAt = &now
 		})
+		if err == nil {
+			r.setSessionNamespace(obj.Name, "")
+		}
+		return reconcile.Result{}, err
 	}
 	if obj.Status.Phase != herorunv1alpha1.SessionPhaseRunning || obj.Status.StartedAt == nil {
 		if err := r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
@@ -110,10 +147,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if ctx.Err() != nil {
 		return reconcile.Result{}, nil
 	}
-	return reconcile.Result{}, r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
+	err := r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
 		applyTerminal(st)
 		st.FinishedAt = &now
 	})
+	if err == nil {
+		r.setSessionNamespace(obj.Name, "")
+	}
+	return reconcile.Result{}, err
 }
 
 func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Session) func(*herorunv1alpha1.SessionStatus) {
@@ -172,6 +213,18 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 		prTool = ao.NewOpenPullRequestTool(ao.OpenPullRequestExpectation{Repository: obj.Spec.Repository, Branch: obj.Spec.Branch})
 		extra = append(extra, prTool)
 	}
+	repoKey, hasMessaging, err := r.sessionRepoKey(obj)
+	if err != nil {
+		return fail(err)
+	}
+	if hasMessaging {
+		extra = append(extra, ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
+			return r.sendMessage(toolCtx, obj, repoKey, recipient, message)
+		}))
+		harness = harness.WithMessageSource(func(msgCtx context.Context, s *session.Session) error {
+			return r.deliverPendingMessages(msgCtx, repoKey, obj.Spec.RunID, s)
+		})
+	}
 	harness = harness.WithExtraTools(extra...)
 	if maxTurns := cmp.Or(obj.Spec.MaxTurns, r.opts.DefaultMaxTurns, harness.RunOptions().MaxTurns); maxTurns > 0 {
 		budget := session.NewTurnBudget(maxTurns)
@@ -199,10 +252,25 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 			scoped.Log(evCtx).V(1).Info("failed to update Session progress status", "session", obj.Name, "error", err)
 		}
 	})
-	if slices.ContainsFunc(sess.Messages(), func(m llm.Message) bool { return m.Role == "user" }) || obj.Spec.InitialPrompt == "" {
-		err = harness.ContinueTurn(turnCtx, sess, events)
-	} else {
-		err = harness.RunTurn(turnCtx, sess, obj.Spec.InitialPrompt, events)
+	hasUserMessage := slices.ContainsFunc(sess.Messages(), func(m llm.Message) bool { return m.Role == "user" })
+	for {
+		if hasUserMessage || obj.Spec.InitialPrompt == "" {
+			err = harness.ContinueTurn(turnCtx, sess, events)
+		} else {
+			err = harness.RunTurn(turnCtx, sess, obj.Spec.InitialPrompt, events)
+			hasUserMessage = true
+		}
+		if err != nil || !hasMessaging || ctx.Err() != nil {
+			break
+		}
+		var hasPending bool
+		if hasPending, err = r.hasPendingMessages(turnCtx, repoKey, obj.Spec.RunID, obj.Name); err != nil || !hasPending {
+			break
+		}
+		if turnCtx.Err() != nil || (obj.Spec.Deadline != nil && !r.opts.Clock().UTC().Before(obj.Spec.Deadline.Time)) {
+			err = cmp.Or(turnCtx.Err(), context.DeadlineExceeded)
+			break
+		}
 	}
 	deadlineExceeded := err != nil && (errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(turnCtx.Err(), context.DeadlineExceeded) ||
