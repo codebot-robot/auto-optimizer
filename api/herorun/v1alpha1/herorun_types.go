@@ -107,6 +107,58 @@ type BudgetSpec struct {
 	MaxCostUSD float64 `json:"maxCostUSD,omitempty"`
 }
 
+// OperationResult classifies the outcome of a finished operation.
+type OperationResult string
+
+const (
+	// OperationResultCompleted indicates the turn completed normally without a tool termination.
+	OperationResultCompleted OperationResult = "Completed"
+	// OperationResultPullRequest indicates the agent requested opening a pull request.
+	OperationResultPullRequest OperationResult = "PullRequest"
+	// OperationResultFinished indicates the agent called the finish tool.
+	OperationResultFinished OperationResult = "Finished"
+	// OperationResultMaxTurns indicates the turn reached the configured turn limit.
+	OperationResultMaxTurns OperationResult = "MaxTurns"
+	// OperationResultCanceled indicates the turn was canceled before completing.
+	OperationResultCanceled OperationResult = "Canceled"
+	// OperationResultFailed indicates the turn failed with an error.
+	OperationResultFailed OperationResult = "Failed"
+)
+
+// ActiveOperation tracks an in-flight or recently completed long-running operation on a HeroRun.
+type ActiveOperation struct {
+	// ID uniquely identifies this operation instance.
+	ID string `json:"id"`
+
+	// Done reports whether the operation worker has finished executing.
+	// +optional
+	Done bool `json:"done,omitempty"`
+
+	// Result classifies the outcome once Done is true.
+	// +optional
+	Result OperationResult `json:"result,omitempty"`
+
+	// PRTitle is the pull request title proposed by the agent when Result is PullRequest.
+	// +optional
+	PRTitle string `json:"prTitle,omitempty"`
+
+	// PRBody is the pull request description proposed by the agent when Result is PullRequest.
+	// +optional
+	PRBody string `json:"prBody,omitempty"`
+
+	// Summary is the agent's finish summary when Result is Finished.
+	// +optional
+	Summary string `json:"summary,omitempty"`
+
+	// Error holds the error message when Result is Failed or Canceled.
+	// +optional
+	Error string `json:"error,omitempty"`
+
+	// FinishedAt is the time when the operation finished.
+	// +optional
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+}
+
 // HeroRunStatus defines the observed state and lifecycle progress of a HeroRun.
 type HeroRunStatus struct {
 	// Phase is the current lifecycle phase of the run, matching the state.RunPhase value.
@@ -121,9 +173,9 @@ type HeroRunStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// ActiveOperation is the identifier of an active long-running operation in flight.
+	// ActiveOperation tracks an active long-running operation in flight and its outcome once finished.
 	// +optional
-	ActiveOperation string `json:"activeOperation,omitempty"`
+	ActiveOperation *ActiveOperation `json:"activeOperation,omitempty"`
 
 	// SandboxName is the name of the Sandbox resource running this optimization session.
 	// +optional

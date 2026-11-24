@@ -195,16 +195,40 @@ func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServe
 }
 
 func (o *Orchestrator) cancelWorkers() {
-	o.runStatesMu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(o.runStates))
-	for _, rs := range o.runStates {
-		if rs != nil && rs.workerCancel != nil {
-			cancels = append(cancels, rs.workerCancel)
+	o.turnWorkersMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(o.turnWorkers))
+	for _, w := range o.turnWorkers {
+		if w != nil && w.cancel != nil {
+			cancels = append(cancels, w.cancel)
 		}
 	}
-	o.runStatesMu.Unlock()
+	o.turnWorkersMu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
+	}
+}
+
+func (o *Orchestrator) isRunActive(runID string) bool {
+	o.turnWorkersMu.Lock()
+	defer o.turnWorkersMu.Unlock()
+	for _, w := range o.turnWorkers {
+		if w != nil && w.runID == runID {
+			return true
+		}
+	}
+	return false
+}
+
+func seedCompletedTurnOp(t *testing.T, ctx context.Context, orch *Orchestrator, runID, opID string, outcome turnOutcome) {
+	t.Helper()
+	name := sandboxNameForRun(runID)
+	var hr herorunv1alpha1.HeroRun
+	if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: orch.namespace(), Name: name}, &hr); err != nil {
+		t.Fatalf("getting HeroRun %s: %v", name, err)
+	}
+	hr.Status.ActiveOperation = completedActiveOperation(opID, outcome)
+	if err := orch.kubeClient.Status().Update(ctx, &hr); err != nil {
+		t.Fatalf("updating HeroRun %s activeOperation: %v", name, err)
 	}
 }
 
@@ -3161,8 +3185,7 @@ func TestOrchestrator_Working_GRPCCanceled_LeavesWorking(t *testing.T) {
 
 	// Storing a gRPC codes.Canceled outcome (like an in-flight sandbox call being canceled) must leave the run Working.
 	grpcErr := status.Error(codes.Canceled, "in-flight sandbox rpc canceled")
-	orch.ensureRunState(runID)
-	orch.storeTurnOutcome(runID, turnOutcome{
+	seedCompletedTurnOp(t, ctx, orch, runID, "op-grpc-cancel", turnOutcome{
 		Err:      fmt.Errorf("in-flight sandbox call: %w", grpcErr),
 		Finished: time.Now(),
 	})
@@ -6308,8 +6331,8 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 	putTestRun(t, ctx, orch, run)
 
 	// Pre-store an outcome for the run
-	orch.ensureRunState(runID)
-	orch.storeTurnOutcome(runID, turnOutcome{
+	opID := "op-consumed-once"
+	seedCompletedTurnOp(t, ctx, orch, runID, opID, turnOutcome{
 		Err:      nil,
 		Finished: fixedTime,
 	})
@@ -6328,8 +6351,8 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 	}
 
 	// Verify outcome was removed upon consumption
-	if _, ok := orch.popTurnOutcome(runID); ok {
-		t.Fatal("expected turn outcome to be deleted once consumed, but was still present")
+	if gotRun.ActiveOperation != nil {
+		t.Fatalf("expected ActiveOperation to be cleared once consumed, got %+v", gotRun.ActiveOperation)
 	}
 
 	// Pass 2: Reconcile again with no outcome stored
@@ -6337,9 +6360,13 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 		t.Fatalf("orch.Reconcile pass 2: %v", err)
 	}
 
-	// Outcome was not consumed twice (map is still empty)
-	if _, ok := orch.popTurnOutcome(runID); ok {
-		t.Fatal("outcome appeared again after pass 2")
+	// Outcome was not consumed twice (ActiveOperation remains nil)
+	gotRun2, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
+	if err != nil {
+		t.Fatalf("GetRun pass 2: %v", err)
+	}
+	if gotRun2.ActiveOperation != nil {
+		t.Fatalf("ActiveOperation appeared again after pass 2: %+v", gotRun2.ActiveOperation)
 	}
 }
 
@@ -6439,7 +6466,7 @@ func findGoroutinesContaining(target string) []string {
 
 func TestOrchestrator_CancelWorker(t *testing.T) {
 	orch := &Orchestrator{
-		runStates: make(map[string]*runState),
+		turnWorkers: make(map[string]*turnWorkerHandle),
 	}
 
 	cancelled := false
@@ -6447,28 +6474,28 @@ func TestOrchestrator_CancelWorker(t *testing.T) {
 		cancelled = true
 	})
 
-	orch.ensureRunState("run-1")
-	orch.setWorkerCancel("run-1", cancel)
-	orch.cancelWorker("run-1")
+	orch.reserveTurnWorker("op-1", "run-1")
+	orch.setTurnWorkerCancel("op-1", cancel)
+	orch.cancelRunTurnWorkers("run-1")
 
 	if !cancelled {
 		t.Errorf("expected worker to be cancelled")
 	}
 
-	// Calling cancelWorker on nonexistent run should not panic
-	orch.cancelWorker("nonexistent")
+	// Calling cancelRunTurnWorkers on nonexistent run should not panic
+	orch.cancelRunTurnWorkers("nonexistent")
 }
 
 func TestOrchestrator_CancelWorkers(t *testing.T) {
 	orch := &Orchestrator{
-		runStates: make(map[string]*runState),
+		turnWorkers: make(map[string]*turnWorkerHandle),
 	}
 
 	var canc1, canc2 bool
-	orch.ensureRunState("run-1")
-	orch.setWorkerCancel("run-1", func() { canc1 = true })
-	orch.ensureRunState("run-2")
-	orch.setWorkerCancel("run-2", func() { canc2 = true })
+	orch.reserveTurnWorker("op-1", "run-1")
+	orch.setTurnWorkerCancel("op-1", func() { canc1 = true })
+	orch.reserveTurnWorker("op-2", "run-2")
+	orch.setTurnWorkerCancel("op-2", func() { canc2 = true })
 	orch.cancelWorkers()
 
 	if !canc1 || !canc2 {
@@ -6488,8 +6515,8 @@ func TestNewTestOrchestrator_WaitsForWorkers(t *testing.T) {
 		})
 
 		ctx, cancel := context.WithCancel(subT.Context())
-		orch.ensureRunState("test-run")
-		orch.setWorkerCancel("test-run", cancel)
+		orch.reserveTurnWorker("op-test", "test-run")
+		orch.setTurnWorkerCancel("op-test", cancel)
 		orch.workerWG.Add(1)
 		go func() {
 			defer orch.workerWG.Done()
@@ -7671,8 +7698,7 @@ func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T)
 	})
 
 	// Store an outcome that finished before the deadline
-	orch.ensureRunState(runID)
-	orch.storeTurnOutcome(runID, turnOutcome{
+	seedCompletedTurnOp(t, ctx, orch, runID, "op-outcome-first", turnOutcome{
 		Err:      session.ErrSessionFinished,
 		Finished: startTime.Add(5 * time.Minute),
 	})
@@ -10894,5 +10920,348 @@ func TestOrchestrator_Wait_ToolCallUsesNoExtraTurns(t *testing.T) {
 	}
 	if childLLMCalls != 2 {
 		t.Errorf("childLLMCalls = %d, want 2", childLLMCalls)
+	}
+}
+
+func TestOrchestrator_ActiveOperation_PersistedBeforeWorkerAndClearedOnCompletion(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261124T100000Z-actop", "run-20261124t100000z-actop"
+
+	var (
+		mu              sync.Mutex
+		observedOpInLLM *herorunv1alpha1.ActiveOperation
+		fakeClient      client.Client
+	)
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	observingLLM := &mockMultiCallLLM{
+		callFn: func(_ llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+			var hr herorunv1alpha1.HeroRun
+			if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: sandboxNameForRun(runID)}, &hr); err == nil && hr.Status.ActiveOperation != nil {
+				mu.Lock()
+				observedOpInLLM = hr.Status.ActiveOperation.DeepCopy()
+				mu.Unlock()
+			}
+			close(started)
+			<-release
+			content := "done"
+			return &llm.ChatCompletionResponse{
+				Choices: []llm.Choice{{Message: llm.Message{Role: "assistant", Content: &content}}},
+			}, nil
+		},
+	}
+
+	store, sessionStore, repo, _, harness, _, fc := setupWorkingTestRun(t, runID, sbName, nil, observingLLM)
+	fakeClient = fc
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		KubeClient:   fakeClient,
+	})
+
+	req := runRequest(orch, repo.Key(), runID)
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile start: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for turn worker to call LLM")
+	}
+
+	gotRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
+	if err != nil {
+		t.Fatalf("GetRun while running: %v", err)
+	}
+	if gotRun.ActiveOperation == nil || gotRun.ActiveOperation.ID == "" || gotRun.ActiveOperation.Done {
+		t.Fatalf("ActiveOperation while running = %+v, want non-empty ID with Done=false", gotRun.ActiveOperation)
+	}
+	opID := gotRun.ActiveOperation.ID
+
+	mu.Lock()
+	seenInWorker := observedOpInLLM
+	mu.Unlock()
+	if seenInWorker == nil || seenInWorker.ID != opID || seenInWorker.Done {
+		t.Errorf("worker observed ActiveOperation=%+v, want ID=%q Done=false", seenInWorker, opID)
+	}
+
+	if !orch.isTurnWorkerRunning(opID) {
+		t.Errorf("expected isTurnWorkerRunning(%q) to be true while worker is running", opID)
+	}
+
+	close(release)
+	waitDeadline := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(runID) {
+		if time.Now().After(waitDeadline) {
+			t.Fatal("timed out waiting for turn worker to finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Worker must have recorded the completed outcome directly on HeroRun.Status and removed its live handle.
+	doneRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
+	if err != nil {
+		t.Fatalf("GetRun after worker exit: %v", err)
+	}
+	if doneRun.ActiveOperation == nil || doneRun.ActiveOperation.ID != opID || !doneRun.ActiveOperation.Done || doneRun.ActiveOperation.Result != state.OperationResultCompleted {
+		t.Fatalf("ActiveOperation after worker exit = %+v, want ID=%q Done=true Result=%q", doneRun.ActiveOperation, opID, state.OperationResultCompleted)
+	}
+	if orch.isTurnWorkerRunning(opID) {
+		t.Errorf("expected live worker handle %q to be removed after worker exited", opID)
+	}
+
+	// A brand-new orchestrator instance (simulating control-plane restart) consumes the outcome from HeroRun.Status.
+	restartedOrch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		KubeClient:   fakeClient,
+	})
+	if _, err := restartedOrch.Reconcile(ctx, runRequest(restartedOrch, repo.Key(), runID)); err != nil {
+		t.Fatalf("restartedOrch.Reconcile consume: %v", err)
+	}
+
+	finalRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
+	if err != nil {
+		t.Fatalf("GetRun after completion: %v", err)
+	}
+	if finalRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("final phase = %s, want %s", finalRun.Phase, state.PhaseNoImprovement)
+	}
+	if finalRun.ActiveOperation != nil {
+		t.Errorf("ActiveOperation after completion = %+v, want nil", finalRun.ActiveOperation)
+	}
+}
+
+func TestOrchestrator_ActiveOperation_ClearedOnDeadlineExceeded(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261124T100000Z-actdl", "run-20261124t100000z-actdl"
+	startTime := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	deadline := startTime.Add(10 * time.Minute)
+	currentTime := startTime
+
+	blockingLLM := newMidTurnBlockingLLM()
+	store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return currentTime },
+		KubeClient:   fakeClient,
+	})
+
+	req := runRequest(orch, repo.Key(), runID)
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile start: %v", err)
+	}
+
+	select {
+	case <-blockingLLM.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for turn worker to start")
+	}
+
+	runningRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
+	if err != nil {
+		t.Fatalf("GetRun while running: %v", err)
+	}
+	if runningRun.ActiveOperation == nil || runningRun.ActiveOperation.ID == "" {
+		t.Fatal("expected ActiveOperation to be set while turn is running")
+	}
+	opID := runningRun.ActiveOperation.ID
+
+	currentTime = deadline.Add(time.Minute)
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile past deadline: %v", err)
+	}
+	orch.workerWG.Wait()
+
+	failedRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
+	if err != nil {
+		t.Fatalf("GetRun after deadline: %v", err)
+	}
+	if failedRun.Phase != state.PhaseFailed {
+		t.Errorf("phase = %s, want %s", failedRun.Phase, state.PhaseFailed)
+	}
+	if failedRun.ActiveOperation != nil {
+		t.Errorf("ActiveOperation after deadline = %+v, want nil", failedRun.ActiveOperation)
+	}
+	if orch.isTurnWorkerRunning(opID) {
+		t.Errorf("expected live worker handle %q to be removed after deadline failure", opID)
+	}
+}
+
+func TestOrchestrator_ActiveOperation_OutcomeRetainedUntilSaveSucceeds(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261124T100000Z-actretry", "run-20261124t100000z-actretry"
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	failNextStatusUpdate := false
+	fakeClient := newTestFakeClientBuilder(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if failNextStatusUpdate {
+					failNextStatusUpdate = false
+					return errors.New("transient status update failure")
+				}
+				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		KubeClient:   fakeClient,
+	})
+
+	putTestRun(t, ctx, orch, &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "retry-goal",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha",
+		SandboxName: sbName,
+	})
+
+	opID := "op-save-retry"
+	seedCompletedTurnOp(t, ctx, orch, runID, opID, turnOutcome{
+		Err:      session.ErrPullRequestRequested,
+		PRTitle:  "Optimize hot loop",
+		PRBody:   "Benchmarks improved.",
+		Finished: time.Now().UTC(),
+	})
+
+	req := runRequest(orch, repo.Key(), runID)
+
+	// Pass 1: status update fails; completed ActiveOperation on HeroRun must remain intact.
+	failNextStatusUpdate = true
+	if _, err := orch.Reconcile(ctx, req); err == nil {
+		t.Fatal("expected Reconcile to return error when status update fails")
+	}
+	afterFailRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
+	if err != nil {
+		t.Fatalf("GetRun after failed save: %v", err)
+	}
+	if afterFailRun.ActiveOperation == nil || afterFailRun.ActiveOperation.ID != opID || !afterFailRun.ActiveOperation.Done {
+		t.Errorf("ActiveOperation after failed save = %+v, want ID=%q Done=true", afterFailRun.ActiveOperation, opID)
+	}
+
+	// Pass 2: status update succeeds; run advances to Selecting and ActiveOperation clears.
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile retry: %v", err)
+	}
+	afterRetryRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
+	if err != nil {
+		t.Fatalf("GetRun after retry: %v", err)
+	}
+	if afterRetryRun.Phase != state.PhaseSelecting {
+		t.Errorf("phase after retry = %s, want %s", afterRetryRun.Phase, state.PhaseSelecting)
+	}
+	if afterRetryRun.PRTitle != "Optimize hot loop" || afterRetryRun.PRBody != "Benchmarks improved." {
+		t.Errorf("PR fields after retry = (%q, %q), want (%q, %q)", afterRetryRun.PRTitle, afterRetryRun.PRBody, "Optimize hot loop", "Benchmarks improved.")
+	}
+	if afterRetryRun.ActiveOperation != nil {
+		t.Errorf("ActiveOperation after retry = %+v, want nil", afterRetryRun.ActiveOperation)
+	}
+}
+
+func TestOrchestrator_ActiveOperation_SaveFailureDoesNotLaunchWorker(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261124T100000Z-actsf", "run-20261124t100000z-actsf"
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	failStatusUpdate := false
+	fakeClient := newTestFakeClientBuilder(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if failStatusUpdate {
+					return errors.New("status update rejected")
+				}
+				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	var llmCalled bool
+	mockLLM := &mockMultiCallLLM{
+		callFn: func(_ llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+			llmCalled = true
+			content := "unexpected"
+			return &llm.ChatCompletionResponse{
+				Choices: []llm.Choice{{Message: llm.Message{Role: "assistant", Content: &content}}},
+			}, nil
+		},
+	}
+
+	harness, _, _ := setupTestHarnessWithLLM(t, nil, mockLLM)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		KubeClient:   fakeClient,
+	})
+
+	putTestRun(t, ctx, orch, &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "save-fail-goal",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha",
+		SandboxName: sbName,
+	})
+
+	failStatusUpdate = true
+	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err == nil {
+		t.Fatal("expected Reconcile to fail when persisting ActiveOperation fails")
+	}
+	orch.workerWG.Wait()
+
+	if llmCalled {
+		t.Error("expected turn worker not to launch when persisting ActiveOperation fails")
+	}
+	if orch.isRunActive(runID) {
+		t.Error("expected no live worker handle to remain after failed startTurn save")
 	}
 }

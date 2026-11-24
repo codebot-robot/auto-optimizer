@@ -278,7 +278,10 @@ type Orchestrator struct {
 
 	runStatesMu sync.Mutex
 	runStates   map[string]*runState
-	workerWG    sync.WaitGroup
+
+	turnWorkersMu sync.Mutex
+	turnWorkers   map[string]*turnWorkerHandle
+	workerWG      sync.WaitGroup
 
 	pendingMessagesMu sync.Mutex
 	pendingMessagesCh chan struct{}
@@ -290,13 +293,16 @@ type Orchestrator struct {
 // ErrRunNotWorking indicates that a message cannot be posted because the run has left the working state.
 var ErrRunNotWorking = errors.New("run is no longer working")
 
-// runState holds in-memory runtime state for an active run.
+// runState holds in-memory runtime state shared across sessions of an active run.
 type runState struct {
-	active       bool
-	workerCancel context.CancelFunc
-	turnOutcome  *turnOutcome
 	sandboxOwner *session.SandboxOwner
 	turnBudget   *session.TurnBudget
+}
+
+// turnWorkerHandle tracks a live in-process turn worker goroutine.
+type turnWorkerHandle struct {
+	runID  string
+	cancel context.CancelFunc
 }
 
 var _ reconcile.Reconciler = (*Orchestrator)(nil)
@@ -372,6 +378,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		runIndex:              make(map[string]runIndexEntry),
 		notifyCh:              make(chan event.TypedGenericEvent[reconcile.Request], 1024),
 		runStates:             make(map[string]*runState),
+		turnWorkers:           make(map[string]*turnWorkerHandle),
 	}
 	return orch, nil
 }
@@ -390,13 +397,6 @@ func (o *Orchestrator) turnBudget(runID string) *session.TurnBudget {
 		rs.turnBudget = session.NewTurnBudget(o.maxTurns)
 	}
 	return rs.turnBudget
-}
-
-func (o *Orchestrator) deleteTurnBudget(runID string) {
-	if o == nil {
-		return
-	}
-	o.deleteRunState(runID)
 }
 
 func (o *Orchestrator) recordRunIndex(name string, repo state.RepoKey, runID string) {
@@ -552,12 +552,8 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 
 	if run.Phase.IsTerminal() {
 		o.deleteRunIndex(req.Name)
-		o.deleteTurnBudget(run.ID)
-		if outcome, ok := o.popTurnOutcome(run.ID); ok {
-			if err := o.handleTurnOutcome(ctx, repo, run, hr, outcome); err != nil {
-				log.V(2).Info("error handling leftover outcome for terminal run", "run", run.ID, "error", err)
-			}
-		}
+		o.cancelRunTurnWorkers(run.ID)
+		o.deleteRunState(run.ID)
 		return reconcile.Result{}, nil
 	}
 
@@ -903,74 +899,133 @@ func (o *Orchestrator) ensureRunState(runID string) *runState {
 	return rs
 }
 
-func (o *Orchestrator) setRunActive(runID string, active bool) bool {
-	o.runStatesMu.Lock()
-	defer o.runStatesMu.Unlock()
-	rs := o.runStates[runID]
-	if rs == nil {
+func newTurnOperationID(sessionID string) (string, error) {
+	b := make([]byte, 8)
+	if _, err := cryptorand.Read(b); err != nil {
+		return "", fmt.Errorf("generating operation ID: %w", err)
+	}
+	return fmt.Sprintf("%s:%x", sessionID, b), nil
+}
+
+func (o *Orchestrator) isTurnWorkerRunning(opID string) bool {
+	if opID == "" {
 		return false
 	}
-	if active {
-		if rs.active {
+	o.turnWorkersMu.Lock()
+	defer o.turnWorkersMu.Unlock()
+	return o.turnWorkers[opID] != nil
+}
+
+func (o *Orchestrator) reserveTurnWorker(opID, runID string) bool {
+	o.turnWorkersMu.Lock()
+	defer o.turnWorkersMu.Unlock()
+	if o.turnWorkers == nil {
+		o.turnWorkers = make(map[string]*turnWorkerHandle)
+	}
+	for _, w := range o.turnWorkers {
+		if w.runID == runID {
 			return false
 		}
-		rs.active = true
-		return true
 	}
-	rs.active = false
-	rs.workerCancel = nil
+	o.turnWorkers[opID] = &turnWorkerHandle{runID: runID}
 	return true
 }
 
-func (o *Orchestrator) setWorkerCancel(runID string, cancel context.CancelFunc) {
-	o.runStatesMu.Lock()
-	defer o.runStatesMu.Unlock()
-	rs := o.runStates[runID]
-	if rs == nil {
-		return
+func (o *Orchestrator) setTurnWorkerCancel(opID string, cancel context.CancelFunc) {
+	o.turnWorkersMu.Lock()
+	defer o.turnWorkersMu.Unlock()
+	if w := o.turnWorkers[opID]; w != nil {
+		w.cancel = cancel
 	}
-	rs.workerCancel = cancel
 }
 
-func (o *Orchestrator) cancelWorker(runID string) {
-	o.runStatesMu.Lock()
-	var cancel context.CancelFunc
-	if rs := o.runStates[runID]; rs != nil {
-		cancel = rs.workerCancel
+func (o *Orchestrator) deleteTurnWorker(opID string) {
+	if opID == "" {
+		return
 	}
-	o.runStatesMu.Unlock()
-	if cancel != nil {
+	o.turnWorkersMu.Lock()
+	defer o.turnWorkersMu.Unlock()
+	delete(o.turnWorkers, opID)
+}
+
+func (o *Orchestrator) cancelRunTurnWorkers(runID string) {
+	o.turnWorkersMu.Lock()
+	var cancels []context.CancelFunc
+	for _, w := range o.turnWorkers {
+		if w.runID == runID && w.cancel != nil {
+			cancels = append(cancels, w.cancel)
+		}
+	}
+	o.turnWorkersMu.Unlock()
+	for _, cancel := range cancels {
 		cancel()
 	}
 }
 
-func (o *Orchestrator) isRunActive(runID string) bool {
-	o.runStatesMu.Lock()
-	defer o.runStatesMu.Unlock()
-	rs := o.runStates[runID]
-	return rs != nil && rs.active
+func completedActiveOperation(opID string, outcome turnOutcome) *herorunv1alpha1.ActiveOperation {
+	op := &herorunv1alpha1.ActiveOperation{
+		ID:   opID,
+		Done: true,
+	}
+	if !outcome.Finished.IsZero() {
+		op.FinishedAt = toMetaTime(&outcome.Finished)
+	}
+	switch {
+	case errors.Is(outcome.Err, session.ErrPullRequestRequested):
+		op.Result = herorunv1alpha1.OperationResultPullRequest
+		op.PRTitle = outcome.PRTitle
+		op.PRBody = outcome.PRBody
+	case errors.Is(outcome.Err, session.ErrSessionFinished):
+		op.Result = herorunv1alpha1.OperationResultFinished
+		op.Summary = outcome.Summary
+	case outcome.Err == nil:
+		op.Result = herorunv1alpha1.OperationResultCompleted
+	case errors.Is(outcome.Err, session.ErrMaxTurns):
+		op.Result = herorunv1alpha1.OperationResultMaxTurns
+	case isCanceled(outcome.Err):
+		op.Result = herorunv1alpha1.OperationResultCanceled
+		op.Error = outcome.Err.Error()
+	default:
+		op.Result = herorunv1alpha1.OperationResultFailed
+		op.Error = outcome.Err.Error()
+	}
+	return op
 }
 
-func (o *Orchestrator) storeTurnOutcome(runID string, outcome turnOutcome) {
-	o.runStatesMu.Lock()
-	defer o.runStatesMu.Unlock()
-	rs := o.runStates[runID]
-	if rs == nil {
+func (o *Orchestrator) recordTurnOutcome(ctx context.Context, runID, opID string, outcome turnOutcome) {
+	if ctx.Err() != nil || o.isManagerCanceled() {
 		return
 	}
-	rs.turnOutcome = &outcome
-}
+	saveCtx := o.getWorkerContext(ctx)
+	key := client.ObjectKey{Namespace: o.namespace(), Name: sandboxNameForRun(runID)}
 
-func (o *Orchestrator) popTurnOutcome(runID string) (turnOutcome, bool) {
-	o.runStatesMu.Lock()
-	defer o.runStatesMu.Unlock()
-	rs := o.runStates[runID]
-	if rs != nil && rs.turnOutcome != nil {
-		outcome := *rs.turnOutcome
-		rs.turnOutcome = nil
-		return outcome, true
+	const maxAttempts = 5
+	for range maxAttempts {
+		var hr herorunv1alpha1.HeroRun
+		if err := o.kubeClient.Get(saveCtx, key, &hr); err != nil {
+			if !k8serrors.IsNotFound(err) {
+				scoped.Log(saveCtx).Error(err, "failed to get HeroRun to record turn outcome", "run", runID, "operation", opID)
+			}
+			return
+		}
+		if state.RunPhase(hr.Status.Phase).IsTerminal() {
+			return
+		}
+		if hr.Status.ActiveOperation == nil || hr.Status.ActiveOperation.ID != opID || hr.Status.ActiveOperation.Done {
+			return
+		}
+		hr.Status.ActiveOperation = completedActiveOperation(opID, outcome)
+		now := metav1.NewTime(o.clock().UTC().Truncate(time.Second))
+		hr.Status.ObservedAt = &now
+		if err := o.kubeClient.Status().Update(saveCtx, &hr); err != nil {
+			if k8serrors.IsConflict(err) {
+				continue
+			}
+			scoped.Log(saveCtx).Error(err, "failed to record turn outcome on HeroRun", "run", runID, "operation", opID)
+			return
+		}
+		return
 	}
-	return turnOutcome{}, false
 }
 
 func (o *Orchestrator) getWorkerContext(ctx context.Context) context.Context {
@@ -1272,7 +1327,7 @@ func (o *Orchestrator) putRun(ctx context.Context, repo *state.Repo, run *state.
 	}
 	if run != nil && run.Phase.IsTerminal() {
 		o.deleteRunIndex(sandboxNameForRun(run.ID))
-		o.deleteTurnBudget(run.ID)
+		o.deleteRunState(run.ID)
 	}
 	return nil
 }
@@ -1358,7 +1413,7 @@ func (o *Orchestrator) saveTerminalRun(ctx context.Context, repo *state.Repo, ru
 		scoped.Log(ctx).Error(err, "failed to append event", "kind", end.Kind, "run", run.ID)
 	}
 
-	o.cancelWorker(run.ID)
+	o.cancelRunTurnWorkers(run.ID)
 	o.deleteRunState(run.ID)
 
 	if end.Sandbox != nil {
@@ -1391,8 +1446,8 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 		return reconcile.Result{}, nil
 	}
 
-	if outcome, ok := o.popTurnOutcome(run.ID); ok {
-		return reconcile.Result{}, o.handleTurnOutcome(ctx, repo, run, hr, outcome)
+	if op := run.ActiveOperation; op != nil && op.Done {
+		return reconcile.Result{}, o.handleTurnOutcome(ctx, repo, run, hr, op)
 	}
 
 	if o.isManagerCanceled() {
@@ -1411,7 +1466,7 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 				elapsed = e
 			}
 		}
-		o.cancelWorker(run.ID)
+		run.ActiveOperation = nil
 		if err := o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseFailed,
 			Kind:    "deadline_exceeded",
@@ -1432,8 +1487,8 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 		requeueAfter = run.Deadline.Sub(now)
 	}
 
-	if o.isRunActive(run.ID) {
-		log.V(2).Info("run is already actively executing a session", "run", run.ID)
+	if op := run.ActiveOperation; op != nil && o.isTurnWorkerRunning(op.ID) {
+		log.V(2).Info("run is already actively executing a session", "run", run.ID, "operation", op.ID)
 		return reconcile.Result{RequeueAfter: requeueAfter}, nil
 	}
 
@@ -1449,16 +1504,27 @@ func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *sta
 	}
 
 	o.ensureRunState(run.ID)
-	if !o.setRunActive(run.ID, true) {
+
+	sessionStarted := false
+	if run.SessionID == "" {
+		run.SessionID = topLevelSessionID(run.ID, "")
+		sessionStarted = true
+	}
+
+	opID, err := newTurnOperationID(run.SessionID)
+	if err != nil {
+		return err
+	}
+	if !o.reserveTurnWorker(opID, run.ID) {
 		return nil
 	}
 
-	if run.SessionID == "" {
-		run.SessionID = topLevelSessionID(run.ID, "")
-		if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
-			o.setRunActive(run.ID, false)
-			return fmt.Errorf("updating run with session ID: %w", err)
-		}
+	run.ActiveOperation = &state.ActiveOperation{ID: opID}
+	if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
+		o.deleteTurnWorker(opID)
+		return fmt.Errorf("updating run with active operation: %w", err)
+	}
+	if sessionStarted {
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    o.clock().UTC(),
 			Phase:   state.PhaseWorking,
@@ -1471,15 +1537,18 @@ func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *sta
 	}
 
 	workerCtx, cancel := context.WithCancel(o.getWorkerContext(ctx))
-	o.setWorkerCancel(run.ID, cancel)
+	o.setTurnWorkerCancel(opID, cancel)
 
 	o.workerWG.Add(1)
 	go func() {
 		defer o.workerWG.Done()
 		defer cancel()
-		defer o.setRunActive(run.ID, false)
+		defer o.deleteTurnWorker(opID)
 		outcome := o.runTurnWorker(workerCtx, repo, run, hr)
-		o.storeTurnOutcome(run.ID, outcome)
+		if workerCtx.Err() == nil {
+			o.recordTurnOutcome(ctx, run.ID, opID, outcome)
+		}
+		o.deleteTurnWorker(opID)
 		o.Notify(repo.Key(), run.ID)
 	}()
 	return nil
@@ -1617,18 +1686,25 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	}
 }
 
-func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, outcome turnOutcome) error {
+func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, op *state.ActiveOperation) error {
 	log := scoped.Log(ctx)
 
 	if run.Phase.IsTerminal() {
 		return nil
 	}
 
-	turnErr := outcome.Err
+	attachSandbox := func() *session.Sandbox {
+		if o.harness != nil && run.SandboxName != "" {
+			return o.harness.GetOrAttachSandbox(run.SandboxName)
+		}
+		return nil
+	}
 
-	if errors.Is(turnErr, session.ErrPullRequestRequested) {
-		run.PRTitle = outcome.PRTitle
-		run.PRBody = outcome.PRBody
+	switch op.Result {
+	case state.OperationResultPullRequest:
+		run.PRTitle = op.PRTitle
+		run.PRBody = op.PRBody
+		run.ActiveOperation = nil
 		prev := run.Phase
 		now := o.clock().UTC()
 		run.SetPhase(state.PhaseSelecting, now)
@@ -1646,54 +1722,65 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		o.releaseSandbox(run.SandboxName)
 		o.Notify(repo.Key(), run.ID)
 		return nil
-	}
 
-	var sb *session.Sandbox
-	if o.harness != nil && run.SandboxName != "" {
-		sb = o.harness.GetOrAttachSandbox(run.SandboxName)
-	}
-
-	if errors.Is(turnErr, session.ErrSessionFinished) {
-		run.Summary = outcome.Summary
+	case state.OperationResultFinished:
+		run.Summary = op.Summary
+		run.ActiveOperation = nil
 		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseNoImprovement,
 			Kind:    "finished",
-			Message: outcome.Summary,
-			Sandbox: sb,
+			Message: op.Summary,
+			Sandbox: attachSandbox(),
 		})
-	}
 
-	if turnErr == nil || errors.Is(turnErr, session.ErrMaxTurns) {
+	case state.OperationResultCompleted, state.OperationResultMaxTurns:
 		hasPending, err := o.hasPendingMessages(ctx, repo.Key(), run.ID, run.SessionID)
 		if err != nil {
 			return fmt.Errorf("checking pending messages: %w", err)
 		}
-		if hasPending && !errors.Is(turnErr, session.ErrMaxTurns) {
+		if hasPending && op.Result != state.OperationResultMaxTurns {
+			run.ActiveOperation = nil
+			if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
+				return fmt.Errorf("clearing active operation: %w", err)
+			}
 			o.Notify(repo.Key(), run.ID)
 			return nil
 		}
+		run.ActiveOperation = nil
 		return o.finishRun(ctx, repo, run, hr, runEnd{
 			Phase:   state.PhaseNoImprovement,
 			Kind:    "no_improvement",
 			Message: "session ended without a pull request",
-			Sandbox: sb,
+			Sandbox: attachSandbox(),
 		})
-	}
 
-	if ctx.Err() != nil || o.isManagerCanceled() || isCanceled(turnErr) {
+	case state.OperationResultCanceled:
+		if ctx.Err() != nil || o.isManagerCanceled() {
+			return nil
+		}
+		run.ActiveOperation = nil
+		if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
+			return fmt.Errorf("clearing active operation: %w", err)
+		}
+		o.Notify(repo.Key(), run.ID)
 		return nil
-	}
 
-	errMsg := fmt.Sprintf("session error: %v", turnErr)
-	if err := o.finishRun(ctx, repo, run, hr, runEnd{
-		Phase:   state.PhaseFailed,
-		Kind:    "failed",
-		Message: errMsg,
-		Sandbox: sb,
-	}); err != nil {
-		return err
+	default:
+		if ctx.Err() != nil || o.isManagerCanceled() {
+			return nil
+		}
+		errMsg := fmt.Sprintf("session error: %s", op.Error)
+		run.ActiveOperation = nil
+		if err := o.finishRun(ctx, repo, run, hr, runEnd{
+			Phase:   state.PhaseFailed,
+			Kind:    "failed",
+			Message: errMsg,
+			Sandbox: attachSandbox(),
+		}); err != nil {
+			return err
+		}
+		return errors.New(errMsg)
 	}
-	return errors.New(errMsg)
 }
 
 func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (reconcile.Result, error) {

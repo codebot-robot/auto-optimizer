@@ -81,7 +81,14 @@ func TestHeroRun_JSONRoundTrip(t *testing.T) {
 					Message:            "run session is in progress",
 				},
 			},
-			ActiveOperation:    "turn-1",
+			ActiveOperation: &herorunv1alpha1.ActiveOperation{
+				ID:         "turn-1",
+				Done:       true,
+				Result:     herorunv1alpha1.OperationResultPullRequest,
+				PRTitle:    "optimize latency",
+				PRBody:     "body text",
+				FinishedAt: &later,
+			},
 			SandboxName:        "run-sandbox-abcd",
 			WorkspaceClaimName: "run-sandbox-abcd",
 			SessionID:          "sess-1",
@@ -156,6 +163,13 @@ func TestHeroRun_DeepCopy(t *testing.T) {
 					Reason:             "Started",
 				},
 			},
+			ActiveOperation: &herorunv1alpha1.ActiveOperation{
+				ID:         "turn-1",
+				Done:       true,
+				Result:     herorunv1alpha1.OperationResultFinished,
+				Summary:    "done",
+				FinishedAt: &now,
+			},
 			Baseline:   &baselineVal,
 			ObservedAt: &now,
 		},
@@ -172,6 +186,7 @@ func TestHeroRun_DeepCopy(t *testing.T) {
 	copied.Spec.GoalDefinition.Metric.Command = "new command"
 	copied.Spec.GoalDefinition.Agents[0] = "mutated coder"
 	copied.Status.Conditions[0].Reason = "Updated"
+	copied.Status.ActiveOperation.Summary = "mutated summary"
 	*copied.Status.Baseline = 50.0
 
 	if original.Spec.Goal == copied.Spec.Goal {
@@ -188,6 +203,9 @@ func TestHeroRun_DeepCopy(t *testing.T) {
 	}
 	if original.Status.Conditions[0].Reason == copied.Status.Conditions[0].Reason {
 		t.Errorf("mutating copy modified original Status.Conditions")
+	}
+	if original.Status.ActiveOperation.Summary == copied.Status.ActiveOperation.Summary {
+		t.Errorf("mutating copy modified original Status.ActiveOperation")
 	}
 	if *original.Status.Baseline == *copied.Status.Baseline {
 		t.Errorf("mutating copy modified original Status.Baseline")
