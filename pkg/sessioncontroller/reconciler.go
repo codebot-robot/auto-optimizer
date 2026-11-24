@@ -18,19 +18,25 @@ package sessioncontroller
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -67,6 +73,7 @@ type Reconciler struct {
 
 	runBudgetsMu sync.Mutex
 	runBudgets   map[string]*session.TurnBudget
+	msgSeq       atomic.Uint64
 }
 
 // NewReconciler validates opts and constructs a Session Reconciler.
@@ -90,6 +97,7 @@ func NewReconciler(opts Options) (*Reconciler, error) {
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&herorunv1alpha1.Session{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Owns(&herorunv1alpha1.SessionMessage{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.opts.MaxConcurrent}).
 		Complete(r)
 }
@@ -204,6 +212,14 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 		prTool = ao.NewOpenPullRequestTool(ao.OpenPullRequestExpectation{Repository: obj.Spec.Repository, Branch: obj.Spec.Branch})
 		extra = append(extra, prTool)
 	}
+	if obj.Spec.RunID != "" {
+		extra = append(extra, ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
+			return r.sendMessage(toolCtx, obj, recipient, message)
+		}))
+		harness = harness.WithMessageSource(func(msgCtx context.Context, s *session.Session) error {
+			return r.deliverPendingMessages(msgCtx, obj, s)
+		})
+	}
 	harness = harness.WithExtraTools(extra...)
 	maxTurns := cmp.Or(obj.Spec.MaxTurns, r.opts.DefaultMaxTurns, harness.RunOptions().MaxTurns)
 	budget, err := r.turnBudgetFor(ctx, obj, sess, maxTurns)
@@ -232,10 +248,33 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 			scoped.Log(evCtx).V(1).Info("failed to update Session progress status", "session", obj.Name, "error", err)
 		}
 	})
-	if slices.ContainsFunc(sess.Messages(), func(m llm.Message) bool { return m.Role == "user" }) || obj.Spec.InitialPrompt == "" {
-		err = harness.ContinueTurn(turnCtx, sess, events)
-	} else {
-		err = harness.RunTurn(turnCtx, sess, obj.Spec.InitialPrompt, events)
+	firstTurn := true
+	for {
+		if firstTurn {
+			firstTurn = false
+			if slices.ContainsFunc(sess.Messages(), func(m llm.Message) bool { return m.Role == "user" }) || obj.Spec.InitialPrompt == "" {
+				err = harness.ContinueTurn(turnCtx, sess, events)
+			} else {
+				err = harness.RunTurn(turnCtx, sess, obj.Spec.InitialPrompt, events)
+			}
+		} else {
+			err = harness.ContinueTurn(turnCtx, sess, events)
+		}
+		if err != nil || obj.Spec.RunID == "" {
+			break
+		}
+		pending, listErr := r.listPendingMessages(turnCtx, obj)
+		if listErr != nil {
+			err = listErr
+			break
+		}
+		if len(pending) == 0 {
+			break
+		}
+		if r.deadlinePassed(obj) {
+			err = context.DeadlineExceeded
+			break
+		}
 	}
 	deadlineExceeded := err != nil && (errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(turnCtx.Err(), context.DeadlineExceeded) ||
@@ -248,6 +287,135 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 		r.recordMetrics(st, sess, model)
 		applyOutcome(st, err, prTool, finishTool, deadlineExceeded)
 	}, false
+}
+
+func (r *Reconciler) deliverPendingMessages(ctx context.Context, obj *herorunv1alpha1.Session, sess *session.Session) error {
+	pending, err := r.listPendingMessages(ctx, obj)
+	if err != nil {
+		return err
+	}
+	for i := range pending {
+		text := formatSessionMessage(pending[i].Spec)
+		if err := sess.AddMessages(ctx, llm.Message{Role: "user", Content: &text}); err != nil {
+			return fmt.Errorf("adding pending message %s to session: %w", pending[i].Name, err)
+		}
+		if err := r.markMessageDelivered(ctx, &pending[i]); err != nil {
+			return fmt.Errorf("marking session message %s delivered: %w", pending[i].Name, err)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) listPendingMessages(ctx context.Context, obj *herorunv1alpha1.Session) ([]herorunv1alpha1.SessionMessage, error) {
+	var list herorunv1alpha1.SessionMessageList
+	if err := r.opts.Client.List(ctx, &list,
+		client.InNamespace(obj.Namespace),
+		client.MatchingLabels{herorunv1alpha1.LabelSession: obj.Name},
+	); err != nil {
+		return nil, fmt.Errorf("listing session messages: %w", err)
+	}
+	var pending []herorunv1alpha1.SessionMessage
+	for i := range list.Items {
+		msg := list.Items[i]
+		if msg.IsDelivered() || msg.DeletionTimestamp != nil {
+			continue
+		}
+		if msg.Spec.SessionName != "" && msg.Spec.SessionName != obj.Name {
+			continue
+		}
+		pending = append(pending, msg)
+	}
+	slices.SortFunc(pending, func(a, b herorunv1alpha1.SessionMessage) int {
+		if c := a.CreationTimestamp.Time.Compare(b.CreationTimestamp.Time); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+	return pending, nil
+}
+
+func (r *Reconciler) markMessageDelivered(ctx context.Context, msg *herorunv1alpha1.SessionMessage) error {
+	key := client.ObjectKeyFromObject(msg)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var current herorunv1alpha1.SessionMessage
+		if err := r.opts.Client.Get(ctx, key, &current); err != nil {
+			if k8serrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if current.IsDelivered() {
+			return nil
+		}
+		now := metav1.NewTime(r.opts.Clock().UTC())
+		current.Status.DeliveredAt = &now
+		return r.opts.Client.Status().Update(ctx, &current)
+	})
+}
+
+func formatSessionMessage(spec herorunv1alpha1.SessionMessageSpec) string {
+	if spec.From != "" {
+		return fmt.Sprintf("Message from %s: %s", spec.From, spec.Text)
+	}
+	return spec.Text
+}
+
+func (r *Reconciler) sendMessage(ctx context.Context, sender *herorunv1alpha1.Session, recipient, message string) error {
+	if sender.Spec.RunID == "" {
+		return errors.New("cannot call send_message: session belongs to no run")
+	}
+	if recipient == sender.Name {
+		return errors.New("cannot send message to self")
+	}
+	var target herorunv1alpha1.Session
+	if err := r.opts.Client.Get(ctx, client.ObjectKey{Namespace: sender.Namespace, Name: recipient}, &target); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return fmt.Errorf("recipient session %q not found", recipient)
+		}
+		return fmt.Errorf("getting recipient session %q: %w", recipient, err)
+	}
+	if target.Spec.RunID != sender.Spec.RunID {
+		return fmt.Errorf("cannot send message to session %q: not in the same run", recipient)
+	}
+	if target.Status.Phase.IsTerminal() || target.DeletionTimestamp != nil {
+		return fmt.Errorf("recipient session %q is not running (phase %s)", recipient, target.Status.Phase)
+	}
+
+	name, err := r.newSessionMessageName(target.Name)
+	if err != nil {
+		return err
+	}
+	spec := herorunv1alpha1.SessionMessageSpec{
+		SessionName: target.Name,
+		RunID:       target.Spec.RunID,
+		From:        sender.Name,
+		Text:        message,
+	}
+	msg := &herorunv1alpha1.SessionMessage{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: target.Namespace,
+			Labels:    spec.Labels(),
+		},
+		Spec: spec,
+	}
+	if err := controllerutil.SetControllerReference(&target, msg, r.opts.Client.Scheme()); err != nil {
+		return fmt.Errorf("setting owner reference on session message: %w", err)
+	}
+	if err := r.opts.Client.Create(ctx, msg); err != nil {
+		return fmt.Errorf("creating session message: %w", err)
+	}
+	return nil
+}
+
+func (r *Reconciler) newSessionMessageName(targetName string) (string, error) {
+	var suffix [2]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", fmt.Errorf("generating session message name: %w", err)
+	}
+	ts := max(r.opts.Clock().UTC().UnixNano(), 0)
+	seq := r.msgSeq.Add(1)
+	return fmt.Sprintf("%s-msg-%016x-%06x-%s", targetName, ts, seq, hex.EncodeToString(suffix[:])), nil
 }
 
 func (r *Reconciler) attachSandbox(ctx context.Context, obj *herorunv1alpha1.Session, harness *session.Harness, sess *session.Session) error {
