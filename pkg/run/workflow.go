@@ -18,8 +18,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/go-git/go-git/v5/plumbing"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -27,6 +31,7 @@ import (
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
+	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
@@ -46,6 +51,7 @@ type runWorkflow struct {
 	repo *state.Repo
 	run  *state.Run
 	hr   *herorunv1alpha1.HeroRun
+	end  *runEnd
 }
 
 // newRunWorkflow creates a runWorkflow for the given orchestrator, repo, run, and HeroRun.
@@ -66,6 +72,8 @@ func (w *runWorkflow) Run(ctx context.Context) (workflowResult, error) {
 		return w.runPending(ctx)
 	case state.PhasePreparing:
 		return w.runPreparing(ctx)
+	case state.PhaseSelecting:
+		return w.runSelecting(ctx)
 	default:
 		return workflowResult{}, fmt.Errorf("unsupported workflow phase: %s", w.run.Phase)
 	}
@@ -283,6 +291,163 @@ func (w *runWorkflow) runPreparing(ctx context.Context) (workflowResult, error) 
 	w.run.ReadyDeadline = nil
 	log.Info("run successfully prepared and entered Working phase", "run", w.run.ID, "sandbox", w.run.SandboxName)
 	return workflowResult{}, nil
+}
+
+// runSelecting executes the Selecting phase: runs the goal's verify command if configured,
+// exports candidate commits as a packfile while enforcing refusal checks, pushes the branch
+// to the forge, and advances the run to OpeningPR. Sandbox release is deferred to the caller
+// after saving the state transition.
+func (w *runWorkflow) runSelecting(ctx context.Context) (workflowResult, error) {
+	log := scoped.Log(ctx)
+
+	if w.run.SandboxName == "" {
+		return w.failRun(w.orch.clock().UTC(), "sandbox name is empty for selecting run"), nil
+	}
+	sb := w.orch.harness.GetOrAttachSandbox(w.run.SandboxName)
+
+	if w.run.Goal != nil && w.run.Goal.Verify != "" {
+		if res, stop := w.runVerify(ctx, sb); stop {
+			return res, nil
+		}
+	}
+
+	destDir, err := os.MkdirTemp("", "ao-export-*")
+	if err != nil {
+		return w.failRun(w.orch.clock().UTC(), fmt.Sprintf("creating temp dir for export: %v", err)), nil
+	}
+	defer func() {
+		if rmErr := os.RemoveAll(destDir); rmErr != nil {
+			log.V(2).Info("failed to remove temp export dir", "dir", destDir, "error", rmErr)
+		}
+	}()
+
+	exportRes, err := sb.ExportCommits(ctx, session.ExportOptions{
+		RepoDir: "/workspace/repo",
+		Base:    w.run.BaseCommit,
+		DestDir: destDir,
+	})
+	if err != nil {
+		now := w.orch.clock().UTC()
+		switch {
+		case errors.Is(err, session.ErrNoChanges):
+			return w.noImprovement(now, "no_changes", "no changes against base commit", nil), nil
+		case errors.Is(err, session.ErrGoalsChanged):
+			return w.noImprovement(now, "refused", "changes under .goals/", nil), nil
+		case errors.Is(err, session.ErrUncommittedChanges):
+			return w.failRun(now, err.Error()), nil
+		default:
+			return w.failRun(now, fmt.Sprintf("export commits: %v", err)), nil
+		}
+	}
+
+	log.V(2).Info("commits exported successfully", "run", w.run.ID, "tip", exportRes.Tip)
+	w.appendEvent(ctx, w.orch.clock().UTC(), state.PhaseSelecting, "commits_exported", fmt.Sprintf("Exported commits with tip %s", exportRes.Tip), map[string]any{"tip": exportRes.Tip})
+
+	var f forge.Forge
+	if w.orch.forgeFor != nil {
+		f, err = w.orch.forgeFor(w.repo.URL)
+		if err != nil {
+			return w.failRunWithKind(w.orch.clock().UTC(), "push_failed", fmt.Sprintf("selecting forge for %s: %v", w.repo.URL, err)), nil
+		}
+	}
+	if f == nil {
+		return w.failRunWithKind(w.orch.clock().UTC(), "push_failed", fmt.Sprintf("no forge configured for repository %s", w.repo.URL)), nil
+	}
+
+	packFile, err := os.Open(exportRes.PackfilePath)
+	if err != nil {
+		return w.failRunWithKind(w.orch.clock().UTC(), "push_failed", fmt.Sprintf("opening packfile: %v", err)), nil
+	}
+	defer func() {
+		if closeErr := packFile.Close(); closeErr != nil {
+			log.V(2).Info("failed to close packfile", "error", closeErr)
+		}
+	}()
+
+	var creds forge.PushCredentialer
+	if c, ok := f.(forge.PushCredentialer); ok {
+		creds = c
+	}
+
+	branchName := w.run.BranchName()
+	if pushErr := forge.PushPackfile(ctx, forge.PushPackfileOptions{
+		RemoteURL:   w.repo.URL,
+		Branch:      branchName,
+		Tip:         plumbing.NewHash(exportRes.Tip),
+		Base:        plumbing.NewHash(w.run.BaseCommit),
+		Packfile:    packFile,
+		Credentials: creds,
+	}); pushErr != nil {
+		now := w.orch.clock().UTC()
+		if errors.Is(pushErr, forge.ErrBranchMoved) {
+			return w.failRunWithKind(now, "branch_moved", "remote branch is not at base commit"), nil
+		}
+		return w.failRunWithKind(now, "push_failed", fmt.Sprintf("push packfile: %v", pushErr)), nil
+	}
+
+	w.run.Branch = branchName
+	pushTime := w.orch.clock().UTC()
+	w.appendEvent(ctx, pushTime, state.PhaseSelecting, "branch_pushed", fmt.Sprintf("Pushed branch %s with tip %s", branchName, exportRes.Tip), map[string]any{
+		"branch": branchName,
+		"tip":    exportRes.Tip,
+	})
+
+	w.run.SetPhase(state.PhaseOpeningPR, pushTime)
+	return workflowResult{}, nil
+}
+
+func (w *runWorkflow) runVerify(ctx context.Context, sb *session.Sandbox) (workflowResult, bool) {
+	w.appendEvent(ctx, w.orch.clock().UTC(), state.PhaseSelecting, "verify_started", fmt.Sprintf("Running verify command: %s", w.run.Goal.Verify), map[string]any{"command": w.run.Goal.Verify})
+
+	verifyCtx, verifyCancel := context.WithTimeout(ctx, w.orch.verifyTimeout)
+	res, err := sb.RunVerify(verifyCtx, "/workspace/repo", w.run.Goal.Verify, 50)
+	timedOut := errors.Is(err, context.DeadlineExceeded) || verifyCtx.Err() == context.DeadlineExceeded || status.Code(err) == codes.DeadlineExceeded
+	verifyCancel()
+
+	if ctx.Err() != nil {
+		return workflowResult{}, true
+	}
+	if err != nil {
+		now := w.orch.clock().UTC()
+		if timedOut {
+			return w.noImprovement(now, "verify_failed", fmt.Sprintf("verify command timed out after %s", w.orch.verifyTimeout), nil), true
+		}
+		return w.failRunWithKind(now, "verify_error", fmt.Sprintf("running verify command: %v", err)), true
+	}
+	if res.ExitCode != 0 {
+		msg := fmt.Sprintf("verify command failed with exit code %d", res.ExitCode)
+		return w.noImprovement(w.orch.clock().UTC(), "verify_failed", msg, map[string]any{
+			"exitCode": res.ExitCode,
+			"tail":     res.Tail,
+		}), true
+	}
+
+	w.appendEvent(ctx, w.orch.clock().UTC(), state.PhaseSelecting, "verify_passed", "Verify command passed", nil)
+	return workflowResult{}, false
+}
+
+func (w *runWorkflow) appendEvent(ctx context.Context, at time.Time, phase state.RunPhase, kind, msg string, data any) {
+	if err := w.orch.store.AppendEvent(ctx, w.repo.Key(), w.run.ID, state.Event{
+		Time:    at,
+		Phase:   phase,
+		Kind:    kind,
+		Message: msg,
+		Data:    data,
+	}); err != nil {
+		scoped.Log(ctx).Error(err, "failed to append event", "kind", kind, "run", w.run.ID)
+	}
+}
+
+func (w *runWorkflow) noImprovement(now time.Time, kind, msg string, data map[string]any) workflowResult {
+	w.run.ReadyDeadline = nil
+	w.run.SetPhase(state.PhaseNoImprovement, now)
+	w.end = &runEnd{
+		Phase:   state.PhaseNoImprovement,
+		Kind:    kind,
+		Message: msg,
+		Data:    data,
+	}
+	return workflowResult{done: true}
 }
 
 func (w *runWorkflow) failRun(now time.Time, errMsg string) workflowResult {

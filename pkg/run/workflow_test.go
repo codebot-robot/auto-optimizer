@@ -22,16 +22,23 @@ import (
 	"time"
 
 	portalsv1 "github.com/gke-labs/service-portals/pkg/portals/v1"
+	"github.com/go-git/go-git/v5/plumbing"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	processv1 "sigs.k8s.io/agent-sandbox/packages/sandboxd/spec/process/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
+	"github.com/gke-labs/auto-optimizer/pkg/forge"
+	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/portal"
+	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
@@ -909,5 +916,553 @@ func TestReconcileWorkflow_TerminalFailure_SavesBeforeDeletingSandbox(t *testing
 	}
 	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
 		t.Errorf("expected sandbox to be deleted after terminal state saved, got err: %v", err)
+	}
+}
+
+func TestRunWorkflow_Selecting_Success(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	remoteURL, bare, _, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+	repoKey, err := state.ParseRepoURL(remoteURL)
+	if err != nil {
+		t.Fatalf("ParseRepoURL: %v", err)
+	}
+	repo := &state.Repo{
+		URL:           remoteURL,
+		Host:          repoKey.Host,
+		Owner:         repoKey.Owner,
+		Name:          repoKey.Name,
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	const verifyCmd = "go test ./..."
+	procSrv := &scriptedExportServer{
+		commands: map[string]string{
+			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+			"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+			"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+			"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+		},
+		startHandlers: map[string]func(stream processv1.ProcessService_StartServer) error{
+			"sh -c cd '/workspace/repo' && " + verifyCmd: func(stream processv1.ProcessService_StartServer) error {
+				_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Init{Init: &processv1.InitEvent{ProcessId: 42}}})
+				_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Stdout{Stdout: []byte("ok\n")}})
+				return stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Exit{Exit: &processv1.ExitEvent{ExitCode: 0}}})
+			},
+		},
+		pack: packBytes,
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	runID := "20261124T120000Z-wfselok"
+	sbName := sandboxNameForRun(runID)
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	now := time.Date(2026, 11, 24, 12, 10, 0, 0, time.UTC)
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+		Spec:       herorunv1alpha1.HeroRunSpec{RunID: runID, Repository: repo.URL},
+		Status:     herorunv1alpha1.HeroRunStatus{Phase: string(state.PhaseSelecting)},
+	}
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: newTestFakeClientBuilder(scheme).WithObjects(hr).Build(),
+		Clock:      func() time.Time { return now },
+		ForgeFor:   func(string) (forge.Forge, error) { return forge.NewGitRemote(), nil },
+	})
+
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "export-goal",
+		Goal:        &goals.Goal{Name: "export-goal", Verify: verifyCmd},
+		Phase:       state.PhaseSelecting,
+		BaseCommit:  baseSHA,
+		SandboxName: sbName,
+	}
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if res.done || res.requeueAfter != 0 {
+		t.Errorf("expected immediate requeue result, got %+v", res)
+	}
+	if wf.run.Phase != state.PhaseOpeningPR {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseOpeningPR)
+	}
+	wantBranch := "ao/export-goal/" + runID
+	if wf.run.Branch != wantBranch {
+		t.Errorf("branch = %q, want %q", wf.run.Branch, wantBranch)
+	}
+	if wf.hr.Status.Phase != string(state.PhaseSelecting) {
+		t.Errorf("expected HeroRun status unchanged until caller saves, got %s", wf.hr.Status.Phase)
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); err != nil {
+		t.Errorf("expected sandbox to remain until caller saves transition, got err: %v", err)
+	}
+
+	ref, err := bare.Reference(plumbing.ReferenceName("refs/heads/"+wantBranch), true)
+	if err != nil {
+		t.Fatalf("bare.Reference: %v", err)
+	}
+	if ref.Hash().String() != tipSHA {
+		t.Errorf("remote branch ref = %s, want %s", ref.Hash().String(), tipSHA)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var kinds []string
+	for _, e := range events {
+		kinds = append(kinds, e.Kind)
+	}
+	wantKinds := []string{"verify_started", "verify_passed", "commits_exported", "branch_pushed"}
+	if strings.Join(kinds, ",") != strings.Join(wantKinds, ",") {
+		t.Errorf("event kinds = %v, want %v", kinds, wantKinds)
+	}
+}
+
+func TestRunWorkflow_Selecting_RefusalsAndDirtyTree(t *testing.T) {
+	const baseSHA = "1234567890abcdef1234567890abcdef12345678"
+	tests := []struct {
+		name        string
+		statusOut   string
+		diffOut     string
+		wantPhase   state.RunPhase
+		wantKind    string
+		wantMessage string
+	}{
+		{
+			name:        "no changes against base",
+			diffOut:     "",
+			wantPhase:   state.PhaseNoImprovement,
+			wantKind:    "no_changes",
+			wantMessage: "no changes against base commit",
+		},
+		{
+			name:        "edits under .goals/",
+			diffOut:     ".goals/perf.md\x00main.go\x00",
+			wantPhase:   state.PhaseNoImprovement,
+			wantKind:    "refused",
+			wantMessage: "changes under .goals/",
+		},
+		{
+			name:        "dirty working tree",
+			statusOut:   "? untracked.txt\x00",
+			wantPhase:   state.PhaseFailed,
+			wantKind:    "failed",
+			wantMessage: session.ErrUncommittedChanges.Error(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			store := state.NewFileStore(t.TempDir())
+			repo := &state.Repo{
+				URL:           "https://github.com/gke-labs/test-repo",
+				Host:          "github.com",
+				Owner:         "gke-labs",
+				Name:          "test-repo",
+				DefaultBranch: "main",
+			}
+			if err := store.PutRepo(ctx, repo); err != nil {
+				t.Fatalf("PutRepo: %v", err)
+			}
+
+			procSrv := &scriptedExportServer{
+				commands: map[string]string{
+					"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": tc.statusOut,
+					"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       tc.diffOut,
+				},
+			}
+			harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, nil)
+			runID := "20261124T120000Z-wfrefuse"
+			sbName := sandboxNameForRun(runID)
+			if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Create(ctx, &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+			}, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("creating sandbox: %v", err)
+			}
+
+			now := time.Date(2026, 11, 24, 12, 10, 0, 0, time.UTC)
+			orch := newTestOrchestrator(t, OrchestratorOptions{
+				Store:   store,
+				Harness: harness,
+				Clock:   func() time.Time { return now },
+			})
+			run := &state.Run{
+				ID:          runID,
+				Repo:        repo.Key(),
+				GoalName:    "test-goal",
+				Phase:       state.PhaseSelecting,
+				BaseCommit:  baseSHA,
+				SandboxName: sbName,
+			}
+			putTestRun(t, ctx, orch, run)
+
+			var hr herorunv1alpha1.HeroRun
+			if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: orch.namespace(), Name: sbName}, &hr); err != nil {
+				t.Fatalf("get HeroRun: %v", err)
+			}
+
+			// Direct Run check: updates run in memory and leaves sandbox intact.
+			wf := newRunWorkflow(orch, repo, run, &hr)
+			res, err := wf.Run(ctx)
+			if err != nil {
+				t.Fatalf("wf.Run: %v", err)
+			}
+			if !res.done {
+				t.Fatalf("expected res.done to be true")
+			}
+			if wf.run.Phase != tc.wantPhase {
+				t.Errorf("phase = %s, want %s", wf.run.Phase, tc.wantPhase)
+			}
+			if tc.wantPhase == state.PhaseNoImprovement {
+				if wf.run.Error != "" || wf.run.ErrorKind != "" {
+					t.Errorf("expected empty Error/ErrorKind for NoImprovement, got %q/%q", wf.run.Error, wf.run.ErrorKind)
+				}
+				if wf.end == nil || wf.end.Kind != tc.wantKind || wf.end.Message != tc.wantMessage {
+					t.Errorf("wf.end = %+v, want kind=%q msg=%q", wf.end, tc.wantKind, tc.wantMessage)
+				}
+			} else {
+				if wf.run.ErrorKind != tc.wantKind || wf.run.Error != tc.wantMessage {
+					t.Errorf("ErrorKind/Error = %q/%q, want %q/%q", wf.run.ErrorKind, wf.run.Error, tc.wantKind, tc.wantMessage)
+				}
+			}
+			if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); err != nil {
+				t.Fatalf("expected sandbox intact before reconcileWorkflow saves: %v", err)
+			}
+
+			// Through Orchestrator.Reconcile: saves terminal phase, appends event, deletes sandbox.
+			if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+				t.Fatalf("orch.Reconcile: %v", err)
+			}
+			gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
+			if err != nil {
+				t.Fatalf("GetRun: %v", err)
+			}
+			if gotRun.Phase != tc.wantPhase {
+				t.Errorf("saved phase = %s, want %s", gotRun.Phase, tc.wantPhase)
+			}
+			events, err := store.ReadEvents(ctx, repo.Key(), runID)
+			if err != nil {
+				t.Fatalf("ReadEvents: %v", err)
+			}
+			found := false
+			for _, e := range events {
+				if e.Phase == tc.wantPhase && e.Kind == tc.wantKind && strings.Contains(e.Message, tc.wantMessage) {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("expected event phase=%s kind=%s msg containing %q, got %+v", tc.wantPhase, tc.wantKind, tc.wantMessage, events)
+			}
+			if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+				t.Errorf("expected sandbox deleted after reconcile, got err: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunWorkflow_Selecting_VerifyOutcomes(t *testing.T) {
+	const verifyCmd = "make test"
+	expectedShell := "sh -c cd '/workspace/repo' && " + verifyCmd
+
+	tests := []struct {
+		name          string
+		procSrv       *scriptedExportServer
+		verifyTimeout time.Duration
+		wantPhase     state.RunPhase
+		wantKind      string
+		wantSubstr    string
+		wantExitCode  int
+	}{
+		{
+			name: "non-zero exit",
+			procSrv: &scriptedExportServer{
+				startHandlers: map[string]func(stream processv1.ProcessService_StartServer) error{
+					expectedShell: func(stream processv1.ProcessService_StartServer) error {
+						_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Init{Init: &processv1.InitEvent{ProcessId: 42}}})
+						_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Stderr{Stderr: []byte("FAIL\n")}})
+						return stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Exit{Exit: &processv1.ExitEvent{ExitCode: 2}}})
+					},
+				},
+			},
+			verifyTimeout: time.Minute,
+			wantPhase:     state.PhaseNoImprovement,
+			wantKind:      "verify_failed",
+			wantSubstr:    "exit code 2",
+			wantExitCode:  2,
+		},
+		{
+			name: "timeout",
+			procSrv: &scriptedExportServer{
+				startHandlers: map[string]func(stream processv1.ProcessService_StartServer) error{
+					expectedShell: func(stream processv1.ProcessService_StartServer) error {
+						<-stream.Context().Done()
+						return status.Error(codes.DeadlineExceeded, "deadline exceeded")
+					},
+				},
+			},
+			verifyTimeout: 30 * time.Millisecond,
+			wantPhase:     state.PhaseNoImprovement,
+			wantKind:      "verify_failed",
+			wantSubstr:    "timed out",
+		},
+		{
+			name: "execution error",
+			procSrv: &scriptedExportServer{
+				startHandlers: map[string]func(stream processv1.ProcessService_StartServer) error{
+					expectedShell: func(stream processv1.ProcessService_StartServer) error {
+						return status.Error(codes.Unavailable, "connection lost")
+					},
+				},
+			},
+			verifyTimeout: time.Minute,
+			wantPhase:     state.PhaseFailed,
+			wantKind:      "verify_error",
+			wantSubstr:    "connection lost",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			store := state.NewFileStore(t.TempDir())
+			repo := &state.Repo{
+				URL:   "https://github.com/gke-labs/test-repo",
+				Host:  "github.com",
+				Owner: "gke-labs",
+				Name:  "test-repo",
+			}
+			if err := store.PutRepo(ctx, repo); err != nil {
+				t.Fatalf("PutRepo: %v", err)
+			}
+			harness, _, _ := setupTestHarnessWithLLM(t, tc.procSrv, nil)
+			orch := newTestOrchestrator(t, OrchestratorOptions{
+				Store:         store,
+				Harness:       harness,
+				VerifyTimeout: tc.verifyTimeout,
+				Clock:         func() time.Time { return time.Date(2026, 11, 24, 12, 10, 0, 0, time.UTC) },
+			})
+
+			run := &state.Run{
+				ID:          "20261124T120000Z-wfver",
+				Repo:        repo.Key(),
+				GoalName:    "test-goal",
+				Goal:        &goals.Goal{Name: "test-goal", Verify: verifyCmd},
+				Phase:       state.PhaseSelecting,
+				SandboxName: "run-20261124t120000z-wfver",
+			}
+			hr := &herorunv1alpha1.HeroRun{
+				ObjectMeta: metav1.ObjectMeta{Name: run.SandboxName, Namespace: harness.Namespace()},
+				Status:     herorunv1alpha1.HeroRunStatus{Phase: string(state.PhaseSelecting)},
+			}
+			wf := newRunWorkflow(orch, repo, run, hr)
+			res, err := wf.Run(ctx)
+			if err != nil {
+				t.Fatalf("wf.Run: %v", err)
+			}
+			if !res.done {
+				t.Fatalf("expected res.done to be true")
+			}
+			if wf.run.Phase != tc.wantPhase {
+				t.Errorf("phase = %s, want %s", wf.run.Phase, tc.wantPhase)
+			}
+			if tc.wantPhase == state.PhaseNoImprovement {
+				if wf.end == nil || wf.end.Kind != tc.wantKind || !strings.Contains(wf.end.Message, tc.wantSubstr) {
+					t.Errorf("wf.end = %+v, want kind=%q msg containing %q", wf.end, tc.wantKind, tc.wantSubstr)
+				}
+				if tc.wantExitCode != 0 {
+					if wf.end.Data["exitCode"] != tc.wantExitCode {
+						t.Errorf("exitCode = %v, want %d", wf.end.Data["exitCode"], tc.wantExitCode)
+					}
+				}
+			} else if wf.run.ErrorKind != tc.wantKind || !strings.Contains(wf.run.Error, tc.wantSubstr) {
+				t.Errorf("ErrorKind/Error = %q/%q, want kind=%q msg containing %q", wf.run.ErrorKind, wf.run.Error, tc.wantKind, tc.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestRunWorkflow_Selecting_EmptySandboxAndPushFailures(t *testing.T) {
+	ctx := t.Context()
+
+	t.Run("empty sandbox name", func(t *testing.T) {
+		store := state.NewFileStore(t.TempDir())
+		repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
+		harness, _, _ := setupTestHarness(t, nil)
+		orch := newTestOrchestrator(t, OrchestratorOptions{Store: store, Harness: harness})
+		run := &state.Run{ID: "20261124T120000Z-nosb", Repo: repo.Key(), Phase: state.PhaseSelecting}
+		wf := newRunWorkflow(orch, repo, run, &herorunv1alpha1.HeroRun{})
+		res, err := wf.Run(ctx)
+		if err != nil {
+			t.Fatalf("wf.Run: %v", err)
+		}
+		if !res.done || wf.run.Phase != state.PhaseFailed || wf.run.ErrorKind != "failed" {
+			t.Errorf("got done=%v phase=%s errorKind=%q, want done=true Failed/failed", res.done, wf.run.Phase, wf.run.ErrorKind)
+		}
+	})
+
+	t.Run("nil forge", func(t *testing.T) {
+		store := state.NewFileStore(t.TempDir())
+		remoteURL, _, _, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+		repoKey, err := state.ParseRepoURL(remoteURL)
+		if err != nil {
+			t.Fatalf("ParseRepoURL: %v", err)
+		}
+		repo := &state.Repo{URL: remoteURL, Host: repoKey.Host, Owner: repoKey.Owner, Name: repoKey.Name}
+		if err := store.PutRepo(ctx, repo); err != nil {
+			t.Fatalf("PutRepo: %v", err)
+		}
+		procSrv := &scriptedExportServer{
+			commands: map[string]string{
+				"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+				"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+				"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+				"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+			},
+			pack: packBytes,
+		}
+		harness, _, _ := setupTestHarnessWithLLM(t, procSrv, nil)
+		orch := newTestOrchestrator(t, OrchestratorOptions{Store: store, Harness: harness})
+		run := &state.Run{
+			ID:          "20261124T120000Z-nilforge",
+			Repo:        repo.Key(),
+			GoalName:    "export-goal",
+			Phase:       state.PhaseSelecting,
+			BaseCommit:  baseSHA,
+			SandboxName: "run-20261124t120000z-nilforge",
+		}
+		wf := newRunWorkflow(orch, repo, run, &herorunv1alpha1.HeroRun{})
+		res, err := wf.Run(ctx)
+		if err != nil {
+			t.Fatalf("wf.Run: %v", err)
+		}
+		if !res.done || wf.run.Phase != state.PhaseFailed || wf.run.ErrorKind != "push_failed" {
+			t.Errorf("got done=%v phase=%s errorKind=%q, want done=true Failed/push_failed", res.done, wf.run.Phase, wf.run.ErrorKind)
+		}
+	})
+}
+
+func TestReconcileWorkflow_Selecting_SavesOpeningPRBeforeDeletingSandbox(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	remoteURL, bare, _, baseSHA, tipSHA, packBytes := createTestRemoteAndPackfile(t)
+	repoKey, err := state.ParseRepoURL(remoteURL)
+	if err != nil {
+		t.Fatalf("ParseRepoURL: %v", err)
+	}
+	repo := &state.Repo{
+		URL:           remoteURL,
+		Host:          repoKey.Host,
+		Owner:         repoKey.Owner,
+		Name:          repoKey.Name,
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	procSrv := &scriptedExportServer{
+		commands: map[string]string{
+			"git -C /workspace/repo status --porcelain=v2 -z --untracked-files=all": "",
+			"git -C /workspace/repo diff --name-only -z " + baseSHA + " HEAD":       "feat.txt\x00",
+			"git -C /workspace/repo rev-parse --verify HEAD^{commit}":               tipSHA + "\n",
+			"git -C /workspace/repo rev-list --objects " + baseSHA + "..HEAD":       tipSHA + "\n",
+		},
+		pack: packBytes,
+	}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	runID := "20261124T120000Z-wfselsave"
+	sbName := sandboxNameForRun(runID)
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	now := time.Date(2026, 11, 24, 12, 10, 0, 0, time.UTC)
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+		Spec:       herorunv1alpha1.HeroRunSpec{RunID: runID, Repository: repo.URL, Goal: "export-goal", BaseCommit: baseSHA},
+		Status:     herorunv1alpha1.HeroRunStatus{Phase: string(state.PhaseSelecting), SandboxName: sbName},
+	}
+
+	// Fake client does not have HeroRun yet, so putRun fails after the branch is pushed.
+	failingClient := newTestFakeClientBuilder(scheme).Build()
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: failingClient,
+		Clock:      func() time.Time { return now },
+		ForgeFor:   func(string) (forge.Forge, error) { return forge.NewGitRemote(), nil },
+	})
+
+	makeRun := func() *state.Run {
+		return &state.Run{
+			ID:          runID,
+			Repo:        repo.Key(),
+			GoalName:    "export-goal",
+			Phase:       state.PhaseSelecting,
+			BaseCommit:  baseSHA,
+			SandboxName: sbName,
+		}
+	}
+
+	if _, err := orch.reconcileWorkflow(ctx, newRunWorkflow(orch, repo, makeRun(), hr)); err == nil {
+		t.Fatalf("expected error when saving OpeningPR HeroRun fails")
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("sandbox must not be deleted when saving OpeningPR fails: %v", err)
+	}
+
+	// Once HeroRun exists, retry pushes idempotently, saves OpeningPR, and deletes sandbox.
+	if err := failingClient.Create(ctx, hr); err != nil {
+		t.Fatalf("Create HeroRun: %v", err)
+	}
+	if _, err := orch.reconcileWorkflow(ctx, newRunWorkflow(orch, repo, makeRun(), hr)); err != nil {
+		t.Fatalf("reconcileWorkflow retry: %v", err)
+	}
+	gotRun, err := GetRun(ctx, failingClient, harness.Namespace(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseOpeningPR {
+		t.Errorf("phase = %s, want %s", gotRun.Phase, state.PhaseOpeningPR)
+	}
+	wantBranch := "ao/export-goal/" + runID
+	if gotRun.Branch != wantBranch {
+		t.Errorf("branch = %q, want %q", gotRun.Branch, wantBranch)
+	}
+	ref, err := bare.Reference(plumbing.ReferenceName("refs/heads/"+wantBranch), true)
+	if err != nil {
+		t.Fatalf("bare.Reference: %v", err)
+	}
+	if ref.Hash().String() != tipSHA {
+		t.Errorf("remote branch ref = %s, want %s", ref.Hash().String(), tipSHA)
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox deleted after OpeningPR saved, got err: %v", err)
 	}
 }
