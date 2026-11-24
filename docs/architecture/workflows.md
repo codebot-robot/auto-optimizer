@@ -1,445 +1,318 @@
 # Workflows Architecture
 
-A workflow in auto-optimizer is a Kubernetes controller. Its state lives in the
-Kubernetes API as a `HeroRun` custom resource, and the `kube-apiserver` is the
-authoritative backing store to start with.
+A workflow in auto-optimizer is a Kubernetes controller.
+A `HeroRun` custom resource represents each run, and the controller drives that
+resource from creation to a terminal outcome through standard reconciliation.
 
-In a standard Kubernetes controller, the control loop watches for changes,
-reads a custom resource from the API server, reconciles desired and observed
-state, and writes the updated status back to the API server. In auto-optimizer,
-the workflow runner executes this exact reconciliation pattern: `Run`
-reconciles the run's `HeroRun` resource fetched from the `kube-apiserver`,
-performs one unit of execution, and the caller writes the updated resource
-status back to the `kube-apiserver`.
+The goal is to adopt the Kubernetes controller model cleanly.
+All workflow state and operation state live on `HeroRun`.
+The controller keeps no shadow state in memory.
+Speaking strictly through the Kubernetes API decouples the controller from
+storage.
+Auto-optimizer starts with `kube-apiserver` as the backing store, and can later
+move storage to a backend such as Redis behind a Kubernetes aggregated API
+server without changing the controller.
 
-This controller model guides the design throughout:
-- **`Run` is `Reconcile`:** Calling `Run` on the workflow runner corresponds to
-  a controller's `Reconcile`. Each invocation performs one discrete unit of work
-  to drive the run toward its desired state, updating `HeroRun` in memory and
-  returning execution directives.
-- **The saved state is the `HeroRun` Custom Resource:** The workflow state
-  object is the `HeroRun` custom resource in the `kube-apiserver`. The
-  reconciler loads the resource from the API server, modifies its spec or status
-  during execution, and saves it back via standard Kubernetes status updates.
-- **`Result` is `reconcile.Result`:** The workflow runner's result directly
-  mirrors controller-runtime's `reconcile.Result`. It instructs the caller how
-  and when to invoke `Run` again (whether the workflow is terminal, needs an
-  immediate requeue, or should wait for an external condition).
-- **Crash recovery is reconciliation idempotency:** Like any well-behaved
-  Kubernetes controller, `Run` is idempotent: calling it again from the same
-  persisted `HeroRun` state in the API server is safe, even when a previous
-  invocation crashed immediately after an external side effect (such as pushing
-  a git commit). There is no event-replay log; the persisted `HeroRun` resource
-  is the sole authoritative record.
-- **Bulk payloads stay on the state volume:** Conversation transcripts
-  (`messages.jsonl`), tool call outputs, and the user-facing event log
-  (`events.jsonl`) remain on the persistent state volume as files. They do not
-  live in the `HeroRun` custom resource because etcd caps object sizes at 1.5 MB
-  and streaming turn-by-turn logs would cause severe write churn.
+## Core rules
 
-## Design rules
+Seven invariants govern workflow design.
 
-The design follows seven core rules:
-1. **The `HeroRun` custom resource in `kube-apiserver` is the workflow state.**
-   The workflow runner reads and updates `HeroRun` directly in the Kubernetes API.
-2. **Bulk payload state is files.** Transcripts, large tool outputs, and the
-   event log live on the state volume as files. No external database is used.
-3. **Fix resumption after a crash at any point.** Do not add graceful-shutdown
-   handling.
-4. **Standard library and controller-runtime first.** Do not adopt an external
-   workflow library.
-5. **The saved state never holds a credential.** All authentication tokens stay
-   in memory or are injected by the portal sidecar.
-6. **Saving updates `kube-apiserver` after each call to `Run`.** An export
-   option writes a disk snapshot (`run.json`) strictly for human inspection.
-   The web UI and CLI read `HeroRun` through the client and must not read the
-   export.
-7. **Run should return quickly.** The design does not enforce a time limit. For
-   a long-running operation, `Run` records the operation's ID in the state and
-   returns. A later call to `Run` looks the operation up by that ID. `Run` does
-   not poll the operation in-process.
+1. **`HeroRun` is the single source of truth for workflow and operation state.**
+   The controller, the web UI, and the CLI all read and update run state through
+   the Kubernetes API.
+   An optional `run.json` disk export exists only for human inspection.
+   The system never reads it.
+2. **The controller keeps no shadow state in memory.**
+   In-flight operation state and completed operation outcomes live on `HeroRun`,
+   not in controller memory.
+   Process memory holds only ephemeral handles to live background work so the
+   controller can detect running goroutines or cancel them.
+3. **Bulk payloads stay on the state volume.**
+   Conversation transcripts, unabridged tool outputs, and the user-facing event
+   log remain files on the persistent state volume rather than fields on
+   `HeroRun`.
+4. **Crash recovery comes from controller idempotency.**
+   Every reconcile pass must be safe to repeat from the last persisted `HeroRun`
+   state after a crash at any point.
+   The system does not rely on graceful shutdown handlers or an event-replay log
+   for correctness.
+5. **Reconciliation returns quickly.**
+   A reconcile pass never blocks on slow work such as sandbox startup or model
+   turns, and it never polls in-process.
+   Long-running operations record their state and outcome on `HeroRun` and wake
+   the controller when they finish.
+6. **Persisted state never holds credentials.**
+   Authentication tokens and signing keys stay out of `HeroRun` and out of state
+   files.
+   The control plane holds secrets in memory or injects them through the portal.
+7. **Prefer standard Kubernetes controller libraries.**
+   Build on the Go standard library and standard Kubernetes controller machinery
+   instead of adopting an external workflow engine.
 
-## Workflow state as the HeroRun custom resource
+## Controller model and `HeroRun` state
 
-The design establishes `HeroRun` as the single authoritative state object for a
-run.
+In a Kubernetes controller, each reconcile pass reads the current resource from
+the API, compares desired state with observed state, performs one bounded unit
+of work, and writes updated status back through the API.
+Auto-optimizer follows this model for every run.
 
-Previously, the repository maintained two distinct types: `HeroRun` in the API
-server for cluster visibility and sandbox ownership, and `state.Run` in
-`run.json` on disk for execution bookkeeping. Maintaining dual representations
-creates schema duplication, translation overhead, and field drift.
+`HeroRun` separates immutable desired inputs from observed execution progress.
 
-Under this architecture, they become one type: `HeroRun`.
-- **`HeroRunSpec`** defines desired and immutable run parameters set when the run
-  is scheduled: target repository URL, goal name, frozen goal definition, base
-  commit SHA, deadline timestamp, and budget constraints.
-- **`HeroRunStatus`** defines observed execution progress: current phase, phase
-  transition timestamps, conditions, active operation identifier, child sandbox
-  reference, workspace claim name, turn counts, costs, benchmark metrics,
-  candidate commit SHA, branch name, pull request metadata, summary, and error
-  details.
-- Obsolete publisher fields, such as `ObservedAt` (which was recorded by the
-  background summary publisher that this design eliminates), are removed.
-- The legacy `state.Run` struct is phased out.
+- **Spec** holds immutable desired inputs set when the scheduler creates the
+  run, such as the target repository, the frozen goal definition, the base
+  commit, and the run limits.
+- **Status** holds all observed workflow and operation state, including the
+  current phase, active and completed operation state, Kubernetes conditions,
+  child resource references, progress and cost metrics, and the run outcome.
 
-### Role of run.json on disk
+Standard Kubernetes optimistic concurrency protects status updates.
+Every write carries the resource version that the controller read.
+If another actor updated `HeroRun` concurrently, the API rejects the write with
+a conflict error.
+The controller discards its stale copy and requeues the run to reconcile from
+the latest resource version.
 
-With `HeroRun` in the `kube-apiserver` serving as the source of truth, `run.json`
-on disk is strictly an export for a person to read:
-`run.json` on disk is not a database and is not read by the controller, the
-CLI, or the web UI. Because the export is written after the save and is
-optional, it can be stale or missing. If the web UI or CLI read `run.json`,
-they would risk displaying a state that the controller does not have.
-Therefore, **the web UI and CLI read `HeroRun` exclusively through the
-Kubernetes client**. The disk export exists solely for a person inspecting a
-run directory with command-line tools (`cat`, `jq`, text editors).
+### Disk exports for human inspection
 
-## Storage separation: what stays on the state volume and why
+The control plane can optionally write a snapshot of `HeroRun` to `run.json` on
+the state volume after a status update.
+It can also write timestamped copies to preserve a point-in-time timeline on
+disk, because etcd regularly compacts older resource versions.
 
-The architecture maintains a strict division between control-plane state in
-`kube-apiserver` and bulk data on the state volume (ObjectFS):
+These exports exist strictly so an operator can inspect a run directory with
+standard command-line tools.
+Because an export is optional and written after the API update, it can be stale
+or missing.
+The controller, the web UI, and the CLI never read `run.json`.
+They always read `HeroRun` through the Kubernetes client so every component sees
+one authoritative state.
 
-- **In `kube-apiserver` (etcd):**
-  The `HeroRun` custom resource holds all workflow execution state: spec inputs,
-  current phase, phase transition timestamps, conditions, child sandbox
-  references, active operation ID, turn counts, costs, and summary metrics.
-- **On the state volume (ObjectFS files):**
-  The run directory (`repos/<host>/<owner>/<name>/runs/<run-id>/`) holds:
-  - `sessions/<session-id>/messages.jsonl`: Full LLM conversation history and
-    transcripts.
-  - `sessions/<session-id>/tools/<n>.json`: Unabridged tool execution payloads
-    (compiler outputs, diffs, large file contents).
-  - `events.jsonl`: Append-only, chronological event stream for UI rendering and
-    detailed audit logs.
-  - `run.json`: Optional exported snapshot of the `HeroRun` object for human
-    inspection.
+## Storage separation
 
-This separation is necessary for two critical reasons:
-1. **etcd 1.5 megabyte object size limit:** Agent conversation transcripts,
-   model context prompts, compiler diagnostics, and tool outputs easily reach
-   several megabytes in a single run. These payloads cannot fit in an etcd
-   resource.
-2. **etcd write churn and write amplification:** LLM turn interactions generate
-   continuous streaming events and large chunked outputs. Persisting every
-   intermediate token or verbose tool response to etcd would trigger excessive
-   Raft consensus rounds, increase compaction frequency, and degrade cluster
-   responsiveness. The state volume is designed for unmetered, high-throughput,
-   append-only file I/O.
+Auto-optimizer divides run data strictly between control-plane state in the
+Kubernetes API and bulk payloads on the persistent state volume.
 
-## Workflow runner interface
+- **`HeroRun` in the Kubernetes API.** Holds workflow phase, conditions,
+  operation state and outcomes, child resource references, progress counters,
+  costs, benchmark metrics, and pull request metadata.
+- **Files on the state volume.** Holds the `messages.jsonl` conversation
+  transcripts, unabridged tool execution outputs, the `events.jsonl` append-only
+  event log, and optional human-readable `HeroRun` exports.
 
-`RunWorkflow` is the concrete runner that drives a run through its
-reconciliation loop. Each invocation of `Run(ctx)` executes one unit of work and
-returns a `Result`:
-- **"Done":** When the run enters a terminal phase (`Succeeded`, `Failed`, or
-  `NoImprovement`), `Run` reports done. The caller saves the final status to
-  `kube-apiserver` and halts execution.
-- **"Call me again":** When a unit of work finishes and more work is ready
-  immediately, `Run` requests an immediate requeue. The caller saves the
-  updated status to `kube-apiserver` and invokes `Run` again.
-- **"Call me again when something external changes":** When execution is
-  waiting on an external condition (such as a Sandbox pod becoming ready),
-  `Run` returns a requeue duration. The caller saves status and yields the worker
-  thread. An informer watching Sandbox resources enqueues the run immediately
-  when conditions change, while the requeue duration provides a safety backstop.
-- **Error:** When an infrastructure error occurs, `Run` returns an error. The
-  caller saves status if modified, logs the error, and retries with backoff.
+Two operational constraints require this split.
 
-### Saving state and optimistic concurrency
+1. **Object size limits.**
+   etcd caps individual objects at 1.5 megabytes.
+   Conversation transcripts, prompts, compiler diagnostics, and tool outputs
+   routinely exceed that limit in a single run and cannot live inside `HeroRun`.
+2. **Write amplification and churn.**
+   Agent turns produce continuous streaming events and verbose tool output.
+   Writing every intermediate message or tool output through etcd would trigger
+   excessive Raft consensus rounds, increase compaction pressure, and degrade
+   cluster responsiveness.
+   The state volume handles high-throughput, append-only file writes without
+   burdening the API server.
 
-With `kube-apiserver` as the backing store, saving state updates the `HeroRun`
-custom resource via standard Kubernetes status updates.
-- **Optimistic locking:** Kubernetes provides optimistic concurrency control via
-  `metadata.resourceVersion`. If another actor modifies the `HeroRun` object
-  concurrently, the status update returns a conflict error (`409 Conflict`). In
-  accordance with standard controller-runtime behavior, the reconciler aborts
-  the current turn and requeues the request to fetch the latest resource
-  version from the API server cache and re-run reconciliation.
-- **History preservation option:** In etcd, older resource versions are
-  regularly compacted and purged. To preserve full point-in-time state history
-  for human inspection and debugging, the history option writes a timestamped
-  export copy to disk before or after each save (for example,
-  `repos/.../runs/<run-id>/history/run.<timestamp>.json`). This gives operators
-  an immutable timeline of state transitions on disk without burdening etcd.
+### Event log and status conditions
 
-### Phase reconciliation lifecycle
+The `events.jsonl` event log is an append-only audit trail for operators and the
+web UI.
+The control plane appends events when phases change, measurements arrive, errors
+occur, or tools execute.
+The controller never reads `events.jsonl` to decide what to do next.
 
-The phases of a run map directly onto `Run`:
-- **Phase `Pending`:** `Run` ensures the workspace persistent volume claim
-  exists, recording its name in status, advances phase to `Preparing`, and
-  requeues immediately.
-- **Phase `Preparing`:** `prepareSandbox` binds the portal egress policy, ensures
-  the repository clone is present at the base commit or reuses the workspace
-  volume, and sets git identity. If an upfront sandbox exists, `Run` waits for
-  readiness (returning a requeue duration when unready) and executes
-  `prepareSandbox`, advancing to `Working`.
-- **Phase `Working`:** `Run` drives the agent session. The session obtains and
-  prepares its Sandbox on demand. For long-running turns, `Run` records the turn
-  operation ID in `ActiveOperation` and returns promptly. When a turn completes,
-  `Run` updates turn counts and cost, clearing `ActiveOperation`. If the session
-  requests a pull request, `Run` records pull request details and advances to
-  `Selecting`. If the session finishes without a pull request, `Run` advances to
+Kubernetes conditions on `HeroRun` status report high-level readiness and
+milestones so operators and cluster tooling can observe progress natively with
+`kubectl`.
+
+## Run lifecycle
+
+A run moves through five active phases before reaching a terminal phase.
+
+- **`Pending`.** The controller ensures the workspace claim and initial sandbox
+  exist with controller owner references pointing to `HeroRun`, records those
+  references in status, and advances to `Preparing`.
+- **`Preparing`.** The controller waits for the sandbox to become ready without
+  blocking.
+  Once ready, the controller binds the portal egress policy, ensures the
+  repository clone is at the base commit, configures git identity, and advances
+  to `Working`.
+- **`Working`.** The controller drives the agent session across one or more
+  asynchronous turns, obtaining or replacing the sandbox on demand when needed.
+  When the session requests a pull request, the run advances to `Selecting`.
+  When the session ends without requesting a pull request, the run enters
   `NoImprovement`.
-- **Phase `Selecting`:** `Run` executes candidate verification tests, exports
-  candidate commits into a packfile, pushes the branch to the remote forge, and
-  advances to `OpeningPR`. Replacement sandboxes are prepared on demand if
-  needed.
-- **Phase `OpeningPR`:** `Run` queries the forge for an existing pull request on
-  the branch or opens a new pull request, recording the pull request URL, and
-  advances to `Succeeded`.
+- **`Selecting`.** The controller verifies the candidate, exports the candidate
+  commits, pushes the branch to the forge, and advances to `OpeningPR`.
+- **`OpeningPR`.** The controller checks for an existing pull request on the
+  branch or opens a new one, records the pull request link, and enters
+  `Succeeded`.
+- **Terminal phases.** When a run reaches `Succeeded`, `Failed`, or
+  `NoImprovement`, the controller stops reconciling the run and releases the
+  active sandbox.
 
-Several fields and in-memory maps on main are eliminated by this abstraction:
-- `ReadyDeadline` is removed. Readiness timeouts are evaluated directly against
-  the run deadline or caller context rather than tracked in persistent state.
-- `PortalBoundAt` is removed. Because `prepareSandbox` binds portal egress policy
-  idempotently whenever a sandbox is created, recording a binding timestamp in
-  run state is unnecessary.
-- The `turnOutcomes` map on `Orchestrator` is removed. Turn outcomes are
-  recorded directly into status upon turn completion.
-- The `activeRuns` and `workerCancels` maps on `Orchestrator` are reduced to an
-  in-memory execution cache. The persisted `ActiveOperation` in `HeroRun.Status`
-  is the authoritative record of work in flight, and an orchestrator restart
-  rebuilds in-memory execution handles directly from that operation ID.
+Each reconcile pass returns one of four outcomes to the controller runtime.
 
-## State persistence and crash resilience
+- **Done.** The run has reached a terminal phase and needs no further
+  reconciliation.
+- **Requeue immediately.** One bounded unit of work finished and the next step
+  can proceed right away.
+- **Wait for external changes.** The run is waiting on an external resource or
+  an asynchronous operation.
+  Kubernetes watches or internal wake signals enqueue the run when conditions
+  change, while a requeue duration provides a safety backstop.
+- **Error.** A transient infrastructure failure occurred.
+  The controller runtime logs the error and retries with backoff.
 
-Crash recovery follows standard Kubernetes controller idempotency.
+## Crash recovery and idempotency
 
-### Worked example: crash between side effect and save
+The control plane can receive `SIGKILL` or lose network access at any instant.
+Rather than catching signals and flushing state during shutdown, every reconcile
+step is idempotent with respect to the last saved `HeroRun` status.
+Repeating a step after an external side effect has already succeeded produces
+the same end state without duplicating work or corrupting the run.
 
-Consider pushing candidate commits to a remote branch in phase `Selecting`:
+### Example: crash between pushing a branch and saving status
 
-1. **State before call:**
-   `HeroRun` in `kube-apiserver` contains `Status.Phase: "Selecting"`, branch
-   `ao/sort-benchmark/run-1`, and candidate commit `d3b0738a9`.
-2. **Caller calls `Run`:**
-   The reconciler receives `HeroRun` and invokes `Run(ctx)`.
-3. **Side effect occurs:**
-   The workflow executes `forge.PushPackfile`. The push succeeds over HTTPS to
-   GitHub, updating `refs/heads/ao/sort-benchmark/run-1` on the remote
-   repository to commit `d3b0738a9`.
-4. **State mutated in memory:**
-   The workflow updates its internal state, setting `Status.Phase: "OpeningPR"`,
-   and prepares to return an immediate requeue.
-5. **The crash:**
-   Before the caller can call status update to save the new status to
-   `kube-apiserver`, the pod receives `SIGKILL`. In `kube-apiserver`, `HeroRun`
-   still records `Status.Phase: "Selecting"`.
-6. **Resumption:**
-   The control plane restarts. The reconciler's informer watches `HeroRun`
-   resources and receives the object from `kube-apiserver`, which still
-   reflects `Status.Phase: "Selecting"`.
-7. **Next call to `Run`:**
-   The reconciler invokes `Run(ctx)` again from the loaded state.
-8. **Why `Run` is safe:**
-   `Run` enters the `Selecting` handler and calls `forge.PushPackfile` with the
-   same branch and commit tip. The remote forge advertises that the remote ref
-   is already at `d3b0738a9`. Git recognises that the push is up to date and
-   returns success immediately without error or duplicate side effects.
-9. **State saved:**
-   `Run` sets `Status.Phase: "OpeningPR"` and returns an immediate requeue. The
-   caller successfully updates `HeroRun.Status` in `kube-apiserver`.
-10. Execution advances to `OpeningPR`.
+Consider pushing candidate commits during `Selecting`.
 
-## Handling long-running work
+1. `HeroRun` records phase `Selecting`, the run's deterministic branch name, and
+   the candidate commit SHA.
+2. The controller exports the candidate commits and pushes them to the forge.
+   The remote repository now points the branch at the candidate commit.
+3. Before the controller writes phase `OpeningPR` to `HeroRun`, the control
+   plane crashes.
+   The Kubernetes API still records phase `Selecting`.
+4. After restart, the controller reads `HeroRun`, sees phase `Selecting`, and
+   repeats the push step for the same branch and commit.
+5. The forge reports that the remote branch already points to that commit, so
+   the push succeeds with no duplicate side effects.
+6. The controller updates `HeroRun` status to `OpeningPR` and continues to the
+   next step.
 
-`Run` returns quickly without blocking on long operations or polling in-process:
+The same principle applies across all phases.
+Creating a workspace claim or sandbox reuses an existing resource owned by the
+same `HeroRun`.
+Binding portal egress policy is idempotent.
+Opening a pull request reuses an existing open pull request on the run's
+deterministic branch.
 
-1. **Operation ID tracking:**
-   For a long-running operation, such as an agent session turn in phase
-   `Working`, `Run` does not block for the duration of the turn. Instead, `Run`
-   initiates the turn, records the operation ID in `Status.ActiveOperation` (for
-   example, `session-1:turn-3`), and returns immediately with a requeue duration
-   as a backstop.
-2. **Where the operation runs:**
-   The session turn executes in a background worker goroutine managed by the
-   session harness in the control plane. It calls the model and executes tool
-   calls against the sandbox asynchronously.
-3. **Subsequent calls to `Run`:**
-   When the reconciler calls `Run` again (woken by `Orchestrator.Notify` when
-   the turn worker signals completion, or by the requeue backstop), `Run` looks
-   up the operation by its ID:
-   - If the turn is still running in the background, `Run` returns a requeue
-     duration without polling in-process.
-   - If the turn has finished, `Run` collects the outcome from the worker,
-     updates turn count and cost, clears `ActiveOperation`, and returns an
-     immediate requeue to continue to the next step.
-4. **Resumption when the control plane restarts:**
-   If the control plane crashes while a turn is running, the background
-   goroutine terminates, but `ActiveOperation` remains in `HeroRun.Status` in
-   the `kube-apiserver`. When the system restarts, the next call to `Run`
-   inspects `Status.ActiveOperation` and consults the session transcript in
-   `messages.jsonl` on the state volume:
-   - If `messages.jsonl` contains the completed turn (the assistant message and
-     tool results were persisted to disk before the crash), `Run` reconstructs
-     the outcome, updates status, clears `ActiveOperation`, and advances.
-   - If `messages.jsonl` shows the turn was interrupted mid-flight, `Run`
-     detects that the worker is dead. Because completed turns are preserved on
-     disk in `messages.jsonl`, `Run` clears the stale operation ID and launches
-     a fresh turn worker to resume from the last completed turn.
-5. **In-memory state as an ephemeral cache:**
-   Any in-memory worker handles or cancellation functions are strictly an
-   execution cache. After a restart, the control plane reconstructs its worker
-   tracking directly from the persisted `Status.ActiveOperation` ID.
+## Long-running work
 
-## Event log and status reporting
+Reconcile passes must return promptly so a bounded pool of controller workers
+can serve many runs without stalling.
+The controller handles two kinds of long-running work without blocking or
+polling in-process.
 
-- **Event log (`events.jsonl`):**
-  The event log on the state volume is an append-only audit trail for user
-  visibility and web UI rendering. The caller compares `HeroRun.Status` before
-  and after each call to `Run`:
-  - When `Phase` changes, the caller detects the transition and appends a phase
-    change event to `events.jsonl`.
-  - When benchmark measurements appear, the caller appends a measurement event.
-  - When an error is recorded, the caller appends an error event.
-  During `Working`, tool-call and message events are appended directly by the
-  background turn worker as they execute. The workflow never reads from
-  `events.jsonl` to determine what to execute next.
-- **Conditions on HeroRun:**
-  Standard Kubernetes conditions (`metav1.Condition`) are recorded directly on
-  `HeroRun.Status.Conditions` (such as `Ready`, `SandboxReady`, `Selected`,
-  `PROpened`), enabling external cluster tooling and `kubectl wait` to track
-  progress natively.
+- **External Kubernetes resources.**
+  When waiting for a sandbox pod to become ready, the controller relies on
+  Kubernetes watch events from owned resources to enqueue the run as soon as the
+  status changes, backed by a periodic requeue safety net.
+- **Asynchronous control-plane operations.**
+  When an agent session turn executes against a model and sandbox, the turn runs
+  in a background worker outside the reconcile pass.
+
+Tracking asynchronous operations follows five rules so no state is hidden in
+controller memory.
+
+1. **Persist before launch.**
+   Before launching a background worker, the controller records the active
+   operation on `HeroRun` status so in-flight work is durable across restarts.
+2. **Record outcomes on `HeroRun`, never in memory.**
+   When the background worker finishes, it writes the completed operation state
+   and outcome directly to `HeroRun` status and wakes the reconciler.
+   The controller does not cache completed operation outcomes in memory.
+3. **Consume and clear during reconciliation.**
+   On the next reconcile pass, the controller reads the operation state from
+   `HeroRun`.
+   If the operation is still running in this process, the controller returns
+   promptly with a requeue backstop.
+   If the operation has completed, the controller applies the outcome to the
+   run, clears the operation from `HeroRun`, and advances to the next step.
+4. **Recover from restarts via durable transcripts.**
+   If the control plane restarts while a turn is in flight, the background
+   worker dies while `HeroRun` still records an active operation.
+   When reconciliation resumes and finds no live local worker for that
+   operation, the controller inspects the durable `messages.jsonl` session
+   transcript on the state volume.
+   If the transcript already contains the completed turn, the controller
+   recovers the outcome, updates `HeroRun`, clears the operation, and advances.
+   If the crash interrupted the turn mid-flight, the controller clears the stale
+   operation and starts a fresh turn from the last completed turn in the
+   transcript.
+5. **Keep only ephemeral execution handles in memory.**
+   The controller may hold in-process handles for currently running goroutines
+   so it knows a worker is alive locally or can cancel it when a run ends.
+   Losing all controller memory never loses workflow progress or completed
+   operation outcomes.
 
 ## Retention and garbage collection
 
-Because `HeroRun` objects hold the authoritative copy of a run's state and own
-its child resources, their lifecycle and cleanup follow strict rules:
+`HeroRun` owns the lifecycle of a run's cluster resources and state files.
 
-- **How long a finished `HeroRun` is kept:**
-  When a run reaches a terminal phase (`Succeeded`, `Failed`, or
-  `NoImprovement`), its `HeroRun` resource is retained:
-  - If a pull request was opened, `HeroRun` is retained for as long as the pull
-    request remains open, so that the session can resume if review comments
-    arrive.
-  - When the pull request is merged or closed, or if the run completed without
-    opening a pull request (or failed), the `HeroRun` is retained for a
-    retention window (such as 30 days) to allow developers and operators to
-    inspect outcomes.
-- **Who deletes it:**
-  A scheduled retention loop in the control plane (`ao serve`) deletes
-  expired `HeroRun` resources after their retention window passes. An operator
-  or user can also delete a `HeroRun` manually via `kubectl delete herorun <name>`.
-- **What deletion does to child resources and files:**
-  - **Child Kubernetes resources:** `HeroRun` is the owner of its `Sandbox`
-    and its workspace `PersistentVolumeClaim` (both carry owner references
-    naming the `HeroRun` with `controller: true`). When the `HeroRun` is
-    deleted, standard Kubernetes cascading garbage collection automatically
-    deletes the child Sandbox (if not already deleted at terminal phase) and
-    deletes the workspace claim.
-  - **Files on the state volume:** The control plane watches for `HeroRun`
-    deletion. When a `HeroRun` is deleted, the control plane deletes the run's
-    directory on the state volume (`repos/<host>/<owner>/<name>/runs/<run-id>/`),
-    removing `messages.jsonl`, `tools/`, `events.jsonl`, and any exported
-    snapshot files.
+- **Retention period.**
+  While an opened pull request remains open, the control plane retains the
+  `HeroRun` resource so the session can resume if review comments arrive.
+  Once the pull request merges or closes, or when a run ends without opening a
+  pull request, the control plane retains `HeroRun` for a configured retention
+  window, such as 30 days, for operator inspection.
+- **Deletion trigger.**
+  A scheduled retention loop in the control plane deletes expired `HeroRun`
+  resources.
+  Operators can also delete a `HeroRun` manually at any time with `kubectl`.
+- **Cascading Kubernetes cleanup.**
+  Each child sandbox and workspace claim carries a controller owner reference to
+  its `HeroRun`.
+  Deleting `HeroRun` causes standard Kubernetes garbage collection to delete any
+  remaining child sandbox and the workspace claim automatically.
+- **State volume cleanup.**
+  The control plane watches for `HeroRun` deletion and deletes the run's
+  directory on the state volume, removing transcripts, tool outputs, event logs,
+  and exported snapshots.
 
-## Testing
+## Hermetic testing
 
-The project's unit tests run hermetically with fakes and no network access:
+Workflow unit tests run completely in memory with no network access, no external
+binaries, and no real `kube-apiserver` or etcd.
 
-- **Fake client for kube-apiserver:**
-  In unit tests of `RunWorkflow.Run` and the orchestrator, controller-runtime's
-  in-memory fake client (`sigs.k8s.io/controller-runtime/pkg/client/fake`,
-  configured with `HeroRun` in the scheme and status subresource) stands in for
-  the `kube-apiserver`.
-- **Hermetic execution:**
-  The fake client implements `client.Client` entirely in memory, tracking
-  objects, updating status subresources, and validating resource versions
-  without launching a `kube-apiserver` binary, without etcd, and without opening
-  network ports.
-- **Combined test doubles:**
-  Tests combine the fake client with the existing fake forge (`forge.NewFake()`),
-  fake agents clientset (`fakeagents.NewSimpleClientset()`), and fake LLM client
-  (`llm.FakeClient`), verifying complete workflow reconciliation without
-  external dependencies.
+An in-memory fake Kubernetes client stands in for `kube-apiserver`.
+It tracks `HeroRun` and child resources in memory, enforces status subresource
+updates, and checks resource versions for optimistic concurrency conflicts.
+Tests combine this fake client with in-memory fakes for the forge, the sandbox
+runtime, and the model client.
+This setup exercises full phase transitions, conflict retries, asynchronous turn
+completion, and crash-recovery scenarios quickly and deterministically.
 
-## Future evolution: when to add a second store or an aggregated API server
+## Storage evolution
 
-Starting with `kube-apiserver` as the backing store for `HeroRun` provides
-immediate architectural benefits: standard controller patterns, native
-controller-runtime client caching, built-in RBAC, and zero synchronization loops
-between disparate stores.
+Starting with `kube-apiserver` backed by etcd provides native watches,
+optimistic concurrency, RBAC, `kubectl` inspection, and owner-reference garbage
+collection.
+It also avoids synchronization loops between separate stores.
 
-However, as auto-optimizer scales, specific operational thresholds would motivate
-introducing a secondary store or an aggregated API server:
+At higher scale, three operational thresholds could justify moving `HeroRun`
+storage off etcd.
 
-1. **High write rate and etcd churn:**
-   If hundreds of concurrent runs execute simultaneous agent turns, saving
-   status updates after every step could generate significant write traffic to
-   etcd, increasing Raft consensus latency and etcd compaction load.
-2. **Object size pressure:**
-   While large transcripts and tool outputs are already kept on the state
-   volume, if goal specifications, candidate commit metadata, or detailed
-   condition histories expand and threaten etcd's 1.5 MB object cap, offloading
-   run state from etcd becomes necessary.
-3. **High run volume and cluster retention:**
-   If repositories accumulate tens of thousands of historical runs, storing all
-   completed run records in etcd would strain cluster storage and backup
-   operations.
+1. **Write rate.**
+   Hundreds of concurrent runs updating status after each step could generate
+   heavy etcd write traffic, raising Raft latency and compaction load.
+2. **Object size.**
+   Even with transcripts and tool outputs on the state volume, richer goal
+   definitions, operation records, or condition histories could grow toward
+   etcd's 1.5 megabyte cap.
+3. **Historical volume.**
+   Retaining tens of thousands of completed runs across many repositories could
+   strain cluster etcd storage and backup sizes.
 
-### Aggregated API Server
+When any of those thresholds matters, auto-optimizer can serve `HeroRun` through
+a Kubernetes aggregated API server backed by a store suited to that workload,
+such as Redis or files on the state volume.
 
-If these thresholds are reached, auto-optimizer can introduce a Kubernetes
-aggregated API server using `k8s.io/apiserver` registered under the
-`auto-optimizer.labs.gke.io` API group.
+Because the controller interacts exclusively through the Kubernetes API and
+holds all workflow and operation state on `HeroRun`, this storage change stays
+behind the API boundary.
 
-With an aggregated API server:
-- The resource schema, API group, and URL path remain the same.
-- `kubectl` commands (`get`, `describe`, `watch`) and controller-runtime
-  clients continue to interact with `HeroRun` through standard Kubernetes REST
-  requests.
-- The reconciler, workflow runner, and RBAC rules remain the same.
-- The storage implementation behind the REST handler changes from etcd to
-  ObjectFS files or a specialized store.
-
-## Migration roadmap
-
-The orchestrator moves to the resumable workflow abstraction through an ordered
-sequence of small PRs. The store changes in one step up front, so state is never
-split across two stores, and each subsequent PR moves one phase of the live
-reconciler onto `Run`:
-
-1. **PR 1: Switch the store for all phases to `HeroRun` in `kube-apiserver` (about 220 lines)**
-   Aligns the `HeroRun` custom resource type in `api/herorun/v1alpha1` with the
-   complete workflow state schema (adding execution fields to `HeroRunStatus`
-   including `ActiveOperation`, and inputs to `HeroRunSpec`), regenerates
-   deepcopy methods and CRD manifests, and updates the existing reconciler in
-   `pkg/run/orchestrator.go` to read and write `HeroRun` in `kube-apiserver`
-   across all phases as the single source of truth. Keeps `run.json` only as an
-   optional disk export for human inspection. Tested in `pkg/run` with
-   `controller-runtime/pkg/client/fake`. Changes the store in one step,
-   preventing dual-store divergence.
-2. **PR 2: Workflow runner skeleton and live adoption of Phase Pending (about 190 lines)**
-   Introduces `RunWorkflow` and `Result`. Implements workspace claim creation in
-   `RunWorkflow.Run` for `PhasePending`. The live reconciler delegates
-   `Pending` reconciliation directly to `RunWorkflow.Run` and updates
-   `HeroRun.Status` via status updates. Main uses `Run` for all pending runs.
-3. **PR 3: Live adoption of Phase Preparing (about 200 lines)**
-   Implements sandbox readiness check with requeue durations and `prepareSandbox`
-   invocation in `RunWorkflow.Run` for `PhasePreparing`. The live reconciler
-   delegates `Preparing` reconciliation to `RunWorkflow.Run`. Main uses `Run`
-   for all preparing runs.
-4. **PR 4: Live adoption of Phase Working (about 210 lines)**
-   Implements turn worker launching, `ActiveOperation` tracking, quick return
-   without in-process polling, and turn completion collection in
-   `RunWorkflow.Run` for `PhaseWorking`. The live reconciler delegates `Working`
-   reconciliation to `RunWorkflow.Run`. Main runs session turns through `Run`.
-5. **PR 5: Live adoption of Phase Selecting (about 200 lines)**
-   Implements candidate verification, commit export, and branch pushing in
-   `RunWorkflow.Run` for `PhaseSelecting`, using on-demand sandbox provisioning.
-   The live reconciler delegates `Selecting` reconciliation to `RunWorkflow.Run`.
-   Main runs selection through `Run`.
-6. **PR 6: Live adoption of Phase OpeningPR and terminal transitions (about 190 lines)**
-   Implements pull request discovery or creation in `RunWorkflow.Run` for
-   `PhaseOpeningPR`, alongside terminal phase transitions with synchronous
-   `HeroRun` status updates. The live reconciler delegates `OpeningPR` to
-   `RunWorkflow.Run`.
-7. **PR 7: Live reconciler unification (about 170 lines)**
-   Simplifies the reconciler's top-level `Reconcile` method into a single
-   invocation of `RunWorkflow.Run`, followed by `HeroRun` status update and
-   event logging, removing the individual phase delegation methods.
-8. **PR 8: Obsolete field and in-memory map cleanup (about 150 lines)**
-   Removes obsolete fields (`ReadyDeadline`, `PortalBoundAt`) and in-memory
-   maps (`turnOutcomes`, `activeRuns`, `workerCancels`) from `Orchestrator` now
-   that work in flight is tracked purely by `ActiveOperation` on
-   `HeroRun.Status`.
+- The `HeroRun` API group, schema, and REST semantics remain unchanged.
+- `kubectl` workflows, RBAC policies, and Kubernetes API clients keep working
+  without modification.
+- The controller itself requires no architectural changes.
