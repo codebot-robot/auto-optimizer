@@ -8757,10 +8757,13 @@ func TestOrchestrator_StartSession_SharesSandboxOwnerAndTurnBudget(t *testing.T)
 	store := state.NewFileStore(t.TempDir())
 	sessionStore := session.NewFileStore(t.TempDir())
 	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
-	_ = store.PutRepo(ctx, repo)
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
 	run := &state.Run{ID: "run-sb-owner", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-owner"}
 
-	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+	procSrv := &mockProcessServer{exitCode: 0, stdout: "ok\n"}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, &llm.ElizaClient{})
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
@@ -8777,17 +8780,37 @@ func TestOrchestrator_StartSession_SharesSandboxOwnerAndTurnBudget(t *testing.T)
 		t.Fatalf("NewSession root: %v", err)
 	}
 
+	sb := harness.GetOrAttachSandbox(run.SandboxName)
 	owner := session.NewSandboxOwner(harness)
+	owner.SetActiveSandbox(sb)
+	owner.SetCreateSandboxOptions(session.CreateSandboxOptions{
+		Name:               run.SandboxName,
+		WorkspaceClaimName: "ws-claim",
+		ExtendLifecycle:    false,
+	})
 	root.SetSandboxOwner(owner)
 
 	rs := orch.ensureRunState(run.ID)
 	rs.sandboxOwner = owner
 
+	tb := orch.turnBudget(run.ID)
+	if tb == nil {
+		t.Fatal("expected non-nil turn budget for run")
+	}
+	// The parent takes 2 turns before starting the child, leaving 3 of 5.
+	for i := 0; i < 2; i++ {
+		if !tb.Take() {
+			t.Fatalf("parent take turn %d failed", i+1)
+		}
+	}
+
 	children := newChildGroup(ctx)
-	childName, err := orch.startChildSession(ctx, children, repo, run, root, "check sb")
+	// ElizaClient handles "run: <cmd>" in 2 turns. Turn 1 requests run_command, and turn 2 returns a text reply.
+	childName, err := orch.startChildSession(ctx, children, repo, run, root, "run: echo from-child")
 	if err != nil {
 		t.Fatalf("startChildSession: %v", err)
 	}
+	children.wg.Wait()
 
 	childSess, err := harness.LoadSession(ctx, sessionStore, childName)
 	if err != nil {
@@ -8797,17 +8820,50 @@ func TestOrchestrator_StartSession_SharesSandboxOwnerAndTurnBudget(t *testing.T)
 		t.Errorf("child Parent = %q, want 'rootsb'", childSess.Metadata.Parent)
 	}
 
-	tb := orch.turnBudget(run.ID)
-	if tb == nil {
-		t.Fatal("expected non-nil turn budget for run")
+	// Verify the child used the parent's active SandboxOwner rather than creating a new sandbox.
+	procSrv.mu.Lock()
+	cmds := slices.Clone(procSrv.commands)
+	procSrv.mu.Unlock()
+	if len(cmds) != 1 || !slices.Equal(cmds[0], []string{"sh", "-c", "echo from-child"}) {
+		t.Errorf("sandbox commands = %v, want [[sh -c echo from-child]]", cmds)
 	}
-	for i := 0; i < 5; i++ {
-		if !tb.Take() {
-			t.Fatalf("take turn %d failed", i+1)
-		}
+	sandboxes, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("listing sandboxes: %v", err)
+	}
+	if len(sandboxes.Items) != 0 {
+		t.Errorf("created sandboxes = %d, want 0 because child must reuse parent SandboxOwner", len(sandboxes.Items))
+	}
+
+	// Verify the child drew 2 turns from the shared budget on top of the parent's 2 turns.
+	if tb.Used() != 4 {
+		t.Fatalf("budget Used() after child = %d, want 4", tb.Used())
+	}
+	if !tb.Take() {
+		t.Fatalf("parent take final turn 5 failed")
 	}
 	if tb.Take() {
 		t.Errorf("expected budget exhausted on 6th turn")
+	}
+
+	// Verify a child started after the shared budget is exhausted makes no LLM turn.
+	exhaustedChild, err := orch.startChildSession(ctx, children, repo, run, root, "after exhaustion")
+	if err != nil {
+		t.Fatalf("startChildSession after exhaustion: %v", err)
+	}
+	children.wg.Wait()
+
+	exhaustedSess, err := harness.LoadSession(ctx, sessionStore, exhaustedChild)
+	if err != nil {
+		t.Fatalf("LoadSession(exhaustedChild): %v", err)
+	}
+	for _, msg := range exhaustedSess.Messages() {
+		if msg.Role == "assistant" {
+			t.Errorf("expected no assistant message when shared budget is exhausted, got %+v", msg)
+		}
+	}
+	if tb.Used() != 5 {
+		t.Errorf("budget Used() after exhausted child = %d, want 5", tb.Used())
 	}
 }
 
