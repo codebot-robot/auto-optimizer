@@ -10578,3 +10578,448 @@ func TestOrchestrator_Working_SendMessage_ToolCall(t *testing.T) {
 		t.Errorf("unexpected pending message: %+v", pending[0])
 	}
 }
+
+func TestOrchestrator_Wait_MessageArrives(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-waitmsg", "run-waitmsg"
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, generateSessionID(runID), session.Metadata{RunID: runID, Repo: repo.Key().String()})
+	if err != nil {
+		t.Fatalf("NewSession root: %v", err)
+	}
+	run.SessionID = root.Name
+	child, err := harness.NewSession(ctx, sessionStore, "childwait", session.Metadata{RunID: runID, Parent: root.Name, Repo: repo.Key().String()})
+	if err != nil {
+		t.Fatalf("NewSession child: %v", err)
+	}
+	other, err := harness.NewSession(ctx, sessionStore, "otherwait", session.Metadata{RunID: runID, Parent: root.Name, Repo: repo.Key().String()})
+	if err != nil {
+		t.Fatalf("NewSession other: %v", err)
+	}
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+	children.setRunning(child.Name, true)
+	children.setRunning(other.Name, true)
+
+	// 1. Session without a run is rejected.
+	noRun, err := harness.NewSession(ctx, sessionStore, "waitnorun", session.Metadata{})
+	if err != nil {
+		t.Fatalf("NewSession norun: %v", err)
+	}
+	if _, err := orch.waitForEvent(ctx, children, repo, run, noRun, time.Second); err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
+		t.Fatalf("expected 'session belongs to no run' error, got %v", err)
+	}
+
+	// 2. Message arriving for another session does not wake root; message for root does.
+	type waitRes struct {
+		out string
+		err error
+	}
+	resCh := make(chan waitRes, 1)
+	go func() {
+		out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
+		resCh <- waitRes{out: out, err: err}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := orch.sendMessage(ctx, children, repo, run, child, other.Name, "for other only"); err != nil {
+		t.Fatalf("sendMessage to other: %v", err)
+	}
+	select {
+	case r := <-resCh:
+		t.Fatalf("root wait woke prematurely for message to other: %+v", r)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	if err := orch.sendMessage(ctx, children, repo, run, child, root.Name, "hello parent"); err != nil {
+		t.Fatalf("sendMessage to root: %v", err)
+	}
+	select {
+	case r := <-resCh:
+		if r.err != nil {
+			t.Fatalf("waitForEvent error: %v", r.err)
+		}
+		if !strings.Contains(r.out, "message") {
+			t.Errorf("expected wait result to mention message, got %q", r.out)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for waitForEvent after sendMessage")
+	}
+
+	// 3. Pre-existing pending message returns immediately without blocking.
+	out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
+	if err != nil || !strings.Contains(out, "message") {
+		t.Fatalf("expected immediate message result, got out=%q err=%v", out, err)
+	}
+	if err := store.ClearPendingMessages(ctx, repo.Key(), runID, root.Name); err != nil {
+		t.Fatalf("ClearPendingMessages: %v", err)
+	}
+
+	// 4. PostMessage from a human also wakes waitForEvent.
+	run.SetPhase(state.PhaseWorking, time.Now().UTC())
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+	go func() {
+		out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
+		resCh <- waitRes{out: out, err: err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if err := orch.PostMessage(ctx, repo.Key(), runID, "human guidance"); err != nil {
+		t.Fatalf("PostMessage: %v", err)
+	}
+	select {
+	case r := <-resCh:
+		if r.err != nil || !strings.Contains(r.out, "message") {
+			t.Fatalf("expected message wakeup after PostMessage, got out=%q err=%v", r.out, r.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for waitForEvent after PostMessage")
+	}
+}
+
+func TestOrchestrator_Wait_ChildStops(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-waitchild", "run-waitchild"
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootchild", session.Metadata{RunID: runID})
+	if err != nil {
+		t.Fatalf("NewSession root: %v", err)
+	}
+	childA, err := harness.NewSession(ctx, sessionStore, "childa", session.Metadata{RunID: runID, Parent: root.Name})
+	if err != nil {
+		t.Fatalf("NewSession childA: %v", err)
+	}
+	childB, err := harness.NewSession(ctx, sessionStore, "childb", session.Metadata{RunID: runID, Parent: root.Name})
+	if err != nil {
+		t.Fatalf("NewSession childB: %v", err)
+	}
+	run.SessionID = root.Name
+
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	defer cancelChildren()
+	children := newChildGroup(childCtx)
+	children.setRunning(childA.Name, true)
+	children.setRunning(childB.Name, true)
+
+	// 1. Sibling stopping does not wake childA; root's child stopping wakes root and names the child.
+	type waitRes struct {
+		out string
+		err error
+	}
+	rootRes := make(chan waitRes, 1)
+	childARes := make(chan waitRes, 1)
+	go func() {
+		out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
+		rootRes <- waitRes{out: out, err: err}
+	}()
+	go func() {
+		out, err := orch.waitForEvent(ctx, children, repo, run, childA, 80*time.Millisecond)
+		childARes <- waitRes{out: out, err: err}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	children.markStopped(root.Name, childB.Name)
+
+	select {
+	case r := <-rootRes:
+		if r.err != nil {
+			t.Fatalf("root waitForEvent error: %v", r.err)
+		}
+		if !strings.Contains(r.out, childB.Name) || !strings.Contains(r.out, "stopped") {
+			t.Errorf("expected root wait result to name stopped child %q, got %q", childB.Name, r.out)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for root to wake when childB stopped")
+	}
+
+	select {
+	case r := <-childARes:
+		if r.err != nil {
+			t.Fatalf("childA waitForEvent error: %v", r.err)
+		}
+		if !strings.Contains(r.out, "Timed out") {
+			t.Errorf("expected childA to time out instead of waking on sibling stop, got %q", r.out)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for childA timeout")
+	}
+
+	// 2. Child stopping BEFORE parent calls wait is reported once, not repeated.
+	children.markStopped(root.Name, childA.Name)
+	out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
+	if err != nil || !strings.Contains(out, childA.Name) {
+		t.Fatalf("expected immediate stop for %q, got out=%q err=%v", childA.Name, out, err)
+	}
+	out2, err := orch.waitForEvent(ctx, children, repo, run, root, 30*time.Millisecond)
+	if err != nil || !strings.Contains(out2, "Timed out") {
+		t.Fatalf("expected second wait to time out after stop was consumed, got out=%q err=%v", out2, err)
+	}
+
+	// 3. A real child started via startChildSession wakes its parent when it finishes.
+	orch.ensureRunState(run.ID)
+	startedChild, err := orch.startChildSession(ctx, children, repo, run, root, "quick task")
+	if err != nil {
+		t.Fatalf("startChildSession: %v", err)
+	}
+	out3, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
+	if err != nil || !strings.Contains(out3, startedChild) || !strings.Contains(out3, "stopped") {
+		t.Fatalf("expected wait to report started child %q stopped, got out=%q err=%v", startedChild, out3, err)
+	}
+	children.wg.Wait()
+}
+
+func TestOrchestrator_Wait_TimeoutRunEndAndDeadline(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-waitbounds", "run-waitbounds"
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        time.Now,
+	})
+
+	root, err := harness.NewSession(ctx, sessionStore, "rootbounds", session.Metadata{RunID: runID})
+	if err != nil {
+		t.Fatalf("NewSession root: %v", err)
+	}
+	run.SessionID = root.Name
+	children := newChildGroup(ctx)
+
+	// 1. Timeout returns timeout description.
+	out, err := orch.waitForEvent(ctx, children, repo, run, root, 30*time.Millisecond)
+	if err != nil || !strings.Contains(out, "Timed out") || !strings.Contains(out, "30ms") {
+		t.Fatalf("expected timeout result, got out=%q err=%v", out, err)
+	}
+
+	// 2. Run ending (context cancelled) ends wait immediately with context.Canceled.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := orch.waitForEvent(runCtx, children, repo, run, root, 5*time.Second)
+		errCh <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancelRun()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled when run ends, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for waitForEvent to exit on run cancel")
+	}
+
+	// 3. Upcoming run deadline ends wait before a much longer timeout.
+	shortDeadline := time.Now().UTC().Add(40 * time.Millisecond)
+	run.Deadline = &shortDeadline
+	start := time.Now()
+	out, err = orch.waitForEvent(ctx, children, repo, run, root, 10*time.Second)
+	if err != nil || !strings.Contains(out, "deadline") {
+		t.Fatalf("expected deadline result, got out=%q err=%v", out, err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("wait took too long (%v) despite short run deadline", time.Since(start))
+	}
+
+	// 4. Already-passed run deadline returns immediately.
+	pastDeadline := time.Now().UTC().Add(-time.Second)
+	run.Deadline = &pastDeadline
+	out, err = orch.waitForEvent(ctx, children, repo, run, root, 10*time.Second)
+	if err != nil || !strings.Contains(out, "deadline") {
+		t.Fatalf("expected immediate deadline result, got out=%q err=%v", out, err)
+	}
+}
+
+func TestOrchestrator_Wait_ToolCallUsesNoExtraTurns(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261123T120000Z-waittool", "run-waittool"
+
+	childRelease := make(chan struct{})
+	var rootLLMCalls, childLLMCalls int
+	var mu sync.Mutex
+	var waitToolResult string
+	var rootSawChildMsg bool
+
+	scriptedLLM := &customCallbackLLM{
+		fn: func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+			// Distinguish child from root by initial user prompt.
+			isChild := false
+			for _, m := range req.Messages {
+				if m.Role == "user" && m.Content != nil && *m.Content == "compute answer" {
+					isChild = true
+					break
+				}
+			}
+
+			mu.Lock()
+			if isChild {
+				childLLMCalls++
+				callNum := childLLMCalls
+				mu.Unlock()
+
+				if callNum == 1 {
+					<-childRelease
+					args, _ := json.Marshal(map[string]string{
+						"recipient": generateSessionID(runID),
+						"message":   "answer is 42",
+					})
+					return &llm.ChatCompletionResponse{
+						Choices: []llm.Choice{{
+							Message: llm.Message{
+								Role: "assistant",
+								ToolCalls: []llm.ToolCall{{
+									ID:   "child-send-1",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "send_message",
+										Arguments: string(args),
+									},
+								}},
+							},
+						}},
+					}, nil
+				}
+				finishArgs, _ := json.Marshal(map[string]string{"summary": "child done"})
+				return &llm.ChatCompletionResponse{
+					Choices: []llm.Choice{{
+						Message: llm.Message{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{{
+								ID:   "child-finish-1",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "finish",
+									Arguments: string(finishArgs),
+								},
+							}},
+						},
+					}},
+				}, nil
+			}
+
+			rootLLMCalls++
+			callNum := rootLLMCalls
+			mu.Unlock()
+
+			switch callNum {
+			case 1:
+				args, _ := json.Marshal(map[string]string{"task": "compute answer"})
+				return &llm.ChatCompletionResponse{
+					Choices: []llm.Choice{{
+						Message: llm.Message{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{{
+								ID:   "root-start-1",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "start_session",
+									Arguments: string(args),
+								},
+							}},
+						},
+					}},
+				}, nil
+			case 2:
+				// Release child slightly after root enters wait.
+				go func() {
+					time.Sleep(40 * time.Millisecond)
+					close(childRelease)
+				}()
+				args, _ := json.Marshal(map[string]string{"timeout": "5s"})
+				return &llm.ChatCompletionResponse{
+					Choices: []llm.Choice{{
+						Message: llm.Message{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{{
+								ID:   "root-wait-1",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "wait",
+									Arguments: string(args),
+								},
+							}},
+						},
+					}},
+				}, nil
+			default:
+				for _, m := range req.Messages {
+					if m.Role == "tool" && m.ToolCallID == "root-wait-1" && m.Content != nil {
+						waitToolResult = *m.Content
+					}
+					if m.Role == "user" && m.Content != nil && strings.Contains(*m.Content, "answer is 42") {
+						rootSawChildMsg = true
+					}
+				}
+				finishArgs, _ := json.Marshal(map[string]string{"summary": "parent done"})
+				return &llm.ChatCompletionResponse{
+					Choices: []llm.Choice{{
+						Message: llm.Message{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{{
+								ID:   "root-finish-1",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "finish",
+									Arguments: string(finishArgs),
+								},
+							}},
+						},
+					}},
+				}, nil
+			}
+		},
+	}
+
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, scriptedLLM)
+	run.SessionID = generateSessionID(runID)
+	run.SetPhase(state.PhaseWorking, time.Now().UTC())
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        time.Now,
+	})
+	orch.ensureRunState(run.ID)
+
+	outcome := orch.runTurnWorker(ctx, repo, run, nil)
+	if !errors.Is(outcome.Err, session.ErrSessionFinished) {
+		t.Fatalf("expected ErrSessionFinished, got %v", outcome.Err)
+	}
+	if !strings.Contains(waitToolResult, "message") {
+		t.Errorf("expected wait tool result to report message arrival, got %q", waitToolResult)
+	}
+	if !rootSawChildMsg {
+		t.Error("expected parent session to receive child message after wait returned")
+	}
+	// Parent spent 3 model turns (start_session, wait, finish) and child spent 2 (send_message, finish).
+	// Waiting itself spent 0 turns.
+	if rootLLMCalls != 3 {
+		t.Errorf("rootLLMCalls = %d, want 3", rootLLMCalls)
+	}
+	if childLLMCalls != 2 {
+		t.Errorf("childLLMCalls = %d, want 2", childLLMCalls)
+	}
+}

@@ -299,6 +299,7 @@ written for maintainers.
 | `start_session(task)` | control plane | Starts a child session in the same run to work on a task in the background and returns its name immediately. |
 | `list_sessions` | control plane | Lists the sessions of the calling run: each one's name, its parent, and whether it is running or stopped. |
 | `send_message(recipient, message)` | control plane | Sends a text message to another session of the calling run by name. |
+| `wait(timeout)` | control plane | Pauses the session without spending model turns until a message arrives for it, one of its child sessions stops, or the timeout elapses. |
 
 ### Child sessions
 
@@ -323,6 +324,8 @@ to inspect whether other sessions in the run are running or stopped.
 Sessions in the same run can also communicate by calling `send_message` with a
 recipient session's name and a message. Because sessions share the workspace
 volume, a message can refer to a file path instead of copying its contents.
+A session can call `wait` with a timeout to pause without spending model turns
+until a message arrives for it or one of its child sessions stops.
 
 ### Personalities for phase 2
 

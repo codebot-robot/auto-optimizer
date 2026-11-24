@@ -282,6 +282,7 @@ type Orchestrator struct {
 	workerWG    sync.WaitGroup
 
 	pendingMessagesMu sync.Mutex
+	pendingMessagesCh chan struct{}
 
 	managerCtxMu sync.Mutex
 	managerCtx   context.Context
@@ -1413,13 +1414,8 @@ func (o *Orchestrator) PostMessage(ctx context.Context, repo state.RepoKey, runI
 
 	sessionID := topLevelSessionID(runID, hr.Status.SessionID)
 
-	o.pendingMessagesMu.Lock()
-	err := o.store.AppendPendingMessage(ctx, repo, runID, sessionID, state.PendingMessage{
-		Text: text,
-	})
-	o.pendingMessagesMu.Unlock()
-	if err != nil {
-		return fmt.Errorf("appending pending message: %w", err)
+	if err := o.appendPendingMessage(ctx, repo, runID, sessionID, state.PendingMessage{Text: text}); err != nil {
+		return err
 	}
 
 	o.Notify(repo, runID)
@@ -1449,18 +1445,100 @@ func (o *Orchestrator) sendMessage(ctx context.Context, children *childGroup, re
 		return fmt.Errorf("recipient session %q is not running", recipient)
 	}
 
-	o.pendingMessagesMu.Lock()
-	err = o.store.AppendPendingMessage(ctx, repo.Key(), run.ID, recipient, state.PendingMessage{
-		From: senderSession.Name,
-		Text: message,
-	})
-	o.pendingMessagesMu.Unlock()
-	if err != nil {
-		return fmt.Errorf("appending pending message: %w", err)
+	if err := o.appendPendingMessage(ctx, repo.Key(), run.ID, recipient, state.PendingMessage{From: senderSession.Name, Text: message}); err != nil {
+		return err
 	}
 
 	o.Notify(repo.Key(), run.ID)
 	return nil
+}
+
+func (o *Orchestrator) appendPendingMessage(ctx context.Context, repo state.RepoKey, runID, sessionID string, msg state.PendingMessage) error {
+	o.pendingMessagesMu.Lock()
+	defer o.pendingMessagesMu.Unlock()
+	if err := o.store.AppendPendingMessage(ctx, repo, runID, sessionID, msg); err != nil {
+		return fmt.Errorf("appending pending message: %w", err)
+	}
+	if o.pendingMessagesCh != nil {
+		close(o.pendingMessagesCh)
+		o.pendingMessagesCh = nil
+	}
+	return nil
+}
+
+func (o *Orchestrator) checkPendingMessages(ctx context.Context, repo state.RepoKey, runID, sessionID string) (bool, chan struct{}, error) {
+	o.pendingMessagesMu.Lock()
+	defer o.pendingMessagesMu.Unlock()
+	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID, sessionID)
+	if err != nil {
+		return false, nil, err
+	}
+	if len(msgs) > 0 {
+		return true, nil, nil
+	}
+	if o.pendingMessagesCh == nil {
+		o.pendingMessagesCh = make(chan struct{})
+	}
+	return false, o.pendingMessagesCh, nil
+}
+
+func (o *Orchestrator) waitForEvent(ctx context.Context, children *childGroup, repo *state.Repo, run *state.Run, sess *session.Session, timeout time.Duration) (string, error) {
+	if sess.Metadata.RunID == "" {
+		return "", errors.New("cannot call wait: session belongs to no run")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	waitDur, cappedByDeadline := timeout, false
+	if run.Deadline != nil {
+		if rem := run.Deadline.Sub(o.clock().UTC()); rem <= 0 {
+			o.Notify(repo.Key(), run.ID)
+			return "Wait ended: run deadline passed.", nil
+		} else if rem < waitDur {
+			waitDur, cappedByDeadline = rem, true
+		}
+	}
+
+	timer := time.NewTimer(waitDur)
+	defer timer.Stop()
+
+	for {
+		hasMsg, msgCh, err := o.checkPendingMessages(ctx, repo.Key(), run.ID, sess.Name)
+		if err != nil {
+			return "", fmt.Errorf("checking pending messages: %w", err)
+		}
+		var stopped []string
+		var childCh chan struct{}
+		if children != nil {
+			stopped, childCh = children.popStopped(sess.Name)
+		}
+		if hasMsg || len(stopped) > 0 {
+			var parts []string
+			if hasMsg {
+				parts = append(parts, "A message arrived.")
+			}
+			if len(stopped) == 1 {
+				parts = append(parts, fmt.Sprintf("Child session %s stopped.", stopped[0]))
+			} else if len(stopped) > 1 {
+				parts = append(parts, fmt.Sprintf("Child sessions stopped: %s.", strings.Join(stopped, ", ")))
+			}
+			return strings.Join(parts, " "), nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-msgCh:
+		case <-childCh:
+		case <-timer.C:
+			if cappedByDeadline {
+				o.Notify(repo.Key(), run.ID)
+				return "Wait ended: run deadline passed.", nil
+			}
+			return fmt.Sprintf("Timed out after %s with no new messages or stopped child sessions.", timeout), nil
+		}
+	}
 }
 
 func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, initialSb *session.Sandbox) *session.SandboxOwner {
@@ -1854,11 +1932,14 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	sendMessageTool := ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
 		return o.sendMessage(toolCtx, children, repo, run, sess, recipient, message)
 	})
+	waitTool := ao.NewWaitTool(func(toolCtx context.Context, timeout time.Duration) (string, error) {
+		return o.waitForEvent(toolCtx, children, repo, run, sess, timeout)
+	})
 	budget := o.turnBudget(run.ID)
 	messageSource := func(ctx context.Context, session *session.Session) error {
 		return o.deliverPendingMessages(ctx, repo.Key(), run.ID, session)
 	}
-	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool, listSessionsTool, sendMessageTool).WithMessageSource(messageSource)
+	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool, listSessionsTool, sendMessageTool, waitTool).WithMessageSource(messageSource)
 
 	var turnErr error
 	if hasUserMessage {
@@ -2491,10 +2572,13 @@ func (o *Orchestrator) startChildSession(ctx context.Context, children *childGro
 	childSendTool := ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
 		return o.sendMessage(toolCtx, children, repo, run, childSess, recipient, message)
 	})
+	childWaitTool := ao.NewWaitTool(func(toolCtx context.Context, timeout time.Duration) (string, error) {
+		return o.waitForEvent(toolCtx, children, repo, run, childSess, timeout)
+	})
 	childMessageSource := func(ctx context.Context, session *session.Session) error {
 		return o.deliverPendingMessages(ctx, repo.Key(), run.ID, session)
 	}
-	childHarness := o.harness.WithTurnBudget(budget).WithExtraTools(childStartTool, childListTool, childSendTool, ao.NewFinishTool()).WithMessageSource(childMessageSource)
+	childHarness := o.harness.WithTurnBudget(budget).WithExtraTools(childStartTool, childListTool, childSendTool, childWaitTool, ao.NewFinishTool()).WithMessageSource(childMessageSource)
 
 	children.setRunning(childName, true)
 	children.wg.Add(1)
@@ -2502,7 +2586,7 @@ func (o *Orchestrator) startChildSession(ctx context.Context, children *childGro
 	go func() {
 		defer o.workerWG.Done()
 		defer children.wg.Done()
-		defer children.setRunning(childName, false)
+		defer children.markStopped(parentSession.Name, childName)
 
 		if len(childSess.Messages()) == 0 {
 			sysPrompt := buildSystemPrompt(o.harness.RunOptions().SystemPrompt, repo, run, task)
@@ -2554,6 +2638,8 @@ type childGroup struct {
 	wg      *sync.WaitGroup
 	mu      sync.Mutex
 	running map[string]bool
+	stopped map[string][]string
+	notify  chan struct{}
 }
 
 func newChildGroup(ctx context.Context) *childGroup {
@@ -2561,6 +2647,7 @@ func newChildGroup(ctx context.Context) *childGroup {
 		ctx:     ctx,
 		wg:      &sync.WaitGroup{},
 		running: make(map[string]bool),
+		stopped: make(map[string][]string),
 	}
 }
 
@@ -2572,6 +2659,30 @@ func (g *childGroup) setRunning(name string, running bool) {
 	} else {
 		delete(g.running, name)
 	}
+}
+
+func (g *childGroup) markStopped(parent, name string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.running, name)
+	g.stopped[parent] = append(g.stopped[parent], name)
+	if g.notify != nil {
+		close(g.notify)
+		g.notify = nil
+	}
+}
+
+func (g *childGroup) popStopped(parent string) ([]string, chan struct{}) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if names := g.stopped[parent]; len(names) > 0 {
+		delete(g.stopped, parent)
+		return names, nil
+	}
+	if g.notify == nil {
+		g.notify = make(chan struct{})
+	}
+	return nil, g.notify
 }
 
 func (g *childGroup) isRunning(name string) bool {
