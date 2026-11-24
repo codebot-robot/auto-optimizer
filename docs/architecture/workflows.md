@@ -120,8 +120,14 @@ execution progress.
   Status holds observed session state, including the current phase, Kubernetes
   conditions, turn and token metrics, requested run actions such as opening a
   pull request, and the terminal outcome.
+- **`SessionMessage` spec and status.**
+  Spec holds the immutable payload of a message addressed to a `Session`,
+  including the target session name, optional run identifier, optional sender
+  identity, and message text.
+  Status records delivery state through `DeliveredAt` so the `Session`
+  controller never mutates spec.
 
-Standard Kubernetes optimistic concurrency protects status updates on both
+Standard Kubernetes optimistic concurrency protects status updates on these
 resources.
 Every write carries the resource version that the controller read.
 If another actor updated the resource concurrently, the API rejects the write
@@ -292,6 +298,22 @@ custom resources with controller owner references pointing to the parent
   Deleting a parent `Session` or the `HeroRun` cascades cleanup through the
   entire session tree automatically.
 
+### Delivering messages with `SessionMessage`
+
+Peer sessions calling `send_message` and users in the web UI or CLI send
+messages to a `Session` by creating immutable `SessionMessage` custom resources.
+Each `SessionMessage` carries labels identifying its target session and optional
+run, along with a controller owner reference pointing to the target `Session`.
+
+Because the `Session` controller registers an `Owns` watch on `SessionMessage`,
+creating a message wakes the target `Session` automatically without
+file-backed pending queues or out-of-band wakeup channels.
+The controller lists undelivered `SessionMessage` resources for the session,
+appends them to `messages.jsonl` in creation order, and writes `DeliveredAt` in
+status only after the transcript write succeeds.
+Messages therefore survive write failures and restarts without modifying
+`SessionMessage` spec.
+
 ### Recovering in-flight sessions after restarts
 
 If the control plane restarts while a session is mid-turn, the `Session`
@@ -363,10 +385,11 @@ deterministic branch.
   The root `Session`, each child sandbox, and the workspace claim carry
   controller owner references to `HeroRun`.
   Each child `Session` carries a controller owner reference to its parent
-  `Session`.
+  `Session`, and each `SessionMessage` carries a controller owner reference to
+  its target `Session`.
   Deleting `HeroRun` causes standard Kubernetes garbage collection to delete the
-  entire `Session` tree, any remaining child sandbox, and the workspace claim
-  automatically.
+  entire `Session` tree, all owned `SessionMessage` resources, any remaining
+  child sandbox, and the workspace claim automatically.
 - **State volume cleanup.**
   The control plane watches for `HeroRun` deletion and deletes the run's
   directory on the state volume, removing root and child session transcripts,
