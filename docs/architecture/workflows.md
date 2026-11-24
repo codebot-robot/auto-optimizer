@@ -1,76 +1,133 @@
 # Workflows Architecture
 
-A workflow in auto-optimizer is a Kubernetes controller.
-A `HeroRun` custom resource represents each run, and the controller drives that
-resource from creation to a terminal outcome through standard reconciliation.
+A workflow in auto-optimizer uses two paired Kubernetes controllers over two
+custom resources, `HeroRun` and `Session`.
+The `HeroRun` controller drives each run from creation to a terminal outcome,
+and the `Session` controller drives each LLM conversation with tools.
 
-The goal is to adopt the Kubernetes controller model cleanly.
-All workflow state and operation state live on `HeroRun`.
-The controller keeps no shadow state in memory.
-Speaking strictly through the Kubernetes API decouples the controller from
+The goal is to adopt the Kubernetes controller model cleanly across both runs
+and sessions.
+All durable workflow state and session state live on `HeroRun` and `Session`.
+Neither controller keeps shadow state in process memory.
+Speaking strictly through the Kubernetes API decouples both controllers from
 storage.
 Auto-optimizer starts with `kube-apiserver` as the backing store, and can later
-move storage to a backend such as Redis behind a Kubernetes aggregated API
-server without changing the controller.
+move both resources to a backend such as Redis behind a Kubernetes aggregated
+API server without changing either controller.
 
 ## Core rules
 
 Seven invariants govern workflow design.
 
-1. **`HeroRun` is the single source of truth for workflow and operation state.**
-   The controller, the web UI, and the CLI all read and update run state through
-   the Kubernetes API.
+1. **`HeroRun` and `Session` are the single source of truth for control-plane
+   state.**
+   The controllers, the web UI, and the CLI all read and update run and session
+   state through the Kubernetes API.
    An optional `run.json` disk export exists only for human inspection.
    The system never reads it.
-2. **The controller keeps no shadow state in memory.**
-   In-flight operation state and completed operation outcomes live on `HeroRun`,
-   not in controller memory.
-   Process memory holds only ephemeral handles to live background work so the
-   controller can detect running goroutines or cancel them.
+2. **Controllers keep no shadow state in memory.**
+   Workflow progress, session state, and session outcomes live on `HeroRun` and
+   `Session` rather than in controller memory.
+   Losing all process memory never loses workflow progress or completed session
+   outcomes.
 3. **Bulk payloads stay on the state volume.**
    Conversation transcripts, unabridged tool outputs, and the user-facing event
    log remain files on the persistent state volume rather than fields on
-   `HeroRun`.
+   `HeroRun` or `Session`.
 4. **Crash recovery comes from controller idempotency.**
    Every reconcile pass must be safe to repeat from the last persisted `HeroRun`
-   state after a crash at any point.
+   or `Session` state and durable state-volume files after a crash at any point.
    The system does not rely on graceful shutdown handlers or an event-replay log
    for correctness.
-5. **Reconciliation returns quickly.**
-   A reconcile pass never blocks on slow work such as sandbox startup or model
-   turns, and it never polls in-process.
-   Long-running operations record their state and outcome on `HeroRun` and wake
-   the controller when they finish.
+5. **Controllers never poll in-process or block unrelated work.**
+   The `HeroRun` controller returns promptly and relies on Kubernetes watches
+   over owned resources rather than waiting on slow work.
+   The `Session` controller isolates model turns and tool calls in its own
+   worker pool and returns promptly whenever a session waits on a sandbox or
+   child sessions.
 6. **Persisted state never holds credentials.**
-   Authentication tokens and signing keys stay out of `HeroRun` and out of state
-   files.
+   Authentication tokens and signing keys stay out of `HeroRun`, `Session`, and
+   state files.
    The control plane holds secrets in memory or injects them through the portal.
 7. **Prefer standard Kubernetes controller libraries.**
    Build on the Go standard library and standard Kubernetes controller machinery
-   instead of adopting an external workflow engine.
+   instead of adopting an external workflow engine or custom background worker
+   framework.
 
-## Controller model and `HeroRun` state
+## Paired `HeroRun` and `Session` controllers
 
 In a Kubernetes controller, each reconcile pass reads the current resource from
 the API, compares desired state with observed state, performs one bounded unit
 of work, and writes updated status back through the API.
-Auto-optimizer follows this model for every run.
+Auto-optimizer applies this pattern as a paired-controller design analogous to
+Kubernetes `CronJob` and `Job`.
 
-`HeroRun` separates immutable desired inputs from observed execution progress.
+Just as `CronJob` manages higher-level lifecycle orchestration and delegates
+execution to owned `Job` resources, `HeroRun` manages the run workflow and
+delegates agent reasoning to owned `Session` resources.
 
-- **Spec** holds immutable desired inputs set when the scheduler creates the
-  run, such as the target repository, the frozen goal definition, the base
-  commit, and the run limits.
-- **Status** holds all observed workflow and operation state, including the
-  current phase, active and completed operation state, Kubernetes conditions,
-  child resource references, progress and cost metrics, and the run outcome.
+- **`HeroRun` orchestrates the run.**
+  The `HeroRun` controller provisions the workspace claim and initial sandbox,
+  prepares the repository clone, creates the run's root `Session`, verifies and
+  exports the candidate, opens a pull request, and releases resources at the end
+  of the run.
+  It never runs an LLM loop itself.
+- **`Session` executes the agent conversation.**
+  The `Session` controller drives the LLM loop for a single session, dispatches
+  tool calls to the sandbox, persists transcripts and tool outputs on the state
+  volume, coordinates delegated child sessions, and reports progress and final
+  outcomes on `Session` status.
 
-Standard Kubernetes optimistic concurrency protects status updates.
+Splitting runs and sessions into paired custom resources provides four
+architectural benefits.
+
+1. **Clear boundaries.**
+   Run orchestration stays separate from model prompting, tool execution, and
+   conversation state.
+2. **Standard Kubernetes coordination.**
+   `HeroRun` owns its root `Session` through a Kubernetes controller owner
+   reference and watches `Session` resources through `Owns`.
+   Whenever the `Session` controller updates `Session` status, the watch wakes
+   the owning `HeroRun` automatically without custom wake channels or in-memory
+   worker registries.
+3. **Isolated concurrency.**
+   Each controller has its own workqueue and worker pool.
+   Slow model responses and sandbox commands run inside the `Session` controller
+   pool and never stall `HeroRun` reconciliation for workspace setup, candidate
+   verification, or other runs.
+4. **First-class observability and cleanup.**
+   Every root and child session is a Kubernetes resource that operators can
+   inspect with `kubectl` and that the CLI and web UI can watch directly.
+   Kubernetes garbage collection deletes those sessions automatically when their
+   owner disappears.
+
+### Spec, status, and optimistic concurrency
+
+Both `HeroRun` and `Session` separate immutable desired inputs from observed
+execution progress.
+
+- **`HeroRun` spec and status.**
+  Spec holds immutable desired inputs set when the scheduler creates the run,
+  such as the target repository, the frozen goal definition, the base commit,
+  and the run limits.
+  Status holds observed workflow state, including the current phase, Kubernetes
+  conditions, child resource references, progress and cost metrics, and the run
+  outcome.
+- **`Session` spec and status.**
+  Spec holds immutable inputs set when the owner creates the session, such as
+  the prompt or role configuration, budget limits, sandbox and workspace
+  context, and parent relationship.
+  Status holds observed session state, including the current phase, Kubernetes
+  conditions, turn and token metrics, requested run actions such as opening a
+  pull request, and the terminal outcome.
+
+Standard Kubernetes optimistic concurrency protects status updates on both
+resources.
 Every write carries the resource version that the controller read.
-If another actor updated `HeroRun` concurrently, the API rejects the write with
-a conflict error.
-The controller discards its stale copy and requeues the run to reconcile from
-the latest resource version.
+If another actor updated the resource concurrently, the API rejects the write
+with a conflict error.
+The controller discards its stale copy and requeues the resource to reconcile
+from the latest resource version.
 
 ### Disk exports for human inspection
 
@@ -83,28 +140,31 @@ These exports exist strictly so an operator can inspect a run directory with
 standard command-line tools.
 Because an export is optional and written after the API update, it can be stale
 or missing.
-The controller, the web UI, and the CLI never read `run.json`.
-They always read `HeroRun` through the Kubernetes client so every component sees
-one authoritative state.
+The controllers, the web UI, and the CLI never read `run.json`.
+They always read `HeroRun` and `Session` through the Kubernetes client so every
+component sees one authoritative state.
 
 ## Storage separation
 
-Auto-optimizer divides run data strictly between control-plane state in the
+Auto-optimizer divides state strictly between control-plane resources in the
 Kubernetes API and bulk payloads on the persistent state volume.
 
-- **`HeroRun` in the Kubernetes API.** Holds workflow phase, conditions,
-  operation state and outcomes, child resource references, progress counters,
-  costs, benchmark metrics, and pull request metadata.
-- **Files on the state volume.** Holds the `messages.jsonl` conversation
-  transcripts, unabridged tool execution outputs, the `events.jsonl` append-only
-  event log, and optional human-readable `HeroRun` exports.
+- **`HeroRun` and `Session` in the Kubernetes API.**
+  Hold workflow and session phases, Kubernetes conditions, ownership and
+  resource references, progress counters, token and cost metrics, benchmark
+  results, and pull request or session outcomes.
+- **Files on the state volume.**
+  Hold the `messages.jsonl` conversation transcripts for root and child
+  sessions, unabridged tool execution outputs, the `events.jsonl` append-only
+  event log, and optional human-readable exports.
 
 Two operational constraints require this split.
 
 1. **Object size limits.**
    etcd caps individual objects at 1.5 megabytes.
    Conversation transcripts, prompts, compiler diagnostics, and tool outputs
-   routinely exceed that limit in a single run and cannot live inside `HeroRun`.
+   routinely exceed that limit in a single run and cannot live inside `HeroRun`
+   or `Session`.
 2. **Write amplification and churn.**
    Agent turns produce continuous streaming events and verbose tool output.
    Writing every intermediate message or tool output through etcd would trigger
@@ -119,56 +179,142 @@ The `events.jsonl` event log is an append-only audit trail for operators and the
 web UI.
 The control plane appends events when phases change, measurements arrive, errors
 occur, or tools execute.
-The controller never reads `events.jsonl` to decide what to do next.
+Neither controller reads `events.jsonl` to decide what to do next.
 
-Kubernetes conditions on `HeroRun` status report high-level readiness and
-milestones so operators and cluster tooling can observe progress natively with
-`kubectl`.
+Kubernetes conditions on `HeroRun` and `Session` status report high-level
+readiness and milestones so operators and cluster tooling can observe progress
+natively with `kubectl`.
 
 ## Run lifecycle
 
-A run moves through five active phases before reaching a terminal phase.
+A `HeroRun` moves through five active phases before reaching a terminal phase.
 
-- **`Pending`.** The controller ensures the workspace claim and initial sandbox
-  exist with controller owner references pointing to `HeroRun`, records those
-  references in status, and advances to `Preparing`.
-- **`Preparing`.** The controller waits for the sandbox to become ready without
-  blocking.
+- **`Pending`.** The `HeroRun` controller ensures the workspace claim and
+  initial sandbox exist with controller owner references pointing to `HeroRun`,
+  records those references in status, and advances to `Preparing`.
+- **`Preparing`.** The `HeroRun` controller waits for the sandbox to become
+  ready without blocking.
   Once ready, the controller binds the portal egress policy, ensures the
   repository clone is at the base commit, configures git identity, and advances
   to `Working`.
-- **`Working`.** The controller drives the agent session across one or more
-  asynchronous turns, obtaining or replacing the sandbox on demand when needed.
-  When the session requests a pull request, the run advances to `Selecting`.
-  When the session ends without requesting a pull request, the run enters
-  `NoImprovement`.
-- **`Selecting`.** The controller verifies the candidate, exports the candidate
-  commits, pushes the branch to the forge, and advances to `OpeningPR`.
-- **`OpeningPR`.** The controller checks for an existing pull request on the
-  branch or opens a new one, records the pull request link, and enters
+- **`Working`.** The `HeroRun` controller ensures the run's root `Session`
+  exists with a controller owner reference pointing to `HeroRun`, records that
+  reference in status, and returns while the `Session` controller runs the
+  conversation.
+  When the root `Session` requests a pull request, `HeroRun` advances to
+  `Selecting`.
+  When the root `Session` finishes without requesting a pull request, `HeroRun`
+  enters `NoImprovement`.
+  When the root `Session` fails, `HeroRun` enters `Failed`.
+- **`Selecting`.** The `HeroRun` controller verifies the candidate, exports the
+  candidate commits, pushes the branch to the forge, and advances to
+  `OpeningPR`.
+- **`OpeningPR`.** The `HeroRun` controller checks for an existing pull request
+  on the branch or opens a new one, records the pull request link, and enters
   `Succeeded`.
 - **Terminal phases.** When a run reaches `Succeeded`, `Failed`, or
-  `NoImprovement`, the controller stops reconciling the run and releases the
-  active sandbox.
+  `NoImprovement`, the `HeroRun` controller stops reconciling the run and
+  releases the active sandbox.
 
 Each reconcile pass returns one of four outcomes to the controller runtime.
 
-- **Done.** The run has reached a terminal phase and needs no further
+- **Done.** The resource has reached a terminal phase and needs no further
   reconciliation.
 - **Requeue immediately.** One bounded unit of work finished and the next step
   can proceed right away.
-- **Wait for external changes.** The run is waiting on an external resource or
-  an asynchronous operation.
-  Kubernetes watches or internal wake signals enqueue the run when conditions
-  change, while a requeue duration provides a safety backstop.
+- **Wait for external changes.** The controller is waiting on an owned resource
+  such as a sandbox or a `Session`.
+  Kubernetes `Owns` watches enqueue the owner when child state changes, while a
+  periodic requeue duration provides a safety backstop.
 - **Error.** A transient infrastructure failure occurred.
   The controller runtime logs the error and retries with backoff.
+
+## The `Session` controller model
+
+The `Session` controller drives every agent conversation through standard
+Kubernetes reconciliation instead of relying on ad-hoc background workers inside
+the `HeroRun` controller.
+
+### Watch-driven handoff between `HeroRun` and `Session`
+
+During `Working`, `HeroRun` does not hold a goroutine open or poll for turn
+completion.
+Instead, `HeroRun` creates a root `Session` owned by that `HeroRun` and returns.
+Because the `HeroRun` controller registers an `Owns` watch on `Session`, any
+status update written by the `Session` controller triggers a watch event that
+maps through the owner reference and enqueues the owning `HeroRun`.
+
+On that wake-up, `HeroRun` reads the updated `Session` status.
+If the `Session` is still active, `HeroRun` stays in `Working` and returns
+promptly.
+If the `Session` has requested a pull request or reached a terminal state,
+`HeroRun` transitions to `Selecting`, `NoImprovement`, or `Failed`.
+All coordination travels through `Session` status and Kubernetes watches rather
+than controller memory.
+
+### Reconciling the LLM loop
+
+The `Session` controller runs its own bounded worker pool so active model calls
+and sandbox tool executions never block `HeroRun` reconciliation.
+On each reconcile pass for an active `Session`, the controller loads the
+session's `messages.jsonl` transcript from the state volume, drives bounded LLM
+and tool-call work against the sandbox, appends new messages to the transcript,
+and writes updated progress or outcome to `Session` status.
+
+If the sandbox disappears during a turn, the `Session` controller obtains a
+replacement sandbox attached to the same persistent workspace volume and
+continues cleanly.
+If the replacement sandbox is still starting, the controller returns promptly
+and wakes when the sandbox becomes ready rather than polling in-process.
+
+### Child sessions as `Session` resources
+
+A session can delegate sub-tasks to child sessions using the exact same
+controller model.
+When a session delegates work, the `Session` controller creates child `Session`
+custom resources with controller owner references pointing to the parent
+`Session` rather than spawning unmanaged in-process goroutines.
+
+- **Uniform execution.** Child sessions run through the same `Session`
+  controller loop, status reporting, and crash-recovery path as root sessions.
+- **Shared run environment.** Child sessions share the run's sandbox, workspace
+  volume, deadline, and budget boundaries while writing to their own
+  `messages.jsonl` transcript files on the state volume.
+- **Non-blocking delegation.** The `Session` controller registers an `Owns`
+  watch on `Session` as well.
+  When a parent session pauses to wait for child sessions, its reconcile pass
+  returns without spending model turns or occupying a worker slot.
+  When a child `Session` updates its status or reaches a terminal outcome, the
+  watch event wakes the parent `Session` through its owner reference so the
+  parent can observe the result and resume.
+- **Hierarchical ownership.** Owner references form a clean tree from `HeroRun`
+  to the root `Session` to any child `Session` resources.
+  Deleting a parent `Session` or the `HeroRun` cascades cleanup through the
+  entire session tree automatically.
+
+### Recovering in-flight sessions after restarts
+
+If the control plane restarts while a session is mid-turn, the `Session`
+resource remains non-terminal in the Kubernetes API.
+Completed messages remain durable in `messages.jsonl` on the state volume.
+When the `Session` controller starts up again, it reconciles every non-terminal
+`Session` from the API.
+
+The controller inspects the durable `messages.jsonl` transcript on the state
+volume to determine where the session left off.
+If the transcript already contains a completed turn or tool result, the
+controller reflects that progress in `Session` status and continues.
+If the crash interrupted an exchange before completion, the controller resumes
+from the last persisted message in the transcript.
+Both root sessions and child sessions recover through this same path without any
+in-memory worker tracking or operation handoff state on `HeroRun`.
 
 ## Crash recovery and idempotency
 
 The control plane can receive `SIGKILL` or lose network access at any instant.
 Rather than catching signals and flushing state during shutdown, every reconcile
-step is idempotent with respect to the last saved `HeroRun` status.
+step in both controllers is idempotent with respect to the last saved resource
+status and durable state-volume files.
 Repeating a step after an external side effect has already succeeded produces
 the same end state without duplicating work or corrupting the run.
 
@@ -178,7 +324,8 @@ Consider pushing candidate commits during `Selecting`.
 
 1. `HeroRun` records phase `Selecting`, the run's deterministic branch name, and
    the candidate commit SHA.
-2. The controller exports the candidate commits and pushes them to the forge.
+2. The `HeroRun` controller exports the candidate commits and pushes them to the
+   forge.
    The remote repository now points the branch at the candidate commit.
 3. Before the controller writes phase `OpeningPR` to `HeroRun`, the control
    plane crashes.
@@ -190,61 +337,12 @@ Consider pushing candidate commits during `Selecting`.
 6. The controller updates `HeroRun` status to `OpeningPR` and continues to the
    next step.
 
-The same principle applies across all phases.
-Creating a workspace claim or sandbox reuses an existing resource owned by the
-same `HeroRun`.
+The same principle applies across all phases and both controllers.
+Creating a workspace claim, sandbox, or owned `Session` reuses an existing
+resource owned by the same parent rather than creating duplicates.
 Binding portal egress policy is idempotent.
 Opening a pull request reuses an existing open pull request on the run's
 deterministic branch.
-
-## Long-running work
-
-Reconcile passes must return promptly so a bounded pool of controller workers
-can serve many runs without stalling.
-The controller handles two kinds of long-running work without blocking or
-polling in-process.
-
-- **External Kubernetes resources.**
-  When waiting for a sandbox pod to become ready, the controller relies on
-  Kubernetes watch events from owned resources to enqueue the run as soon as the
-  status changes, backed by a periodic requeue safety net.
-- **Asynchronous control-plane operations.**
-  When an agent session turn executes against a model and sandbox, the turn runs
-  in a background worker outside the reconcile pass.
-
-Tracking asynchronous operations follows five rules so no state is hidden in
-controller memory.
-
-1. **Persist before launch.**
-   Before launching a background worker, the controller records the active
-   operation on `HeroRun` status so in-flight work is durable across restarts.
-2. **Record outcomes on `HeroRun`, never in memory.**
-   When the background worker finishes, it writes the completed operation state
-   and outcome directly to `HeroRun` status and wakes the reconciler.
-   The controller does not cache completed operation outcomes in memory.
-3. **Consume and clear during reconciliation.**
-   On the next reconcile pass, the controller reads the operation state from
-   `HeroRun`.
-   If the operation is still running in this process, the controller returns
-   promptly with a requeue backstop.
-   If the operation has completed, the controller applies the outcome to the
-   run, clears the operation from `HeroRun`, and advances to the next step.
-4. **Recover from restarts via durable transcripts.**
-   If the control plane restarts while a turn is in flight, the background
-   worker dies while `HeroRun` still records an active operation.
-   When reconciliation resumes and finds no live local worker for that
-   operation, the controller inspects the durable `messages.jsonl` session
-   transcript on the state volume.
-   If the transcript already contains the completed turn, the controller
-   recovers the outcome, updates `HeroRun`, clears the operation, and advances.
-   If the crash interrupted the turn mid-flight, the controller clears the stale
-   operation and starts a fresh turn from the last completed turn in the
-   transcript.
-5. **Keep only ephemeral execution handles in memory.**
-   The controller may hold in-process handles for currently running goroutines
-   so it knows a worker is alive locally or can cancel it when a run ends.
-   Losing all controller memory never loses workflow progress or completed
-   operation outcomes.
 
 ## Retention and garbage collection
 
@@ -252,7 +350,8 @@ controller memory.
 
 - **Retention period.**
   While an opened pull request remains open, the control plane retains the
-  `HeroRun` resource so the session can resume if review comments arrive.
+  `HeroRun` resource so the run and its sessions can resume if review comments
+  arrive.
   Once the pull request merges or closes, or when a run ends without opening a
   pull request, the control plane retains `HeroRun` for a configured retention
   window, such as 30 days, for operator inspection.
@@ -261,14 +360,17 @@ controller memory.
   resources.
   Operators can also delete a `HeroRun` manually at any time with `kubectl`.
 - **Cascading Kubernetes cleanup.**
-  Each child sandbox and workspace claim carries a controller owner reference to
-  its `HeroRun`.
-  Deleting `HeroRun` causes standard Kubernetes garbage collection to delete any
-  remaining child sandbox and the workspace claim automatically.
+  The root `Session`, each child sandbox, and the workspace claim carry
+  controller owner references to `HeroRun`.
+  Each child `Session` carries a controller owner reference to its parent
+  `Session`.
+  Deleting `HeroRun` causes standard Kubernetes garbage collection to delete the
+  entire `Session` tree, any remaining child sandbox, and the workspace claim
+  automatically.
 - **State volume cleanup.**
   The control plane watches for `HeroRun` deletion and deletes the run's
-  directory on the state volume, removing transcripts, tool outputs, event logs,
-  and exported snapshots.
+  directory on the state volume, removing root and child session transcripts,
+  tool outputs, event logs, and exported snapshots.
 
 ## Hermetic testing
 
@@ -276,43 +378,47 @@ Workflow unit tests run completely in memory with no network access, no external
 binaries, and no real `kube-apiserver` or etcd.
 
 An in-memory fake Kubernetes client stands in for `kube-apiserver`.
-It tracks `HeroRun` and child resources in memory, enforces status subresource
-updates, and checks resource versions for optimistic concurrency conflicts.
+It tracks `HeroRun`, `Session`, and child resources in memory, enforces status
+subresource updates, and checks resource versions for optimistic concurrency
+conflicts.
 Tests combine this fake client with in-memory fakes for the forge, the sandbox
 runtime, and the model client.
-This setup exercises full phase transitions, conflict retries, asynchronous turn
-completion, and crash-recovery scenarios quickly and deterministically.
+This setup exercises full run phase transitions, `HeroRun` and `Session`
+watch-driven handoffs, child session delegation, conflict retries, and
+crash-recovery scenarios quickly and deterministically.
 
 ## Storage evolution
 
 Starting with `kube-apiserver` backed by etcd provides native watches,
 optimistic concurrency, RBAC, `kubectl` inspection, and owner-reference garbage
-collection.
+collection for both `HeroRun` and `Session`.
 It also avoids synchronization loops between separate stores.
 
-At higher scale, three operational thresholds could justify moving `HeroRun`
-storage off etcd.
+At higher scale, three operational thresholds could justify moving `HeroRun` and
+`Session` storage off etcd.
 
 1. **Write rate.**
-   Hundreds of concurrent runs updating status after each step could generate
-   heavy etcd write traffic, raising Raft latency and compaction load.
+   Hundreds of concurrent runs and active sessions updating status after each
+   step could generate heavy etcd write traffic, raising Raft latency and
+   compaction load.
 2. **Object size.**
    Even with transcripts and tool outputs on the state volume, richer goal
-   definitions, operation records, or condition histories could grow toward
+   definitions, session summaries, or condition histories could grow toward
    etcd's 1.5 megabyte cap.
 3. **Historical volume.**
-   Retaining tens of thousands of completed runs across many repositories could
-   strain cluster etcd storage and backup sizes.
+   Retaining tens of thousands of completed runs and their sessions across many
+   repositories could strain cluster etcd storage and backup sizes.
 
-When any of those thresholds matters, auto-optimizer can serve `HeroRun` through
-a Kubernetes aggregated API server backed by a store suited to that workload,
-such as Redis or files on the state volume.
+When any of those thresholds matters, auto-optimizer can serve `HeroRun` and
+`Session` through a Kubernetes aggregated API server backed by a store suited to
+that workload, such as Redis or files on the state volume.
 
-Because the controller interacts exclusively through the Kubernetes API and
-holds all workflow and operation state on `HeroRun`, this storage change stays
-behind the API boundary.
+Because both controllers interact exclusively through the Kubernetes API and
+hold all control-plane state on `HeroRun` and `Session`, this storage change
+stays behind the API boundary.
 
-- The `HeroRun` API group, schema, and REST semantics remain unchanged.
+- The `HeroRun` and `Session` API group, schemas, and REST semantics remain
+  unchanged.
 - `kubectl` workflows, RBAC policies, and Kubernetes API clients keep working
   without modification.
-- The controller itself requires no architectural changes.
+- Neither controller requires architectural changes.
