@@ -11396,3 +11396,155 @@ func TestOrchestrator_RunningSessions(t *testing.T) {
 		t.Errorf("RunningSessions after clearing children = %v, want empty", got)
 	}
 }
+
+func TestOrchestrator_SandboxOwnerForSession(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:  "https://github.com/gke-labs/test-repo",
+		Host: "github.com", Owner: "gke-labs", Name: "test-repo",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	deadline := time.Date(2026, 11, 24, 13, 0, 0, 0, time.UTC)
+	run := &state.Run{
+		ID:                 "run-sb-hook",
+		Repo:               repo.Key(),
+		BaseCommit:         "abc1234",
+		Phase:              state.PhaseWorking,
+		SandboxName:        "ao-run-sb-hook",
+		WorkspaceClaimName: "ao-run-sb-hook",
+		Deadline:           &deadline,
+	}
+
+	procSrv := &mockProcessServer{exitCode: 0, stdout: "abc1234\n"}
+	harness, agentsCS, coreCS := setupTestHarness(t, procSrv)
+
+	// Mark newly created sandboxes ready and create their backing pod for portal binding.
+	agentsCS.PrependReactor("create", "sandboxes", func(action k8stesting.Action) (bool, apiruntime.Object, error) {
+		sb := action.(k8stesting.CreateAction).GetObject().(*sandboxv1beta1.Sandbox).DeepCopy()
+		sb.Status.Conditions = []metav1.Condition{{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		}}
+		sb.Status.PodIPs = []string{"10.0.0.42"}
+		sb.UID = types.UID("uid-" + sb.Name)
+		_ = agentsCS.Tracker().Create(action.GetResource(), sb, action.GetNamespace())
+		_, _ = coreCS.CoreV1().Pods(sb.Namespace).Create(ctx, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sb.Name,
+				Namespace: sb.Namespace,
+				UID:       types.UID("pod-uid-" + sb.Name),
+			},
+		}, metav1.CreateOptions{})
+		return true, sb, nil
+	})
+
+	binder := &fakePortalBinder{}
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:         store,
+		SessionStore:  sessionStore,
+		Harness:       harness,
+		PortalBinder:  binder,
+		PolicyFactory: portal.HostListPolicyFactory([]string{"github.com"}),
+	})
+	putTestRun(t, ctx, orch, run)
+
+	// Record a UID on the HeroRun so OwnerReferences can be verified.
+	var hr herorunv1alpha1.HeroRun
+	if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: orch.namespace(), Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
+		t.Fatalf("Get HeroRun: %v", err)
+	}
+	hr.UID = "hr-uid-hook"
+	if err := orch.kubeClient.Update(ctx, &hr); err != nil {
+		t.Fatalf("Update HeroRun UID: %v", err)
+	}
+
+	// Standalone sessions return (nil, nil).
+	standaloneOwner, err := orch.SandboxOwnerForSession(ctx, &herorunv1alpha1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "standalone", Namespace: orch.namespace()},
+	})
+	if err != nil || standaloneOwner != nil {
+		t.Fatalf("SandboxOwnerForSession(standalone) = (%v, %v), want (nil, nil)", standaloneOwner, err)
+	}
+
+	// Root and child sessions sharing RunID receive the exact same SandboxOwner,
+	// even before Orchestrator.Reconcile has populated runStates.
+	rootSess := &herorunv1alpha1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "rootsess", Namespace: orch.namespace()},
+		Spec: herorunv1alpha1.SessionSpec{
+			RunID:              run.ID,
+			HeroRunName:        hr.Name,
+			SandboxName:        run.SandboxName,
+			WorkspaceClaimName: run.WorkspaceClaimName,
+		},
+	}
+	childSess := &herorunv1alpha1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "childsess", Namespace: orch.namespace()},
+		Spec: herorunv1alpha1.SessionSpec{
+			RunID:              run.ID,
+			HeroRunName:        hr.Name,
+			Parent:             "rootsess",
+			Ancestors:          []string{"rootsess"},
+			SandboxName:        run.SandboxName,
+			WorkspaceClaimName: run.WorkspaceClaimName,
+		},
+	}
+
+	owner1, err := orch.SandboxOwnerForSession(ctx, rootSess)
+	if err != nil {
+		t.Fatalf("SandboxOwnerForSession(root): %v", err)
+	}
+	owner2, err := orch.SandboxOwnerForSession(ctx, childSess)
+	if err != nil {
+		t.Fatalf("SandboxOwnerForSession(child): %v", err)
+	}
+	if owner1 == nil || owner1 != owner2 {
+		t.Fatalf("expected root and child to share the same SandboxOwner, got %p and %p", owner1, owner2)
+	}
+	if owner1.ExtendLifecycleEnabled() {
+		t.Error("expected ExtendLifecycleEnabled=false for run SandboxOwner")
+	}
+	if !owner1.HasWorkspaceClaim() {
+		t.Error("expected HasWorkspaceClaim=true for run SandboxOwner")
+	}
+	if active := owner1.ActiveSandbox(); active == nil || active.SandboxName() != run.SandboxName {
+		t.Fatalf("ActiveSandbox = %v, want %q", active, run.SandboxName)
+	}
+
+	// Simulate the initial sandbox disappearing and verify on-demand replacement
+	// preserves full run options and runs workspace + portal preparation.
+	owner1.DropDeadSandbox(ctx, owner1.ActiveSandbox())
+	if _, err := owner1.EnsureSandbox(ctx); err != nil {
+		t.Fatalf("EnsureSandbox replacement: %v", err)
+	}
+
+	sb, err := agentsCS.AgentsV1beta1().Sandboxes(orch.namespace()).Get(ctx, run.SandboxName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get replacement Sandbox: %v", err)
+	}
+	if sb.Labels[LabelRun] != run.ID {
+		t.Errorf("Sandbox label %s = %q, want %q", LabelRun, sb.Labels[LabelRun], run.ID)
+	}
+	if sb.Annotations[AnnotationRepo] != repo.Key().String() {
+		t.Errorf("Sandbox annotation %s = %q, want %q", AnnotationRepo, sb.Annotations[AnnotationRepo], repo.Key().String())
+	}
+	if len(sb.OwnerReferences) != 1 || sb.OwnerReferences[0].Kind != "HeroRun" || sb.OwnerReferences[0].UID != hr.UID {
+		t.Errorf("Sandbox OwnerReferences = %+v, want HeroRun UID %q", sb.OwnerReferences, hr.UID)
+	}
+	if sb.Spec.PodTemplate.ObjectMeta.Labels[session.PortalInterceptLabel] != "true" {
+		t.Errorf("expected PortalIntercept label on replacement sandbox, got %v", sb.Spec.PodTemplate.ObjectMeta.Labels)
+	}
+	if wantShutdown := deadline.Add(SandboxShutdownGrace); sb.Spec.ShutdownTime == nil || !sb.Spec.ShutdownTime.Time.Equal(wantShutdown) {
+		t.Errorf("Sandbox ShutdownTime = %v, want %v", sb.Spec.ShutdownTime, wantShutdown)
+	}
+	binder.mu.Lock()
+	bindCalls := len(binder.calls)
+	binder.mu.Unlock()
+	if bindCalls != 1 {
+		t.Errorf("portal bind calls = %d, want 1", bindCalls)
+	}
+}

@@ -20,8 +20,11 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,17 +38,22 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets/ao"
 )
 
-const defaultMaxConcurrent = 4
+const (
+	defaultMaxConcurrent = 4
+	cancelRequeueDelay   = time.Second
+)
 
 // Options configures a Session Reconciler.
 type Options struct {
 	Client          client.Client
 	SessionStore    session.Store
 	HarnessFactory  func(toolset string) (*session.Harness, error)
+	SandboxOwnerFor func(ctx context.Context, obj *herorunv1alpha1.Session) (*session.SandboxOwner, error)
 	DefaultToolset  string
 	DefaultMaxTurns int
 	MaxConcurrent   int
@@ -56,6 +64,9 @@ type Options struct {
 // Reconciler watches Session custom resources and drives each session's LLM loop.
 type Reconciler struct {
 	opts Options
+
+	runBudgetsMu sync.Mutex
+	runBudgets   map[string]*session.TurnBudget
 }
 
 // NewReconciler validates opts and constructs a Session Reconciler.
@@ -69,7 +80,10 @@ func NewReconciler(opts Options) (*Reconciler, error) {
 	if opts.Clock == nil {
 		opts.Clock = time.Now
 	}
-	return &Reconciler{opts: opts}, nil
+	return &Reconciler{
+		opts:       opts,
+		runBudgets: make(map[string]*session.TurnBudget),
+	}, nil
 }
 
 // SetupWithManager registers the Session reconciler with mgr.
@@ -86,14 +100,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if err := r.opts.Client.Get(ctx, req.NamespacedName, &obj); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
-	if obj.Status.Phase.IsTerminal() || ctx.Err() != nil {
+	if obj.Status.Phase.IsTerminal() {
+		r.releaseRunBudgetIfRoot(&obj)
 		return reconcile.Result{}, nil
 	}
-	if obj.Spec.Deadline != nil && !r.opts.Clock().UTC().Before(obj.Spec.Deadline.Time) {
-		return reconcile.Result{}, r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
+	if ctx.Err() != nil {
+		return reconcile.Result{}, nil
+	}
+	if r.deadlinePassed(&obj) {
+		err := r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
 			st.Phase, st.Outcome, st.Error = herorunv1alpha1.SessionPhaseFailed, herorunv1alpha1.SessionOutcomeDeadlineExceeded, "deadline exceeded"
 			st.FinishedAt = &now
 		})
+		if err == nil {
+			r.releaseRunBudgetIfRoot(&obj)
+		}
+		return reconcile.Result{}, err
 	}
 	if obj.Status.Phase != herorunv1alpha1.SessionPhaseRunning || obj.Status.StartedAt == nil {
 		if err := r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
@@ -106,19 +128,37 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 	}
 
-	applyTerminal := r.runSession(ctx, &obj)
+	applyTerminal, canceled := r.runSession(ctx, &obj)
 	if ctx.Err() != nil {
 		return reconcile.Result{}, nil
 	}
-	return reconcile.Result{}, r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
+	if canceled {
+		delay := cancelRequeueDelay
+		if obj.Spec.Deadline != nil {
+			if rem := obj.Spec.Deadline.Time.Sub(r.opts.Clock().UTC()); rem < delay {
+				delay = max(rem, time.Millisecond)
+			}
+		}
+		return reconcile.Result{RequeueAfter: delay}, nil
+	}
+	err := r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
 		applyTerminal(st)
 		st.FinishedAt = &now
 	})
+	if err == nil {
+		r.releaseRunBudgetIfRoot(&obj)
+	}
+	return reconcile.Result{}, err
 }
 
-func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Session) func(*herorunv1alpha1.SessionStatus) {
-	fail := func(err error) func(*herorunv1alpha1.SessionStatus) {
-		return func(st *herorunv1alpha1.SessionStatus) { applyOutcome(st, err, nil, nil, false) }
+func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Session) (func(*herorunv1alpha1.SessionStatus), bool) {
+	fail := func(err error) (func(*herorunv1alpha1.SessionStatus), bool) {
+		deadlineExceeded := errors.Is(err, context.DeadlineExceeded) || r.deadlinePassed(obj)
+		if !deadlineExceeded && isCanceled(err) {
+			scoped.Log(ctx).V(1).Info("session interrupted by cancellation; will resume", "session", obj.Name, "error", err)
+			return nil, true
+		}
+		return func(st *herorunv1alpha1.SessionStatus) { applyOutcome(st, err, nil, nil, deadlineExceeded) }, false
 	}
 	toolset := cmp.Or(obj.Spec.Toolset, r.opts.DefaultToolset)
 	harness, err := r.opts.HarnessFactory(toolset)
@@ -134,7 +174,7 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 			Ancestors: slices.Clone(obj.Spec.Ancestors),
 			Parent:    obj.Spec.Parent,
 			Toolset:   toolset,
-			Repo:      obj.Spec.Repository,
+			Repo:      normalizeRepoMetadata(ctx, obj.Spec.Repository),
 			RunID:     obj.Spec.RunID,
 			CreatedAt: r.opts.Clock().UTC(),
 		})
@@ -142,16 +182,8 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 	if err != nil {
 		return fail(err)
 	}
-	if obj.Spec.WorkspaceClaimName != "" {
-		sess.SetCreateSandboxOptions(session.CreateSandboxOptions{
-			Name:               cmp.Or(obj.Spec.SandboxName, obj.Name),
-			WorkspaceClaimName: obj.Spec.WorkspaceClaimName,
-		})
-	}
-	if obj.Spec.SandboxName != "" {
-		if sb := harness.GetOrAttachSandbox(obj.Spec.SandboxName); sb != nil {
-			sess.SetActiveSandbox(sb)
-		}
+	if err := r.attachSandbox(ctx, obj, harness, sess); err != nil {
+		return fail(err)
 	}
 	if len(sess.Messages()) == 0 {
 		if obj.Spec.SystemPrompt != "" {
@@ -173,11 +205,12 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 		extra = append(extra, prTool)
 	}
 	harness = harness.WithExtraTools(extra...)
-	if maxTurns := cmp.Or(obj.Spec.MaxTurns, r.opts.DefaultMaxTurns, harness.RunOptions().MaxTurns); maxTurns > 0 {
-		budget := session.NewTurnBudget(maxTurns)
-		for range countTurns(sess.Messages()) {
-			budget.Take()
-		}
+	maxTurns := cmp.Or(obj.Spec.MaxTurns, r.opts.DefaultMaxTurns, harness.RunOptions().MaxTurns)
+	budget, err := r.turnBudgetFor(ctx, obj, sess, maxTurns)
+	if err != nil {
+		return fail(err)
+	}
+	if budget != nil {
 		harness = harness.WithTurnBudget(budget)
 	}
 
@@ -206,11 +239,130 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 	}
 	deadlineExceeded := err != nil && (errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(turnCtx.Err(), context.DeadlineExceeded) ||
-		(obj.Spec.Deadline != nil && !r.opts.Clock().UTC().Before(obj.Spec.Deadline.Time)))
+		r.deadlinePassed(obj))
+	if err != nil && !deadlineExceeded && isCanceled(err) {
+		scoped.Log(ctx).V(1).Info("session turn interrupted by cancellation; will resume", "session", obj.Name, "error", err)
+		return nil, true
+	}
 	return func(st *herorunv1alpha1.SessionStatus) {
 		r.recordMetrics(st, sess, model)
 		applyOutcome(st, err, prTool, finishTool, deadlineExceeded)
+	}, false
+}
+
+func (r *Reconciler) attachSandbox(ctx context.Context, obj *herorunv1alpha1.Session, harness *session.Harness, sess *session.Session) error {
+	if obj.Spec.RunID != "" && r.opts.SandboxOwnerFor != nil {
+		owner, err := r.opts.SandboxOwnerFor(ctx, obj)
+		if err != nil {
+			return err
+		}
+		if owner != nil {
+			sess.SetSandboxOwner(owner)
+			return nil
+		}
 	}
+	if obj.Spec.WorkspaceClaimName != "" {
+		sess.SetCreateSandboxOptions(session.CreateSandboxOptions{
+			Name:               cmp.Or(obj.Spec.SandboxName, obj.Name),
+			WorkspaceClaimName: obj.Spec.WorkspaceClaimName,
+		})
+	}
+	if obj.Spec.SandboxName != "" {
+		if sb := harness.GetOrAttachSandbox(obj.Spec.SandboxName); sb != nil {
+			sess.SetActiveSandbox(sb)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) turnBudgetFor(ctx context.Context, obj *herorunv1alpha1.Session, sess *session.Session, maxTurns int) (*session.TurnBudget, error) {
+	if obj.Spec.RunID == "" {
+		return seedTurnBudget(maxTurns, countTurns(sess.Messages())), nil
+	}
+
+	r.runBudgetsMu.Lock()
+	existing := r.runBudgets[obj.Spec.RunID]
+	r.runBudgetsMu.Unlock()
+	if existing != nil || maxTurns <= 0 {
+		return existing, nil
+	}
+
+	used, err := r.countRunTurns(ctx, obj.Spec.RunID, sess)
+	if err != nil {
+		return nil, err
+	}
+	budget := seedTurnBudget(maxTurns, used)
+
+	r.runBudgetsMu.Lock()
+	defer r.runBudgetsMu.Unlock()
+	if existing := r.runBudgets[obj.Spec.RunID]; existing != nil {
+		return existing, nil
+	}
+	r.runBudgets[obj.Spec.RunID] = budget
+	return budget, nil
+}
+
+func seedTurnBudget(maxTurns, used int) *session.TurnBudget {
+	if maxTurns <= 0 {
+		return nil
+	}
+	budget := session.NewTurnBudget(maxTurns)
+	for range used {
+		budget.Take()
+	}
+	return budget
+}
+
+func (r *Reconciler) countRunTurns(ctx context.Context, runID string, current *session.Session) (int, error) {
+	summaries, err := session.ListRunSessions(ctx, r.opts.SessionStore, runID)
+	if err != nil {
+		return 0, err
+	}
+	total := countTurns(current.Messages())
+	for _, sum := range summaries {
+		if sum.Name == current.Name {
+			continue
+		}
+		msgs, _, err := r.opts.SessionStore.LoadSession(ctx, sum.Name)
+		if err != nil && !errors.Is(err, session.ErrNotFound) {
+			return 0, err
+		}
+		total += countTurns(msgs)
+	}
+	return total, nil
+}
+
+func (r *Reconciler) releaseRunBudgetIfRoot(obj *herorunv1alpha1.Session) {
+	if obj.Spec.RunID == "" || obj.Spec.Depth() != 0 {
+		return
+	}
+	r.runBudgetsMu.Lock()
+	delete(r.runBudgets, obj.Spec.RunID)
+	r.runBudgetsMu.Unlock()
+}
+
+func (r *Reconciler) deadlinePassed(obj *herorunv1alpha1.Session) bool {
+	return obj.Spec.Deadline != nil && !r.opts.Clock().UTC().Before(obj.Spec.Deadline.Time)
+}
+
+func normalizeRepoMetadata(ctx context.Context, repo string) string {
+	if repo == "" {
+		return ""
+	}
+	key, err := state.ParseRepoURL(repo)
+	if err != nil {
+		scoped.Log(ctx).V(1).Info("failed to normalize session repository metadata", "repository", repo, "error", err)
+		return repo
+	}
+	return key.String()
+}
+
+func isCanceled(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	var se interface{ GRPCStatus() *status.Status }
+	return errors.As(err, &se) && se.GRPCStatus().Code() == codes.Canceled
 }
 
 func (r *Reconciler) recordMetrics(st *herorunv1alpha1.SessionStatus, sess *session.Session, model string) {
