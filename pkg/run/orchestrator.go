@@ -537,7 +537,8 @@ func (o *Orchestrator) getRunForReconcile(ctx context.Context, req reconcile.Req
 }
 
 // Reconcile loads the run and the repository, dispatches on the phase to
-// runWorkflow.Run (for Pending), reconcilePreparing, or workRun, and returns.
+// runWorkflow.Run (for Pending and Preparing), workRun, reconcileSelecting,
+// or openPullRequest, and returns.
 func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
@@ -561,19 +562,8 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 	}
 
 	switch run.Phase {
-	case state.PhasePending:
+	case state.PhasePending, state.PhasePreparing:
 		return o.reconcileWorkflow(ctx, newRunWorkflow(o, repo, run, hr))
-
-	case state.PhasePreparing:
-		res, err := o.reconcilePreparing(ctx, repo, run, hr)
-		if err != nil {
-			log.Error(err, "reconciling preparing run failed", "repo", repo.URL, "run", run.ID)
-			if run.Phase.IsTerminal() {
-				return reconcile.Result{}, nil
-			}
-			return reconcile.Result{}, err
-		}
-		return res, nil
 
 	case state.PhaseWorking:
 		if o.sessionStore != nil && o.harness != nil && o.harness.LLMClient() != nil {
@@ -637,7 +627,10 @@ func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (
 			Phase: wf.run.Phase,
 		}
 		if wf.run.Phase == state.PhaseFailed {
-			end.Kind = "failed"
+			end.Kind = res.endKind
+			if end.Kind == "" {
+				end.Kind = "failed"
+			}
 			end.Message = wf.run.Error
 		}
 		if err := o.saveTerminalRun(ctx, wf.repo, wf.run, wf.hr, prev, eventTime, end); err != nil {
@@ -666,6 +659,10 @@ func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (
 			log.Error(err, "failed to append phase event", "phase", wf.run.Phase, "run", wf.run.ID)
 		}
 	}
+	if res.requeue {
+		o.Notify(wf.repo.Key(), wf.run.ID)
+		return reconcile.Result{}, nil
+	}
 	return reconcile.Result{RequeueAfter: res.requeueAfter}, nil
 }
 
@@ -689,119 +686,6 @@ func heroRunOwnerReferences(heroRun *herorunv1alpha1.HeroRun) []metav1.OwnerRefe
 			Controller: &isController,
 		},
 	}
-}
-
-// isSandboxFailed inspects sandbox status conditions to detect failure before readiness.
-func isSandboxFailed(sb *sandboxv1beta1.Sandbox) (string, bool) {
-	return session.IsSandboxFailed(sb)
-}
-
-// waitForSandboxReady checks whether the Sandbox for run is ready.
-// If the Sandbox was deleted, reported a failure condition, or the ready deadline expired,
-// it marks the run failed and returns an error.
-// If the Sandbox is not ready yet and the ready deadline has not passed, it returns a
-// reconcile.Result with RequeueAfter.
-// If the Sandbox is ready, it records the sandbox_ready event, attaches the sandbox handle,
-// sets its pod info, and returns the handle.
-func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (*session.Sandbox, reconcile.Result, error) {
-	log := scoped.Log(ctx)
-	now := o.clock().UTC()
-
-	// 1. Fetch Sandbox resource
-	if o.harness == nil || o.harness.SandboxClient() == nil {
-		return nil, reconcile.Result{}, errors.New("harness sandbox client is nil")
-	}
-
-	sbObj, err := o.harness.SandboxClient().GetSandboxResource(ctx, o.harness.Namespace(), run.SandboxName)
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			run.ReadyDeadline = nil
-			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("sandbox %s was deleted before becoming ready", run.SandboxName))
-		}
-		return nil, reconcile.Result{}, fmt.Errorf("getting sandbox %s: %w", run.SandboxName, err)
-	}
-
-	// 2. Check for reported failure on Sandbox
-	if failMsg, failed := isSandboxFailed(sbObj); failed {
-		if delErr := o.harness.SandboxClient().DeleteSandboxByName(ctx, o.harness.Namespace(), run.SandboxName); delErr != nil {
-			log.V(2).Info("error deleting failed sandbox", "sandbox", run.SandboxName, "error", delErr)
-		}
-		run.ReadyDeadline = nil
-		return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("sandbox %s failed: %s", run.SandboxName, failMsg))
-	}
-
-	sb := o.harness.GetOrAttachSandbox(run.SandboxName)
-	if sb != nil {
-		if pullErr := sb.CheckPodImagePullStatus(ctx); pullErr != nil {
-			if delErr := o.harness.SandboxClient().DeleteSandboxByName(ctx, o.harness.Namespace(), run.SandboxName); delErr != nil {
-				log.V(2).Info("error deleting failed sandbox", "sandbox", run.SandboxName, "error", delErr)
-			}
-			run.ReadyDeadline = nil
-			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, fmt.Sprintf("sandbox %s pod image pull failed: %v", run.SandboxName, pullErr))
-		}
-	}
-
-	// 3. Check if Sandbox is Ready
-	var ready bool
-	for _, cond := range sbObj.Status.Conditions {
-		if cond.Type == string(sandboxv1beta1.SandboxConditionReady) && cond.Status == metav1.ConditionTrue {
-			ready = true
-			break
-		}
-	}
-
-	if !ready {
-		// If deadline has passed and it is not Ready, fail the run.
-		if run.ReadyDeadline != nil && !now.Before(*run.ReadyDeadline) {
-			if o.harness != nil && o.harness.SandboxClient() != nil && run.SandboxName != "" {
-				if delErr := o.harness.SandboxClient().DeleteSandboxByName(ctx, o.harness.Namespace(), run.SandboxName); delErr != nil {
-					log.V(2).Info("error deleting unready sandbox after timeout", "sandbox", run.SandboxName, "error", delErr)
-				}
-			}
-			run.ReadyDeadline = nil
-			return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, "sandbox not ready before deadline")
-		}
-
-		// Otherwise return RequeueAfter with a slow safety interval capped at the deadline.
-		requeueAfter := readySafetyRequeueInterval
-		if run.ReadyDeadline != nil {
-			rem := run.ReadyDeadline.Sub(now)
-			if rem < requeueAfter {
-				requeueAfter = rem
-			}
-		}
-		if requeueAfter <= 0 {
-			requeueAfter = time.Millisecond
-		}
-		return nil, reconcile.Result{RequeueAfter: requeueAfter}, nil
-	}
-
-	// 4. Sandbox is Ready! Attach, set pod info, record sandbox_ready event.
-	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-		Time:    o.clock().UTC(),
-		Phase:   run.Phase,
-		Kind:    "sandbox_ready",
-		Message: fmt.Sprintf("Sandbox %s is ready", run.SandboxName),
-		Data:    map[string]any{"sandbox": run.SandboxName},
-	}); err != nil {
-		log.Error(err, "failed to append sandbox_ready event", "run", run.ID)
-	}
-
-	if sb == nil {
-		sb = o.harness.GetOrAttachSandbox(run.SandboxName)
-	}
-	if sb == nil {
-		run.ReadyDeadline = nil
-		return nil, reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, "failed to get sandbox handle")
-	}
-
-	podIP := ""
-	if len(sbObj.Status.PodIPs) > 0 {
-		podIP = sbObj.Status.PodIPs[0]
-	}
-	sb.SetPodInfo(sbObj.Name, podIP)
-
-	return sb, reconcile.Result{}, nil
 }
 
 // portalBindError marks a failure the caller may retry, because the portal can lag
@@ -1007,113 +891,6 @@ func (o *Orchestrator) prepareSandbox(ctx context.Context, repo *state.Repo, run
 	}
 
 	return nil
-}
-
-// prepareReadySandbox configures a ready Sandbox for the run: binds the portal egress
-// policy if configured, clones or reuses the repo, and configures the git identity.
-// If portal binding fails before the ready deadline, it returns a reconcile.Result with RequeueAfter.
-// If any command fails or deadline expires, it cleans up and marks the run failed.
-func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, sb *session.Sandbox) (reconcile.Result, error) {
-	log := scoped.Log(ctx)
-	now := o.clock().UTC()
-
-	if sb == nil {
-		sb = o.harness.GetOrAttachSandbox(run.SandboxName)
-	}
-	if sb == nil {
-		run.ReadyDeadline = nil
-		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, "failed to get sandbox handle")
-	}
-
-	err := o.prepareSandbox(ctx, repo, run, sb)
-	if err != nil {
-		var pErr *portalBindError
-		if errors.As(err, &pErr) {
-			log.Error(pErr.err, "failed to bind portal egress policy", "run", run.ID, "sandbox", run.SandboxName)
-			if run.ReadyDeadline != nil && !now.Before(*run.ReadyDeadline) {
-				run.ReadyDeadline = nil
-				if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
-					Phase:   state.PhaseFailed,
-					Kind:    "portal_bind_failed",
-					Message: pErr.err.Error(),
-					Sandbox: sb,
-				}); finishErr != nil {
-					return reconcile.Result{}, finishErr
-				}
-				return reconcile.Result{}, pErr.err
-			}
-
-			requeueAfter := portalBindRetryInterval
-			if run.ReadyDeadline != nil {
-				rem := run.ReadyDeadline.Sub(now)
-				if rem < requeueAfter {
-					requeueAfter = rem
-				}
-			}
-			if requeueAfter <= 0 {
-				requeueAfter = time.Millisecond
-			}
-			return reconcile.Result{RequeueAfter: requeueAfter}, nil
-		}
-
-		log.Error(err, "command failed; deleting sandbox", "run", run.ID, "sandbox", run.SandboxName)
-		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-			log.Error(delErr, "failed to delete sandbox after command failure", "sandbox", run.SandboxName)
-		}
-
-		run.ReadyDeadline = nil
-		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, hr, err.Error())
-	}
-
-	if o.portalBinder != nil && run.PortalBoundAt == nil {
-		nowBound := o.clock().UTC()
-		run.PortalBoundAt = &nowBound
-		if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
-			return reconcile.Result{}, fmt.Errorf("updating run with PortalBoundAt: %w", err)
-		}
-	}
-
-	return reconcile.Result{}, nil
-}
-
-// reconcilePreparing executes the second step of Preparing: reads the Sandbox,
-// checks failure conditions / deletion / deadline expiration, clones the repository,
-// moves the run to Working, and enqueues it.
-func (o *Orchestrator) reconcilePreparing(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (reconcile.Result, error) {
-	log := scoped.Log(ctx)
-
-	sb, res, err := o.waitForSandboxReady(ctx, repo, run, hr)
-	if err != nil || !res.IsZero() {
-		return res, err
-	}
-
-	res, err = o.prepareReadySandbox(ctx, repo, run, hr, sb)
-	if err != nil || !res.IsZero() {
-		return res, err
-	}
-
-	// Move to Working phase
-	prev := run.Phase
-	workTime := o.clock().UTC()
-	run.SetPhase(state.PhaseWorking, workTime)
-	run.ReadyDeadline = nil
-	if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
-		return reconcile.Result{}, fmt.Errorf("updating run to Working: %w", err)
-	}
-
-	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-		Time:    workTime,
-		Phase:   state.PhaseWorking,
-		Kind:    "phase",
-		Message: fmt.Sprintf("Run %s entered Working phase", run.ID),
-	}); err != nil {
-		log.Error(err, "failed to append Working phase event", "run", run.ID)
-	}
-
-	log.Info("run successfully prepared and entered Working phase", "run", run.ID, "sandbox", run.SandboxName)
-
-	o.Notify(repo.Key(), run.ID)
-	return reconcile.Result{}, nil
 }
 
 // ensureRunState creates the in-memory state for a run if it does not yet exist.
@@ -1448,7 +1225,7 @@ func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.
 	owner.SetSandboxPreparer(func(ctx context.Context, s *session.Sandbox) error {
 		// When a replacement Sandbox pod becomes ready in the Working phase, the service portal
 		// controller's pod watch or NRI registration can briefly lag behind pod readiness.
-		// While reconcilePreparing retries via the reconciler's RequeueAfter queue, this worker
+		// While runPreparing retries via the reconciler's RequeueAfter queue, this worker
 		// preparer retries prepareSandbox for up to 10 attempts (5 seconds) while the error is a
 		// portalBindError before giving up.
 		var err error
@@ -1592,17 +1369,6 @@ func (o *Orchestrator) saveTerminalRun(ctx context.Context, repo *state.Repo, ru
 		}
 	}
 	return nil
-}
-
-func (o *Orchestrator) failRunWithEvent(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, errMsg string) error {
-	if err := o.finishRun(ctx, repo, run, hr, runEnd{
-		Phase:   state.PhaseFailed,
-		Kind:    "failed",
-		Message: errMsg,
-	}); err != nil {
-		return err
-	}
-	return errors.New(errMsg)
 }
 
 func runStartTime(run *state.Run) time.Time {
