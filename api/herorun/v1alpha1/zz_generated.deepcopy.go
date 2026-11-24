@@ -182,10 +182,6 @@ func (in *HeroRunStatus) DeepCopyInto(out *HeroRunStatus) {
 		in, out := &in.ReadyDeadline, &out.ReadyDeadline
 		*out = (*in).DeepCopy()
 	}
-	if in.PortalBoundAt != nil {
-		in, out := &in.PortalBoundAt, &out.PortalBoundAt
-		*out = (*in).DeepCopy()
-	}
 	if in.StartedAt != nil {
 		in, out := &in.StartedAt, &out.StartedAt
 		*out = (*in).DeepCopy()
