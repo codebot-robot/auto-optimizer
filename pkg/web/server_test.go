@@ -1291,8 +1291,8 @@ func TestRunAgain(t *testing.T) {
 	}
 	newRunID := strings.TrimPrefix(newRunLocation, "/runs/")
 
-	// Verify new run in store
-	newRun, err := stateStore.GetRun(ctx, repoKey, newRunID)
+	// Verify new run in HeroRun
+	newRun, err := run.GetRun(ctx, fakeClient, session.DefaultNamespace, newRunID)
 	if err != nil {
 		t.Fatalf("GetRun newRunID: %v", err)
 	}
