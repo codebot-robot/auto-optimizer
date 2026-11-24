@@ -1930,6 +1930,13 @@ func (h *Harness) WithMaxTurns(maxTurns int) *Harness {
 	return &c
 }
 
+// WithModel returns a shallow copy of the harness with ModelName set.
+func (h *Harness) WithModel(model string) *Harness {
+	c := *h
+	c.opts.ModelName = model
+	return &c
+}
+
 // WithTurnBudget returns a shallow copy of the harness with the given turn budget.
 func (h *Harness) WithTurnBudget(budget *TurnBudget) *Harness {
 	c := *h
@@ -2291,7 +2298,9 @@ func (h *Harness) executeToolCalls(ctx context.Context, session *Session, events
 				callErr = fmt.Errorf("failed to parse arguments: %w", err)
 			} else {
 				var sb tools.Sandbox
-				if active := session.ActiveSandbox(); active != nil {
+				if h.sandboxOverride != nil {
+					sb = h.sandboxOverride
+				} else if active := session.ActiveSandbox(); active != nil {
 					sb = active
 				}
 				toolMsg, callErr = h.callWithSandboxRetry(ctx, session, tc.Function.Name, sb, func(s tools.Sandbox) (llm.Message, error) {
