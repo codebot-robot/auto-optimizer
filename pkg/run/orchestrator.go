@@ -15,6 +15,7 @@
 package run
 
 import (
+	"cmp"
 	"context"
 	cryptorand "crypto/rand"
 	"errors"
@@ -1247,9 +1248,45 @@ func (o *Orchestrator) waitForEvent(ctx context.Context, children *childGroup, r
 	}
 }
 
+// SandboxOwnerForSession returns the shared SandboxOwner for a HeroRun-owned
+// Session, configured with the run's replacement sandbox options and on-demand
+// workspace and portal preparation. It returns (nil, nil) for standalone
+// sessions with no RunID.
+func (o *Orchestrator) SandboxOwnerForSession(ctx context.Context, obj *herorunv1alpha1.Session) (*session.SandboxOwner, error) {
+	if o == nil || obj == nil || obj.Spec.RunID == "" {
+		return nil, nil
+	}
+	ns := cmp.Or(obj.Namespace, o.namespace())
+	hrName := cmp.Or(obj.Spec.HeroRunName, sandboxNameForRun(obj.Spec.RunID))
+	var hr herorunv1alpha1.HeroRun
+	if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: hrName}, &hr); err != nil {
+		return nil, fmt.Errorf("getting HeroRun %s: %w", hrName, err)
+	}
+	run, err := HeroRunToRun(&hr)
+	if err != nil {
+		return nil, fmt.Errorf("converting HeroRun %s: %w", hrName, err)
+	}
+	run.ID = cmp.Or(run.ID, obj.Spec.RunID)
+	run.SandboxName = cmp.Or(run.SandboxName, obj.Spec.SandboxName)
+	run.WorkspaceClaimName = cmp.Or(run.WorkspaceClaimName, obj.Spec.WorkspaceClaimName)
+	repo, err := o.store.GetRepo(ctx, run.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("getting repo %s: %w", run.Repo, err)
+	}
+	var initialSb *session.Sandbox
+	if o.harness != nil && run.SandboxName != "" {
+		initialSb = o.harness.GetOrAttachSandbox(run.SandboxName)
+	}
+	return o.getOrCreateSandboxOwner(ctx, repo, run, &hr, initialSb), nil
+}
+
 func (o *Orchestrator) getOrCreateSandboxOwner(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, initialSb *session.Sandbox) *session.SandboxOwner {
 	o.runStatesMu.Lock()
 	rs := o.runStates[run.ID]
+	if rs == nil {
+		rs = &runState{}
+		o.runStates[run.ID] = rs
+	}
 	if rs.sandboxOwner == nil {
 		rs.sandboxOwner = session.NewSandboxOwner(o.harness)
 	}
