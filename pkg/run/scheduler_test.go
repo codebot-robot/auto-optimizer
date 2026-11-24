@@ -38,19 +38,6 @@ func newTestScheduler(t *testing.T, opts SchedulerOptions) *Scheduler {
 			t.Fatalf("NewScheme: %v", err)
 		}
 		fakeClient := newTestFakeClientBuilder(scheme).Build()
-		if opts.Store != nil {
-			repos, _ := opts.Store.ListRepos(t.Context())
-			for _, r := range repos {
-				runs, _ := opts.Store.ListRuns(t.Context(), r.Key())
-				for _, run := range runs {
-					hr := HeroRunFromRun(run)
-					hr.Namespace = harness.Namespace()
-					hr.Spec.Repository = r.URL
-					_ = fakeClient.Create(t.Context(), hr)
-					_ = fakeClient.Status().Update(t.Context(), hr)
-				}
-			}
-		}
 		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:      opts.Store,
 			Harness:    harness,
@@ -120,9 +107,9 @@ func TestScheduler_NewGoalCreatesRun(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 
-	runs, err := store.ListRuns(ctx, repo.Key())
+	runs, err := scheduler.listRuns(ctx, repo)
 	if err != nil {
-		t.Fatalf("ListRuns: %v", err)
+		t.Fatalf("listRuns: %v", err)
 	}
 	if len(runs) != 1 {
 		t.Fatalf("expected 1 run, got %d", len(runs))
@@ -229,7 +216,7 @@ func TestScheduler_PublishesHeroRunOnRunCreation(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 
-	runs, err := store.ListRuns(ctx, repo.Key())
+	runs, err := scheduler.listRuns(ctx, repo)
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("expected 1 run, got %d (err: %v)", len(runs), err)
 	}
@@ -288,9 +275,9 @@ func TestScheduler_UnchangedGoalDoesNotCreateRun(t *testing.T) {
 		t.Fatalf("Tick 1: %v", err)
 	}
 
-	runs, err := store.ListRuns(ctx, repo.Key())
+	runs, err := scheduler.listRuns(ctx, repo)
 	if err != nil {
-		t.Fatalf("ListRuns: %v", err)
+		t.Fatalf("listRuns: %v", err)
 	}
 	if len(runs) != 1 {
 		t.Fatalf("expected 1 run, got %d", len(runs))
@@ -298,9 +285,7 @@ func TestScheduler_UnchangedGoalDoesNotCreateRun(t *testing.T) {
 
 	// Mark first run as terminal
 	runs[0].SetPhase(state.PhaseSucceeded, now)
-	if err := store.PutRun(ctx, runs[0]); err != nil {
-		t.Fatalf("PutRun terminal: %v", err)
-	}
+	saveTestHeroRun(t, ctx, scheduler.Orchestrator, runs[0])
 
 	// Second tick with unchanged goal should NOT create a second run
 	now = now.Add(time.Minute)
@@ -308,9 +293,9 @@ func TestScheduler_UnchangedGoalDoesNotCreateRun(t *testing.T) {
 		t.Fatalf("Tick 2: %v", err)
 	}
 
-	runsAfter, err := store.ListRuns(ctx, repo.Key())
+	runsAfter, err := scheduler.listRuns(ctx, repo)
 	if err != nil {
-		t.Fatalf("ListRuns after: %v", err)
+		t.Fatalf("listRuns after: %v", err)
 	}
 	if len(runsAfter) != 1 {
 		t.Fatalf("expected still 1 run for unchanged goal, got %d", len(runsAfter))
@@ -358,9 +343,9 @@ func TestScheduler_ChangedHashCreatesSecondRunOnceFirstIsTerminal(t *testing.T) 
 		t.Fatalf("Tick 1: %v", err)
 	}
 
-	runs, err := store.ListRuns(ctx, repo.Key())
+	runs, err := scheduler.listRuns(ctx, repo)
 	if err != nil {
-		t.Fatalf("ListRuns: %v", err)
+		t.Fatalf("listRuns: %v", err)
 	}
 	if len(runs) != 1 {
 		t.Fatalf("expected 1 run, got %d", len(runs))
@@ -379,9 +364,9 @@ func TestScheduler_ChangedHashCreatesSecondRunOnceFirstIsTerminal(t *testing.T) 
 		t.Fatalf("Tick with non-terminal: %v", err)
 	}
 
-	runs, err = store.ListRuns(ctx, repo.Key())
+	runs, err = scheduler.listRuns(ctx, repo)
 	if err != nil {
-		t.Fatalf("ListRuns: %v", err)
+		t.Fatalf("listRuns: %v", err)
 	}
 	if len(runs) != 1 {
 		t.Fatalf("expected non-terminal run to block new run, got %d runs", len(runs))
@@ -390,9 +375,6 @@ func TestScheduler_ChangedHashCreatesSecondRunOnceFirstIsTerminal(t *testing.T) 
 	// Now mark first run terminal
 	runs[0].SetPhase(state.PhaseSucceeded, currentTime)
 	saveTestHeroRun(t, ctx, scheduler.Orchestrator, runs[0])
-	if err := store.PutRun(ctx, runs[0]); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	// Tick again -> should create Run 2 because hash changed and Run 1 is terminal
 	currentTime = currentTime.Add(time.Minute)
@@ -400,9 +382,9 @@ func TestScheduler_ChangedHashCreatesSecondRunOnceFirstIsTerminal(t *testing.T) 
 		t.Fatalf("Tick after terminal: %v", err)
 	}
 
-	runs, err = store.ListRuns(ctx, repo.Key())
+	runs, err = scheduler.listRuns(ctx, repo)
 	if err != nil {
-		t.Fatalf("ListRuns: %v", err)
+		t.Fatalf("listRuns: %v", err)
 	}
 	if len(runs) != 2 {
 		t.Fatalf("expected 2 runs, got %d", len(runs))
@@ -474,19 +456,6 @@ func TestScheduler_NonTerminalRunBlocksNewOne(t *testing.T) {
 				t.Fatalf("PutGoal: %v", err)
 			}
 
-			// Pre-create a run in the non-terminal phase
-			run := &state.Run{
-				ID:         "20261030T100000Z-0001",
-				Repo:       repo.Key(),
-				GoalName:   "task",
-				BaseCommit: "commit-1",
-				Phase:      phase,
-				Goal:       goalRec.Goal,
-			}
-			if err := subStore.PutRun(ctx, run); err != nil {
-				t.Fatalf("PutRun: %v", err)
-			}
-
 			// Change the goal so it would otherwise trigger
 			changedGoal := *goalRec
 			changedGoal.Hash = "hash-different"
@@ -501,13 +470,25 @@ func TestScheduler_NonTerminalRunBlocksNewOne(t *testing.T) {
 			}
 
 			scheduler := newTestScheduler(t, SchedulerOptions{Store: subStore})
+
+			// Pre-create a run in the non-terminal phase
+			run := &state.Run{
+				ID:         "20261030T100000Z-0001",
+				Repo:       repo.Key(),
+				GoalName:   "task",
+				BaseCommit: "commit-1",
+				Phase:      phase,
+				Goal:       goalRec.Goal,
+			}
+			putTestRun(t, ctx, scheduler.Orchestrator, run)
+
 			if err := scheduler.Tick(ctx); err != nil {
 				t.Fatalf("Tick: %v", err)
 			}
 
-			runs, err := subStore.ListRuns(ctx, repo.Key())
+			runs, err := scheduler.listRuns(ctx, repo)
 			if err != nil {
-				t.Fatalf("ListRuns: %v", err)
+				t.Fatalf("listRuns: %v", err)
 			}
 			if len(runs) != 1 {
 				t.Fatalf("expected non-terminal phase %s to block new run, got %d runs", phase, len(runs))
@@ -554,9 +535,9 @@ func TestScheduler_ManualGoalNeverStarts(t *testing.T) {
 				t.Fatalf("Tick: %v", err)
 			}
 
-			runs, err := store.ListRuns(ctx, repo.Key())
+			runs, err := scheduler.listRuns(ctx, repo)
 			if err != nil {
-				t.Fatalf("ListRuns: %v", err)
+				t.Fatalf("listRuns: %v", err)
 			}
 			for _, r := range runs {
 				if r.GoalName == goalRec.Goal.Name {
@@ -607,9 +588,9 @@ func TestScheduler_BaseCommitChangedCreatesRun(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 
-	runs, err := store.ListRuns(ctx, repo.Key())
+	runs, err := scheduler.listRuns(ctx, repo)
 	if err != nil {
-		t.Fatalf("ListRuns: %v", err)
+		t.Fatalf("listRuns: %v", err)
 	}
 	if len(runs) != 1 {
 		t.Fatalf("expected 1 run, got %d", len(runs))
@@ -618,9 +599,6 @@ func TestScheduler_BaseCommitChangedCreatesRun(t *testing.T) {
 	// Mark first run terminal
 	runs[0].SetPhase(state.PhaseSucceeded, currTime)
 	saveTestHeroRun(t, ctx, scheduler.Orchestrator, runs[0])
-	if err := store.PutRun(ctx, runs[0]); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	// Update base commit on the goal record (e.g. main branch advanced), but keep hash the same
 	goalRec.BaseCommit = "commit-new"
@@ -633,9 +611,9 @@ func TestScheduler_BaseCommitChangedCreatesRun(t *testing.T) {
 		t.Fatalf("Tick 2: %v", err)
 	}
 
-	runs, err = store.ListRuns(ctx, repo.Key())
+	runs, err = scheduler.listRuns(ctx, repo)
 	if err != nil {
-		t.Fatalf("ListRuns: %v", err)
+		t.Fatalf("listRuns: %v", err)
 	}
 	if len(runs) != 2 {
 		t.Fatalf("expected 2 runs after base commit changed, got %d", len(runs))
@@ -700,7 +678,7 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	if err := scheduler.Tick(ctx); err != nil {
 		t.Fatalf("Tick 1: %v", err)
 	}
-	runs, err := store.ListRuns(ctx, repo.Key())
+	runs, err := scheduler.listRuns(ctx, repo)
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("expected 1 run, got %d (err: %v)", len(runs), err)
 	}
@@ -708,9 +686,6 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	// Mark run 1 terminal
 	runs[0].SetPhase(state.PhaseSucceeded, now)
 	saveTestHeroRun(t, ctx, scheduler.Orchestrator, runs[0])
-	if err := store.PutRun(ctx, runs[0]); err != nil {
-		t.Fatalf("PutRun terminal: %v", err)
-	}
 
 	// Update base commit so goal would trigger a new run
 	goalRec.BaseCommit = "commit-bbb"
@@ -733,7 +708,7 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	if err := scheduler.Tick(ctx); err != nil {
 		t.Fatalf("Tick with open PR: %v", err)
 	}
-	runs, err = store.ListRuns(ctx, repo.Key())
+	runs, err = scheduler.listRuns(ctx, repo)
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("expected open PR to prevent new run, got %d runs", len(runs))
 	}
@@ -755,14 +730,13 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 		if err := scheduler.Tick(ctx); err != nil {
 			t.Fatalf("Tick with %s PR: %v", stateVal, err)
 		}
-		runs, err = store.ListRuns(ctx, repo.Key())
+		runs, err = scheduler.listRuns(ctx, repo)
 		if err != nil || len(runs) != expectedRuns {
 			t.Fatalf("expected %s PR not to prevent new run, got %d runs (wanted %d)", stateVal, len(runs), expectedRuns)
 		}
 		// Reset latest run to terminal for next subtest
 		runs[len(runs)-1].SetPhase(state.PhaseSucceeded, now)
 		saveTestHeroRun(t, ctx, scheduler.Orchestrator, runs[len(runs)-1])
-		_ = store.PutRun(ctx, runs[len(runs)-1])
 		goalRec.BaseCommit = "commit-" + stateVal
 		_ = store.PutGoal(ctx, repo.Key(), goalRec)
 	}
@@ -782,7 +756,7 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	if err := scheduler.Tick(ctx); err != nil {
 		t.Fatalf("Tick with other goal PR: %v", err)
 	}
-	runs, err = store.ListRuns(ctx, repo.Key())
+	runs, err = scheduler.listRuns(ctx, repo)
 	if err != nil || len(runs) != expectedRuns {
 		t.Fatalf("expected other goal PR not to prevent new run, got %d runs (wanted %d)", len(runs), expectedRuns)
 	}
@@ -790,22 +764,22 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	// Mark last run terminal and update base commit
 	runs[len(runs)-1].SetPhase(state.PhaseSucceeded, now)
 	saveTestHeroRun(t, ctx, scheduler.Orchestrator, runs[len(runs)-1])
-	_ = store.PutRun(ctx, runs[len(runs)-1])
 	goalRec.BaseCommit = "commit-ddd"
 	_ = store.PutGoal(ctx, repo.Key(), goalRec)
 
 	// 4. A forge without ChangeRequestCreator (e.g. GitRemote) schedules as before
 	expectedRuns++
 	schedulerNoCR := newTestScheduler(t, SchedulerOptions{
-		Store:    store,
-		Clock:    func() time.Time { return now },
-		ForgeFor: func(repoURL string) (forge.Forge, error) { return forge.NewGitRemote(), nil },
+		Store:        store,
+		Orchestrator: scheduler.Orchestrator,
+		Clock:        func() time.Time { return now },
+		ForgeFor:     func(repoURL string) (forge.Forge, error) { return forge.NewGitRemote(), nil },
 	})
 	now = now.Add(time.Minute)
 	if err := schedulerNoCR.Tick(ctx); err != nil {
 		t.Fatalf("Tick with GitRemote: %v", err)
 	}
-	runs, err = store.ListRuns(ctx, repo.Key())
+	runs, err = schedulerNoCR.listRuns(ctx, repo)
 	if err != nil || len(runs) != expectedRuns {
 		t.Fatalf("expected forge without ChangeRequestCreator to schedule run, got %d runs (wanted %d)", len(runs), expectedRuns)
 	}
@@ -813,7 +787,6 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	// Mark last run terminal and update base commit
 	runs[len(runs)-1].SetPhase(state.PhaseSucceeded, now)
 	saveTestHeroRun(t, ctx, schedulerNoCR.Orchestrator, runs[len(runs)-1])
-	_ = store.PutRun(ctx, runs[len(runs)-1])
 	goalRec.BaseCommit = "commit-eee"
 	_ = store.PutGoal(ctx, repo.Key(), goalRec)
 
@@ -833,7 +806,7 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	if err := scheduler.Tick(ctx); err != nil {
 		t.Fatalf("Tick with flaky forge error: %v", err)
 	}
-	runs, err = store.ListRuns(ctx, repo.Key())
+	runs, err = scheduler.listRuns(ctx, repo)
 	if err != nil || len(runs) != expectedRuns {
 		t.Fatalf("expected flaky forge error not to block run creation, got %d runs (wanted %d)", len(runs), expectedRuns)
 	}
@@ -841,22 +814,22 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	// Mark last run terminal and update base commit
 	runs[len(runs)-1].SetPhase(state.PhaseSucceeded, now)
 	saveTestHeroRun(t, ctx, scheduler.Orchestrator, runs[len(runs)-1])
-	_ = store.PutRun(ctx, runs[len(runs)-1])
 	goalRec.BaseCommit = "commit-fff"
 	_ = store.PutGoal(ctx, repo.Key(), goalRec)
 
 	// 6. Forge selection error does not block scheduling
 	expectedRuns++
 	schedulerErrForge := newTestScheduler(t, SchedulerOptions{
-		Store:    store,
-		Clock:    func() time.Time { return now },
-		ForgeFor: func(repoURL string) (forge.Forge, error) { return nil, errors.New("forge lookup error") },
+		Store:        store,
+		Orchestrator: scheduler.Orchestrator,
+		Clock:        func() time.Time { return now },
+		ForgeFor:     func(repoURL string) (forge.Forge, error) { return nil, errors.New("forge lookup error") },
 	})
 	now = now.Add(time.Minute)
 	if err := schedulerErrForge.Tick(ctx); err != nil {
 		t.Fatalf("Tick with forge selection error: %v", err)
 	}
-	runs, err = store.ListRuns(ctx, repo.Key())
+	runs, err = schedulerErrForge.listRuns(ctx, repo)
 	if err != nil || len(runs) != expectedRuns {
 		t.Fatalf("expected forge selection error not to block run creation, got %d runs (wanted %d)", len(runs), expectedRuns)
 	}
@@ -864,7 +837,7 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	if err := schedulerErrForge.Tick(ctx); err != nil {
 		t.Fatalf("Tick with forge selection error: %v", err)
 	}
-	runs, err = store.ListRuns(ctx, repo.Key())
+	runs, err = schedulerErrForge.listRuns(ctx, repo)
 	if err != nil || len(runs) != expectedRuns {
 		t.Fatalf("expected forge selection error not to block run creation, got %d runs (wanted %d)", len(runs), expectedRuns)
 	}
@@ -1049,9 +1022,6 @@ func TestScheduler_StartRun(t *testing.T) {
 	// 3. Mark run terminal and add open PR -> refuses with ErrOpenPullRequest
 	run.SetPhase(state.PhaseFailed, time.Now().UTC())
 	saveTestHeroRun(t, ctx, scheduler.Orchestrator, run)
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun terminal: %v", err)
-	}
 
 	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
 		{Number: 1, Head: "ao/optimize-latency/run-1", State: "open", URL: repo.URL + "/pull/1"},

@@ -232,21 +232,7 @@ func newTestOrchestrator(t *testing.T, opts OrchestratorOptions) *Orchestrator {
 		if err != nil {
 			t.Fatalf("NewScheme: %v", err)
 		}
-		fakeClient := newTestFakeClientBuilder(scheme).Build()
-		if opts.Store != nil && opts.Harness != nil {
-			repos, _ := opts.Store.ListRepos(t.Context())
-			for _, r := range repos {
-				runs, _ := opts.Store.ListRuns(t.Context(), r.Key())
-				for _, run := range runs {
-					hr := HeroRunFromRun(run)
-					hr.Namespace = opts.Harness.Namespace()
-					hr.Spec.Repository = r.URL
-					_ = fakeClient.Create(t.Context(), hr)
-					_ = fakeClient.Status().Update(t.Context(), hr)
-				}
-			}
-		}
-		opts.KubeClient = fakeClient
+		opts.KubeClient = newTestFakeClientBuilder(scheme).Build()
 	}
 	orch, err := NewOrchestrator(opts)
 	if err != nil {
@@ -259,40 +245,61 @@ func newTestOrchestrator(t *testing.T, opts OrchestratorOptions) *Orchestrator {
 	return orch
 }
 
+func putTestHeroRun(t *testing.T, ctx context.Context, c client.Client, ns, repoURL string, run *state.Run) {
+	t.Helper()
+	name := sandboxNameForRun(run.ID)
+	var existing herorunv1alpha1.HeroRun
+	err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &existing)
+	if k8serrors.IsNotFound(err) {
+		hr := HeroRunFromRun(run)
+		hr.Namespace = ns
+		if repoURL != "" {
+			hr.Spec.Repository = repoURL
+		}
+		status := hr.Status
+		if err := c.Create(ctx, hr); err != nil {
+			t.Fatalf("creating HeroRun %s: %v", name, err)
+		}
+		hr.Status = status
+		if err := c.Status().Update(ctx, hr); err != nil {
+			t.Fatalf("updating HeroRun status %s: %v", name, err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("getting HeroRun %s: %v", name, err)
+	}
+	fresh := HeroRunFromRun(run)
+	existing.Spec = fresh.Spec
+	if repoURL != "" {
+		existing.Spec.Repository = repoURL
+	}
+	if err := c.Update(ctx, &existing); err != nil {
+		t.Fatalf("updating HeroRun %s: %v", name, err)
+	}
+	existing.Status = fresh.Status
+	if err := c.Status().Update(ctx, &existing); err != nil {
+		t.Fatalf("updating HeroRun status %s: %v", name, err)
+	}
+}
+
+func putTestRun(t *testing.T, ctx context.Context, orch *Orchestrator, run *state.Run) {
+	t.Helper()
+	var repoURL string
+	if orch.store != nil {
+		if repo, err := orch.store.GetRepo(ctx, run.Repo); err == nil && repo != nil {
+			repoURL = repo.URL
+		}
+	}
+	putTestHeroRun(t, ctx, orch.kubeClient, orch.namespace(), repoURL, run)
+}
+
 func runRequest(orch *Orchestrator, repo state.RepoKey, runID string) reconcile.Request {
 	name := sandboxNameForRun(runID)
 	orch.recordRunIndex(name, repo, runID)
 	var ns string
 	if orch != nil && orch.harness != nil {
 		ns = orch.harness.Namespace()
-	}
-	if orch != nil && orch.kubeClient != nil {
-		ctx := context.Background()
-		var hr herorunv1alpha1.HeroRun
-		if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &hr); k8serrors.IsNotFound(err) {
-			if r, err := orch.store.GetRun(ctx, repo, runID); err == nil {
-				repoObj, _ := orch.store.GetRepo(ctx, repo)
-				newHR := HeroRunFromRun(r)
-				newHR.Namespace = ns
-				if repoObj != nil {
-					newHR.Spec.Repository = repoObj.URL
-				}
-				_ = orch.kubeClient.Create(ctx, newHR)
-				_ = orch.kubeClient.Status().Update(ctx, newHR)
-			}
-		} else if err == nil {
-			if r, err := orch.store.GetRun(ctx, repo, runID); err == nil {
-				repoObj, _ := orch.store.GetRepo(ctx, repo)
-				freshHR := HeroRunFromRun(r)
-				hr.Spec = freshHR.Spec
-				hr.Status = freshHR.Status
-				if repoObj != nil {
-					hr.Spec.Repository = repoObj.URL
-				}
-				_ = orch.kubeClient.Update(ctx, &hr)
-				_ = orch.kubeClient.Status().Update(ctx, &hr)
-			}
-		}
 	}
 	return reconcile.Request{
 		NamespacedName: types.NamespacedName{
@@ -351,9 +358,6 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-base123",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{
 		exitCode: 0,
@@ -369,6 +373,7 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 		Clock:     func() time.Time { return fixedTime },
 		GitAuthor: author,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: Reconcile Pending run.
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -380,7 +385,7 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 	}
 
 	// 1. After the first step the run has a SandboxName, is in Preparing phase, and has ReadyDeadline set.
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -430,7 +435,7 @@ func TestOrchestrator_PendingToWorking(t *testing.T) {
 		t.Fatalf("orch.Reconcile step 2: %v", err)
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -531,9 +536,6 @@ func TestOrchestrator_ConfigureGitIdentityFailure(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-base123",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{
 		exitCode: 0,
@@ -548,13 +550,14 @@ func TestOrchestrator_ConfigureGitIdentityFailure(t *testing.T) {
 		Clock:     func() time.Time { return fixedTime },
 		GitAuthor: "invalid-author<",
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: Reconcile Pending run to Preparing.
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -580,7 +583,7 @@ func TestOrchestrator_ConfigureGitIdentityFailure(t *testing.T) {
 	}
 
 	// 1. Verify run is in Failed phase
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -639,9 +642,6 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "bad-commit-sha",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	// Simulate clone failure with exit code 128
 	procSrv := &mockProcessServer{
@@ -656,13 +656,14 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 		Harness: harness,
 		Clock:   func() time.Time { return fixedTime },
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: reconcile Pending run to Preparing.
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -691,7 +692,7 @@ func TestOrchestrator_CloneFailure(t *testing.T) {
 	}
 
 	// 1. Verify run is in Failed phase
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -749,9 +750,6 @@ func TestOrchestrator_WorkspaceReuse(t *testing.T) {
 			Phase:      state.PhasePending,
 			BaseCommit: "base123",
 		}
-		if err := store.PutRun(ctx, run); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 		harness, agentsCS, _ := setupTestHarness(t, procSrv)
 		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:     store,
@@ -759,10 +757,11 @@ func TestOrchestrator_WorkspaceReuse(t *testing.T) {
 			Clock:     func() time.Time { return time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC) },
 			GitAuthor: "bot <bot@test.com>",
 		})
+		putTestRun(t, ctx, orch, run)
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("Reconcile step 1: %v", err)
 		}
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -783,7 +782,7 @@ func TestOrchestrator_WorkspaceReuse(t *testing.T) {
 		if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err != nil {
 			t.Fatalf("Reconcile step 2: %v", err)
 		}
-		gotRun, err := store.GetRun(t.Context(), repo.Key(), run.ID)
+		gotRun, err := GetRun(t.Context(), orch.kubeClient, orch.namespace(), run.ID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -816,7 +815,7 @@ func TestOrchestrator_WorkspaceReuse(t *testing.T) {
 		if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err != nil {
 			t.Fatalf("Reconcile step 2: %v", err)
 		}
-		gotRun, err := store.GetRun(t.Context(), repo.Key(), run.ID)
+		gotRun, err := GetRun(t.Context(), orch.kubeClient, orch.namespace(), run.ID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -894,11 +893,11 @@ func TestOrchestrator_WorkspaceReuse(t *testing.T) {
 
 	t.Run("check failure fails step", func(t *testing.T) {
 		procSrv := &mockProcessServer{err: errors.New("sandbox process error")}
-		orch, store, agentsCS, repo, run := setupReadyRun(t, "run-checkfail", procSrv)
+		orch, _, agentsCS, repo, run := setupReadyRun(t, "run-checkfail", procSrv)
 		if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err == nil {
 			t.Logf("Reconcile completed")
 		}
-		gotRun, err := store.GetRun(t.Context(), repo.Key(), run.ID)
+		gotRun, err := GetRun(t.Context(), orch.kubeClient, orch.namespace(), run.ID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -916,11 +915,11 @@ func TestOrchestrator_WorkspaceReuse(t *testing.T) {
 
 	t.Run("check exit code failure fails step", func(t *testing.T) {
 		procSrv := &mockProcessServer{exitCode: 1, stderr: "fatal: git check failure\n"}
-		orch, store, agentsCS, repo, run := setupReadyRun(t, "run-checkexitfail", procSrv)
+		orch, _, agentsCS, repo, run := setupReadyRun(t, "run-checkexitfail", procSrv)
 		if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err == nil {
 			t.Logf("Reconcile completed")
 		}
-		gotRun, err := store.GetRun(t.Context(), repo.Key(), run.ID)
+		gotRun, err := GetRun(t.Context(), orch.kubeClient, orch.namespace(), run.ID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -960,9 +959,6 @@ func TestOrchestrator_Preparing_DeleteSandboxFailsRun(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-base123",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
@@ -972,13 +968,14 @@ func TestOrchestrator_Preparing_DeleteSandboxFailsRun(t *testing.T) {
 		Harness: harness,
 		Clock:   func() time.Time { return fixedTime },
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: Reconcile creates sandbox and moves to Preparing
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -996,7 +993,7 @@ func TestOrchestrator_Preparing_DeleteSandboxFailsRun(t *testing.T) {
 		t.Fatalf("orch.Reconcile step 2: %v", err)
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -1047,9 +1044,6 @@ func TestOrchestrator_Preparing_NeverReadyDeadlinePasses(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-base123",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
@@ -1060,13 +1054,14 @@ func TestOrchestrator_Preparing_NeverReadyDeadlinePasses(t *testing.T) {
 		Clock:        func() time.Time { return currentTime },
 		ReadyTimeout: 10 * time.Second,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: Reconcile creates sandbox and sets ReadyDeadline = currentTime + 10s
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile step 1: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -1085,7 +1080,7 @@ func TestOrchestrator_Preparing_NeverReadyDeadlinePasses(t *testing.T) {
 		t.Fatalf("orch.Reconcile step 2: %v", err)
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -1147,9 +1142,6 @@ func TestOrchestrator_Resume_PreparingEnqueued(t *testing.T) {
 		SandboxName:   "run-20261030t120000z-preparing",
 		ReadyDeadline: &deadline,
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
@@ -1170,13 +1162,14 @@ func TestOrchestrator_Resume_PreparingEnqueued(t *testing.T) {
 		Harness: harness,
 		Clock:   func() time.Time { return fixedTime },
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if err := orch.Resume(ctx); err != nil {
 		t.Fatalf("orch.Resume: %v", err)
 	}
 
 	// 1. Verify run remains in Preparing phase (not failed)
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -1233,9 +1226,6 @@ func TestOrchestrator_Working_StartsSession_ModelStops_NoImprovement(t *testing.
 			Body: goalBody,
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{
 		exitCode: 0,
@@ -1269,13 +1259,14 @@ func TestOrchestrator_Working_StartsSession_ModelStops_NoImprovement(t *testing.
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	// 1. Verify run is marked NoImprovement
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -1402,9 +1393,6 @@ func TestOrchestrator_Working_MaxTurns(t *testing.T) {
 			Body: "run forever",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{
 		exitCode: 0,
@@ -1438,6 +1426,7 @@ func TestOrchestrator_Working_MaxTurns(t *testing.T) {
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     3,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
@@ -1452,7 +1441,7 @@ func TestOrchestrator_Working_MaxTurns(t *testing.T) {
 	}
 
 	// 2. Verify run is marked NoImprovement
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -1553,9 +1542,6 @@ func TestOrchestrator_Working_SharedTurnBudget(t *testing.T) {
 			Body: "optimize",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{
 		exitCode: 0,
@@ -1593,6 +1579,7 @@ func TestOrchestrator_Working_SharedTurnBudget(t *testing.T) {
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     3,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	var hr herorunv1alpha1.HeroRun
 	if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: harness.Namespace(), Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
@@ -1672,9 +1659,6 @@ func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 		BaseCommit:  "base-sha-exp",
 		SandboxName: sandboxName,
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
 	// Sandbox is intentionally NOT created in fake k8s (already expired/deleted).
@@ -1688,13 +1672,14 @@ func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	// Verify run carried on to NoImprovement
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -1813,9 +1798,6 @@ func TestOrchestrator_Working_ExpiredSandbox_DuringSession(t *testing.T) {
 		SandboxName:        sandboxName,
 		WorkspaceClaimName: claimName,
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &failingOnFirstCallServer{}
 	delLLM := &deleteSandboxLLM{sbName: sandboxName}
@@ -1871,12 +1853,13 @@ func TestOrchestrator_Working_ExpiredSandbox_DuringSession(t *testing.T) {
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -2016,9 +1999,6 @@ func TestOrchestrator_Working_ToolCallInterruptedBySandboxDeletion_RetriedAndFin
 		WorkspaceClaimName: claimName,
 		Deadline:           &deadline,
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &midToolDeletingServer{sbName: sandboxName}
 	toolLLM := &toolCallingThenStopLLM{}
@@ -2090,12 +2070,13 @@ func TestOrchestrator_Working_ToolCallInterruptedBySandboxDeletion_RetriedAndFin
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -2156,9 +2137,6 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 			Body: goalBody,
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{
 		exitCode: 0,
@@ -2174,6 +2152,7 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: Pending -> Preparing
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -2206,7 +2185,7 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 	}
 
 	// 1. Verify run reached NoImprovement
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -2302,9 +2281,6 @@ func TestOrchestrator_Working_FinishTool_EndsSession_RecordsSummary(t *testing.T
 			Body: "achieve optimization and finish",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	finishSummary := "Successfully investigated and finished with no PR needed."
 	finishLLM := &scriptedFinishLLM{summary: finishSummary}
@@ -2335,13 +2311,14 @@ func TestOrchestrator_Working_FinishTool_EndsSession_RecordsSummary(t *testing.T
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	// 1. Verify run is in NoImprovement and has the summary recorded
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -2496,9 +2473,6 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 			Body: "recover from error and finish",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	finishSummary := "Finished after recovering from command error."
 	errLLM := &scriptedErrorThenFinishLLM{summary: finishSummary}
@@ -2530,13 +2504,14 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	// 1. Verify session completed and run has the finish summary
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -2638,24 +2613,6 @@ func startReconcileDriver(t *testing.T, orch *Orchestrator) *reconcileDriver {
 		orch.cancelWorkers()
 		orch.workerWG.Wait()
 	})
-
-	if orch.store != nil && orch.kubeClient != nil {
-		repos, _ := orch.store.ListRepos(ctx)
-		for _, repo := range repos {
-			runs, _ := orch.store.ListRuns(ctx, repo.Key())
-			for _, r := range runs {
-				name := sandboxNameForRun(r.ID)
-				var hr herorunv1alpha1.HeroRun
-				if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: orch.namespace(), Name: name}, &hr); k8serrors.IsNotFound(err) {
-					newHR := HeroRunFromRun(r)
-					newHR.Namespace = orch.namespace()
-					newHR.Spec.Repository = repo.URL
-					_ = orch.kubeClient.Create(ctx, newHR)
-					_ = orch.kubeClient.Status().Update(ctx, newHR)
-				}
-			}
-		}
-	}
 
 	go func() {
 		_ = orch.Start(ctx)
@@ -2835,7 +2792,7 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 				return
 			default:
 			}
-			runs, err := store.ListRuns(ctx, repo.Key())
+			runs, err := ListRuns(ctx, orch.kubeClient, orch.namespace(), repo.Key())
 			if err == nil && len(runs) > 0 && runs[0].SandboxName != "" {
 				sb, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, runs[0].SandboxName, metav1.GetOptions{})
 				if err == nil && len(sb.Status.Conditions) == 0 {
@@ -2861,7 +2818,7 @@ func TestOrchestrator_ReconciledAfterNotify_WithoutTimer(t *testing.T) {
 
 	// Verify the run is reconciled to Working without any timer
 	d.runUntil(func() bool {
-		runs, err := store.ListRuns(ctx, repo.Key())
+		runs, err := ListRuns(ctx, orch.kubeClient, orch.namespace(), repo.Key())
 		return err == nil && len(runs) > 0 && runs[0].Phase == state.PhaseWorking
 	})
 }
@@ -2916,9 +2873,6 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit1",
 	}
-	if err := store.PutRun(ctx, run1); err != nil {
-		t.Fatalf("PutRun 1: %v", err)
-	}
 
 	run2 := &state.Run{
 		ID:         "20261030T120000Z-run2",
@@ -2926,9 +2880,6 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 		GoalName:   "goal2",
 		Phase:      state.PhasePending,
 		BaseCommit: "commit2",
-	}
-	if err := store.PutRun(ctx, run2); err != nil {
-		t.Fatalf("PutRun 2: %v", err)
 	}
 
 	// Use channels to verify both runs execute their clone command concurrently.
@@ -2992,6 +2943,8 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 		KubeClient:        fakeClient,
 		MaxConcurrentRuns: 4,
 	})
+	putTestRun(t, ctx, orch, run1)
+	putTestRun(t, ctx, orch, run2)
 
 	d := startReconcileDriver(t, orch)
 
@@ -3000,8 +2953,8 @@ func TestOrchestrator_ConcurrentRuns_DifferentRepos(t *testing.T) {
 
 	// Wait for both to reach Working
 	d.runUntil(func() bool {
-		r1, err1 := store.GetRun(ctx, repo1.Key(), run1.ID)
-		r2, err2 := store.GetRun(ctx, repo2.Key(), run2.ID)
+		r1, err1 := GetRun(ctx, orch.kubeClient, orch.namespace(), run1.ID)
+		r2, err2 := GetRun(ctx, orch.kubeClient, orch.namespace(), run2.ID)
 		return err1 == nil && r1.Phase == state.PhaseWorking &&
 			err2 == nil && r2.Phase == state.PhaseWorking
 	})
@@ -3048,9 +3001,6 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 		BaseCommit:  "commit-base123",
 		SandboxName: sandboxName,
 	}
-	if err := store.PutRun(t.Context(), run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	testCtx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -3085,6 +3035,7 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
+	putTestRun(t, t.Context(), orch, run)
 
 	go func() {
 		_ = orch.Start(testCtx)
@@ -3102,7 +3053,7 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 	}
 
 	// Check with test context: run MUST stay in Working phase
-	gotRun, err := store.GetRun(t.Context(), repo.Key(), runID)
+	gotRun, err := GetRun(t.Context(), orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -3154,12 +3105,13 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      restartedHarness,
+		KubeClient:   orch.kubeClient,
 	})
 	if _, err := reconcileWorkingRun(t.Context(), restartedOrch, runRequest(restartedOrch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun on restart: %v", err)
 	}
 
-	resRun, err := store.GetRun(t.Context(), repo.Key(), runID)
+	resRun, err := GetRun(t.Context(), restartedOrch.kubeClient, restartedOrch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun on restart: %v", err)
 	}
@@ -3198,9 +3150,6 @@ func TestOrchestrator_Working_GRPCCanceled_LeavesWorking(t *testing.T) {
 		BaseCommit:  "base-sha",
 		SandboxName: sandboxName,
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, _, _ := setupTestHarnessWithLLM(t, nil, nil)
 	orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -3208,6 +3157,7 @@ func TestOrchestrator_Working_GRPCCanceled_LeavesWorking(t *testing.T) {
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Storing a gRPC codes.Canceled outcome (like an in-flight sandbox call being canceled) must leave the run Working.
 	grpcErr := status.Error(codes.Canceled, "in-flight sandbox rpc canceled")
@@ -3221,7 +3171,7 @@ func TestOrchestrator_Working_GRPCCanceled_LeavesWorking(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -3265,9 +3215,6 @@ func TestOrchestrator_Working_UnansweredToolCall_ContinuesWithoutUserMessage(t *
 			Name: "unanswered-goal",
 			Body: "run command and finish",
 		},
-	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
 	}
 
 	sysPrompt := "system prompt"
@@ -3325,6 +3272,7 @@ func TestOrchestrator_Working_UnansweredToolCall_ContinuesWithoutUserMessage(t *
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
@@ -3351,7 +3299,7 @@ func TestOrchestrator_Working_UnansweredToolCall_ContinuesWithoutUserMessage(t *
 		t.Errorf("expected exactly 1 user message in transcript, got %d", userCount)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -3396,9 +3344,6 @@ func TestOrchestrator_Working_SystemPromptOnly_RunsTurnWithGoal(t *testing.T) {
 			Body: "goal body",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	// Seed session transcript with ONLY a system prompt (no user message)
 	sysPrompt := "system prompt"
@@ -3434,6 +3379,7 @@ func TestOrchestrator_Working_SystemPromptOnly_RunsTurnWithGoal(t *testing.T) {
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
@@ -3484,9 +3430,6 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 		BaseCommit:  "commit-base",
 		SandboxName: "run-working",
 	}
-	if err := store.PutRun(ctx, workingRun); err != nil {
-		t.Fatalf("PutRun working: %v", err)
-	}
 
 	prepRunID := "20261030T120000Z-prep"
 	prepRun := &state.Run{
@@ -3496,9 +3439,6 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 		Phase:       state.PhasePreparing,
 		BaseCommit:  "commit-base",
 		SandboxName: "run-prep",
-	}
-	if err := store.PutRun(ctx, prepRun); err != nil {
-		t.Fatalf("PutRun prep: %v", err)
 	}
 
 	procSrv := &mockProcessServer{
@@ -3533,17 +3473,19 @@ func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
+	putTestRun(t, ctx, orch, workingRun)
+	putTestRun(t, ctx, orch, prepRun)
 
 	d := startReconcileDriver(t, orch)
 
 	d.runUntil(func() bool {
-		r, err := store.GetRun(ctx, repo.Key(), workingRunID)
+		r, err := GetRun(ctx, orch.kubeClient, orch.namespace(), workingRunID)
 		return err == nil && r.Phase == state.PhaseNoImprovement
 	})
 
 	// Verify Preparing run was enqueued on start and reached Working or NoImprovement
 	d.runUntil(func() bool {
-		rPrep, err := store.GetRun(ctx, repo.Key(), prepRunID)
+		rPrep, err := GetRun(ctx, orch.kubeClient, orch.namespace(), prepRunID)
 		return err == nil && (rPrep.Phase == state.PhaseWorking || rPrep.Phase == state.PhaseNoImprovement)
 	})
 }
@@ -3689,9 +3631,6 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-base123",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{
 		exitCode: 0,
@@ -3710,6 +3649,7 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	d := startReconcileDriver(t, orch)
 
@@ -3718,7 +3658,7 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 	// 1. Wait until the run enters Preparing and has a Sandbox created
 	var sb *sandboxv1beta1.Sandbox
 	d.runUntil(func() bool {
-		r, err := store.GetRun(ctx, repo.Key(), runID)
+		r, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err == nil && r.Phase == state.PhasePreparing && r.SandboxName != "" {
 			if s, getErr := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, r.SandboxName, metav1.GetOptions{}); getErr == nil {
 				sb = s
@@ -3749,7 +3689,7 @@ func TestOrchestrator_Preparing_WatchStatusReadyEnqueuesRun(t *testing.T) {
 
 	// 4. Verify watch detects status change, enqueues run, clones, and moves to Working
 	d.runUntil(func() bool {
-		r, err := store.GetRun(ctx, repo.Key(), runID)
+		r, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		return err == nil && r.Phase == state.PhaseWorking
 	})
 
@@ -3786,9 +3726,6 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-base123",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
@@ -3803,6 +3740,7 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	d := startReconcileDriver(t, orch)
 
@@ -3811,7 +3749,7 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 	// Wait until run enters Preparing and sandbox exists in Kubernetes
 	var sbName string
 	d.runUntil(func() bool {
-		r, err := store.GetRun(ctx, repo.Key(), runID)
+		r, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err == nil && r.Phase == state.PhasePreparing && r.SandboxName != "" {
 			if _, getErr := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, r.SandboxName, metav1.GetOptions{}); getErr == nil {
 				sbName = r.SandboxName
@@ -3828,11 +3766,11 @@ func TestOrchestrator_Preparing_WatchDeleteEnqueuesAndFailsRun(t *testing.T) {
 
 	// Verify watch detects deletion, enqueues run, and marks it Failed
 	d.runUntil(func() bool {
-		r, err := store.GetRun(ctx, repo.Key(), runID)
+		r, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		return err == nil && r.Phase == state.PhaseFailed
 	})
 
-	r, err := store.GetRun(ctx, repo.Key(), runID)
+	r, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -3866,9 +3804,6 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-base123",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
@@ -3883,6 +3818,7 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 		Harness:    harness,
 		KubeClient: fakeClient,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	d := startReconcileDriver(t, orch)
 
@@ -3891,7 +3827,7 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	// Wait until run enters Preparing and sandbox exists in Kubernetes
 	var sb *sandboxv1beta1.Sandbox
 	d.runUntil(func() bool {
-		r, err := store.GetRun(ctx, repo.Key(), runID)
+		r, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err == nil && r.Phase == state.PhasePreparing && r.SandboxName != "" {
 			if s, getErr := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Get(ctx, r.SandboxName, metav1.GetOptions{}); getErr == nil {
 				sb = s
@@ -3916,11 +3852,11 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 
 	// Verify watch detects status change, enqueues run, and marks it Failed
 	d.runUntil(func() bool {
-		r, err := store.GetRun(ctx, repo.Key(), runID)
+		r, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		return err == nil && r.Phase == state.PhaseFailed
 	})
 
-	r, err := store.GetRun(ctx, repo.Key(), runID)
+	r, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -4240,9 +4176,6 @@ func TestOrchestrator_FinishedRunHasNoIndexEntry(t *testing.T) {
 	orch.Notify(repoKey, runID)
 
 	run := &state.Run{ID: runID, Repo: repoKey, Phase: state.PhaseWorking}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 	hr := HeroRunFromRun(run)
 	hr.Namespace = harness.Namespace()
 	hr.Spec.Repository = repo.URL
@@ -4295,9 +4228,6 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-base123",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
@@ -4314,6 +4244,7 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 		Clock:      func() time.Time { return fixedTime },
 		KubeClient: fakeClient,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Reconcile Pending run -> leaves Pending to Preparing
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -4325,7 +4256,7 @@ func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
 	}
 
 	// Verify run left Pending
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -4517,9 +4448,6 @@ func TestOrchestrator_SaveHeroRunFailureFailsReconcile(t *testing.T) {
 		Phase:      state.PhasePending,
 		BaseCommit: "commit-base123",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, _, _ := setupTestHarness(t, nil)
 
@@ -4569,16 +4497,6 @@ func TestOrchestrator_SandboxOwnerReference_PreExistingHeroRunHasUID(t *testing.
 	}
 
 	runID := "20261030T120000Z-uidtest"
-	run := &state.Run{
-		ID:         runID,
-		Repo:       repo.Key(),
-		GoalName:   "optimize-search",
-		Phase:      state.PhasePending,
-		BaseCommit: "commit-base123",
-	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, agentsCS, _ := setupTestHarness(t, nil)
 
@@ -4781,9 +4699,6 @@ func setupSelectingRun(t *testing.T, phase state.RunPhase, baseSHA string, procS
 		ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: phase, BaseCommit: baseSHA, SandboxName: sandboxName,
 		Goal: &goals.Goal{Name: "goal", Body: "goal body"},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, llmClient)
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	if _, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
@@ -4796,6 +4711,7 @@ func setupSelectingRun(t *testing.T, phase state.RunPhase, baseSHA string, procS
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store: store, SessionStore: session.NewFileStore(t.TempDir()), Harness: harness, Clock: func() time.Time { return fixedTime }, MaxTurns: 30,
 	})
+	putTestRun(t, ctx, orch, run)
 	return orch, store, agentsCS, repo, run
 }
 
@@ -4813,7 +4729,7 @@ func TestOrchestrator_Working_OpenPullRequest_TransitionsToSelecting(t *testing.
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -4872,9 +4788,6 @@ func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 		PRTitle:     "Add feature",
 		PRBody:      "Implements feature",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &scriptedExportServer{
 		commands: map[string]string{
@@ -4906,13 +4819,14 @@ func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 			return forge.NewGitRemote(), nil
 		},
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify run ended in Succeeded with Branch set
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5009,9 +4923,6 @@ func TestOrchestrator_Selecting_BranchMoved_Fails(t *testing.T) {
 		PRTitle:     "Add feature",
 		PRBody:      "Implements feature",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	// Advance ao/<goal>/<run-id> in the bare repository to another commit before Selecting
 	wantBranch := "ao/export-goal/" + runID
@@ -5063,13 +4974,14 @@ func TestOrchestrator_Selecting_BranchMoved_Fails(t *testing.T) {
 			return forge.NewGitRemote(), nil
 		},
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify run ended in Failed
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5143,9 +5055,6 @@ func TestOrchestrator_Selecting_PushFailed(t *testing.T) {
 		BaseCommit:  baseSHA,
 		SandboxName: sandboxName,
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &scriptedExportServer{
 		commands: map[string]string{
@@ -5177,13 +5086,14 @@ func TestOrchestrator_Selecting_PushFailed(t *testing.T) {
 			return forge.NewGitRemote(), nil
 		},
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify run ended in Failed
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5246,9 +5156,6 @@ func TestOrchestrator_Selecting_NilForge_Fails(t *testing.T) {
 		BaseCommit:  baseSHA,
 		SandboxName: sandboxName,
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &scriptedExportServer{
 		commands: map[string]string{
@@ -5278,13 +5185,14 @@ func TestOrchestrator_Selecting_NilForge_Fails(t *testing.T) {
 		MaxTurns:     30,
 		ForgeFor:     nil, // explicitly nil
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify run ended in Failed
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5338,7 +5246,7 @@ func TestOrchestrator_Selecting_Refusals_NoImprovement(t *testing.T) {
 				t.Fatalf("orch.Reconcile: %v", err)
 			}
 
-			gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+			gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 			if err != nil {
 				t.Fatalf("GetRun: %v", err)
 			}
@@ -5387,15 +5295,13 @@ func TestOrchestrator_Selecting_Verify_PassingProceedsToExport(t *testing.T) {
 	}
 	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, baseSHA, procSrv, nil)
 	run.Goal.Verify = verifyCmd
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5452,15 +5358,13 @@ func TestOrchestrator_Selecting_Verify_FailingEndsInNoImprovement(t *testing.T) 
 	}
 	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, "base-sha", procSrv, nil)
 	run.Goal.Verify = verifyCmd
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5536,9 +5440,7 @@ func TestOrchestrator_Selecting_Verify_TimeoutEndsInNoImprovement(t *testing.T) 
 	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, "base-sha", procSrv, nil)
 	orch.verifyTimeout = 50 * time.Millisecond
 	run.Goal.Verify = verifyCmd
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
@@ -5551,7 +5453,7 @@ func TestOrchestrator_Selecting_Verify_TimeoutEndsInNoImprovement(t *testing.T) 
 		t.Fatalf("expected timeout handler for %q to be invoked, but it was not", expectedVerifyShell)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5588,15 +5490,13 @@ func TestOrchestrator_Selecting_Verify_ExecutionErrorFailsRun(t *testing.T) {
 	}
 	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, "base-sha", procSrv, nil)
 	run.Goal.Verify = verifyCmd
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5634,9 +5534,7 @@ func TestOrchestrator_Selecting_GoalWithoutVerify_RunsNoCommandBeforeExport(t *t
 	}
 	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseSelecting, baseSHA, procSrv, nil)
 	run.Goal.Verify = ""
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), run.ID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
@@ -5717,9 +5615,6 @@ func setupOpeningPRTest(t *testing.T, forgeFor func(string) (forge.Forge, error)
 		PRTitle:    "Speed up queries",
 		PRBody:     "Replaced linear scan with hash map lookup.",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, _, _ := setupTestHarness(t, nil)
 	fixedTime := time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC)
@@ -5731,6 +5626,7 @@ func setupOpeningPRTest(t *testing.T, forgeFor func(string) (forge.Forge, error)
 		Clock:        func() time.Time { return fixedTime },
 		ForgeFor:     forgeFor,
 	})
+	putTestRun(t, ctx, orch, run)
 	return orch, store, repo, run
 }
 
@@ -5746,7 +5642,7 @@ func TestOrchestrator_OpeningPR_OpensPullRequest_Succeeds(t *testing.T) {
 	}
 
 	// 1. Verify run ended in Succeeded with PRURL set
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5809,7 +5705,7 @@ func TestOrchestrator_OpeningPR_ReusesOpenPullRequest(t *testing.T) {
 	}
 
 	// 1. Verify run ended in Succeeded with existing PR URL recorded
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5852,7 +5748,7 @@ func TestOrchestrator_OpeningPR_GitRemote_CannotOpenPR(t *testing.T) {
 	}
 
 	// 1. Verify run ended in Succeeded without PRURL
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5892,7 +5788,7 @@ func TestOrchestrator_OpeningPR_OpenPullRequestError_Fails(t *testing.T) {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -5950,9 +5846,6 @@ func TestOrchestrator_Selecting_PushesAndOpensPullRequest_WithFakeForge(t *testi
 		PRTitle:     "Add feature",
 		PRBody:      "Implements feature",
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &scriptedExportServer{
 		commands: map[string]string{
@@ -5988,13 +5881,14 @@ func TestOrchestrator_Selecting_PushesAndOpensPullRequest_WithFakeForge(t *testi
 			return fakeForge, nil
 		},
 	})
+	putTestRun(t, ctx, orch, run)
 
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile: %v", err)
 	}
 
 	// 1. Verify run ended in Succeeded with Branch and PRURL set
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -6144,9 +6038,6 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 			Body: "run1 goal",
 		},
 	}
-	if err := store.PutRun(ctx, run1); err != nil {
-		t.Fatalf("PutRun 1: %v", err)
-	}
 
 	run2ID := "20261030T120000Z-run2"
 	sb2Name := "run-20261030t120000z-run2"
@@ -6157,9 +6048,6 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 		Phase:       state.PhasePreparing,
 		BaseCommit:  "commit-base2",
 		SandboxName: sb2Name,
-	}
-	if err := store.PutRun(ctx, run2); err != nil {
-		t.Fatalf("PutRun 2: %v", err)
 	}
 
 	toolEntered := make(chan struct{})
@@ -6214,6 +6102,8 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 		Clock:        func() time.Time { return fixedTime },
 		MaxTurns:     30,
 	})
+	putTestRun(t, ctx, orch, run1)
+	putTestRun(t, ctx, orch, run2)
 
 	// 1. Reconcile run1 (Working). This starts the turn worker, which runs in a goroutine.
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo1.Key(), run1ID)); err != nil {
@@ -6233,7 +6123,7 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 	}
 
 	// Verify run2 reached Working phase even though run1 is still blocked in its turn.
-	gotRun2, err := store.GetRun(ctx, repo2.Key(), run2ID)
+	gotRun2, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run2ID)
 	if err != nil {
 		t.Fatalf("GetRun run2: %v", err)
 	}
@@ -6257,7 +6147,7 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 		t.Fatalf("orch.Reconcile run1 outcome: %v", err)
 	}
 
-	gotRun1, err := store.GetRun(ctx, repo1.Key(), run1ID)
+	gotRun1, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run1ID)
 	if err != nil {
 		t.Fatalf("GetRun run1: %v", err)
 	}
@@ -6294,9 +6184,6 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 			BaseCommit:  "base-sha",
 			SandboxName: sandboxName,
 		}
-		if err := store.PutRun(ctx, run); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 
 		harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
 		policy := sandboxv1beta1.ShutdownPolicyDelete
@@ -6313,12 +6200,13 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 			SessionStore: sessionStore,
 			Harness:      harness,
 		})
+		putTestRun(t, ctx, orch, run)
 
 		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("reconcileWorkingRun: %v", err)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -6344,9 +6232,6 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 			BaseCommit:  "base-sha",
 			SandboxName: sandboxName,
 		}
-		if err := store.PutRun(ctx, run); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 
 		// Use failing LLM so session fails
 		harness, _, _ := setupTestHarnessWithLLM(t, nil, &failingChatClient{})
@@ -6355,12 +6240,13 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 			SessionStore: sessionStore,
 			Harness:      harness,
 		})
+		putTestRun(t, ctx, orch, run)
 
 		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
 			t.Logf("reconcileWorkingRun completed (errors handled)")
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -6401,9 +6287,6 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 		BaseCommit:  "base-sha",
 		SandboxName: sandboxName,
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
 	policy := sandboxv1beta1.ShutdownPolicyDelete
@@ -6422,6 +6305,7 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 		Harness:      harness,
 		Clock:        func() time.Time { return fixedTime },
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Pre-store an outcome for the run
 	orch.ensureRunState(runID)
@@ -6435,7 +6319,7 @@ func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
 		t.Fatalf("orch.Reconcile pass 1: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -6652,9 +6536,6 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 				},
 			},
 		}
-		if err := store.PutRun(ctx, run); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 
 		harness, agentsCS, _ := setupTestHarness(t, nil)
 		orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -6665,12 +6546,13 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 				return currentTime
 			},
 		})
+		putTestRun(t, ctx, orch, run)
 
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -6721,9 +6603,6 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 				Name: "no-budget",
 			},
 		}
-		if err := store.PutRun(ctx, run); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 
 		harness, agentsCS, _ := setupTestHarness(t, nil)
 		orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -6734,12 +6613,13 @@ func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
 				return currentTime
 			},
 		})
+		putTestRun(t, ctx, orch, run)
 
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -6851,9 +6731,6 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 			Body: "test goal",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	step1Finished := make(chan struct{})
 	step2Entered := make(chan struct{})
@@ -6932,6 +6809,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 		Clock:        getClock,
 		MaxTurns:     30,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// 1. First reconcile pass starts the turn worker. RequeueAfter should be 0.
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -7024,7 +6902,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 		t.Fatalf("orch.Reconcile outcome: %v", err)
 	}
 
-	gotRunFinal, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRunFinal, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -7078,9 +6956,6 @@ func TestOrchestrator_Working_MissingOrExpiredSandboxAtStart_CarriesOn(t *testin
 				Body: "test goal",
 			},
 		}
-		if err := store.PutRun(ctx, run); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 
 		harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
 
@@ -7120,12 +6995,13 @@ func TestOrchestrator_Working_MissingOrExpiredSandboxAtStart_CarriesOn(t *testin
 				return currentTime
 			},
 		})
+		putTestRun(t, ctx, orch, run)
 
 		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("reconcileWorkingRun: %v", err)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -7174,9 +7050,6 @@ func TestOrchestrator_Working_MissingOrExpiredSandboxAtStart_CarriesOn(t *testin
 				Body: "test goal",
 			},
 		}
-		if err := store.PutRun(ctx, run); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 
 		harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
 
@@ -7185,12 +7058,13 @@ func TestOrchestrator_Working_MissingOrExpiredSandboxAtStart_CarriesOn(t *testin
 			SessionStore: sessionStore,
 			Harness:      harness,
 		})
+		putTestRun(t, ctx, orch, run)
 
 		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("reconcileWorkingRun: %v", err)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -7521,7 +7395,7 @@ func (m *midTurnBlockingLLM) CreateChatCompletion(ctx context.Context, req llm.C
 	}
 }
 
-func setupWorkingTestRun(t *testing.T, runID, sbName string, deadline *time.Time, llmClient llm.ChatClient) (*state.FileStore, *session.FileStore, *state.Repo, *state.Run, *session.Harness, *fakeagents.Clientset) {
+func setupWorkingTestRun(t *testing.T, runID, sbName string, deadline *time.Time, llmClient llm.ChatClient) (*state.FileStore, *session.FileStore, *state.Repo, *state.Run, *session.Harness, *fakeagents.Clientset, client.Client) {
 	t.Helper()
 	store := state.NewFileStore(t.TempDir())
 	sessionStore := session.NewFileStore(t.TempDir())
@@ -7545,16 +7419,19 @@ func setupWorkingTestRun(t *testing.T, runID, sbName string, deadline *time.Time
 		Deadline:    deadline,
 		Goal:        &goals.Goal{Name: "test-goal", Body: "body"},
 	}
-	if err := store.PutRun(t.Context(), run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, llmClient)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+	fakeClient := newTestFakeClientBuilder(scheme).Build()
+	putTestHeroRun(t, t.Context(), fakeClient, harness.Namespace(), repo.URL, run)
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	shutdownTime := time.Now().Add(time.Hour)
 	if deadline != nil {
 		shutdownTime = deadline.Add(15 * time.Minute)
 	}
-	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(t.Context(), &sandboxv1beta1.Sandbox{
+	_, err = agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(t.Context(), &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: "ao-sandboxes", Labels: map[string]string{LabelRun: runID}},
 		Spec: sandboxv1beta1.SandboxSpec{
 			Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: shutdownTime}, ShutdownPolicy: &policy},
@@ -7564,7 +7441,7 @@ func setupWorkingTestRun(t *testing.T, runID, sbName string, deadline *time.Time
 	if err != nil {
 		t.Fatalf("creating sandbox: %v", err)
 	}
-	return store, sessionStore, repo, run, harness, agentsCS
+	return store, sessionStore, repo, run, harness, agentsCS, fakeClient
 }
 
 func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
@@ -7574,15 +7451,16 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 	deadline := startTime.Add(10 * time.Minute)
 
 	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, run, harness, agentsCS := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
+	store, sessionStore, repo, run, harness, agentsCS, fakeClient := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
 	run.SetPhase(state.PhaseWorking, startTime)
-	_ = store.PutRun(ctx, run)
 
 	currentTime := startTime
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store: store, SessionStore: sessionStore, Harness: harness,
-		Clock: func() time.Time { return currentTime },
+		Clock:      func() time.Time { return currentTime },
+		KubeClient: fakeClient,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil || res.RequeueAfter != 10*time.Minute {
@@ -7606,7 +7484,7 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 		t.Fatal("expected worker context to be cancelled")
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil || gotRun.Phase != state.PhaseFailed {
 		t.Fatalf("expected phase Failed, got %v (err %v)", gotRun.Phase, err)
 	}
@@ -7639,7 +7517,7 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile with leftover outcome: %v", err)
 	}
-	gotRunAfter, _ := store.GetRun(ctx, repo.Key(), runID)
+	gotRunAfter, _ := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if gotRunAfter.Phase != state.PhaseFailed {
 		t.Errorf("expected phase to remain Failed, got %s", gotRunAfter.Phase)
 	}
@@ -7685,11 +7563,12 @@ func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
 			deadline := startTime.Add(30 * time.Minute)
 
 			blockingLLM := newMidTurnBlockingLLM()
-			store, sessionStore, repo, _, harness, agentsCS := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
+			store, sessionStore, repo, _, harness, agentsCS, fakeClient := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
 
 			orch := newTestOrchestrator(t, OrchestratorOptions{
 				Store: store, SessionStore: sessionStore, Harness: harness,
-				Clock: func() time.Time { return startTime },
+				Clock:      func() time.Time { return startTime },
+				KubeClient: fakeClient,
 			})
 
 			if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
@@ -7723,7 +7602,7 @@ func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
 				t.Fatalf("Reconcile after worker finish: %v", err)
 			}
 
-			gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+			gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 			if err != nil || gotRun.Phase != state.PhaseNoImprovement {
 				t.Fatalf("expected phase NoImprovement, got %v (err %v)", gotRun.Phase, err)
 			}
@@ -7748,12 +7627,13 @@ func TestOrchestrator_Working_RequeueRemainingDeadline(t *testing.T) {
 	deadline := startTime.Add(25 * time.Minute)
 
 	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
+	store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
 
 	currentTime := startTime
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store: store, SessionStore: sessionStore, Harness: harness,
-		Clock: func() time.Time { return currentTime },
+		Clock:      func() time.Time { return currentTime },
+		KubeClient: fakeClient,
 	})
 
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
@@ -7781,12 +7661,13 @@ func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T)
 	startTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
 	deadline := startTime.Add(10 * time.Minute)
 
-	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, &deadline, &llm.ElizaClient{})
+	store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, &deadline, &llm.ElizaClient{})
 
 	currentTime := startTime
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store: store, SessionStore: sessionStore, Harness: harness,
-		Clock: func() time.Time { return currentTime },
+		Clock:      func() time.Time { return currentTime },
+		KubeClient: fakeClient,
 	})
 
 	// Store an outcome that finished before the deadline
@@ -7803,7 +7684,7 @@ func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T)
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -7869,9 +7750,6 @@ func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
 			Name: "test-goal",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{
 		exitCode: 0,
@@ -7903,13 +7781,14 @@ func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
 		PortalBinder:  binder,
 		PolicyFactory: policyFactory,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: Reconcile Pending -> Preparing
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile step 1: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -7964,7 +7843,7 @@ func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
 		t.Fatalf("Reconcile step 2: %v", err)
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun after step 2: %v", err)
 	}
@@ -8081,9 +7960,6 @@ func TestOrchestrator_PortalBinder_FailsAfterDeadline(t *testing.T) {
 			Name: "test-goal",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{}
 	harness, agentsCS, coreCS := setupTestHarness(t, procSrv)
@@ -8110,13 +7986,14 @@ func TestOrchestrator_PortalBinder_FailsAfterDeadline(t *testing.T) {
 		PortalBinder:  binder,
 		PolicyFactory: portal.HostListPolicyFactory(nil),
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: Pending -> Preparing (sets ReadyDeadline)
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile step 1: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -8160,7 +8037,7 @@ func TestOrchestrator_PortalBinder_FailsAfterDeadline(t *testing.T) {
 		t.Errorf("expected RequeueAfter == %v for retry, got %v", portalBindRetryInterval, res.RequeueAfter)
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -8178,7 +8055,7 @@ func TestOrchestrator_PortalBinder_FailsAfterDeadline(t *testing.T) {
 		t.Logf("Reconcile returned nil error (as terminal failures are logged)")
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -8238,9 +8115,6 @@ func TestOrchestrator_PortalBinder_FactoryErrorFailsAfterDeadline(t *testing.T) 
 			Name: "test-goal",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{}
 	harness, agentsCS, coreCS := setupTestHarness(t, procSrv)
@@ -8266,13 +8140,14 @@ func TestOrchestrator_PortalBinder_FactoryErrorFailsAfterDeadline(t *testing.T) 
 		PortalBinder:  binder,
 		PolicyFactory: policyFactory,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: Pending -> Preparing (sets ReadyDeadline)
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile step 1: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -8316,7 +8191,7 @@ func TestOrchestrator_PortalBinder_FactoryErrorFailsAfterDeadline(t *testing.T) 
 		t.Errorf("expected RequeueAfter == %v for retry, got %v", portalBindRetryInterval, res.RequeueAfter)
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -8340,7 +8215,7 @@ func TestOrchestrator_PortalBinder_FactoryErrorFailsAfterDeadline(t *testing.T) 
 		t.Logf("Reconcile returned nil error (as terminal failures are logged)")
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -8400,9 +8275,6 @@ func TestOrchestrator_PortalBinder_DisabledWithoutBinder(t *testing.T) {
 			Name: "test-goal",
 		},
 	}
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	procSrv := &mockProcessServer{
 		exitCode: 0,
@@ -8417,13 +8289,14 @@ func TestOrchestrator_PortalBinder_DisabledWithoutBinder(t *testing.T) {
 		Clock:        func() time.Time { return fixedTime },
 		PortalBinder: nil, // disabled
 	})
+	putTestRun(t, ctx, orch, run)
 
 	// Step 1: Reconcile Pending -> Preparing
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile step 1: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -8466,7 +8339,7 @@ func TestOrchestrator_PortalBinder_DisabledWithoutBinder(t *testing.T) {
 		t.Fatalf("Reconcile step 2: %v", err)
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun after step 2: %v", err)
 	}
@@ -8527,14 +8400,12 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 
 	t.Run("with StorageClass set claim exists and sandbox mounts it", func(t *testing.T) {
 		runID := "20261030T120000Z-scset"
-		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 		fakeClient := newTestFakeClientBuilder(scheme).Build()
 		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store: store, Harness: harness, KubeClient: fakeClient,
 			WorkspaceStorageClass: "standard", WorkspaceSize: "20Gi",
 		})
+		putTestRun(t, ctx, orch, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending})
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
@@ -8595,7 +8466,7 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			t.Errorf("expected home mount with name 'workspace' and subPath 'home', got %+v", homeMount)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -8606,9 +8477,6 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 
 	t.Run("second pass reuses existing claim", func(t *testing.T) {
 		runID := "20261030T120000Z-reuse"
-		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 		name := sandboxNameForRun(runID)
 		const existingUID = types.UID("existing-claim-uid-123")
 		scName := "standard"
@@ -8624,6 +8492,7 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			Store: store, Harness: harness, KubeClient: fakeClient,
 			WorkspaceStorageClass: "standard",
 		})
+		putTestRun(t, ctx, orch, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending})
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
@@ -8641,7 +8510,7 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			t.Errorf("expected workspace volume to mount claim %s, got %+v", name, vol)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -8652,13 +8521,11 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 
 	t.Run("with no StorageClass no claim is created and sandbox uses emptyDir", func(t *testing.T) {
 		runID := "20261030T120000Z-noclaim"
-		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 		fakeClient := newTestFakeClientBuilder(scheme).Build()
 		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store: store, Harness: harness, KubeClient: fakeClient,
 		})
+		putTestRun(t, ctx, orch, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending})
 		if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
@@ -8704,7 +8571,7 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			t.Errorf("expected home mount with name 'home' and empty subPath, got %+v", homeMount)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -8715,9 +8582,6 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 
 	t.Run("with StorageClass set fails when HeroRun owner is unavailable", func(t *testing.T) {
 		runID := "20261030T120000Z-noowner"
-		if err := store.PutRun(ctx, &state.Run{ID: runID, Repo: repo.Key(), GoalName: "goal", Phase: state.PhasePending}); err != nil {
-			t.Fatalf("PutRun: %v", err)
-		}
 		name := sandboxNameForRun(runID)
 		hrWithoutUID := &herorunv1alpha1.HeroRun{
 			ObjectMeta: metav1.ObjectMeta{
@@ -8744,7 +8608,7 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			t.Fatalf("orch.Reconcile: %v", err)
 		}
 
-		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
@@ -8845,7 +8709,7 @@ func TestOrchestrator_Working_StartSession_CreatesChildSession(t *testing.T) {
 	}
 	childName := strings.TrimSuffix(parts[3], ".")
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), run.ID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -8898,7 +8762,6 @@ func TestOrchestrator_StartSession_SharesSandboxOwnerAndTurnBudget(t *testing.T)
 	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
 	_ = store.PutRepo(ctx, repo)
 	run := &state.Run{ID: "run-sb-owner", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-owner"}
-	_ = store.PutRun(ctx, run)
 
 	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
 	orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -8907,6 +8770,7 @@ func TestOrchestrator_StartSession_SharesSandboxOwnerAndTurnBudget(t *testing.T)
 		Harness:      harness,
 		MaxTurns:     5,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootsb", session.Metadata{
 		RunID: run.ID,
@@ -8957,7 +8821,6 @@ func TestOrchestrator_StartSession_DepthLimit(t *testing.T) {
 	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
 	_ = store.PutRepo(ctx, repo)
 	run := &state.Run{ID: "run-depth-test", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-depth"}
-	_ = store.PutRun(ctx, run)
 
 	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
 	orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -8966,6 +8829,7 @@ func TestOrchestrator_StartSession_DepthLimit(t *testing.T) {
 		Harness:         harness,
 		MaxSessionDepth: 3,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	root, err := harness.NewSession(ctx, sessionStore, "root", session.Metadata{
 		RunID: run.ID,
@@ -9077,7 +8941,6 @@ func TestOrchestrator_StartSession_NoLLMClient(t *testing.T) {
 	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
 	_ = store.PutRepo(ctx, repo)
 	run := &state.Run{ID: "run-no-llm", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-no-llm"}
-	_ = store.PutRun(ctx, run)
 
 	harness, _, _ := setupTestHarness(t, nil)
 	orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -9085,6 +8948,7 @@ func TestOrchestrator_StartSession_NoLLMClient(t *testing.T) {
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootnollm", session.Metadata{
 		RunID: run.ID,
@@ -9108,7 +8972,6 @@ func TestOrchestrator_StartSession_NoTurnBudget(t *testing.T) {
 	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
 	_ = store.PutRepo(ctx, repo)
 	run := &state.Run{ID: "run-no-budget", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-no-budget"}
-	_ = store.PutRun(ctx, run)
 
 	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
 	orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -9116,6 +8979,7 @@ func TestOrchestrator_StartSession_NoTurnBudget(t *testing.T) {
 		SessionStore: sessionStore,
 		Harness:      harness,
 	})
+	putTestRun(t, ctx, orch, run)
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootnobudget", session.Metadata{
 		RunID: run.ID,
@@ -9136,13 +9000,14 @@ func TestOrchestrator_StartSession_NoTurnBudget(t *testing.T) {
 func TestOrchestrator_StartSession_RunBounds_ChildStopsWhenRunEnds(t *testing.T) {
 	ctx := t.Context()
 	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, "run-child-bound", "sb-bound", nil, blockingLLM)
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, "run-child-bound", "sb-bound", nil, blockingLLM)
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        time.Now,
+		KubeClient:   fakeClient,
 	})
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootbound", session.Metadata{
@@ -9188,13 +9053,14 @@ func TestOrchestrator_StartSession_RunBounds_ChildStopsWhenRunEnds(t *testing.T)
 func TestOrchestrator_Working_ChildrenStopWhenTopLevelFinishes(t *testing.T) {
 	ctx := t.Context()
 	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, "run-child-topfinish", "sb-topfinish", nil, blockingLLM)
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, "run-child-topfinish", "sb-topfinish", nil, blockingLLM)
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        time.Now,
+		KubeClient:   fakeClient,
 	})
 
 	root, err := harness.NewSession(ctx, sessionStore, "roottopfinish", session.Metadata{
@@ -9316,13 +9182,11 @@ func TestOrchestrator_Working_ListSessions_RootAndChildren(t *testing.T) {
 		},
 	}
 
-	orch, store, _, repo, run := setupSelectingRun(t, state.PhaseWorking, "base-sha", &mockProcessServer{}, listLLM)
+	orch, _, _, repo, run := setupSelectingRun(t, state.PhaseWorking, "base-sha", &mockProcessServer{}, listLLM)
 
 	// Ensure run has a session ID
 	run.SessionID = generateSessionID(run.ID)
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
+	putTestRun(t, ctx, orch, run)
 
 	// Pre-create a stopped child session
 	_, err := orch.harness.NewSession(ctx, orch.sessionStore, "childstopped", session.Metadata{
@@ -9365,13 +9229,14 @@ func TestOrchestrator_Working_ListSessions_RootAndChildren(t *testing.T) {
 func TestOrchestrator_ListSessions_RunningChild(t *testing.T) {
 	ctx := t.Context()
 	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, "run-list-running", "sb-list-running", nil, blockingLLM)
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, "run-list-running", "sb-list-running", nil, blockingLLM)
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        time.Now,
+		KubeClient:   fakeClient,
 	})
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootrunning", session.Metadata{
@@ -9562,12 +9427,13 @@ func TestOrchestrator_Working_ChildSession_CanCallListSessions(t *testing.T) {
 func TestOrchestrator_PostMessage_Validation(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-postval", "run-postval"
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	// 1. Empty message text
@@ -9668,12 +9534,13 @@ func TestOrchestrator_PostMessage_RunJSONDeletedSucceeds(t *testing.T) {
 func TestOrchestrator_PostMessage_DeliveredOnNextTurn(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-postnext", "run-postnext"
-	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	customMsg := "Please optimize the database queries."
@@ -9685,7 +9552,7 @@ func TestOrchestrator_PostMessage_DeliveredOnNextTurn(t *testing.T) {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -9768,7 +9635,7 @@ func TestOrchestrator_PostMessage_DeliveredBeforeNextModelCall(t *testing.T) {
 		},
 	}
 
-	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, mockLLM)
+	store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, mockLLM)
 
 	// Override sandbox to block on tool call
 	fakeSB := &blockingToolSandbox{
@@ -9781,6 +9648,7 @@ func TestOrchestrator_PostMessage_DeliveredBeforeNextModelCall(t *testing.T) {
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	req := runRequest(orch, repo.Key(), runID)
@@ -9863,12 +9731,13 @@ func TestOrchestrator_PostMessage_DeliveredBeforeNextModelCall(t *testing.T) {
 func TestOrchestrator_PostMessage_SurvivesRestart(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-postres", "run-postres"
-	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch1 := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	targetSessID := generateSessionID(runID)
@@ -9888,13 +9757,14 @@ func TestOrchestrator_PostMessage_SurvivesRestart(t *testing.T) {
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   orch1.kubeClient,
 	})
 
 	if _, err := reconcileWorkingRun(ctx, orch2, runRequest(orch2, repo.Key(), runID)); err != nil {
 		t.Fatalf("reconcileWorkingRun on orch2: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch2.kubeClient, orch2.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -9927,12 +9797,13 @@ func TestOrchestrator_PostMessage_SurvivesRestart(t *testing.T) {
 func TestOrchestrator_PostMessage_SessionWriteFails_RemainsPending(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-postfail", "run-postfail"
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	// Create a session backed by a failing session store.
@@ -9949,9 +9820,7 @@ func TestOrchestrator_PostMessage_SessionWriteFails_RemainsPending(t *testing.T)
 		t.Fatalf("NewSession: %v", err)
 	}
 	run.SessionID = failingSess.Name
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
+	putTestRun(t, ctx, orch, run)
 
 	pendingText := "critical instruction that must not be lost"
 	if err := orch.PostMessage(ctx, repo.Key(), runID, pendingText); err != nil {
@@ -10016,12 +9885,13 @@ func TestOrchestrator_PostMessage_WhileTurnActive_DeliveredOnSubsequentTurn(t *t
 	runID, sbName := "20261123T120000Z-postmid", "run-postmid"
 
 	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, _, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, blockingLLM)
+	store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, blockingLLM)
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	req := runRequest(orch, repo.Key(), runID)
@@ -10066,7 +9936,7 @@ func TestOrchestrator_PostMessage_WhileTurnActive_DeliveredOnSubsequentTurn(t *t
 		t.Fatalf("Reconcile pass 2: %v", err)
 	}
 
-	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
@@ -10083,7 +9953,7 @@ func TestOrchestrator_PostMessage_WhileTurnActive_DeliveredOnSubsequentTurn(t *t
 		t.Fatalf("reconcileWorkingRun for turn 2: %v", err)
 	}
 
-	gotRun, err = store.GetRun(ctx, repo.Key(), runID)
+	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
 		t.Fatalf("GetRun after turn 2: %v", err)
 	}
@@ -10115,12 +9985,13 @@ func TestOrchestrator_PostMessage_WhileTurnActive_DeliveredOnSubsequentTurn(t *t
 func TestOrchestrator_SendMessage_Validation(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-msgval", "run-msgval"
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootval", session.Metadata{
@@ -10203,12 +10074,13 @@ func TestOrchestrator_SendMessage_ParentToChild_And_ChildToParent(t *testing.T) 
 		},
 	}
 
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, childLLM)
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, childLLM)
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootparent", session.Metadata{
@@ -10300,12 +10172,13 @@ func TestOrchestrator_SendMessage_ParentToChild_And_ChildToParent(t *testing.T) 
 func TestOrchestrator_SendMessage_OrderPreserved(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-msgorder", "run-msgorder"
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	s1, err := harness.NewSession(ctx, sessionStore, "sess1", session.Metadata{RunID: runID})
@@ -10357,12 +10230,13 @@ func TestOrchestrator_SendMessage_OrderPreserved(t *testing.T) {
 func TestOrchestrator_SendMessage_SurvivesRestart(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-msgsurvive", "run-msgsurvive"
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch1 := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	s1, err := harness.NewSession(ctx, sessionStore, "s1", session.Metadata{RunID: runID})
@@ -10397,6 +10271,7 @@ func TestOrchestrator_SendMessage_SurvivesRestart(t *testing.T) {
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   orch1.kubeClient,
 	})
 
 	if err := orch2.deliverPendingMessages(ctx, repo.Key(), runID, s2); err != nil {
@@ -10421,12 +10296,13 @@ func TestOrchestrator_SendMessage_SurvivesRestart(t *testing.T) {
 func TestOrchestrator_SendMessage_IdleRecipient_RefusedOrWoken(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-msgidle", "run-msgidle"
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootidle", session.Metadata{RunID: runID})
@@ -10582,12 +10458,13 @@ func TestOrchestrator_Working_SendMessage_ToolCall(t *testing.T) {
 func TestOrchestrator_Wait_MessageArrives(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-waitmsg", "run-waitmsg"
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	root, err := harness.NewSession(ctx, sessionStore, generateSessionID(runID), session.Metadata{RunID: runID, Repo: repo.Key().String()})
@@ -10666,9 +10543,7 @@ func TestOrchestrator_Wait_MessageArrives(t *testing.T) {
 
 	// 4. PostMessage from a human also wakes waitForEvent.
 	run.SetPhase(state.PhaseWorking, time.Now().UTC())
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
+	putTestRun(t, ctx, orch, run)
 	go func() {
 		out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
 		resCh <- waitRes{out: out, err: err}
@@ -10690,12 +10565,13 @@ func TestOrchestrator_Wait_MessageArrives(t *testing.T) {
 func TestOrchestrator_Wait_ChildStops(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-waitchild", "run-waitchild"
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
+		KubeClient:   fakeClient,
 	})
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootchild", session.Metadata{RunID: runID})
@@ -10788,13 +10664,14 @@ func TestOrchestrator_Wait_ChildStops(t *testing.T) {
 func TestOrchestrator_Wait_TimeoutRunEndAndDeadline(t *testing.T) {
 	ctx := t.Context()
 	runID, sbName := "20261123T120000Z-waitbounds", "run-waitbounds"
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        time.Now,
+		KubeClient:   fakeClient,
 	})
 
 	root, err := harness.NewSession(ctx, sessionStore, "rootbounds", session.Metadata{RunID: runID})
@@ -10989,19 +10866,18 @@ func TestOrchestrator_Wait_ToolCallUsesNoExtraTurns(t *testing.T) {
 		},
 	}
 
-	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, nil, scriptedLLM)
+	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, scriptedLLM)
 	run.SessionID = generateSessionID(runID)
 	run.SetPhase(state.PhaseWorking, time.Now().UTC())
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		Clock:        time.Now,
+		KubeClient:   fakeClient,
 	})
+	putTestRun(t, ctx, orch, run)
 	orch.ensureRunState(run.ID)
 
 	outcome := orch.runTurnWorker(ctx, repo, run, nil)

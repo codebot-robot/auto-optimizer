@@ -68,15 +68,6 @@ type Store interface {
 	// PutRun creates or updates a run record in run.json.
 	PutRun(ctx context.Context, run *Run) error
 
-	// GetRun retrieves a run record by repository key and run ID.
-	GetRun(ctx context.Context, key RepoKey, runID string) (*Run, error)
-
-	// FindRun searches across all registered repositories for a run by its ID.
-	FindRun(ctx context.Context, runID string) (*Run, error)
-
-	// ListRuns returns all runs for a repository sorted chronologically by run ID.
-	ListRuns(ctx context.Context, key RepoKey) ([]*Run, error)
-
 	// AppendEvent appends one or more events to events.jsonl for a run.
 	AppendEvent(ctx context.Context, key RepoKey, runID string, events ...Event) error
 
@@ -464,99 +455,6 @@ func (s *FileStore) PutRun(ctx context.Context, run *Run) error {
 	p := s.runPath(run.Repo, run.ID)
 	log.V(2).Info("putting run record", "repo", run.Repo.String(), "run", run.ID, "path", p)
 	return writeJSONAtomically(ctx, p, run)
-}
-
-// GetRun reads run.json for the given run ID.
-func (s *FileStore) GetRun(ctx context.Context, key RepoKey, runID string) (*Run, error) {
-	if err := ValidateRepoKey(key); err != nil {
-		return nil, err
-	}
-	if runID == "" {
-		return nil, errors.New("run id cannot be empty")
-	}
-
-	log := scoped.Log(ctx)
-	p := s.runPath(key, runID)
-	log.V(2).Info("getting run record", "repo", key.String(), "run", runID, "path", p)
-
-	data, err := os.ReadFile(p)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("run %q for repo %s: %w", runID, key, ErrNotFound)
-		}
-		return nil, fmt.Errorf("reading run record %s: %w", p, err)
-	}
-
-	var run Run
-	if err := json.Unmarshal(data, &run); err != nil {
-		return nil, fmt.Errorf("decoding run record %s: %w", p, err)
-	}
-	return &run, nil
-}
-
-// ListRuns returns all runs for a repository, sorted chronologically by run ID.
-func (s *FileStore) ListRuns(ctx context.Context, key RepoKey) ([]*Run, error) {
-	if err := ValidateRepoKey(key); err != nil {
-		return nil, err
-	}
-
-	log := scoped.Log(ctx)
-	runsDir := filepath.Join(s.repoDir(key), "runs")
-	log.V(2).Info("listing run records", "repo", key.String(), "dir", runsDir)
-
-	entries, err := os.ReadDir(runsDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading runs directory %s: %w", runsDir, err)
-	}
-
-	var runs []*Run
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		runID := entry.Name()
-		run, err := s.GetRun(ctx, key, runID)
-		if err != nil {
-			if !errors.Is(err, ErrNotFound) {
-				log.V(2).Info("failed to load run record", "run", runID, "error", err)
-			}
-			continue
-		}
-		runs = append(runs, run)
-	}
-
-	slices.SortFunc(runs, func(a, b *Run) int {
-		return strings.Compare(a.ID, b.ID)
-	})
-
-	return runs, nil
-}
-
-// FindRun searches across all registered repositories for a run by its ID.
-func (s *FileStore) FindRun(ctx context.Context, runID string) (*Run, error) {
-	if runID == "" {
-		return nil, errors.New("run id cannot be empty")
-	}
-
-	repos, err := s.ListRepos(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing repositories to find run: %w", err)
-	}
-
-	for _, repo := range repos {
-		run, err := s.GetRun(ctx, repo.Key(), runID)
-		if err == nil {
-			return run, nil
-		}
-		if !errors.Is(err, ErrNotFound) {
-			return nil, err
-		}
-	}
-
-	return nil, fmt.Errorf("run %q: %w", runID, ErrNotFound)
 }
 
 // appendJSONL appends records to a JSONL file, writing a leading newline before each batch.

@@ -16,6 +16,7 @@ package state
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -212,7 +213,7 @@ func TestGoal_PutGetListDelete(t *testing.T) {
 	}
 }
 
-func TestRun_PutGetList(t *testing.T) {
+func TestRun_PutRun(t *testing.T) {
 	ctx := t.Context()
 	storeDir := t.TempDir()
 	store := NewFileStore(storeDir)
@@ -221,202 +222,45 @@ func TestRun_PutGetList(t *testing.T) {
 	baseline := 150.0
 	candidate := 120.0
 	t1 := time.Date(2026, 10, 23, 10, 0, 0, 0, time.UTC)
-	t2 := time.Date(2026, 10, 23, 11, 0, 0, 0, time.UTC)
+	readyDeadline := t1.Add(5 * time.Minute)
+	deadline := t1.Add(time.Hour)
 
-	run1 := &Run{
-		ID:         "20261023T100000Z-0001",
-		Repo:       key,
-		GoalName:   "bench",
-		Phase:      PhaseSucceeded,
-		BaseCommit: "c0ffee",
-		Branch:     "ao/bench/20261023T100000Z-0001",
-		PRTitle:    "optimize benchmark",
-		PRBody:     "improves runtime by 15%",
-		PRURL:      "https://github.com/gke-labs/auto-optimizer/pull/1",
-		SessionID:  "sess-1",
-		Summary:    "optimized benchmark runtime",
-		Baseline:   &baseline,
-		Candidate:  &candidate,
-		CostUSD:    0.45,
-	}
-	run1.SetPhase(PhasePending, t1)
-	run1.SetPhase(PhaseSucceeded, t1.Add(5*time.Minute))
-
-	run2 := &Run{
-		ID:         "20261023T110000Z-0002",
-		Repo:       key,
-		GoalName:   "bench",
-		Phase:      PhaseFailed,
-		BaseCommit: "c0ffee",
-		Error:      "compilation failed",
-	}
-	run2.SetPhase(PhasePending, t2)
-	run2.SetPhase(PhaseFailed, t2.Add(2*time.Minute))
-
-	// Initially empty
-	runs, err := store.ListRuns(ctx, key)
-	if err != nil {
-		t.Fatalf("ListRuns on empty store failed: %v", err)
-	}
-	if len(runs) != 0 {
-		t.Fatalf("expected 0 runs, got %d", len(runs))
-	}
-
-	// Put in reverse order
-	if err := store.PutRun(ctx, run2); err != nil {
-		t.Fatalf("PutRun(run2) failed: %v", err)
-	}
-	if err := store.PutRun(ctx, run1); err != nil {
-		t.Fatalf("PutRun(run1) failed: %v", err)
-	}
-
-	// GetRun
-	got, err := store.GetRun(ctx, key, run1.ID)
-	if err != nil {
-		t.Fatalf("GetRun(run1) failed: %v", err)
-	}
-	if diff := cmp.Diff(run1, got); diff != "" {
-		t.Errorf("GetRun mismatch (-want +got):\n%s", diff)
-	}
-
-	// Missing run
-	_, err = store.GetRun(ctx, key, "missing-id")
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("expected ErrNotFound for missing run, got %v", err)
-	}
-
-	// ListRuns should be sorted chronologically by run ID: run1 then run2
-	allRuns, err := store.ListRuns(ctx, key)
-	if err != nil {
-		t.Fatalf("ListRuns failed: %v", err)
-	}
-	if len(allRuns) != 2 {
-		t.Fatalf("expected 2 runs, got %d", len(allRuns))
-	}
-	if allRuns[0].ID != run1.ID || allRuns[1].ID != run2.ID {
-		t.Errorf("unexpected order in ListRuns: got [%s, %s], want [%s, %s]",
-			allRuns[0].ID, allRuns[1].ID, run1.ID, run2.ID)
-	}
-}
-
-func TestRun_ReadyDeadline(t *testing.T) {
-	ctx := t.Context()
-	store := NewFileStore(t.TempDir())
-	key := RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
-
-	deadline := time.Date(2026, 10, 30, 12, 5, 0, 0, time.UTC)
 	run := &Run{
-		ID:            "20261030T120000Z-0001",
+		ID:            "20261023T100000Z-0001",
 		Repo:          key,
-		Phase:         PhasePreparing,
+		GoalName:      "bench",
+		Phase:         PhaseSucceeded,
+		BaseCommit:    "c0ffee",
+		Branch:        "ao/bench/20261023T100000Z-0001",
+		PRTitle:       "optimize benchmark",
+		PRBody:        "improves runtime by 15%",
+		PRURL:         "https://github.com/gke-labs/auto-optimizer/pull/1",
+		SessionID:     "sess-1",
 		SandboxName:   "run-sandbox-1",
-		ReadyDeadline: &deadline,
+		ReadyDeadline: &readyDeadline,
+		Deadline:      &deadline,
+		Summary:       "optimized benchmark runtime",
+		Baseline:      &baseline,
+		Candidate:     &candidate,
+		CostUSD:       0.45,
 	}
+	run.SetPhase(PhasePending, t1)
+	run.SetPhase(PhaseSucceeded, t1.Add(5*time.Minute))
 
 	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
+		t.Fatalf("PutRun failed: %v", err)
 	}
 
-	got, err := store.GetRun(ctx, key, run.ID)
+	data, err := os.ReadFile(store.runPath(key, run.ID))
 	if err != nil {
-		t.Fatalf("GetRun: %v", err)
+		t.Fatalf("reading exported run.json: %v", err)
 	}
-	if got.ReadyDeadline == nil || !got.ReadyDeadline.Equal(deadline) {
-		t.Errorf("expected ReadyDeadline %v, got %v", deadline, got.ReadyDeadline)
+	var got Run
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshaling exported run.json: %v", err)
 	}
-}
-
-func TestRun_Deadline(t *testing.T) {
-	ctx := t.Context()
-	store := NewFileStore(t.TempDir())
-	key := RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
-
-	deadline := time.Date(2026, 10, 30, 13, 0, 0, 0, time.UTC)
-	run := &Run{
-		ID:          "20261030T120000Z-0002",
-		Repo:        key,
-		Phase:       PhaseWorking,
-		SandboxName: "run-sandbox-2",
-		Deadline:    &deadline,
-	}
-
-	if err := store.PutRun(ctx, run); err != nil {
-		t.Fatalf("PutRun: %v", err)
-	}
-
-	got, err := store.GetRun(ctx, key, run.ID)
-	if err != nil {
-		t.Fatalf("GetRun: %v", err)
-	}
-	if got.Deadline == nil || !got.Deadline.Equal(deadline) {
-		t.Errorf("expected Deadline %v, got %v", deadline, got.Deadline)
-	}
-}
-
-func TestRun_FindRun(t *testing.T) {
-	ctx := t.Context()
-	storeDir := t.TempDir()
-	store := NewFileStore(storeDir)
-
-	// Empty ID returns error
-	if _, err := store.FindRun(ctx, ""); err == nil {
-		t.Error("expected error for empty run ID")
-	}
-
-	// Missing run in empty store
-	if _, err := store.FindRun(ctx, "missing-id"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("expected ErrNotFound for missing run, got %v", err)
-	}
-
-	// Create two repos
-	r1 := &Repo{
-		URL:            "https://github.com/gke-labs/repo-a",
-		Host:           "github.com",
-		Owner:          "gke-labs",
-		Name:           "repo-a",
-		DefaultBranch:  "main",
-		ForgeKind:      "github",
-		RegisteredTime: time.Now(),
-	}
-	r2 := &Repo{
-		URL:            "https://github.com/gke-labs/repo-b",
-		Host:           "github.com",
-		Owner:          "gke-labs",
-		Name:           "repo-b",
-		DefaultBranch:  "main",
-		ForgeKind:      "github",
-		RegisteredTime: time.Now(),
-	}
-	if err := store.PutRepo(ctx, r1); err != nil {
-		t.Fatalf("PutRepo(r1): %v", err)
-	}
-	if err := store.PutRepo(ctx, r2); err != nil {
-		t.Fatalf("PutRepo(r2): %v", err)
-	}
-
-	// Add run to repo-b
-	runB := &Run{
-		ID:       "20261023T150000Z-9999",
-		Repo:     r2.Key(),
-		GoalName: "perf",
-		Phase:    PhaseWorking,
-	}
-	if err := store.PutRun(ctx, runB); err != nil {
-		t.Fatalf("PutRun(runB): %v", err)
-	}
-
-	// Find runB across repos
-	found, err := store.FindRun(ctx, runB.ID)
-	if err != nil {
-		t.Fatalf("FindRun(%s) failed: %v", runB.ID, err)
-	}
-	if diff := cmp.Diff(runB, found); diff != "" {
-		t.Errorf("FindRun mismatch (-want +got):\n%s", diff)
-	}
-
-	// Missing run in non-empty store
-	if _, err := store.FindRun(ctx, "20261023T000000Z-0000"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("expected ErrNotFound, got %v", err)
+	if diff := cmp.Diff(run, &got); diff != "" {
+		t.Errorf("exported run.json mismatch (-want +got):\n%s", diff)
 	}
 }
 
