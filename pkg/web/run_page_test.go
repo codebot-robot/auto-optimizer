@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
+	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
@@ -178,5 +179,94 @@ func TestRenderRunPage_CancelledContext(t *testing.T) {
 	err := RenderRunPage(ctx, rec, RunPageData{})
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
+	}
+}
+
+func TestRunPageData_SessionTree(t *testing.T) {
+	t.Run("hierarchy", func(t *testing.T) {
+		data := RunPageData{
+			Sessions: []sessionapi.SessionSummary{
+				{Name: "root", InFlight: true},
+				{Name: "child-a", Parent: "root"},
+				{Name: "child-b", Parent: "root", InFlight: true},
+				{Name: "grandchild", Parent: "child-a"},
+			},
+		}
+
+		roots := data.SessionTree()
+		if len(roots) != 1 || roots[0].Name != "root" {
+			t.Fatalf("roots = %v, want [root]", roots)
+		}
+		if len(roots[0].Children) != 2 || roots[0].Children[0].Name != "child-a" || roots[0].Children[1].Name != "child-b" {
+			t.Fatalf("root children = %v, want [child-a, child-b]", roots[0].Children)
+		}
+		gc := roots[0].Children[0].Children
+		if len(gc) != 1 || gc[0].Name != "grandchild" {
+			t.Fatalf("child-a children = %v, want [grandchild]", gc)
+		}
+	})
+
+	t.Run("orphan_and_cycle_safe", func(t *testing.T) {
+		data := RunPageData{
+			Sessions: []sessionapi.SessionSummary{
+				{Name: "orphan", Parent: "missing"},
+				{Name: "self", Parent: "self"},
+				{Name: "cyc-a", Parent: "cyc-b"},
+				{Name: "cyc-b", Parent: "cyc-a"},
+				{Name: "orphan", Parent: "missing"}, // duplicate
+			},
+		}
+
+		roots := data.SessionTree()
+		if len(roots) != 3 {
+			t.Fatalf("len(roots) = %d, want 3 (orphan, self, cyc-b)", len(roots))
+		}
+	})
+}
+
+func TestRenderRunPage_SessionTree(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ts := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	data := RunPageData{
+		Run: &state.Run{
+			ID:       "20261124T100000Z-tree",
+			Repo:     state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"},
+			GoalName: "tree-goal",
+			Phase:    state.PhaseWorking,
+		},
+		Sessions: []sessionapi.SessionSummary{
+			{Name: "root-s", Toolset: "basic", CreatedAt: ts, MessageCount: 5, InFlight: true},
+			{Name: "child-1", Parent: "root-s", Toolset: "basic", CreatedAt: ts.Add(time.Minute), MessageCount: 1, InFlight: false},
+			{Name: "grandchild-1", Parent: "child-1", Toolset: "basic", CreatedAt: ts.Add(2 * time.Minute), MessageCount: 2, InFlight: true},
+		},
+	}
+
+	if err := RenderRunPage(t.Context(), rec, data); err != nil {
+		t.Fatalf("RenderRunPage: %v", err)
+	}
+
+	body := rec.Body.String()
+	for _, want := range []string{
+		`/sessions/root-s`,
+		`/sessions/child-1`,
+		`/sessions/grandchild-1`,
+		`<span class="badge badge-in-flight">running</span>`,
+		`<span class="badge badge-idle">stopped</span>`,
+		`1 message`,
+		`5 messages`,
+		`<ul class="session-tree session-tree-root">`,
+		`<ul class="session-tree">`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("rendered page missing %q\nbody:\n%s", want, body)
+		}
+	}
+
+	// Verify nested ordering: root-s appears before child-1, which appears before grandchild-1.
+	rootIdx := strings.Index(body, "/sessions/root-s")
+	childIdx := strings.Index(body, "/sessions/child-1")
+	grandIdx := strings.Index(body, "/sessions/grandchild-1")
+	if !(rootIdx < childIdx && childIdx < grandIdx) {
+		t.Errorf("unexpected session order in HTML: root=%d child=%d grandchild=%d", rootIdx, childIdx, grandIdx)
 	}
 }

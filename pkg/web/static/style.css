@@ -509,3 +509,41 @@ details.tool-result pre {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+.session-tree {
+  list-style: none;
+  margin: 0;
+  padding-left: 24px;
+  border-left: 2px solid var(--line);
+}
+
+.session-tree-root {
+  padding-left: 0;
+  border-left: none;
+}
+
+.session-tree-item {
+  margin-top: 8px;
+}
+
+.session-tree-root > .session-tree-item:first-child {
+  margin-top: 0;
+}
+
+.session-tree-node {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--canvas);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.session-meta {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+}
