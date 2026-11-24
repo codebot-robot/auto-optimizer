@@ -181,15 +181,14 @@ type HeroRunStatus struct {
 	// +optional
 	Error string `json:"error,omitempty"`
 
+	// ErrorKind classifies the fatal error (for example "failed" or "portal_bind_failed").
+	// +optional
+	ErrorKind string `json:"errorKind,omitempty"`
+
 	// ReadyDeadline is the deadline by which the sandbox environment must become ready.
 	// Temporary: retained for compatibility with today's reconciler until PhasePreparing is migrated to Run.
 	// +optional
 	ReadyDeadline *metav1.Time `json:"readyDeadline,omitempty"`
-
-	// PortalBoundAt is the time when the egress portal was bound to the sandbox.
-	// Temporary: retained for compatibility with today's reconciler until PhasePreparing is migrated to Run.
-	// +optional
-	PortalBoundAt *metav1.Time `json:"portalBoundAt,omitempty"`
 
 	// StartedAt is the time when the run started.
 	// +optional

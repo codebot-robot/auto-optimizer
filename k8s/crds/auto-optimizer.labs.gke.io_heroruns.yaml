@@ -251,6 +251,10 @@ spec:
                 description: Error holds any fatal error message that caused the run
                   to fail.
                 type: string
+              errorKind:
+                description: ErrorKind classifies the fatal error (for example "failed"
+                  or "portal_bind_failed").
+                type: string
               finishedAt:
                 description: FinishedAt is the time when the run reached a terminal
                   phase.
@@ -272,12 +276,6 @@ spec:
                 description: PhaseTimestamps tracks the timestamps of lifecycle phase
                   transitions.
                 type: object
-              portalBoundAt:
-                description: |-
-                  PortalBoundAt is the time when the egress portal was bound to the sandbox.
-                  Temporary: retained for compatibility with today's reconciler until PhasePreparing is migrated to Run.
-                format: date-time
-                type: string
               prBody:
                 description: PRBody is the markdown description of the pull request
                   for this run.

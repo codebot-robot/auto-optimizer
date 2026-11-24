@@ -16,9 +16,14 @@ package run
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
+	portalsv1 "github.com/gke-labs/service-portals/pkg/portals/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
@@ -26,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
+	"github.com/gke-labs/auto-optimizer/pkg/portal"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
@@ -490,5 +496,418 @@ func TestRunWorkflow_UnsupportedPhase(t *testing.T) {
 	_, err := wf.Run(ctx)
 	if err == nil {
 		t.Fatalf("expected error for unsupported phase, got nil")
+	}
+}
+
+func TestRunWorkflow_Preparing_NotReadyRequeues(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	runID := "20261124T120000Z-wfprepwait"
+	sbName := sandboxNameForRun(runID)
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	deadline := now.Add(10 * time.Second)
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+		Status:     herorunv1alpha1.HeroRunStatus{Phase: string(state.PhasePreparing)},
+	}
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: newTestFakeClientBuilder(scheme).WithObjects(hr).Build(),
+		Clock:      func() time.Time { return now },
+	})
+
+	run := &state.Run{
+		ID:            runID,
+		Repo:          repo.Key(),
+		Phase:         state.PhasePreparing,
+		SandboxName:   sbName,
+		ReadyDeadline: &deadline,
+	}
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if res.done {
+		t.Errorf("expected waiting result, got %+v", res)
+	}
+	if res.requeueAfter != 10*time.Second {
+		t.Errorf("requeueAfter = %v, want 10s", res.requeueAfter)
+	}
+	if wf.run.Phase != state.PhasePreparing {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhasePreparing)
+	}
+	if wf.hr.Status.Phase != string(state.PhasePreparing) {
+		t.Errorf("expected HeroRun status unchanged until caller saves, got %s", wf.hr.Status.Phase)
+	}
+}
+
+func TestRunWorkflow_Preparing_ReadyDeadlinePassedFails(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	runID := "20261124T120000Z-wfprepexp"
+	sbName := sandboxNameForRun(runID)
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	now := time.Date(2026, 11, 24, 12, 5, 0, 0, time.UTC)
+	deadline := now.Add(-time.Second)
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+		Status:     herorunv1alpha1.HeroRunStatus{Phase: string(state.PhasePreparing)},
+	}
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: newTestFakeClientBuilder(scheme).WithObjects(hr).Build(),
+		Clock:      func() time.Time { return now },
+	})
+
+	run := &state.Run{
+		ID:            runID,
+		Repo:          repo.Key(),
+		Phase:         state.PhasePreparing,
+		SandboxName:   sbName,
+		ReadyDeadline: &deadline,
+	}
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if !res.done {
+		t.Fatalf("expected res.done to be true")
+	}
+	if wf.run.Phase != state.PhaseFailed {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseFailed)
+	}
+	if wf.run.ErrorKind != "failed" {
+		t.Errorf("errorKind = %q, want %q", wf.run.ErrorKind, "failed")
+	}
+	if wf.run.ReadyDeadline != nil {
+		t.Errorf("expected ReadyDeadline to be cleared, got %v", wf.run.ReadyDeadline)
+	}
+	if !strings.Contains(wf.run.Error, "sandbox not ready before deadline") {
+		t.Errorf("unexpected error: %q", wf.run.Error)
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); err != nil {
+		t.Errorf("expected sandbox to remain until caller saves terminal state, got err: %v", err)
+	}
+}
+
+func TestRunWorkflow_Preparing_ReadyAdvancesToWorking(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	procSrv := &mockProcessServer{}
+	harness, agentsCS, coreCS := setupTestHarness(t, procSrv)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	runID := "20261124T120000Z-wfprepready"
+	sbName := sandboxNameForRun(runID)
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type:   string(sandboxv1beta1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			}},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+	if _, err := coreCS.CoreV1().Pods(harness.Namespace()).Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sbName,
+			Namespace: harness.Namespace(),
+			UID:       types.UID("pod-uid-wfprep"),
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating pod: %v", err)
+	}
+
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	deadline := now.Add(time.Minute)
+	binder := &fakePortalBinder{}
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+		Status:     herorunv1alpha1.HeroRunStatus{Phase: string(state.PhasePreparing)},
+	}
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:         store,
+		Harness:       harness,
+		KubeClient:    newTestFakeClientBuilder(scheme).WithObjects(hr).Build(),
+		Clock:         func() time.Time { return now },
+		GitAuthor:     "auto-optimizer <ao@example.com>",
+		PortalBinder:  binder,
+		PolicyFactory: portal.HostListPolicyFactory([]string{"github.com"}),
+	})
+
+	run := &state.Run{
+		ID:            runID,
+		Repo:          repo.Key(),
+		BaseCommit:    "abc123",
+		Phase:         state.PhasePreparing,
+		SandboxName:   sbName,
+		ReadyDeadline: &deadline,
+	}
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if res.done || res.requeueAfter != 0 {
+		t.Errorf("expected immediate requeue result, got %+v", res)
+	}
+	if wf.run.Phase != state.PhaseWorking {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseWorking)
+	}
+	if wf.run.ReadyDeadline != nil {
+		t.Errorf("expected ReadyDeadline to be cleared, got %v", wf.run.ReadyDeadline)
+	}
+	if wf.hr.Status.Phase != string(state.PhasePreparing) {
+		t.Errorf("expected HeroRun status unchanged until caller saves, got %s", wf.hr.Status.Phase)
+	}
+}
+
+func TestRunWorkflow_Preparing_PortalBindRetryAndDeadline(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	harness, agentsCS, coreCS := setupTestHarness(t, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	runID := "20261124T120000Z-wfportal"
+	sbName := sandboxNameForRun(runID)
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type:   string(sandboxv1beta1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			}},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+	if _, err := coreCS.CoreV1().Pods(harness.Namespace()).Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sbName,
+			Namespace: harness.Namespace(),
+			UID:       types.UID("pod-uid-wfportal"),
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating pod: %v", err)
+	}
+
+	currentTime := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	deadline := currentTime.Add(30 * time.Second)
+	binder := &fakePortalBinder{
+		bindFunc: func(context.Context, types.UID, *portalsv1.EgressPolicy) error {
+			return errors.New("portal lagging")
+		},
+	}
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+		Status:     herorunv1alpha1.HeroRunStatus{Phase: string(state.PhasePreparing)},
+	}
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:         store,
+		Harness:       harness,
+		KubeClient:    newTestFakeClientBuilder(scheme).WithObjects(hr).Build(),
+		Clock:         func() time.Time { return currentTime },
+		PortalBinder:  binder,
+		PolicyFactory: portal.HostListPolicyFactory(nil),
+	})
+
+	run := &state.Run{
+		ID:            runID,
+		Repo:          repo.Key(),
+		Phase:         state.PhasePreparing,
+		SandboxName:   sbName,
+		ReadyDeadline: &deadline,
+	}
+
+	// Before deadline: requeues at portalBindRetryInterval.
+	wf := newRunWorkflow(orch, repo, run, hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run before deadline: %v", err)
+	}
+	if res.done || res.requeueAfter != portalBindRetryInterval {
+		t.Errorf("expected retry after %v, got %+v", portalBindRetryInterval, res)
+	}
+	if wf.run.Phase != state.PhasePreparing {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhasePreparing)
+	}
+
+	// After deadline: fails with ErrorKind portal_bind_failed and leaves deletion to caller.
+	currentTime = deadline.Add(time.Second)
+	res, err = wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run after deadline: %v", err)
+	}
+	if !res.done {
+		t.Fatalf("expected res.done to be true")
+	}
+	if wf.run.Phase != state.PhaseFailed {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseFailed)
+	}
+	if wf.run.ErrorKind != "portal_bind_failed" {
+		t.Errorf("errorKind = %q, want %q", wf.run.ErrorKind, "portal_bind_failed")
+	}
+	if wf.run.ReadyDeadline != nil {
+		t.Errorf("expected ReadyDeadline to be cleared, got %v", wf.run.ReadyDeadline)
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); err != nil {
+		t.Errorf("expected sandbox to remain until caller saves terminal state, got err: %v", err)
+	}
+}
+
+func TestReconcileWorkflow_TerminalFailure_SavesBeforeDeletingSandbox(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	runID := "20261124T120000Z-wfsaveorder"
+	sbName := sandboxNameForRun(runID)
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	now := time.Date(2026, 11, 24, 12, 5, 0, 0, time.UTC)
+	deadline := now.Add(-time.Second)
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: harness.Namespace()},
+		Spec:       herorunv1alpha1.HeroRunSpec{RunID: runID, Repository: repo.URL},
+		Status:     herorunv1alpha1.HeroRunStatus{Phase: string(state.PhasePreparing)},
+	}
+
+	// Build a fake client without the HeroRun so Status().Update fails.
+	failingClient := newTestFakeClientBuilder(scheme).Build()
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:      store,
+		Harness:    harness,
+		KubeClient: failingClient,
+		Clock:      func() time.Time { return now },
+	})
+
+	run := &state.Run{
+		ID:            runID,
+		Repo:          repo.Key(),
+		Phase:         state.PhasePreparing,
+		SandboxName:   sbName,
+		ReadyDeadline: &deadline,
+	}
+	if _, err := orch.reconcileWorkflow(ctx, newRunWorkflow(orch, repo, run, hr)); err == nil {
+		t.Fatalf("expected error when saving terminal HeroRun fails")
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("sandbox must not be deleted when saving terminal state fails: %v", err)
+	}
+
+	// Once the HeroRun exists and saving succeeds, the sandbox is deleted.
+	if err := failingClient.Create(ctx, hr); err != nil {
+		t.Fatalf("Create HeroRun: %v", err)
+	}
+	runRetry := &state.Run{
+		ID:            runID,
+		Repo:          repo.Key(),
+		Phase:         state.PhasePreparing,
+		SandboxName:   sbName,
+		ReadyDeadline: &deadline,
+	}
+	if _, err := orch.reconcileWorkflow(ctx, newRunWorkflow(orch, repo, runRetry, hr)); err != nil {
+		t.Fatalf("reconcileWorkflow retry: %v", err)
+	}
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Get(ctx, sbName, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected sandbox to be deleted after terminal state saved, got err: %v", err)
 	}
 }

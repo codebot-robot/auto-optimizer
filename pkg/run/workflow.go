@@ -16,6 +16,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
@@ -34,7 +36,7 @@ import (
 type workflowResult struct {
 	// done reports that the workflow has reached a terminal phase and should not be called again.
 	done bool
-	// requeueAfter tells the caller to invoke Run again after a duration.
+	// requeueAfter tells the caller to invoke Run again after a duration; zero means invoke again immediately.
 	requeueAfter time.Duration
 }
 
@@ -62,6 +64,8 @@ func (w *runWorkflow) Run(ctx context.Context) (workflowResult, error) {
 	switch w.run.Phase {
 	case state.PhasePending:
 		return w.runPending(ctx)
+	case state.PhasePreparing:
+		return w.runPreparing(ctx)
 	default:
 		return workflowResult{}, fmt.Errorf("unsupported workflow phase: %s", w.run.Phase)
 	}
@@ -74,11 +78,10 @@ func (w *runWorkflow) runPending(ctx context.Context) (workflowResult, error) {
 	log := scoped.Log(ctx)
 	now := w.orch.clock().UTC()
 
-	// 1. Assign sandbox name if not already assigned
+	// 1. Determine sandbox name
 	sandboxName := w.run.SandboxName
 	if sandboxName == "" {
 		sandboxName = sandboxNameForRun(w.run.ID)
-		w.run.SandboxName = sandboxName
 	}
 
 	// 2. Set ready deadline
@@ -124,7 +127,8 @@ func (w *runWorkflow) runPending(ctx context.Context) (workflowResult, error) {
 		}
 	}
 
-	// 5. Advance phase to Preparing
+	// 5. Record sandbox ownership and advance phase to Preparing
+	w.run.SandboxName = sandboxName
 	w.run.SetPhase(state.PhasePreparing, now)
 
 	requeueAfter := min(readySafetyRequeueInterval, w.orch.readyTimeout)
@@ -198,9 +202,110 @@ func (w *runWorkflow) ensureWorkspaceClaim(ctx context.Context, name string, own
 	return nil
 }
 
+// runPreparing checks whether the run's Sandbox is ready, prepares it when ready
+// (binding portal egress policy, ensuring the repository clone, and configuring
+// git identity), and advances the run to Working. When the Sandbox is not ready
+// yet or portal binding lags before the ready deadline, runPreparing returns a
+// requeue duration without polling.
+func (w *runWorkflow) runPreparing(ctx context.Context) (workflowResult, error) {
+	log := scoped.Log(ctx)
+	now := w.orch.clock().UTC()
+
+	sbObj, err := w.orch.harness.SandboxClient().GetSandboxResource(ctx, w.orch.namespace(), w.run.SandboxName)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return w.failRun(now, fmt.Sprintf("sandbox %s was deleted before becoming ready", w.run.SandboxName)), nil
+		}
+		return workflowResult{}, fmt.Errorf("getting sandbox %s: %w", w.run.SandboxName, err)
+	}
+
+	if failMsg, failed := session.IsSandboxFailed(sbObj); failed {
+		return w.failRun(now, fmt.Sprintf("sandbox %s failed: %s", w.run.SandboxName, failMsg)), nil
+	}
+
+	sb := w.orch.harness.GetOrAttachSandbox(w.run.SandboxName)
+	if pullErr := sb.CheckPodImagePullStatus(ctx); pullErr != nil {
+		return w.failRun(now, fmt.Sprintf("sandbox %s pod image pull failed: %v", w.run.SandboxName, pullErr)), nil
+	}
+
+	ready := false
+	for _, cond := range sbObj.Status.Conditions {
+		if cond.Type == string(sandboxv1beta1.SandboxConditionReady) && cond.Status == metav1.ConditionTrue {
+			ready = true
+			break
+		}
+	}
+
+	if !ready {
+		if w.run.ReadyDeadline != nil && !now.Before(*w.run.ReadyDeadline) {
+			return w.failRun(now, "sandbox not ready before deadline"), nil
+		}
+		return workflowResult{
+			requeueAfter: requeueUntilDeadline(readySafetyRequeueInterval, now, w.run.ReadyDeadline),
+		}, nil
+	}
+
+	if err := w.orch.store.AppendEvent(ctx, w.repo.Key(), w.run.ID, state.Event{
+		Time:    w.orch.clock().UTC(),
+		Phase:   w.run.Phase,
+		Kind:    "sandbox_ready",
+		Message: fmt.Sprintf("Sandbox %s is ready", w.run.SandboxName),
+		Data:    map[string]any{"sandbox": w.run.SandboxName},
+	}); err != nil {
+		log.Error(err, "failed to append sandbox_ready event", "run", w.run.ID)
+	}
+
+	podIP := ""
+	if len(sbObj.Status.PodIPs) > 0 {
+		podIP = sbObj.Status.PodIPs[0]
+	}
+	sb.SetPodInfo(sbObj.Name, podIP)
+
+	if err := w.orch.prepareSandbox(ctx, w.repo, w.run, sb); err != nil {
+		failTime := w.orch.clock().UTC()
+		var pErr *portalBindError
+		if errors.As(err, &pErr) {
+			log.Error(pErr.err, "failed to bind portal egress policy", "run", w.run.ID, "sandbox", w.run.SandboxName)
+			if w.run.ReadyDeadline != nil && !now.Before(*w.run.ReadyDeadline) {
+				return w.failRunWithKind(failTime, "portal_bind_failed", pErr.err.Error()), nil
+			}
+			return workflowResult{
+				requeueAfter: requeueUntilDeadline(portalBindRetryInterval, now, w.run.ReadyDeadline),
+			}, nil
+		}
+
+		log.Error(err, "sandbox preparation failed", "run", w.run.ID, "sandbox", w.run.SandboxName)
+		return w.failRun(failTime, err.Error()), nil
+	}
+
+	workTime := w.orch.clock().UTC()
+	w.run.SetPhase(state.PhaseWorking, workTime)
+	w.run.ReadyDeadline = nil
+	log.Info("run successfully prepared and entered Working phase", "run", w.run.ID, "sandbox", w.run.SandboxName)
+	return workflowResult{}, nil
+}
+
 func (w *runWorkflow) failRun(now time.Time, errMsg string) workflowResult {
+	return w.failRunWithKind(now, "failed", errMsg)
+}
+
+func (w *runWorkflow) failRunWithKind(now time.Time, kind, errMsg string) workflowResult {
 	w.run.ReadyDeadline = nil
 	w.run.SetPhase(state.PhaseFailed, now)
 	w.run.Error = errMsg
+	w.run.ErrorKind = kind
 	return workflowResult{done: true}
+}
+
+func requeueUntilDeadline(interval time.Duration, now time.Time, deadline *time.Time) time.Duration {
+	requeueAfter := interval
+	if deadline != nil {
+		if rem := deadline.Sub(now); rem < requeueAfter {
+			requeueAfter = rem
+		}
+	}
+	if requeueAfter <= 0 {
+		return time.Millisecond
+	}
+	return requeueAfter
 }
