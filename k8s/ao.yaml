@@ -62,6 +62,7 @@ rules:
       - auto-optimizer.labs.gke.io
     resources:
       - heroruns
+      - sessions
     verbs:
       - get
       - list
@@ -74,6 +75,7 @@ rules:
       - auto-optimizer.labs.gke.io
     resources:
       - heroruns/status
+      - sessions/status
     verbs:
       - update
       - patch
