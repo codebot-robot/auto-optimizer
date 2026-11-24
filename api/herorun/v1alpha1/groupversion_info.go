@@ -31,5 +31,5 @@ var (
 )
 
 func init() {
-	SchemeBuilder.Register(&HeroRun{}, &HeroRunList{}, &Session{}, &SessionList{})
+	SchemeBuilder.Register(&HeroRun{}, &HeroRunList{}, &Session{}, &SessionList{}, &SessionMessage{}, &SessionMessageList{})
 }

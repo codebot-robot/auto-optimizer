@@ -63,6 +63,7 @@ rules:
     resources:
       - heroruns
       - sessions
+      - sessionmessages
     verbs:
       - get
       - list
@@ -76,6 +77,7 @@ rules:
     resources:
       - heroruns/status
       - sessions/status
+      - sessionmessages/status
     verbs:
       - update
       - patch
