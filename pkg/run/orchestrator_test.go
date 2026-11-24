@@ -10963,9 +10963,13 @@ func TestOrchestrator_ActiveOperation_PersistedBeforeWorkerAndClearedOnCompletio
 	})
 
 	req := runRequest(orch, repo.Key(), runID)
-	if _, err := orch.Reconcile(ctx, req); err != nil {
+	reconcileCtx, cancelReconcile := context.WithCancel(ctx)
+	if _, err := orch.Reconcile(reconcileCtx, req); err != nil {
 		t.Fatalf("Reconcile start: %v", err)
 	}
+	// Canceling the Reconcile request context after startTurn returns must not prevent
+	// the background worker from persisting its completed outcome to HeroRun.Status.
+	cancelReconcile()
 
 	select {
 	case <-started:

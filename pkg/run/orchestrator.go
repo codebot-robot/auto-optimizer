@@ -996,15 +996,14 @@ func (o *Orchestrator) recordTurnOutcome(ctx context.Context, runID, opID string
 	if ctx.Err() != nil || o.isManagerCanceled() {
 		return
 	}
-	saveCtx := o.getWorkerContext(ctx)
 	key := client.ObjectKey{Namespace: o.namespace(), Name: sandboxNameForRun(runID)}
 
 	const maxAttempts = 5
 	for range maxAttempts {
 		var hr herorunv1alpha1.HeroRun
-		if err := o.kubeClient.Get(saveCtx, key, &hr); err != nil {
+		if err := o.kubeClient.Get(ctx, key, &hr); err != nil {
 			if !k8serrors.IsNotFound(err) {
-				scoped.Log(saveCtx).Error(err, "failed to get HeroRun to record turn outcome", "run", runID, "operation", opID)
+				scoped.Log(ctx).Error(err, "failed to get HeroRun to record turn outcome", "run", runID, "operation", opID)
 			}
 			return
 		}
@@ -1017,11 +1016,11 @@ func (o *Orchestrator) recordTurnOutcome(ctx context.Context, runID, opID string
 		hr.Status.ActiveOperation = completedActiveOperation(opID, outcome)
 		now := metav1.NewTime(o.clock().UTC().Truncate(time.Second))
 		hr.Status.ObservedAt = &now
-		if err := o.kubeClient.Status().Update(saveCtx, &hr); err != nil {
+		if err := o.kubeClient.Status().Update(ctx, &hr); err != nil {
 			if k8serrors.IsConflict(err) {
 				continue
 			}
-			scoped.Log(saveCtx).Error(err, "failed to record turn outcome on HeroRun", "run", runID, "operation", opID)
+			scoped.Log(ctx).Error(err, "failed to record turn outcome on HeroRun", "run", runID, "operation", opID)
 			return
 		}
 		return
@@ -1545,9 +1544,7 @@ func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *sta
 		defer cancel()
 		defer o.deleteTurnWorker(opID)
 		outcome := o.runTurnWorker(workerCtx, repo, run, hr)
-		if workerCtx.Err() == nil {
-			o.recordTurnOutcome(ctx, run.ID, opID, outcome)
-		}
+		o.recordTurnOutcome(workerCtx, run.ID, opID, outcome)
 		o.deleteTurnWorker(opID)
 		o.Notify(repo.Key(), run.ID)
 	}()
