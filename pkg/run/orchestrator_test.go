@@ -7971,9 +7971,6 @@ func TestOrchestrator_PortalBinder_BindBeforeCommands(t *testing.T) {
 	if gotRun.Phase != state.PhaseWorking {
 		t.Errorf("expected phase %s, got %s", state.PhaseWorking, gotRun.Phase)
 	}
-	if gotRun.PortalBoundAt == nil {
-		t.Errorf("expected PortalBoundAt to be set on run")
-	}
 
 	if len(factoryCalls) != 1 {
 		t.Fatalf("expected 1 factory call, got %d", len(factoryCalls))

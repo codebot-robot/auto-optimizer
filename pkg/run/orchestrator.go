@@ -627,11 +627,11 @@ func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (
 			Phase: wf.run.Phase,
 		}
 		if wf.run.Phase == state.PhaseFailed {
-			end.Kind = res.endKind
-			if end.Kind == "" {
-				end.Kind = "failed"
-			}
+			end.Kind = wf.run.ErrorKind
 			end.Message = wf.run.Error
+		}
+		if wf.run.SandboxName != "" {
+			end.Sandbox = o.harness.GetOrAttachSandbox(wf.run.SandboxName)
 		}
 		if err := o.saveTerminalRun(ctx, wf.repo, wf.run, wf.hr, prev, eventTime, end); err != nil {
 			return reconcile.Result{}, err
@@ -659,11 +659,11 @@ func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (
 			log.Error(err, "failed to append phase event", "phase", wf.run.Phase, "run", wf.run.ID)
 		}
 	}
-	if res.requeue {
-		o.Notify(wf.repo.Key(), wf.run.ID)
-		return reconcile.Result{}, nil
+	if res.requeueAfter > 0 {
+		return reconcile.Result{RequeueAfter: res.requeueAfter}, nil
 	}
-	return reconcile.Result{RequeueAfter: res.requeueAfter}, nil
+	o.Notify(wf.repo.Key(), wf.run.ID)
+	return reconcile.Result{}, nil
 }
 
 // sandboxNameForRun returns the canonical name for a run's Sandbox and HeroRun objects.
@@ -758,23 +758,21 @@ func (o *Orchestrator) prepareSandbox(ctx context.Context, repo *state.Repo, run
 			return &portalBindError{err: err}
 		}
 
-		if run.PortalBoundAt == nil {
-			hosts := portal.PolicyHostnames(policy)
-			if hosts == nil {
-				hosts = []string{}
-			}
-			nowBound := o.clock().UTC()
-			if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-				Time:    nowBound,
-				Phase:   run.Phase,
-				Kind:    "portal_bound",
-				Message: fmt.Sprintf("portal egress policy bound for hosts: %s", strings.Join(hosts, ", ")),
-				Data: map[string]any{
-					"hosts": append([]string(nil), hosts...),
-				},
-			}); err != nil {
-				scoped.Log(ctx).Error(err, "failed to append portal_bound event", "run", run.ID)
-			}
+		hosts := portal.PolicyHostnames(policy)
+		if hosts == nil {
+			hosts = []string{}
+		}
+		nowBound := o.clock().UTC()
+		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+			Time:    nowBound,
+			Phase:   run.Phase,
+			Kind:    "portal_bound",
+			Message: fmt.Sprintf("portal egress policy bound for hosts: %s", strings.Join(hosts, ", ")),
+			Data: map[string]any{
+				"hosts": append([]string(nil), hosts...),
+			},
+		}); err != nil {
+			scoped.Log(ctx).Error(err, "failed to append portal_bound event", "run", run.ID)
 		}
 	}
 

@@ -36,12 +36,8 @@ import (
 type workflowResult struct {
 	// done reports that the workflow has reached a terminal phase and should not be called again.
 	done bool
-	// requeue asks the caller to invoke Run again immediately.
-	requeue bool
-	// requeueAfter tells the caller to invoke Run again after a duration.
+	// requeueAfter tells the caller to invoke Run again after a duration; zero means invoke again immediately.
 	requeueAfter time.Duration
-	// endKind overrides the event kind recorded when done is true.
-	endKind string
 }
 
 // runWorkflow drives a run through its reconciliation loop.
@@ -82,11 +78,10 @@ func (w *runWorkflow) runPending(ctx context.Context) (workflowResult, error) {
 	log := scoped.Log(ctx)
 	now := w.orch.clock().UTC()
 
-	// 1. Assign sandbox name if not already assigned
+	// 1. Determine sandbox name
 	sandboxName := w.run.SandboxName
 	if sandboxName == "" {
 		sandboxName = sandboxNameForRun(w.run.ID)
-		w.run.SandboxName = sandboxName
 	}
 
 	// 2. Set ready deadline
@@ -132,7 +127,8 @@ func (w *runWorkflow) runPending(ctx context.Context) (workflowResult, error) {
 		}
 	}
 
-	// 5. Advance phase to Preparing
+	// 5. Record sandbox ownership and advance phase to Preparing
+	w.run.SandboxName = sandboxName
 	w.run.SetPhase(state.PhasePreparing, now)
 
 	requeueAfter := min(readySafetyRequeueInterval, w.orch.readyTimeout)
@@ -215,10 +211,6 @@ func (w *runWorkflow) runPreparing(ctx context.Context) (workflowResult, error) 
 	log := scoped.Log(ctx)
 	now := w.orch.clock().UTC()
 
-	if w.orch.harness == nil || w.orch.harness.SandboxClient() == nil {
-		return workflowResult{}, errors.New("harness sandbox client is nil")
-	}
-
 	sbObj, err := w.orch.harness.SandboxClient().GetSandboxResource(ctx, w.orch.namespace(), w.run.SandboxName)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -228,16 +220,12 @@ func (w *runWorkflow) runPreparing(ctx context.Context) (workflowResult, error) 
 	}
 
 	if failMsg, failed := session.IsSandboxFailed(sbObj); failed {
-		w.deleteSandbox(ctx, nil)
 		return w.failRun(now, fmt.Sprintf("sandbox %s failed: %s", w.run.SandboxName, failMsg)), nil
 	}
 
 	sb := w.orch.harness.GetOrAttachSandbox(w.run.SandboxName)
-	if sb != nil {
-		if pullErr := sb.CheckPodImagePullStatus(ctx); pullErr != nil {
-			w.deleteSandbox(ctx, sb)
-			return w.failRun(now, fmt.Sprintf("sandbox %s pod image pull failed: %v", w.run.SandboxName, pullErr)), nil
-		}
+	if pullErr := sb.CheckPodImagePullStatus(ctx); pullErr != nil {
+		return w.failRun(now, fmt.Sprintf("sandbox %s pod image pull failed: %v", w.run.SandboxName, pullErr)), nil
 	}
 
 	ready := false
@@ -250,7 +238,6 @@ func (w *runWorkflow) runPreparing(ctx context.Context) (workflowResult, error) 
 
 	if !ready {
 		if w.run.ReadyDeadline != nil && !now.Before(*w.run.ReadyDeadline) {
-			w.deleteSandbox(ctx, sb)
 			return w.failRun(now, "sandbox not ready before deadline"), nil
 		}
 		return workflowResult{
@@ -268,10 +255,6 @@ func (w *runWorkflow) runPreparing(ctx context.Context) (workflowResult, error) 
 		log.Error(err, "failed to append sandbox_ready event", "run", w.run.ID)
 	}
 
-	if sb == nil {
-		return w.failRun(now, "failed to get sandbox handle"), nil
-	}
-
 	podIP := ""
 	if len(sbObj.Status.PodIPs) > 0 {
 		podIP = sbObj.Status.PodIPs[0]
@@ -284,7 +267,6 @@ func (w *runWorkflow) runPreparing(ctx context.Context) (workflowResult, error) 
 		if errors.As(err, &pErr) {
 			log.Error(pErr.err, "failed to bind portal egress policy", "run", w.run.ID, "sandbox", w.run.SandboxName)
 			if w.run.ReadyDeadline != nil && !now.Before(*w.run.ReadyDeadline) {
-				w.deleteSandbox(ctx, sb)
 				return w.failRunWithKind(failTime, "portal_bind_failed", pErr.err.Error()), nil
 			}
 			return workflowResult{
@@ -292,50 +274,27 @@ func (w *runWorkflow) runPreparing(ctx context.Context) (workflowResult, error) 
 			}, nil
 		}
 
-		log.Error(err, "command failed; deleting sandbox", "run", w.run.ID, "sandbox", w.run.SandboxName)
-		w.deleteSandbox(ctx, sb)
+		log.Error(err, "sandbox preparation failed", "run", w.run.ID, "sandbox", w.run.SandboxName)
 		return w.failRun(failTime, err.Error()), nil
-	}
-
-	if w.orch.portalBinder != nil && w.run.PortalBoundAt == nil {
-		nowBound := w.orch.clock().UTC()
-		w.run.PortalBoundAt = &nowBound
 	}
 
 	workTime := w.orch.clock().UTC()
 	w.run.SetPhase(state.PhaseWorking, workTime)
 	w.run.ReadyDeadline = nil
 	log.Info("run successfully prepared and entered Working phase", "run", w.run.ID, "sandbox", w.run.SandboxName)
-	return workflowResult{requeue: true}, nil
-}
-
-func (w *runWorkflow) deleteSandbox(ctx context.Context, sb *session.Sandbox) {
-	if ctx.Err() != nil || w.orch.isManagerCanceled() {
-		return
-	}
-	log := scoped.Log(ctx)
-	if sb != nil {
-		if delErr := w.orch.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-			log.V(2).Info("error deleting sandbox", "sandbox", w.run.SandboxName, "error", delErr)
-		}
-		return
-	}
-	if w.orch.harness != nil && w.orch.harness.SandboxClient() != nil && w.run.SandboxName != "" {
-		if delErr := w.orch.harness.SandboxClient().DeleteSandboxByName(context.WithoutCancel(ctx), w.orch.namespace(), w.run.SandboxName); delErr != nil {
-			log.V(2).Info("error deleting sandbox", "sandbox", w.run.SandboxName, "error", delErr)
-		}
-	}
+	return workflowResult{}, nil
 }
 
 func (w *runWorkflow) failRun(now time.Time, errMsg string) workflowResult {
-	return w.failRunWithKind(now, "", errMsg)
+	return w.failRunWithKind(now, "failed", errMsg)
 }
 
 func (w *runWorkflow) failRunWithKind(now time.Time, kind, errMsg string) workflowResult {
 	w.run.ReadyDeadline = nil
 	w.run.SetPhase(state.PhaseFailed, now)
 	w.run.Error = errMsg
-	return workflowResult{done: true, endKind: kind}
+	w.run.ErrorKind = kind
+	return workflowResult{done: true}
 }
 
 func requeueUntilDeadline(interval time.Duration, now time.Time, deadline *time.Time) time.Duration {

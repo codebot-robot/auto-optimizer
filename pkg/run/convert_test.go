@@ -57,7 +57,6 @@ func TestRoundTrip_AllPhases_ThroughJSON(t *testing.T) {
 	baseTime := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
 	deadline := baseTime.Add(2 * time.Hour)
 	readyDeadline := baseTime.Add(10 * time.Minute)
-	portalBoundAt := baseTime.Add(2 * time.Minute)
 
 	baselineVal := 120.5
 	candidateVal := 98.2
@@ -91,7 +90,6 @@ func TestRoundTrip_AllPhases_ThroughJSON(t *testing.T) {
 				WorkspaceClaimName: "run-20261122t100000z-0002",
 				ReadyDeadline:      &readyDeadline,
 				Deadline:           &deadline,
-				PortalBoundAt:      &portalBoundAt,
 				Goal:               sampleGoal(),
 				PhaseTimestamps: map[state.RunPhase]time.Time{
 					state.PhasePending:   baseTime,
@@ -239,6 +237,7 @@ func TestRoundTrip_AllPhases_ThroughJSON(t *testing.T) {
 				ReadyDeadline:      &readyDeadline,
 				Deadline:           &deadline,
 				Error:              "sandbox failed to achieve readiness before deadline",
+				ErrorKind:          "failed",
 				Summary:            "Infrastructure error during sandbox preparation.",
 				CostUSD:            0.05,
 				Goal:               sampleGoal(),
