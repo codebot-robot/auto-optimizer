@@ -19,12 +19,10 @@ import (
 	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -537,7 +535,7 @@ func (o *Orchestrator) getRunForReconcile(ctx context.Context, req reconcile.Req
 }
 
 // Reconcile loads the run and the repository, dispatches on the phase to
-// runWorkflow.Run (for Pending and Preparing), workRun, reconcileSelecting,
+// runWorkflow.Run (for Pending, Preparing, and Selecting), workRun,
 // or openPullRequest, and returns.
 func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
@@ -558,7 +556,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 	}
 
 	switch run.Phase {
-	case state.PhasePending, state.PhasePreparing:
+	case state.PhasePending, state.PhasePreparing, state.PhaseSelecting:
 		return o.reconcileWorkflow(ctx, newRunWorkflow(o, repo, run, hr))
 
 	case state.PhaseWorking:
@@ -573,17 +571,6 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 			}
 			return res, nil
 		}
-
-	case state.PhaseSelecting:
-		res, err := o.reconcileSelecting(ctx, repo, run, hr)
-		if err != nil {
-			log.Error(err, "reconciling selecting run failed", "repo", repo.URL, "run", run.ID)
-			if run.Phase.IsTerminal() {
-				return reconcile.Result{}, nil
-			}
-			return reconcile.Result{}, err
-		}
-		return res, nil
 
 	case state.PhaseOpeningPR:
 		if err := o.openPullRequest(ctx, repo, run, hr); err != nil {
@@ -600,7 +587,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 }
 
 // reconcileWorkflow executes one step of wf, saves the resulting state, records any
-// phase-change event, and cleans up when the run reaches a terminal phase.
+// phase-change event, and cleans up when the run leaves Selecting or reaches a terminal phase.
 func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 	prev := wf.run.Phase
@@ -610,11 +597,11 @@ func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (
 		log.Error(err, "workflow run failed", "repo", wf.repo.URL, "run", wf.run.ID)
 		return reconcile.Result{}, err
 	}
+	if ctx.Err() != nil || o.isManagerCanceled() {
+		return reconcile.Result{}, nil
+	}
 
 	if res.done {
-		if ctx.Err() != nil || o.isManagerCanceled() {
-			return reconcile.Result{}, nil
-		}
 		eventTime := o.clock().UTC()
 		if t, ok := wf.run.PhaseTimestamps[wf.run.Phase]; ok {
 			eventTime = t
@@ -622,7 +609,10 @@ func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (
 		end := runEnd{
 			Phase: wf.run.Phase,
 		}
-		if wf.run.Phase == state.PhaseFailed {
+		if wf.end != nil {
+			end = *wf.end
+			end.Phase = wf.run.Phase
+		} else if wf.run.Phase == state.PhaseFailed {
 			end.Kind = wf.run.ErrorKind
 			end.Message = wf.run.Error
 		}
@@ -640,6 +630,13 @@ func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (
 
 	if err := o.putRun(ctx, wf.repo, wf.run, wf.hr, prev); err != nil {
 		return reconcile.Result{}, fmt.Errorf("updating run: %w", err)
+	}
+	if prev == state.PhaseSelecting && wf.run.Phase != prev && wf.run.SandboxName != "" {
+		if sb := o.harness.GetOrAttachSandbox(wf.run.SandboxName); sb != nil {
+			if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+				log.V(2).Info("error deleting sandbox after run left selecting", "sandbox", wf.run.SandboxName, "error", delErr)
+			}
+		}
 	}
 	if wf.run.Phase != prev {
 		eventTime := o.clock().UTC()
@@ -1778,304 +1775,6 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		}
 		return errors.New(errMsg)
 	}
-}
-
-func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (reconcile.Result, error) {
-	log := scoped.Log(ctx)
-
-	if o.harness == nil {
-		return reconcile.Result{}, errors.New("harness is nil")
-	}
-
-	sandboxName := run.SandboxName
-	if sandboxName == "" {
-		if err := o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "failed",
-			Message: "sandbox name is empty for selecting run",
-		}); err != nil {
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{}, nil
-	}
-
-	sb := o.harness.GetOrAttachSandbox(sandboxName)
-	if sb == nil {
-		if err := o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "failed",
-			Message: "failed to get sandbox handle",
-		}); err != nil {
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{}, nil
-	}
-
-	if run.Goal != nil && run.Goal.Verify != "" {
-		now := o.clock().UTC()
-		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-			Time:    now,
-			Phase:   state.PhaseSelecting,
-			Kind:    "verify_started",
-			Message: fmt.Sprintf("Running verify command: %s", run.Goal.Verify),
-			Data:    map[string]any{"command": run.Goal.Verify},
-		}); err != nil {
-			log.Error(err, "failed to append verify_started event", "run", run.ID)
-		}
-
-		verifyCtx, verifyCancel := context.WithTimeout(ctx, o.verifyTimeout)
-		res, err := sb.RunVerify(verifyCtx, "/workspace/repo", run.Goal.Verify, 50)
-		timedOut := errors.Is(err, context.DeadlineExceeded) || verifyCtx.Err() == context.DeadlineExceeded || status.Code(err) == codes.DeadlineExceeded
-		verifyCancel()
-
-		if ctx.Err() != nil {
-			return reconcile.Result{}, nil
-		}
-
-		if err != nil {
-			if timedOut {
-				if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
-					Phase:   state.PhaseNoImprovement,
-					Kind:    "verify_failed",
-					Message: fmt.Sprintf("verify command timed out after %s", o.verifyTimeout),
-					Sandbox: sb,
-				}); finishErr != nil {
-					return reconcile.Result{}, finishErr
-				}
-				return reconcile.Result{}, nil
-			}
-			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
-				Phase:   state.PhaseFailed,
-				Kind:    "verify_error",
-				Message: fmt.Sprintf("running verify command: %v", err),
-				Sandbox: sb,
-			}); finishErr != nil {
-				return reconcile.Result{}, finishErr
-			}
-			return reconcile.Result{}, nil
-		}
-
-		if res.ExitCode != 0 {
-			msg := fmt.Sprintf("verify command failed with exit code %d", res.ExitCode)
-			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
-				Phase:   state.PhaseNoImprovement,
-				Kind:    "verify_failed",
-				Message: msg,
-				Data: map[string]any{
-					"exitCode": res.ExitCode,
-					"tail":     res.Tail,
-				},
-				Sandbox: sb,
-			}); finishErr != nil {
-				return reconcile.Result{}, finishErr
-			}
-			return reconcile.Result{}, nil
-		}
-
-		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-			Time:    o.clock().UTC(),
-			Phase:   state.PhaseSelecting,
-			Kind:    "verify_passed",
-			Message: "Verify command passed",
-		}); err != nil {
-			log.Error(err, "failed to append verify_passed event", "run", run.ID)
-		}
-	}
-
-	destDir, err := os.MkdirTemp("", "ao-export-*")
-	if err != nil {
-		if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "failed",
-			Message: fmt.Sprintf("creating temp dir for export: %v", err),
-			Sandbox: sb,
-		}); finishErr != nil {
-			return reconcile.Result{}, finishErr
-		}
-		return reconcile.Result{}, nil
-	}
-	defer func() {
-		if rmErr := os.RemoveAll(destDir); rmErr != nil {
-			log.V(2).Info("failed to remove temp export dir", "dir", destDir, "error", rmErr)
-		}
-	}()
-
-	res, err := sb.ExportCommits(ctx, session.ExportOptions{
-		RepoDir: "/workspace/repo",
-		Base:    run.BaseCommit,
-		DestDir: destDir,
-	})
-	if err != nil {
-		if errors.Is(err, session.ErrNoChanges) {
-			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
-				Phase:   state.PhaseNoImprovement,
-				Kind:    "no_changes",
-				Message: "no changes against base commit",
-				Sandbox: sb,
-			}); finishErr != nil {
-				return reconcile.Result{}, finishErr
-			}
-			return reconcile.Result{}, nil
-		}
-		if errors.Is(err, session.ErrGoalsChanged) {
-			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
-				Phase:   state.PhaseNoImprovement,
-				Kind:    "refused",
-				Message: "changes under .goals/",
-				Sandbox: sb,
-			}); finishErr != nil {
-				return reconcile.Result{}, finishErr
-			}
-			return reconcile.Result{}, nil
-		}
-		if errors.Is(err, session.ErrUncommittedChanges) {
-			if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
-				Phase:   state.PhaseFailed,
-				Kind:    "failed",
-				Message: err.Error(),
-				Sandbox: sb,
-			}); finishErr != nil {
-				return reconcile.Result{}, finishErr
-			}
-			return reconcile.Result{}, nil
-		}
-		if finishErr := o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "failed",
-			Message: fmt.Sprintf("export commits: %v", err),
-			Sandbox: sb,
-		}); finishErr != nil {
-			return reconcile.Result{}, finishErr
-		}
-		return reconcile.Result{}, nil
-	}
-
-	log.V(2).Info("commits exported successfully", "run", run.ID, "tip", res.Tip)
-	return reconcile.Result{}, o.exportSuccess(ctx, repo, run, hr, sb, res)
-}
-
-func (o *Orchestrator) exportSuccess(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, sb *session.Sandbox, res *session.ExportResult) error {
-	if res.PackfilePath != "" {
-		defer func() {
-			if err := os.Remove(res.PackfilePath); err != nil && !os.IsNotExist(err) {
-				scoped.Log(ctx).V(2).Info("failed to remove packfile", "path", res.PackfilePath, "error", err)
-			}
-		}()
-	}
-
-	now := o.clock().UTC()
-	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-		Time:    now,
-		Phase:   state.PhaseSelecting,
-		Kind:    "commits_exported",
-		Message: fmt.Sprintf("Exported commits with tip %s", res.Tip),
-		Data:    map[string]any{"tip": res.Tip},
-	}); err != nil {
-		scoped.Log(ctx).Error(err, "failed to append commits_exported event", "run", run.ID)
-	}
-
-	if o.forgeFor == nil {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "push_failed",
-			Message: fmt.Sprintf("no forge configured for repository %s", repo.URL),
-			Sandbox: sb,
-		})
-	}
-
-	f, err := o.forgeFor(repo.URL)
-	if err != nil {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "push_failed",
-			Message: fmt.Sprintf("selecting forge for %s: %v", repo.URL, err),
-			Sandbox: sb,
-		})
-	}
-	if f == nil {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "push_failed",
-			Message: fmt.Sprintf("no forge configured for repository %s", repo.URL),
-			Sandbox: sb,
-		})
-	}
-
-	packFile, err := os.Open(res.PackfilePath)
-	if err != nil {
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "push_failed",
-			Message: fmt.Sprintf("opening packfile: %v", err),
-			Sandbox: sb,
-		})
-	}
-	defer func() {
-		if closeErr := packFile.Close(); closeErr != nil {
-			scoped.Log(ctx).V(2).Info("failed to close packfile", "error", closeErr)
-		}
-	}()
-
-	var creds forge.PushCredentialer
-	if c, ok := f.(forge.PushCredentialer); ok {
-		creds = c
-	}
-
-	branchName := run.BranchName()
-	pushErr := forge.PushPackfile(ctx, forge.PushPackfileOptions{
-		RemoteURL:   repo.URL,
-		Branch:      branchName,
-		Tip:         plumbing.NewHash(res.Tip),
-		Base:        plumbing.NewHash(run.BaseCommit),
-		Packfile:    packFile,
-		Credentials: creds,
-	})
-	if pushErr != nil {
-		if errors.Is(pushErr, forge.ErrBranchMoved) {
-			return o.finishRun(ctx, repo, run, hr, runEnd{
-				Phase:   state.PhaseFailed,
-				Kind:    "branch_moved",
-				Message: "remote branch is not at base commit",
-				Sandbox: sb,
-			})
-		}
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "push_failed",
-			Message: fmt.Sprintf("push packfile: %v", pushErr),
-			Sandbox: sb,
-		})
-	}
-
-	run.Branch = branchName
-
-	pushTime := o.clock().UTC()
-	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-		Time:    pushTime,
-		Phase:   state.PhaseSelecting,
-		Kind:    "branch_pushed",
-		Message: fmt.Sprintf("Pushed branch %s with tip %s", branchName, res.Tip),
-		Data: map[string]any{
-			"branch": branchName,
-			"tip":    res.Tip,
-		},
-	}); err != nil {
-		scoped.Log(ctx).Error(err, "failed to append branch_pushed event", "run", run.ID)
-	}
-
-	prev := run.Phase
-	run.SetPhase(state.PhaseOpeningPR, pushTime)
-	if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
-		return fmt.Errorf("updating run to OpeningPR: %w", err)
-	}
-
-	if sb != nil {
-		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-			scoped.Log(ctx).V(2).Info("error deleting sandbox after run left selecting", "sandbox", run.SandboxName, "error", delErr)
-		}
-	}
-
-	return o.openPullRequest(ctx, repo, run, hr)
 }
 
 func (o *Orchestrator) openPullRequest(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) error {

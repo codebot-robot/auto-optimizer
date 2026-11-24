@@ -4844,8 +4844,12 @@ func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 	})
 	putTestRun(t, ctx, orch, run)
 
-	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-		t.Fatalf("orch.Reconcile: %v", err)
+	req := runRequest(orch, repo.Key(), runID)
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("orch.Reconcile (Selecting): %v", err)
+	}
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("orch.Reconcile (OpeningPR): %v", err)
 	}
 
 	// 1. Verify run ended in Succeeded with Branch set
@@ -5906,8 +5910,12 @@ func TestOrchestrator_Selecting_PushesAndOpensPullRequest_WithFakeForge(t *testi
 	})
 	putTestRun(t, ctx, orch, run)
 
-	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-		t.Fatalf("orch.Reconcile: %v", err)
+	req := runRequest(orch, repo.Key(), runID)
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("orch.Reconcile (Selecting): %v", err)
+	}
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("orch.Reconcile (OpeningPR): %v", err)
 	}
 
 	// 1. Verify run ended in Succeeded with Branch and PRURL set
