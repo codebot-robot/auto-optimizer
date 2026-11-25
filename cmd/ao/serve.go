@@ -41,6 +41,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
+	"github.com/gke-labs/auto-optimizer/pkg/sessioncontroller"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/syncer"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
@@ -398,6 +399,9 @@ func runServe(ctx context.Context, opts serveOptions) error {
 	if err := orchestrator.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setting up orchestrator controller: %w", err)
 	}
+	if err := setupSessionController(mgr, sessionStore, stateStore, harnessFactory, orchestrator, opts); err != nil {
+		return err
+	}
 
 	scheduler, err := run.NewScheduler(run.SchedulerOptions{
 		Store:        stateStore,
@@ -517,6 +521,34 @@ func runServe(ctx context.Context, opts serveOptions) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func setupSessionController(
+	mgr ctrl.Manager,
+	sessionStore session.Store,
+	stateStore state.Store,
+	harnessFactory func(string) (*session.Harness, error),
+	orchestrator *run.Orchestrator,
+	opts serveOptions,
+) error {
+	reconciler, err := sessioncontroller.NewReconciler(sessioncontroller.Options{
+		Client:          mgr.GetClient(),
+		SessionStore:    sessionStore,
+		StateStore:      stateStore,
+		HarnessFactory:  harnessFactory,
+		SandboxOwnerFor: orchestrator.SandboxOwnerForSession,
+		DefaultToolset:  opts.toolset,
+		DefaultMaxTurns: opts.orchestrator.MaxTurns,
+		DefaultMaxDepth: opts.orchestrator.MaxSessionDepth,
+		MaxConcurrent:   max(opts.orchestrator.MaxConcurrentRuns*4, 16),
+	})
+	if err != nil {
+		return fmt.Errorf("initializing session controller: %w", err)
+	}
+	if err := reconciler.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setting up session controller: %w", err)
+	}
+	return nil
 }
 
 func selectForge(repoURL, githubToken string) (forge.Forge, string, error) {

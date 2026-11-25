@@ -18,10 +18,12 @@ import (
 	"cmp"
 	"context"
 	cryptorand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -41,6 +43,7 @@ import (
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -284,6 +287,7 @@ type Orchestrator struct {
 
 	pendingMessagesMu sync.Mutex
 	pendingMessagesCh chan struct{}
+	msgSeq            atomic.Uint64
 
 	managerCtxMu sync.Mutex
 	managerCtx   context.Context
@@ -459,6 +463,7 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&herorunv1alpha1.HeroRun{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&sandboxv1beta1.Sandbox{}).
+		Owns(&herorunv1alpha1.Session{}).
 		WatchesRawSource(src).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: o.maxConcurrentRuns,
@@ -1121,12 +1126,64 @@ func (o *Orchestrator) PostMessage(ctx context.Context, repo state.RepoKey, runI
 
 	sessionID := topLevelSessionID(runID, hr.Status.SessionID)
 
+	var target herorunv1alpha1.Session
+	err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: o.namespace(), Name: sessionID}, &target)
+	if err == nil {
+		if target.Spec.RunID != "" && target.Spec.RunID != runID {
+			return fmt.Errorf("session %s belongs to run %s, not %s", sessionID, target.Spec.RunID, runID)
+		}
+		if target.Status.Phase.IsTerminal() || target.DeletionTimestamp != nil {
+			return fmt.Errorf("%w: session %s is in phase %s", ErrRunNotWorking, sessionID, target.Status.Phase)
+		}
+		return o.createSessionMessage(ctx, &target, runID, text)
+	}
+	if !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("getting Session %s: %w", sessionID, err)
+	}
+
 	if err := o.appendPendingMessage(ctx, repo, runID, sessionID, state.PendingMessage{Text: text}); err != nil {
 		return err
 	}
 
 	o.Notify(repo, runID)
 	return nil
+}
+
+func (o *Orchestrator) createSessionMessage(ctx context.Context, target *herorunv1alpha1.Session, runID, text string) error {
+	name, err := o.newSessionMessageName(target.Name)
+	if err != nil {
+		return err
+	}
+	spec := herorunv1alpha1.SessionMessageSpec{
+		SessionName: target.Name,
+		RunID:       cmp.Or(target.Spec.RunID, runID),
+		Text:        text,
+	}
+	msg := &herorunv1alpha1.SessionMessage{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: cmp.Or(target.Namespace, o.namespace()),
+			Labels:    spec.Labels(),
+		},
+		Spec: spec,
+	}
+	if err := controllerutil.SetControllerReference(target, msg, o.kubeClient.Scheme()); err != nil {
+		return fmt.Errorf("setting owner reference on session message: %w", err)
+	}
+	if err := o.kubeClient.Create(ctx, msg); err != nil {
+		return fmt.Errorf("creating session message: %w", err)
+	}
+	return nil
+}
+
+func (o *Orchestrator) newSessionMessageName(targetName string) (string, error) {
+	var suffix [2]byte
+	if _, err := cryptorand.Read(suffix[:]); err != nil {
+		return "", fmt.Errorf("generating session message name: %w", err)
+	}
+	ts := max(o.clock().UTC().UnixNano(), 0)
+	seq := o.msgSeq.Add(1)
+	return fmt.Sprintf("%s-msg-%016x-%06x-%s", targetName, ts, seq, hex.EncodeToString(suffix[:])), nil
 }
 
 func (o *Orchestrator) sendMessage(ctx context.Context, children *childGroup, repo *state.Repo, run *state.Run, senderSession *session.Session, recipient string, message string) error {

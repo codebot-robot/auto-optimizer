@@ -192,7 +192,7 @@ func TestScheduler_PublishesHeroRunOnRunCreation(t *testing.T) {
 	}
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&herorunv1alpha1.HeroRun{}).
+		WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).
 		Build()
 	harness, _, _ := setupTestHarness(t, nil)
 
@@ -876,7 +876,7 @@ func TestSchedulerOptions_Validate(t *testing.T) {
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
 	scheme, _ := NewScheme()
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).Build()
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
 		Harness:    harness,

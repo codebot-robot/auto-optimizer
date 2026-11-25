@@ -1384,6 +1384,17 @@ func assertSandboxPodObjectFS(t *testing.T, subH *Harness, sandboxName string) {
 	t.Logf("PASS: Sandbox pod %s mounts claim %s bound through StorageClass %s at /workspace and %s", sandboxName, claimName, *pvc.Spec.StorageClassName, homeDir)
 }
 
+func cleanupRunResources(t *testing.T, subH *Harness) {
+	t.Helper()
+	deleteAll := func() {
+		_, _ = subH.Kubectl("delete", "sessionmessages", "--all", "-n", "ao-sandboxes")
+		_, _ = subH.Kubectl("delete", "sessions", "--all", "-n", "ao-sandboxes")
+		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	}
+	deleteAll()
+	t.Cleanup(deleteAll)
+}
+
 func TestRunLifecycle(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e run lifecycle tests")
@@ -1405,10 +1416,7 @@ func TestRunLifecycle(t *testing.T) {
 	aoBin := buildAOBinary(t, gitRoot)
 
 	subH := h.WithT(t)
-	_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
-	t.Cleanup(func() {
-		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
-	})
+	cleanupRunResources(t, subH)
 
 	_, repoURL, baseCommit := setupHelloRepoFixture(t, subH)
 	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, repoURL, "OPENAI_MODEL=fake-eliza")
@@ -1542,6 +1550,7 @@ func TestRunPushesBranch(t *testing.T) {
 
 	aoBin := buildAOBinary(t, gitRoot)
 	subH := h.WithT(t)
+	cleanupRunResources(t, subH)
 	bareRepoDir, repoURL, baseCommit := setupHelloRepoFixture(t, subH)
 
 	scriptJSON := `[{"tool":"run_command","args":{"command":"cd /workspace/repo && echo 'appended line for scripted run' >> README.md && git add README.md && git commit -m 'docs: add a line to the README'"}},{"tool":"open_pull_request","args":{"title":"docs: add a line to the README","body":"This scripted run adds a line to the README."}}]`
@@ -1664,11 +1673,7 @@ func TestRunSandboxPortalIsolation(t *testing.T) {
 
 	aoBin := buildAOBinary(t, gitRoot)
 	subH := h.WithT(t)
-
-	_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
-	t.Cleanup(func() {
-		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
-	})
+	cleanupRunResources(t, subH)
 
 	aoClusterIP, err := subH.Kubectl("get", "service", "-n", "ao-system", "ao", "-o", "jsonpath={.spec.clusterIP}")
 	if err != nil {
@@ -1831,11 +1836,7 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 
 	aoBin := buildAOBinary(t, gitRoot)
 	subH := h.WithT(t)
-
-	_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
-	t.Cleanup(func() {
-		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
-	})
+	cleanupRunResources(t, subH)
 
 	_, repoURL, _ := setupHelloRepoFixture(t, subH)
 

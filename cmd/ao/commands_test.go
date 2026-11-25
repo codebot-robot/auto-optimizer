@@ -23,6 +23,7 @@ import (
 
 	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
@@ -557,7 +558,7 @@ func TestRunListCommand_Execution(t *testing.T) {
 	// Create a Pending run
 	scheme := runtime.NewScheme()
 	_ = herorunv1alpha1.AddToScheme(scheme)
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).Build()
 
 	pendingRun := &state.Run{
 		ID:         "20261030T120000Z-0001",
@@ -640,7 +641,7 @@ func TestRunGetCommand_Execution(t *testing.T) {
 
 	scheme := runtime.NewScheme()
 	_ = herorunv1alpha1.AddToScheme(scheme)
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).Build()
 
 	runID := "20261030T100000Z-1234"
 	runRecord := &state.Run{
@@ -836,5 +837,40 @@ func TestSessionRunCommand_DefaultHomeDir(t *testing.T) {
 	}
 	if f.DefValue != session.DefaultHomeDir {
 		t.Errorf("homedir default = %q, want %q", f.DefValue, session.DefaultHomeDir)
+	}
+}
+
+func TestSetupControllersWithManager(t *testing.T) {
+	mgr, err := runpkg.NewManager(&rest.Config{Host: "http://127.0.0.1:65534"}, session.DefaultNamespace)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	dir := t.TempDir()
+	stateStore := state.NewFileStore(dir)
+	sessionStore := session.NewFileStore(dir)
+	harness := session.NewHarness(nil, nil, nil, session.RunOptions{Namespace: session.DefaultNamespace})
+
+	var opts serveOptions
+	opts.InitDefaults()
+	opts.toolset = "basic"
+
+	orchOpts := opts.orchestrator
+	orchOpts.Store = stateStore
+	orchOpts.SessionStore = sessionStore
+	orchOpts.Harness = harness
+	orchOpts.KubeClient = mgr.GetClient()
+
+	orch, err := runpkg.NewOrchestrator(orchOpts)
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	if err := orch.SetupWithManager(mgr); err != nil {
+		t.Fatalf("orchestrator.SetupWithManager: %v", err)
+	}
+	if err := setupSessionController(mgr, sessionStore, stateStore, func(string) (*session.Harness, error) {
+		return harness, nil
+	}, orch, opts); err != nil {
+		t.Fatalf("setupSessionController: %v", err)
 	}
 }

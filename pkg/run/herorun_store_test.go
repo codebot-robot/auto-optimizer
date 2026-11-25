@@ -672,7 +672,7 @@ func TestOrchestrator_PrepareRun_SaveConflictRetriesWithSameSandbox(t *testing.T
 	failNextSave := true
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&herorunv1alpha1.HeroRun{}).
+		WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).
 		WithObjects(hr).
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceUpdate: func(ctx context.Context, client client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
