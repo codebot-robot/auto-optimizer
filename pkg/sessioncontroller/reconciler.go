@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,12 +32,14 @@ import (
 	"google.golang.org/grpc/status"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -51,6 +54,7 @@ import (
 
 const (
 	defaultMaxConcurrent = 4
+	defaultMaxDepth      = 3
 	cancelRequeueDelay   = time.Second
 )
 
@@ -58,10 +62,12 @@ const (
 type Options struct {
 	Client          client.Client
 	SessionStore    session.Store
+	StateStore      state.Store
 	HarnessFactory  func(toolset string) (*session.Harness, error)
 	SandboxOwnerFor func(ctx context.Context, obj *herorunv1alpha1.Session) (*session.SandboxOwner, error)
 	DefaultToolset  string
 	DefaultMaxTurns int
+	DefaultMaxDepth int
 	MaxConcurrent   int
 	Clock           func() time.Time
 	EstimateCost    func(model string, messages []llm.Message) float64
@@ -74,6 +80,10 @@ type Reconciler struct {
 	runBudgetsMu sync.Mutex
 	runBudgets   map[string]*session.TurnBudget
 	msgSeq       atomic.Uint64
+
+	handlesMu sync.Mutex
+	active    map[types.NamespacedName]*context.CancelFunc
+	waiters   map[types.NamespacedName]chan struct{}
 }
 
 // NewReconciler validates opts and constructs a Session Reconciler.
@@ -84,12 +94,17 @@ func NewReconciler(opts Options) (*Reconciler, error) {
 	if opts.MaxConcurrent <= 0 {
 		opts.MaxConcurrent = defaultMaxConcurrent
 	}
+	if opts.DefaultMaxDepth <= 0 {
+		opts.DefaultMaxDepth = defaultMaxDepth
+	}
 	if opts.Clock == nil {
 		opts.Clock = time.Now
 	}
 	return &Reconciler{
 		opts:       opts,
 		runBudgets: make(map[string]*session.TurnBudget),
+		active:     make(map[types.NamespacedName]*context.CancelFunc),
+		waiters:    make(map[types.NamespacedName]chan struct{}),
 	}, nil
 }
 
@@ -97,9 +112,50 @@ func NewReconciler(opts Options) (*Reconciler, error) {
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&herorunv1alpha1.Session{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		Owns(&herorunv1alpha1.SessionMessage{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Owns(&herorunv1alpha1.Session{}, builder.WithPredicates(r.childSessionPredicate())).
+		Owns(&herorunv1alpha1.SessionMessage{}, builder.WithPredicates(r.sessionMessagePredicate())).
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.opts.MaxConcurrent}).
 		Complete(r)
+}
+
+func (r *Reconciler) childSessionPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			next, ok := e.ObjectNew.(*herorunv1alpha1.Session)
+			if !ok || !next.Status.Phase.IsTerminal() {
+				return false
+			}
+			if prev, ok := e.ObjectOld.(*herorunv1alpha1.Session); ok && prev.Status.Phase.IsTerminal() {
+				return false
+			}
+			r.wakeParent(next)
+			return true
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			if s, ok := e.Object.(*herorunv1alpha1.Session); ok && s.Spec.Parent != "" {
+				r.wakeParent(s)
+				return true
+			}
+			return false
+		},
+	}
+}
+
+func (r *Reconciler) sessionMessagePredicate() predicate.Predicate {
+	gen := predicate.GenerationChangedPredicate{}
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			if m, ok := e.Object.(*herorunv1alpha1.SessionMessage); ok && !m.IsDelivered() && m.Spec.SessionName != "" {
+				r.wakeWaiter(types.NamespacedName{Namespace: m.Namespace, Name: m.Spec.SessionName})
+			}
+			return gen.Create(e)
+		},
+		UpdateFunc:  gen.Update,
+		DeleteFunc:  gen.Delete,
+		GenericFunc: gen.Generic,
+	}
 }
 
 // Reconcile drives a Session resource from Pending through Running to a terminal status.
@@ -109,25 +165,36 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 	if obj.Status.Phase.IsTerminal() {
-		r.releaseRunBudgetIfRoot(&obj)
-		return reconcile.Result{}, nil
+		return reconcile.Result{}, r.handleTerminal(ctx, &obj)
 	}
 	if ctx.Err() != nil {
 		return reconcile.Result{}, nil
 	}
+	if obj.Spec.Parent != "" {
+		var parent herorunv1alpha1.Session
+		err := r.opts.Client.Get(ctx, client.ObjectKey{Namespace: obj.Namespace, Name: obj.Spec.Parent}, &parent)
+		if err == nil && parent.Status.Phase.IsTerminal() {
+			if err := r.markCanceled(ctx, &obj); err != nil {
+				return reconcile.Result{}, err
+			}
+			return reconcile.Result{}, r.handleTerminal(ctx, &obj)
+		} else if err != nil && !k8serrors.IsNotFound(err) {
+			return reconcile.Result{}, err
+		}
+	}
 	if r.deadlinePassed(&obj) {
 		err := r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
 			st.Phase, st.Outcome, st.Error = herorunv1alpha1.SessionPhaseFailed, herorunv1alpha1.SessionOutcomeDeadlineExceeded, "deadline exceeded"
-			st.FinishedAt = &now
+			st.WaitingUntil, st.FinishedAt = nil, &now
 		})
-		if err == nil {
-			r.releaseRunBudgetIfRoot(&obj)
+		if err != nil {
+			return reconcile.Result{}, err
 		}
-		return reconcile.Result{}, err
+		return reconcile.Result{}, r.handleTerminal(ctx, &obj)
 	}
 	if obj.Status.Phase != herorunv1alpha1.SessionPhaseRunning || obj.Status.StartedAt == nil {
 		if err := r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
-			st.Phase = herorunv1alpha1.SessionPhaseRunning
+			st.Phase, st.WaitingUntil = herorunv1alpha1.SessionPhaseRunning, nil
 			if st.StartedAt == nil {
 				st.StartedAt = &now
 			}
@@ -136,11 +203,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 	}
 
-	applyTerminal, canceled := r.runSession(ctx, &obj)
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	defer r.trackActive(req.NamespacedName, cancelRun)()
+
+	applyTerminal, canceled := r.runSession(runCtx, &obj)
 	if ctx.Err() != nil {
 		return reconcile.Result{}, nil
 	}
 	if canceled {
+		var latest herorunv1alpha1.Session
+		if err := r.opts.Client.Get(ctx, req.NamespacedName, &latest); err != nil {
+			return reconcile.Result{}, client.IgnoreNotFound(err)
+		}
+		if latest.Status.Phase.IsTerminal() {
+			return reconcile.Result{}, r.handleTerminal(ctx, &latest)
+		}
 		delay := cancelRequeueDelay
 		if obj.Spec.Deadline != nil {
 			if rem := obj.Spec.Deadline.Time.Sub(r.opts.Clock().UTC()); rem < delay {
@@ -151,12 +229,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 	err := r.updateStatus(ctx, &obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
 		applyTerminal(st)
-		st.FinishedAt = &now
+		st.WaitingUntil, st.FinishedAt = nil, &now
 	})
-	if err == nil {
-		r.releaseRunBudgetIfRoot(&obj)
+	if err != nil {
+		return reconcile.Result{}, err
 	}
-	return reconcile.Result{}, err
+	return reconcile.Result{}, r.handleTerminal(ctx, &obj)
 }
 
 func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Session) (func(*herorunv1alpha1.SessionStatus), bool) {
@@ -213,9 +291,21 @@ func (r *Reconciler) runSession(ctx context.Context, obj *herorunv1alpha1.Sessio
 		extra = append(extra, prTool)
 	}
 	if obj.Spec.RunID != "" {
-		extra = append(extra, ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
-			return r.sendMessage(toolCtx, obj, recipient, message)
-		}))
+		seenStopped := make(map[string]bool)
+		extra = append(extra,
+			ao.NewStartSessionTool(func(toolCtx context.Context, task string) (string, error) {
+				return r.startChildSession(toolCtx, obj, task)
+			}),
+			ao.NewListSessionsTool(func(toolCtx context.Context) ([]ao.SessionInfo, error) {
+				return r.listRunSessions(toolCtx, obj)
+			}),
+			ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
+				return r.sendMessage(toolCtx, obj, recipient, message)
+			}),
+			ao.NewWaitTool(func(toolCtx context.Context, timeout time.Duration) (string, error) {
+				return r.waitForEvent(toolCtx, obj, seenStopped, timeout)
+			}),
+		)
 		harness = harness.WithMessageSource(func(msgCtx context.Context, s *session.Session) error {
 			return r.deliverPendingMessages(msgCtx, obj, s)
 		})
@@ -405,7 +495,292 @@ func (r *Reconciler) sendMessage(ctx context.Context, sender *herorunv1alpha1.Se
 	if err := r.opts.Client.Create(ctx, msg); err != nil {
 		return fmt.Errorf("creating session message: %w", err)
 	}
+	r.wakeWaiter(types.NamespacedName{Namespace: target.Namespace, Name: target.Name})
 	return nil
+}
+
+func (r *Reconciler) startChildSession(ctx context.Context, parent *herorunv1alpha1.Session, task string) (string, error) {
+	if parent.Spec.RunID == "" {
+		return "", errors.New("cannot call start_session: session belongs to no run")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	maxDepth := parent.Spec.MaxDepth
+	if maxDepth <= 0 {
+		maxDepth = r.opts.DefaultMaxDepth
+	}
+	if parent.Spec.Depth() >= maxDepth {
+		return "", fmt.Errorf("depth limit of %d reached; cannot start child session", maxDepth)
+	}
+	var suffix [4]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", fmt.Errorf("generating child session name: %w", err)
+	}
+	childName := fmt.Sprintf("%sc%x", parent.Name[:min(len(parent.Name), 28)], suffix)
+
+	ancestors := slices.Clone(parent.Spec.Ancestors)
+	if len(ancestors) == 0 && parent.Spec.Parent != "" {
+		ancestors = []string{parent.Spec.Parent}
+	}
+	childSpec := *parent.Spec.DeepCopy()
+	childSpec.Parent, childSpec.Ancestors = parent.Name, append(ancestors, parent.Name)
+	childSpec.InitialPrompt, childSpec.AllowPullRequest = task, false
+
+	child := &herorunv1alpha1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      childName,
+			Namespace: parent.Namespace,
+			Labels:    map[string]string{herorunv1alpha1.LabelRun: parent.Spec.RunID},
+		},
+		Spec: childSpec,
+	}
+	if err := controllerutil.SetControllerReference(parent, child, r.opts.Client.Scheme()); err != nil {
+		return "", fmt.Errorf("setting owner reference on child session: %w", err)
+	}
+	if err := r.opts.Client.Create(ctx, child); err != nil {
+		return "", fmt.Errorf("creating child session: %w", err)
+	}
+	if r.opts.StateStore != nil && parent.Spec.Repository != "" {
+		if repoKey, err := state.ParseRepoURL(parent.Spec.Repository); err != nil {
+			scoped.Log(ctx).Error(err, "failed to parse repository for session_started event", "run", parent.Spec.RunID, "session", childName)
+		} else if err := r.opts.StateStore.AppendEvent(ctx, repoKey, parent.Spec.RunID, state.Event{
+			Time: r.opts.Clock().UTC(), Phase: state.PhaseWorking, Kind: "session_started",
+			Message: fmt.Sprintf("Started session %s", childName),
+			Data:    map[string]any{"session_id": childName, "parent": parent.Name},
+		}); err != nil {
+			scoped.Log(ctx).Error(err, "failed to append session_started event", "run", parent.Spec.RunID, "session", childName)
+		}
+	}
+	return childName, nil
+}
+
+func (r *Reconciler) listRunSessions(ctx context.Context, obj *herorunv1alpha1.Session) ([]ao.SessionInfo, error) {
+	if obj.Spec.RunID == "" {
+		return nil, errors.New("cannot call list_sessions: session belongs to no run")
+	}
+	var list herorunv1alpha1.SessionList
+	if err := r.opts.Client.List(ctx, &list, client.InNamespace(obj.Namespace)); err != nil {
+		return nil, fmt.Errorf("listing sessions: %w", err)
+	}
+	var sessions []herorunv1alpha1.Session
+	for i := range list.Items {
+		if list.Items[i].Spec.RunID == obj.Spec.RunID {
+			sessions = append(sessions, list.Items[i])
+		}
+	}
+	slices.SortFunc(sessions, func(a, b herorunv1alpha1.Session) int {
+		return cmp.Or(cmp.Compare(a.Spec.Depth(), b.Spec.Depth()), a.CreationTimestamp.Time.Compare(b.CreationTimestamp.Time), cmp.Compare(a.Name, b.Name))
+	})
+	result := make([]ao.SessionInfo, len(sessions))
+	for i := range sessions {
+		s := &sessions[i]
+		st := "running"
+		if s.Status.Phase.IsTerminal() || s.DeletionTimestamp != nil {
+			st = "stopped"
+		}
+		result[i] = ao.SessionInfo{Name: s.Name, Parent: s.Spec.Parent, State: st}
+	}
+	return result, nil
+}
+
+func (r *Reconciler) waitForEvent(ctx context.Context, obj *herorunv1alpha1.Session, seenStopped map[string]bool, timeout time.Duration) (string, error) {
+	if obj.Spec.RunID == "" {
+		return "", errors.New("cannot call wait: session belongs to no run")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	waitDur, cappedByDeadline := timeout, false
+	if obj.Spec.Deadline != nil {
+		if rem := obj.Spec.Deadline.Time.Sub(r.opts.Clock().UTC()); rem <= 0 {
+			return "Wait ended: run deadline passed.", nil
+		} else if rem < waitDur {
+			waitDur, cappedByDeadline = rem, true
+		}
+	}
+
+	key := types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}
+	timer := time.NewTimer(waitDur)
+	defer timer.Stop()
+
+	setPhase := func(phase herorunv1alpha1.SessionPhase, until *metav1.Time) {
+		if err := r.updateStatus(ctx, obj, func(st *herorunv1alpha1.SessionStatus, _ metav1.Time) {
+			st.Phase, st.WaitingUntil = phase, until
+		}); err != nil {
+			scoped.Log(ctx).V(1).Info("failed to update Session wait status", "session", obj.Name, "phase", phase, "error", err)
+		}
+	}
+	waiting := false
+	defer func() {
+		if waiting && ctx.Err() == nil {
+			setPhase(herorunv1alpha1.SessionPhaseRunning, nil)
+		}
+	}()
+
+	for {
+		ch := r.waitChan(key)
+		msg, ready, err := r.checkWaitEvents(ctx, obj, seenStopped)
+		if err != nil || ready {
+			r.clearWaiter(key, ch)
+			return msg, err
+		}
+		if !waiting {
+			waiting = true
+			until := metav1.NewTime(r.opts.Clock().UTC().Add(waitDur))
+			setPhase(herorunv1alpha1.SessionPhaseWaiting, &until)
+		}
+		select {
+		case <-ctx.Done():
+			r.clearWaiter(key, ch)
+			return "", ctx.Err()
+		case <-ch:
+		case <-timer.C:
+			r.clearWaiter(key, ch)
+			if cappedByDeadline {
+				return "Wait ended: run deadline passed.", nil
+			}
+			return fmt.Sprintf("Timed out after %s with no new messages or stopped child sessions.", timeout), nil
+		}
+	}
+}
+
+func (r *Reconciler) checkWaitEvents(ctx context.Context, parent *herorunv1alpha1.Session, seen map[string]bool) (string, bool, error) {
+	pending, err := r.listPendingMessages(ctx, parent)
+	if err != nil {
+		return "", false, fmt.Errorf("checking pending messages: %w", err)
+	}
+	var list herorunv1alpha1.SessionList
+	if err := r.opts.Client.List(ctx, &list, client.InNamespace(parent.Namespace)); err != nil {
+		return "", false, fmt.Errorf("checking child sessions: %w", err)
+	}
+	var stopped []string
+	for i := range list.Items {
+		c := &list.Items[i]
+		if c.Spec.RunID == parent.Spec.RunID && c.Spec.Parent == parent.Name && c.Status.Phase.IsTerminal() && !seen[c.Name] {
+			stopped = append(stopped, c.Name)
+		}
+	}
+	if len(pending) == 0 && len(stopped) == 0 {
+		return "", false, nil
+	}
+	slices.Sort(stopped)
+	for _, name := range stopped {
+		seen[name] = true
+	}
+	var parts []string
+	if len(pending) > 0 {
+		parts = append(parts, "A message arrived.")
+	}
+	if len(stopped) == 1 {
+		parts = append(parts, fmt.Sprintf("Child session %s stopped.", stopped[0]))
+	} else if len(stopped) > 1 {
+		parts = append(parts, fmt.Sprintf("Child sessions stopped: %s.", strings.Join(stopped, ", ")))
+	}
+	return strings.Join(parts, " "), true, nil
+}
+
+func (r *Reconciler) handleTerminal(ctx context.Context, obj *herorunv1alpha1.Session) error {
+	r.releaseRunBudgetIfRoot(obj)
+	r.wakeParent(obj)
+	return r.cancelChildren(ctx, obj)
+}
+
+func (r *Reconciler) markCanceled(ctx context.Context, obj *herorunv1alpha1.Session) error {
+	return r.updateStatus(ctx, obj, func(st *herorunv1alpha1.SessionStatus, now metav1.Time) {
+		st.Phase, st.Outcome, st.Error = herorunv1alpha1.SessionPhaseCanceled, herorunv1alpha1.SessionOutcomeCanceled, "parent session terminated"
+		st.WaitingUntil, st.FinishedAt = nil, &now
+	})
+}
+
+func (r *Reconciler) cancelChildren(ctx context.Context, parent *herorunv1alpha1.Session) error {
+	var list herorunv1alpha1.SessionList
+	if err := r.opts.Client.List(ctx, &list, client.InNamespace(parent.Namespace)); err != nil {
+		return fmt.Errorf("listing child sessions: %w", err)
+	}
+	descendants := map[string]bool{parent.Name: true}
+	for changed := true; changed; {
+		changed = false
+		for i := range list.Items {
+			c := &list.Items[i]
+			if !descendants[c.Name] && (descendants[c.Spec.Parent] || slices.ContainsFunc(c.Spec.Ancestors, func(a string) bool { return descendants[a] })) {
+				descendants[c.Name], changed = true, true
+			}
+		}
+	}
+	var firstErr error
+	for i := range list.Items {
+		child := list.Items[i]
+		if child.Name == parent.Name || !descendants[child.Name] || child.Status.Phase.IsTerminal() {
+			continue
+		}
+		if err := r.markCanceled(ctx, &child); err != nil && !k8serrors.IsNotFound(err) {
+			firstErr = cmp.Or(firstErr, err)
+			continue
+		}
+		r.cancelActive(types.NamespacedName{Namespace: child.Namespace, Name: child.Name})
+		if child.Spec.Parent != parent.Name {
+			r.wakeParent(&child)
+		}
+	}
+	return firstErr
+}
+
+func (r *Reconciler) trackActive(key types.NamespacedName, cancel context.CancelFunc) func() {
+	h := &cancel
+	r.handlesMu.Lock()
+	r.active[key] = h
+	r.handlesMu.Unlock()
+	return func() {
+		r.handlesMu.Lock()
+		if r.active[key] == h {
+			delete(r.active, key)
+		}
+		r.handlesMu.Unlock()
+	}
+}
+
+func (r *Reconciler) cancelActive(key types.NamespacedName) {
+	r.handlesMu.Lock()
+	h := r.active[key]
+	r.handlesMu.Unlock()
+	if h != nil {
+		(*h)()
+	}
+}
+
+func (r *Reconciler) waitChan(key types.NamespacedName) <-chan struct{} {
+	r.handlesMu.Lock()
+	defer r.handlesMu.Unlock()
+	if ch := r.waiters[key]; ch != nil {
+		return ch
+	}
+	ch := make(chan struct{})
+	r.waiters[key] = ch
+	return ch
+}
+
+func (r *Reconciler) clearWaiter(key types.NamespacedName, ch <-chan struct{}) {
+	r.handlesMu.Lock()
+	if r.waiters[key] == ch {
+		delete(r.waiters, key)
+	}
+	r.handlesMu.Unlock()
+}
+
+func (r *Reconciler) wakeParent(obj *herorunv1alpha1.Session) {
+	if obj.Spec.Parent != "" {
+		r.wakeWaiter(types.NamespacedName{Namespace: obj.Namespace, Name: obj.Spec.Parent})
+	}
+}
+
+func (r *Reconciler) wakeWaiter(key types.NamespacedName) {
+	r.handlesMu.Lock()
+	if ch := r.waiters[key]; ch != nil {
+		delete(r.waiters, key)
+		close(ch)
+	}
+	r.handlesMu.Unlock()
 }
 
 func (r *Reconciler) newSessionMessageName(targetName string) (string, error) {
