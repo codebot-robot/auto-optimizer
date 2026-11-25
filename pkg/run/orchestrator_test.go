@@ -235,7 +235,7 @@ func seedCompletedTurnOp(t *testing.T, ctx context.Context, orch *Orchestrator, 
 func newTestFakeClientBuilder(scheme *apiruntime.Scheme) *fake.ClientBuilder {
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&herorunv1alpha1.HeroRun{}).
+		WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 				if obj.GetUID() == "" {
@@ -3899,6 +3899,16 @@ func TestNewScheme(t *testing.T) {
 		t.Errorf("scheme does not recognize %s", hrGVK)
 	}
 
+	sessGVK := herorunv1alpha1.GroupVersion.WithKind("Session")
+	if !scheme.Recognizes(sessGVK) {
+		t.Errorf("scheme does not recognize %s", sessGVK)
+	}
+
+	msgGVK := herorunv1alpha1.GroupVersion.WithKind("SessionMessage")
+	if !scheme.Recognizes(msgGVK) {
+		t.Errorf("scheme does not recognize %s", msgGVK)
+	}
+
 	sbGVK := sandboxv1beta1.GroupVersion.WithKind("Sandbox")
 	if !scheme.Recognizes(sbGVK) {
 		t.Errorf("scheme does not recognize %s", sbGVK)
@@ -4121,7 +4131,7 @@ func TestOrchestrator_Reconcile_UnknownNameDroppedWithoutError(t *testing.T) {
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
 	scheme, _ := NewScheme()
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -4181,7 +4191,7 @@ func TestOrchestrator_FinishedRunHasNoIndexEntry(t *testing.T) {
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
 	scheme, _ := NewScheme()
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:      store,
@@ -4484,7 +4494,7 @@ func TestOrchestrator_SaveHeroRunFailureFailsReconcile(t *testing.T) {
 	hr.Spec.Repository = repo.URL
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&herorunv1alpha1.HeroRun{}).
+		WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).
 		WithObjects(hr).
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceUpdate: func(ctx context.Context, client client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
@@ -4548,7 +4558,7 @@ func TestOrchestrator_SandboxOwnerReference_PreExistingHeroRunHasUID(t *testing.
 	}
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&herorunv1alpha1.HeroRun{}).
+		WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).
 		WithObjects(preExistingHR).
 		Build()
 
@@ -7239,7 +7249,7 @@ func TestOrchestratorOptions_Validate(t *testing.T) {
 	harness, _, _ := setupTestHarness(t, nil)
 
 	scheme, _ := NewScheme()
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).Build()
 
 	baseValid := func() OrchestratorOptions {
 		opts := OrchestratorOptions{
@@ -9189,7 +9199,7 @@ func TestOrchestratorOptions_Validate_MaxSessionDepth(t *testing.T) {
 	store := state.NewFileStore(t.TempDir())
 	harness, _, _ := setupTestHarness(t, nil)
 	scheme, _ := NewScheme()
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).Build()
 
 	for _, d := range []int{-2, -1, 0} {
 		opts := OrchestratorOptions{
@@ -11547,4 +11557,184 @@ func TestOrchestrator_SandboxOwnerForSession(t *testing.T) {
 	if bindCalls != 1 {
 		t.Errorf("portal bind calls = %d, want 1", bindCalls)
 	}
+}
+
+func TestOrchestrator_PostMessage_CreatesSessionMessage(t *testing.T) {
+	ctx := t.Context()
+	fixedTime := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+
+	newFixture := func(t *testing.T, runID string, sess *herorunv1alpha1.Session) (*Orchestrator, state.Store, state.RepoKey, client.Client) {
+		t.Helper()
+		store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, "run-"+runID, nil, &llm.ElizaClient{})
+		sess.Namespace = harness.Namespace()
+		statusCopy := sess.Status
+		if err := fakeClient.Create(ctx, sess); err != nil {
+			t.Fatalf("creating Session: %v", err)
+		}
+		if statusCopy.Phase != "" {
+			sess.Status = statusCopy
+			if err := fakeClient.Status().Update(ctx, sess); err != nil {
+				t.Fatalf("updating Session status: %v", err)
+			}
+		}
+		run.SessionID = sess.Name
+		putTestHeroRun(t, ctx, fakeClient, harness.Namespace(), repo.URL, run)
+		orch := newTestOrchestrator(t, OrchestratorOptions{
+			Store:        store,
+			SessionStore: sessionStore,
+			Harness:      harness,
+			KubeClient:   fakeClient,
+			Clock:        func() time.Time { return fixedTime },
+		})
+		return orch, store, repo.Key(), fakeClient
+	}
+
+	t.Run("active session creates owned labeled SessionMessages without file pending messages", func(t *testing.T) {
+		const runID = "20261125T120000Z-smsgok"
+		sessName := generateSessionID(runID)
+		sess := &herorunv1alpha1.Session{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: sessName,
+				UID:  types.UID("sess-uid-123"),
+			},
+			Spec: herorunv1alpha1.SessionSpec{
+				RunID: runID,
+			},
+			Status: herorunv1alpha1.SessionStatus{
+				Phase: herorunv1alpha1.SessionPhaseRunning,
+			},
+		}
+		orch, store, repoKey, fakeClient := newFixture(t, runID, sess)
+
+		if err := orch.PostMessage(ctx, repoKey, runID, "first guidance"); err != nil {
+			t.Fatalf("PostMessage(first): %v", err)
+		}
+		if err := orch.PostMessage(ctx, repoKey, runID, "second guidance"); err != nil {
+			t.Fatalf("PostMessage(second): %v", err)
+		}
+
+		// File-based pending messages must not be written when Session CRD exists.
+		pending, err := store.ReadPendingMessages(ctx, repoKey, runID, sessName)
+		if err != nil {
+			t.Fatalf("ReadPendingMessages: %v", err)
+		}
+		if len(pending) != 0 {
+			t.Fatalf("expected 0 file pending messages, got %+v", pending)
+		}
+
+		var list herorunv1alpha1.SessionMessageList
+		if err := fakeClient.List(ctx, &list,
+			client.InNamespace(orch.namespace()),
+			client.MatchingLabels{herorunv1alpha1.LabelSession: sessName},
+		); err != nil {
+			t.Fatalf("List SessionMessages: %v", err)
+		}
+		if len(list.Items) != 2 {
+			t.Fatalf("expected 2 SessionMessages, got %d", len(list.Items))
+		}
+		slices.SortFunc(list.Items, func(a, b herorunv1alpha1.SessionMessage) int {
+			return strings.Compare(a.Name, b.Name)
+		})
+
+		wantTexts := []string{"first guidance", "second guidance"}
+		for i, msg := range list.Items {
+			if msg.Spec.SessionName != sessName {
+				t.Errorf("msg[%d].Spec.SessionName = %q, want %q", i, msg.Spec.SessionName, sessName)
+			}
+			if msg.Spec.RunID != runID {
+				t.Errorf("msg[%d].Spec.RunID = %q, want %q", i, msg.Spec.RunID, runID)
+			}
+			if msg.Spec.From != "" {
+				t.Errorf("msg[%d].Spec.From = %q, want empty", i, msg.Spec.From)
+			}
+			if msg.Spec.Text != wantTexts[i] {
+				t.Errorf("msg[%d].Spec.Text = %q, want %q", i, msg.Spec.Text, wantTexts[i])
+			}
+			if msg.Labels[herorunv1alpha1.LabelSession] != sessName {
+				t.Errorf("msg[%d] label %s = %q, want %q", i, herorunv1alpha1.LabelSession, msg.Labels[herorunv1alpha1.LabelSession], sessName)
+			}
+			if msg.Labels[herorunv1alpha1.LabelRun] != runID {
+				t.Errorf("msg[%d] label %s = %q, want %q", i, herorunv1alpha1.LabelRun, msg.Labels[herorunv1alpha1.LabelRun], runID)
+			}
+			if len(msg.OwnerReferences) != 1 {
+				t.Fatalf("msg[%d] OwnerReferences = %+v, want 1", i, msg.OwnerReferences)
+			}
+			ref := msg.OwnerReferences[0]
+			if ref.Kind != "Session" || ref.Name != sessName || ref.UID != sess.UID || ref.Controller == nil || !*ref.Controller {
+				t.Errorf("msg[%d] unexpected OwnerReference: %+v", i, ref)
+			}
+		}
+	})
+
+	t.Run("terminal session returns ErrRunNotWorking", func(t *testing.T) {
+		const runID = "20261125T120000Z-smsgterm"
+		sessName := generateSessionID(runID)
+		sess := &herorunv1alpha1.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessName},
+			Spec:       herorunv1alpha1.SessionSpec{RunID: runID},
+			Status:     herorunv1alpha1.SessionStatus{Phase: herorunv1alpha1.SessionPhaseSucceeded},
+		}
+		orch, _, repoKey, fakeClient := newFixture(t, runID, sess)
+
+		if err := orch.PostMessage(ctx, repoKey, runID, "too late"); !errors.Is(err, ErrRunNotWorking) {
+			t.Fatalf("PostMessage on terminal session = %v, want ErrRunNotWorking", err)
+		}
+		var list herorunv1alpha1.SessionMessageList
+		if err := fakeClient.List(ctx, &list); err != nil {
+			t.Fatalf("List SessionMessages: %v", err)
+		}
+		if len(list.Items) != 0 {
+			t.Errorf("expected 0 SessionMessages, got %d", len(list.Items))
+		}
+	})
+
+	t.Run("deleting session returns ErrRunNotWorking", func(t *testing.T) {
+		const runID = "20261125T120000Z-smsgdel"
+		sessName := generateSessionID(runID)
+		sess := &herorunv1alpha1.Session{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       sessName,
+				Finalizers: []string{"test.auto-optimizer.labs.gke.io/hold"},
+			},
+			Spec:   herorunv1alpha1.SessionSpec{RunID: runID},
+			Status: herorunv1alpha1.SessionStatus{Phase: herorunv1alpha1.SessionPhaseRunning},
+		}
+		orch, _, repoKey, fakeClient := newFixture(t, runID, sess)
+		if err := fakeClient.Delete(ctx, sess); err != nil {
+			t.Fatalf("Delete Session: %v", err)
+		}
+
+		if err := orch.PostMessage(ctx, repoKey, runID, "deleting"); !errors.Is(err, ErrRunNotWorking) {
+			t.Fatalf("PostMessage on deleting session = %v, want ErrRunNotWorking", err)
+		}
+		var list herorunv1alpha1.SessionMessageList
+		if err := fakeClient.List(ctx, &list); err != nil {
+			t.Fatalf("List SessionMessages: %v", err)
+		}
+		if len(list.Items) != 0 {
+			t.Errorf("expected 0 SessionMessages, got %d", len(list.Items))
+		}
+	})
+
+	t.Run("mismatched session RunID returns error", func(t *testing.T) {
+		const runID = "20261125T120000Z-smsgmis"
+		sessName := generateSessionID(runID)
+		sess := &herorunv1alpha1.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessName},
+			Spec:       herorunv1alpha1.SessionSpec{RunID: "different-run"},
+			Status:     herorunv1alpha1.SessionStatus{Phase: herorunv1alpha1.SessionPhaseRunning},
+		}
+		orch, _, repoKey, fakeClient := newFixture(t, runID, sess)
+
+		if err := orch.PostMessage(ctx, repoKey, runID, "wrong run"); err == nil {
+			t.Fatal("expected error for mismatched session RunID, got nil")
+		}
+		var list herorunv1alpha1.SessionMessageList
+		if err := fakeClient.List(ctx, &list); err != nil {
+			t.Fatalf("List SessionMessages: %v", err)
+		}
+		if len(list.Items) != 0 {
+			t.Errorf("expected 0 SessionMessages, got %d", len(list.Items))
+		}
+	})
 }

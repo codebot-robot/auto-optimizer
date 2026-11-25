@@ -609,6 +609,13 @@ EOF
     fi
   fi
 
+  echo "Waiting for auto-optimizer CRDs to be established..."
+  kubectl wait --for=condition=Established \
+    crd/heroruns.auto-optimizer.labs.gke.io \
+    crd/sessions.auto-optimizer.labs.gke.io \
+    crd/sessionmessages.auto-optimizer.labs.gke.io \
+    --timeout=60s
+
   if [[ "${IS_KIND}" != "true" ]] && ! kubectl get secret ao-web-auth -n ao-system >/dev/null 2>&1; then
     echo "WARNING: Secret 'ao-web-auth' was not found in namespace ao-system."
     echo "ao serve requires GitHub OAuth authentication when running without --insecure-no-auth."

@@ -392,7 +392,7 @@ func TestGetRun_And_ListRuns(t *testing.T) {
 	ctx := t.Context()
 	scheme := runtime.NewScheme()
 	_ = herorunv1alpha1.AddToScheme(scheme)
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).Build()
 
 	const ns = "test-sandboxes"
 

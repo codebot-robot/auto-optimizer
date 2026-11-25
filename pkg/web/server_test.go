@@ -53,7 +53,7 @@ func setupFakeKubeClient(t *testing.T) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	_ = herorunv1alpha1.AddToScheme(scheme)
-	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}).Build()
+	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&herorunv1alpha1.HeroRun{}, &herorunv1alpha1.Session{}, &herorunv1alpha1.SessionMessage{}).Build()
 }
 
 func testServerOptions(t *testing.T) ServerOptions {
