@@ -30,6 +30,14 @@ IMAGE_PREFIX=<your-registry-prefix> ./dev/tasks/deploy-to-kube --only ao
 The script deploys the `ao` Deployment and Service in the `ao-system` namespace.
 It also configures the `ao-sandboxes` namespace for sandbox execution.
 
+Run `./dev/tasks/setup-secrets` to create or update the `ao-forge`, `ao-web-auth`, and optional `ao-model-keys` Secrets in `ao-system`:
+
+```bash
+./dev/tasks/setup-secrets
+```
+
+Pass `--only forge`, `--only web-auth`, or `--only model-keys` to configure a subset of Secrets, or create them manually with `kubectl` as shown below.
+
 Provide model credentials to the control plane.
 Create the `ao-model-keys` Secret in the `ao-system` namespace.
 For Gemini, provide `GEMINI_API_KEY`:
