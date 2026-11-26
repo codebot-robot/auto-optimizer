@@ -164,6 +164,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if err := r.opts.Client.Get(ctx, req.NamespacedName, &obj); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
+	if r.opts.StateStore != nil && obj.Spec.RunID != "" && obj.Spec.Repository != "" {
+		repoKey, err := state.ParseRepoURL(obj.Spec.Repository)
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("parsing repository %q: %w", obj.Spec.Repository, err)
+		}
+		if _, err := r.opts.StateStore.GetRepo(ctx, repoKey); err != nil {
+			if errors.Is(err, state.ErrNotFound) {
+				return reconcile.Result{}, nil
+			}
+			return reconcile.Result{}, fmt.Errorf("getting repo %s: %w", repoKey, err)
+		}
+	}
 	if obj.Status.Phase.IsTerminal() {
 		return reconcile.Result{}, r.handleTerminal(ctx, &obj)
 	}
