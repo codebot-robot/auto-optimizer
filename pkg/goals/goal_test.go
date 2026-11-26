@@ -424,3 +424,13 @@ func TestLoadDir_NonexistentDir(t *testing.T) {
 		t.Fatal("expected error for nonexistent directory, got nil")
 	}
 }
+
+func TestLoadDir_RepoGoals(t *testing.T) {
+	loaded, err := goals.LoadDir(os.DirFS(filepath.Join("..", "..")), ".goals")
+	if err != nil {
+		t.Fatalf("LoadDir(.goals) failed: %v", err)
+	}
+	if len(loaded) == 0 {
+		t.Fatal("expected at least one goal in .goals/")
+	}
+}
