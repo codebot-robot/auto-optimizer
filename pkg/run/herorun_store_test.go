@@ -181,12 +181,14 @@ func TestOrchestrator_DeletingRunJSONDoesNotAffectRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HeroRunToRun: %v", err)
 	}
-	if err := orch.finishRun(ctx, repo, workingRun, &hr, runEnd{
+	prevPhase := workingRun.Phase
+	workingRun.SetPhase(state.PhaseNoImprovement, fixedTime)
+	if err := orch.saveTerminalRun(ctx, repo, workingRun, &hr, prevPhase, fixedTime, runEnd{
 		Phase:   state.PhaseNoImprovement,
 		Kind:    "finished",
 		Message: "no improvement found",
 	}); err != nil {
-		t.Fatalf("finishRun: %v", err)
+		t.Fatalf("saveTerminalRun: %v", err)
 	}
 
 	// Reconcile terminal run with run.json deleted
