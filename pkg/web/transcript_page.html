@@ -29,15 +29,15 @@
       {{else}}
         {{if .Content}}
           <div class="message-content">
-            {{if and (not $.Full) (canTruncate .Content)}}
-              {{truncate .Content}}
+            {{- if and (not $.Full) (canTruncate .Content) -}}
+              {{- truncate .Content -}}
               <div><a href="/sessions/{{$.Summary.Name}}?full=1" class="show-all-link">show all</a></div>
-            {{else}}
-              {{.Content}}
-              {{if and $.Full (canTruncate .Content)}}
+            {{- else -}}
+              {{- .Content -}}
+              {{- if and $.Full (canTruncate .Content) -}}
                 <div><a href="/sessions/{{$.Summary.Name}}" class="show-all-link">show less</a></div>
-              {{end}}
-            {{end}}
+              {{- end -}}
+            {{- end -}}
           </div>
         {{end}}
         {{range .ToolCalls}}
