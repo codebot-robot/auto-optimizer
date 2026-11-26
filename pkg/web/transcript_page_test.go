@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
@@ -149,5 +150,61 @@ func TestRenderTranscriptPage_CancelledContext(t *testing.T) {
 	err := RenderTranscriptPage(ctx, rec, TranscriptPageData{})
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
+	}
+}
+
+func TestRenderTranscriptPage_TerminalAndWaitingStates(t *testing.T) {
+	tests := []struct {
+		name      string
+		phase     herorunv1alpha1.SessionPhase
+		outcome   herorunv1alpha1.SessionOutcome
+		wantBadge string
+		terminal  bool
+	}{
+		{"finished", herorunv1alpha1.SessionPhaseSucceeded, herorunv1alpha1.SessionOutcomeFinished, `<span class="badge badge-succeeded">finished</span>`, true},
+		{"pull_request", herorunv1alpha1.SessionPhaseSucceeded, herorunv1alpha1.SessionOutcomePullRequest, `<span class="badge badge-succeeded">succeeded</span>`, true},
+		{"max_turns", herorunv1alpha1.SessionPhaseSucceeded, herorunv1alpha1.SessionOutcomeMaxTurns, `<span class="badge badge-max-turns">max turns</span>`, true},
+		{"failed", herorunv1alpha1.SessionPhaseFailed, herorunv1alpha1.SessionOutcomeFailed, `<span class="badge badge-failed">failed</span>`, true},
+		{"deadline", herorunv1alpha1.SessionPhaseFailed, herorunv1alpha1.SessionOutcomeDeadlineExceeded, `<span class="badge badge-failed">deadline exceeded</span>`, true},
+		{"cancelled", herorunv1alpha1.SessionPhaseCanceled, herorunv1alpha1.SessionOutcomeCanceled, `<span class="badge badge-cancelled">cancelled</span>`, true},
+		{"waiting", herorunv1alpha1.SessionPhaseWaiting, "", `<span class="badge badge-in-flight">waiting</span>`, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			data := TranscriptPageData{
+				Detail: sessionapi.SessionDetail{
+					Summary: sessionapi.SessionSummary{Name: "s-" + tc.name, Toolset: "basic", Phase: tc.phase, Outcome: tc.outcome},
+				},
+			}
+			if err := RenderTranscriptPage(t.Context(), rec, data); err != nil {
+				t.Fatalf("RenderTranscriptPage: %v", err)
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, tc.wantBadge) {
+				t.Errorf("missing badge %q in:\n%s", tc.wantBadge, body)
+			}
+			if strings.Contains(body, "badge-idle") {
+				t.Errorf("unexpected idle badge in:\n%s", body)
+			}
+			hasForm := strings.Contains(body, `class="message-form"`)
+			if tc.terminal && hasForm {
+				t.Errorf("expected Send Message form to be hidden for terminal session")
+			}
+			if tc.terminal && !strings.Contains(body, "This session has ended") {
+				t.Errorf("expected ended note for terminal session")
+			}
+			if !tc.terminal && !hasForm {
+				t.Errorf("expected Send Message form to remain visible for non-terminal session")
+			}
+			hasRefresh := strings.Contains(body, `http-equiv="refresh"`)
+			if tc.terminal && hasRefresh {
+				t.Errorf("unexpected auto-refresh for terminal session")
+			}
+			if !tc.terminal && !hasRefresh {
+				t.Errorf("expected auto-refresh for waiting session")
+			}
+		})
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"io"
 	"time"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/web/auth"
 )
@@ -31,11 +32,12 @@ var layoutHTML string
 const maxTruncateLen = 500
 
 var templateFuncs = template.FuncMap{
-	"formatTime":  formatTime,
-	"truncate":    truncate,
-	"canTruncate": canTruncate,
-	"isTool":      isTool,
-	"csrfToken":   func() string { return "" },
+	"formatTime":   formatTime,
+	"truncate":     truncate,
+	"canTruncate":  canTruncate,
+	"isTool":       isTool,
+	"sessionBadge": sessionStatusBadge,
+	"csrfToken":    func() string { return "" },
 }
 
 type csrfContextKey struct{}
@@ -102,6 +104,40 @@ func canTruncate(s string) bool {
 
 func isTool(m sessionapi.Message) bool {
 	return m.Role == "tool" || m.ToolCallID != ""
+}
+
+type sessionBadge struct {
+	Class string
+	Label string
+}
+
+func sessionStatusBadge(s sessionapi.SessionSummary) sessionBadge {
+	switch s.Outcome {
+	case herorunv1alpha1.SessionOutcomeFinished:
+		return sessionBadge{"badge-succeeded", "finished"}
+	case herorunv1alpha1.SessionOutcomePullRequest, herorunv1alpha1.SessionOutcomeCompleted:
+		return sessionBadge{"badge-succeeded", "succeeded"}
+	case herorunv1alpha1.SessionOutcomeMaxTurns:
+		return sessionBadge{"badge-max-turns", "max turns"}
+	case herorunv1alpha1.SessionOutcomeDeadlineExceeded:
+		return sessionBadge{"badge-failed", "deadline exceeded"}
+	case herorunv1alpha1.SessionOutcomeCanceled:
+		return sessionBadge{"badge-cancelled", "cancelled"}
+	case herorunv1alpha1.SessionOutcomeFailed:
+		return sessionBadge{"badge-failed", "failed"}
+	}
+	switch s.Phase {
+	case herorunv1alpha1.SessionPhaseSucceeded:
+		return sessionBadge{"badge-succeeded", "succeeded"}
+	case herorunv1alpha1.SessionPhaseFailed:
+		return sessionBadge{"badge-failed", "failed"}
+	case herorunv1alpha1.SessionPhaseCanceled:
+		return sessionBadge{"badge-cancelled", "cancelled"}
+	case herorunv1alpha1.SessionPhaseWaiting:
+		return sessionBadge{"badge-in-flight", "waiting"}
+	default:
+		return sessionBadge{"badge-idle", "idle"}
+	}
 }
 
 // truncateRunes returns the prefix of s up to maxRunes, and whether s exceeded maxRunes.

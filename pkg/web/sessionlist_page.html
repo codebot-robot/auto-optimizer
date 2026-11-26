@@ -41,8 +41,12 @@
           <td>{{formatTime .CreatedAt}}</td>
           <td>{{.MessageCount}}</td>
           <td>
-            {{if .InFlight}}
+            {{if .IsTerminal}}
+            {{with sessionBadge .}}<span class="badge {{.Class}}">{{.Label}}</span>{{end}}
+            {{else if .InFlight}}
             <span class="badge badge-in-flight">in flight</span>
+            {{else if eq .Phase "Waiting"}}
+            <span class="badge badge-in-flight">waiting</span>
             {{else}}
             <span class="badge badge-idle">idle</span>
             {{end}}

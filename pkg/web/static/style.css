@@ -203,6 +203,22 @@ tr:last-child td {
   color: var(--indigo);
 }
 
+.badge-succeeded {
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+.badge-failed,
+.badge-cancelled {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+
+.badge-max-turns {
+  background: var(--indigo-soft);
+  color: var(--ink-2);
+}
+
 .meta-badges {
   display: flex;
   flex-wrap: wrap;

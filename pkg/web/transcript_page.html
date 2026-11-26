@@ -7,8 +7,12 @@
       {{end}}<span class="meta-badge">toolset: {{.Summary.Toolset}}</span>
       {{if .Summary.Parent}}<span class="meta-badge">parent: {{.Summary.Parent}}</span>{{end}}
       <span class="meta-badge">created: {{formatTime .Summary.CreatedAt}}</span>
-      {{if .Summary.InFlight}}
+      {{if .Summary.IsTerminal}}
+      {{with sessionBadge .Summary}}<span class="badge {{.Class}}">{{.Label}}</span>{{end}}
+      {{else if .Summary.InFlight}}
       <span class="badge badge-in-flight">turn in flight</span>
+      {{else if eq .Summary.Phase "Waiting"}}
+      <span class="badge badge-in-flight">waiting</span>
       {{else}}
       <span class="badge badge-idle">idle</span>
       {{end}}
@@ -53,6 +57,11 @@
   {{end}}
 </div>
 
+{{if .Summary.IsTerminal -}}
+<div class="card message-form-section">
+  <p class="text-muted">This session has ended ({{(sessionBadge .Summary).Label}}).</p>
+</div>
+{{- else -}}
 <div class="card message-form-section">
   <h3>Send Message</h3>
   <form action="/sessions/{{.Summary.Name}}/messages" method="POST" class="message-form">
@@ -63,4 +72,5 @@
     <button type="submit" class="btn primary" {{if .Summary.InFlight}}disabled{{end}}>Send</button>
   </form>
 </div>
+{{- end}}
 {{end}}
