@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/run"
@@ -33,6 +34,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -55,6 +57,13 @@ type SessionSummary struct {
 	CreatedAt    time.Time
 	MessageCount int
 	InFlight     bool
+	Phase        herorunv1alpha1.SessionPhase
+	Outcome      herorunv1alpha1.SessionOutcome
+}
+
+// IsTerminal reports whether the session has reached a terminal lifecycle phase.
+func (s SessionSummary) IsTerminal() bool {
+	return s.Phase.IsTerminal()
 }
 
 // ToolCall represents an assistant tool call.
@@ -770,6 +779,11 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 		return nil, err
 	}
 
+	sessionCRDs, err := s.sessionResourcesMap(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -779,7 +793,7 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 		if sessionRuns != nil {
 			fallbackRunID = sessionRuns[sum.Name]
 		}
-		result = append(result, s.sessionSummaryFromStore(sum, fallbackRunID))
+		result = append(result, s.sessionSummaryFromStore(sum, fallbackRunID, sessionCRDs[sum.Name]))
 	}
 
 	sort.Slice(result, func(i, j int) bool {
@@ -789,7 +803,7 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 	return result, nil
 }
 
-func (s *Server) sessionSummaryFromStore(sum session.SessionSummary, fallbackRunID string) SessionSummary {
+func (s *Server) sessionSummaryFromStore(sum session.SessionSummary, fallbackRunID string, crd *herorunv1alpha1.Session) SessionSummary {
 	msgCount := sum.MessageCount
 	if act, ok := s.activeSessions[sum.Name]; ok {
 		msgCount = len(act.Messages())
@@ -798,7 +812,7 @@ func (s *Server) sessionSummaryFromStore(sum session.SessionSummary, fallbackRun
 	if runID == "" {
 		runID = fallbackRunID
 	}
-	return SessionSummary{
+	res := SessionSummary{
 		Name:         sum.Name,
 		Repo:         sum.Metadata.Repo,
 		RunID:        runID,
@@ -810,6 +824,43 @@ func (s *Server) sessionSummaryFromStore(sum session.SessionSummary, fallbackRun
 		MessageCount: msgCount,
 		InFlight:     s.busySessions[sum.Name],
 	}
+	applySessionCRD(&res, crd)
+	return res
+}
+
+func applySessionCRD(sum *SessionSummary, crd *herorunv1alpha1.Session) {
+	if crd == nil {
+		return
+	}
+	sum.Phase = crd.Status.Phase
+	sum.Outcome = crd.Status.Outcome
+	if crd.DeletionTimestamp == nil && (crd.Status.Phase == herorunv1alpha1.SessionPhaseRunning || crd.Status.Phase == herorunv1alpha1.SessionPhasePending) {
+		sum.InFlight = true
+	}
+}
+
+func (s *Server) sessionResourcesMap(ctx context.Context) (map[string]*herorunv1alpha1.Session, error) {
+	var list herorunv1alpha1.SessionList
+	if err := s.kubeClient.List(ctx, &list, client.InNamespace(s.namespace)); err != nil {
+		return nil, fmt.Errorf("listing session resources: %w", err)
+	}
+	res := make(map[string]*herorunv1alpha1.Session, len(list.Items))
+	for i := range list.Items {
+		item := &list.Items[i]
+		res[item.Name] = item
+	}
+	return res, nil
+}
+
+func (s *Server) sessionResource(ctx context.Context, name string) (*herorunv1alpha1.Session, error) {
+	var sess herorunv1alpha1.Session
+	if err := s.kubeClient.Get(ctx, client.ObjectKey{Namespace: s.namespace, Name: name}, &sess); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("getting session resource %q: %w", name, err)
+	}
+	return &sess, nil
 }
 
 func (s *Server) sessionRunsMap(ctx context.Context) (map[string]string, error) {
@@ -887,7 +938,12 @@ func (s *Server) GetSessionDetail(ctx context.Context, name string) (*SessionDet
 		}
 	}
 
-	return &SessionDetail{
+	crd, err := s.sessionResource(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+
+	detail := &SessionDetail{
 		Summary: SessionSummary{
 			Name:         name,
 			Repo:         meta.Repo,
@@ -901,7 +957,9 @@ func (s *Server) GetSessionDetail(ctx context.Context, name string) (*SessionDet
 			InFlight:     inFlight,
 		},
 		Messages: webMsgs,
-	}, nil
+	}
+	applySessionCRD(&detail.Summary, crd)
+	return detail, nil
 }
 
 // CreateNewSession creates a session with the specified name and toolset.
@@ -925,12 +983,17 @@ func (s *Server) ListRunSessions(ctx context.Context, runID string) ([]SessionSu
 		return nil, err
 	}
 
+	sessionCRDs, err := s.sessionResourcesMap(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	result := make([]SessionSummary, len(sessions))
 	for i, sum := range sessions {
-		result[i] = s.sessionSummaryFromStore(sum, runID)
+		result[i] = s.sessionSummaryFromStore(sum, runID, sessionCRDs[sum.Name])
 	}
 
 	return result, nil
