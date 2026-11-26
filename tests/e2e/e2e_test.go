@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -38,6 +40,24 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	corev1 "k8s.io/api/core/v1"
 )
+
+var (
+	aoBinOnce sync.Once
+	aoBinDir  string
+	aoBinPath string
+	aoBinErr  error
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if aoBinDir != "" {
+		if err := os.RemoveAll(aoBinDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to remove ao binary temp dir %s: %v\n", aoBinDir, err)
+		}
+	}
+	CleanupCreatedClusters()
+	os.Exit(code)
+}
 
 func getSandboxdImage(t *testing.T, subH *Harness) string {
 	t.Helper()
@@ -96,7 +116,7 @@ func assertSandboxdAuthAndNoSecretsRBAC(t *testing.T, subH *Harness, sessionName
 // accessible to kind cluster nodes via a Kubernetes Service and EndpointSlice, and starts
 // an in-process HTTP forward proxy on localhost so host-side commands (git and ao serve)
 // can resolve the Service name without privileges.
-func startFixtureGitServer(t *testing.T, subH *Harness, bareRepoDir string) string {
+func startFixtureGitServer(t *testing.T, subH *Harness, namespace, bareRepoDir string) (string, []string) {
 	t.Helper()
 
 	bareRepoDir = filepath.Clean(bareRepoDir)
@@ -172,7 +192,7 @@ func startFixtureGitServer(t *testing.T, subH *Harness, bareRepoDir string) stri
 kind: Service
 metadata:
   name: %s
-  namespace: ao-sandboxes
+  namespace: %s
 spec:
   ports:
     - name: http
@@ -183,7 +203,7 @@ apiVersion: discovery.k8s.io/v1
 kind: EndpointSlice
 metadata:
   name: %s
-  namespace: ao-sandboxes
+  namespace: %s
   labels:
     kubernetes.io/service-name: %s
 addressType: IPv4
@@ -193,14 +213,14 @@ ports:
 endpoints:
   - addresses:
       - "%s"
-`, svcName, gitPort, svcName, svcName, gitPort, kindGatewayIPv4)
+`, svcName, namespace, gitPort, svcName, namespace, svcName, gitPort, kindGatewayIPv4)
 
 	if _, err := subH.KubectlWithStdin(manifest, "apply", "-f", "-"); err != nil {
 		t.Fatalf("failed to create fixture git service and endpointslice: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = subH.Kubectl("delete", "service", svcName, "-n", "ao-sandboxes", "--ignore-not-found")
-		_, _ = subH.Kubectl("delete", "endpointslice", svcName, "-n", "ao-sandboxes", "--ignore-not-found")
+		_, _ = subH.Kubectl("delete", "service", svcName, "-n", namespace, "--ignore-not-found")
+		_, _ = subH.Kubectl("delete", "endpointslice", svcName, "-n", namespace, "--ignore-not-found")
 	})
 
 	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -221,21 +241,24 @@ endpoints:
 	t.Cleanup(func() { _ = proxyServer.Close() })
 
 	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
-	t.Setenv("HTTP_PROXY", proxyURL)
-	t.Setenv("http_proxy", proxyURL)
-	t.Setenv("NO_PROXY", "127.0.0.1,localhost")
-	t.Setenv("no_proxy", "127.0.0.1,localhost")
+	proxyEnv := []string{
+		"HTTP_PROXY=" + proxyURL,
+		"http_proxy=" + proxyURL,
+		"NO_PROXY=127.0.0.1,localhost",
+		"no_proxy=127.0.0.1,localhost",
+	}
 
-	repoHost := fmt.Sprintf("%s.ao-sandboxes.svc.cluster.local", svcName)
+	repoHost := fmt.Sprintf("%s.%s.svc.cluster.local", svcName, namespace)
 	repoURL := fmt.Sprintf("http://%s:80/%s", repoHost, filepath.Base(bareRepoDir))
 	t.Logf("Git repository available at %s (backend %s)", repoURL, gitHTTPBackend)
-	return repoURL
+	return repoURL, proxyEnv
 }
 
 func TestSmoke(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e smoke tests")
 	}
+	t.Parallel()
 
 	clusterName := os.Getenv("KIND_CLUSTER_NAME")
 	if clusterName == "" {
@@ -246,6 +269,7 @@ func TestSmoke(t *testing.T) {
 	h.Setup()
 
 	t.Run("SandboxHealth", func(t *testing.T) {
+		t.Parallel()
 		subH := h.WithT(t)
 		sandboxName := "smoke-test-sandbox"
 		subH.DeleteWithCleanup("ao-sandboxes", "sandbox", sandboxName)
@@ -319,6 +343,7 @@ spec:
 	})
 
 	t.Run("ObjectFSPVCWrite", func(t *testing.T) {
+		t.Parallel()
 		subH := h.WithT(t)
 		pvcName := "smoke-test-objectfs-pvc"
 		podName := "smoke-test-objectfs-pod"
@@ -379,6 +404,7 @@ spec:
 	})
 
 	t.Run("ServicePortals", func(t *testing.T) {
+		t.Parallel()
 		subH := h.WithT(t)
 		subH.WaitForCondition("service-portal-system", "deployment/service-portal-controller", "condition=Available", 60*time.Second)
 		if out, err := subH.Kubectl("rollout", "status", "daemonset/portal-node-agent", "-n", "service-portal-system", "--timeout=60s"); err != nil {
@@ -388,6 +414,7 @@ spec:
 	})
 
 	t.Run("SandboxGoImage", func(t *testing.T) {
+		t.Parallel()
 		subH := h.WithT(t)
 		podName := "smoke-test-sandbox-go"
 		subH.DeleteWithCleanup("default", "pod", podName)
@@ -438,6 +465,7 @@ func TestSession(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e session tests")
 	}
+	t.Parallel()
 
 	clusterName := os.Getenv("KIND_CLUSTER_NAME")
 	if clusterName == "" {
@@ -452,12 +480,7 @@ func TestSession(t *testing.T) {
 		t.Fatalf("failed to get git root: %v", err)
 	}
 
-	aoBin := filepath.Join(t.TempDir(), "ao")
-	buildCmd := exec.Command("go", "build", "-o", aoBin, "./cmd/ao")
-	buildCmd.Dir = gitRoot
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
-	}
+	aoBin := buildAOBinary(t, gitRoot)
 
 	sessionName := "e2esession"
 	stateDir := t.TempDir()
@@ -563,6 +586,7 @@ func TestSessionUnpullableImageFailsFast(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e session tests")
 	}
+	t.Parallel()
 
 	clusterName := os.Getenv("KIND_CLUSTER_NAME")
 	if clusterName == "" {
@@ -577,12 +601,7 @@ func TestSessionUnpullableImageFailsFast(t *testing.T) {
 		t.Fatalf("failed to get git root: %v", err)
 	}
 
-	aoBin := filepath.Join(t.TempDir(), "ao")
-	buildCmd := exec.Command("go", "build", "-o", aoBin, "./cmd/ao")
-	buildCmd.Dir = gitRoot
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
-	}
+	aoBin := buildAOBinary(t, gitRoot)
 
 	sessionName := "e2eunpullable"
 	stateDir := t.TempDir()
@@ -634,6 +653,7 @@ func TestSessionAPI(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e session API tests")
 	}
+	t.Parallel()
 
 	clusterName := os.Getenv("KIND_CLUSTER_NAME")
 	if clusterName == "" {
@@ -648,12 +668,7 @@ func TestSessionAPI(t *testing.T) {
 		t.Fatalf("failed to get git root: %v", err)
 	}
 
-	aoBin := filepath.Join(t.TempDir(), "ao")
-	buildCmd := exec.Command("go", "build", "-o", aoBin, "./cmd/ao")
-	buildCmd.Dir = gitRoot
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
-	}
+	aoBin := buildAOBinary(t, gitRoot)
 
 	// Allocate a free port for ao serve.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -671,6 +686,7 @@ func TestSessionAPI(t *testing.T) {
 
 	serveCmd := exec.Command(aoBin, "serve",
 		"--listen", serverAddr,
+		"--http", "",
 		"--state-dir", stateDir,
 		"--insecure-no-auth",
 	)
@@ -822,6 +838,7 @@ func TestSessionAPIInCluster(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e in-cluster session API tests")
 	}
+	t.Parallel()
 
 	clusterName := os.Getenv("KIND_CLUSTER_NAME")
 	if clusterName == "" {
@@ -836,12 +853,7 @@ func TestSessionAPIInCluster(t *testing.T) {
 		t.Fatalf("failed to get git root: %v", err)
 	}
 
-	aoBin := filepath.Join(t.TempDir(), "ao")
-	buildCmd := exec.Command("go", "build", "-o", aoBin, "./cmd/ao")
-	buildCmd.Dir = gitRoot
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
-	}
+	aoBin := buildAOBinary(t, gitRoot)
 
 	sessionName := "e2eincluster"
 	subH := h.WithT(t)
@@ -1019,8 +1031,16 @@ func TestSessionAPIInCluster(t *testing.T) {
 
 func runGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	return runGitEnv(t, dir, nil, args...)
+}
+
+func runGitEnv(t *testing.T, dir string, extraEnv []string, args ...string) string {
+	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v in %s failed: %v\nOutput: %s", args, dir, err, string(out))
@@ -1030,16 +1050,29 @@ func runGit(t *testing.T, dir string, args ...string) string {
 
 func buildAOBinary(t *testing.T, gitRoot string) string {
 	t.Helper()
-	aoBin := filepath.Join(t.TempDir(), "ao")
-	buildCmd := exec.Command("go", "build", "-o", aoBin, "./cmd/ao")
-	buildCmd.Dir = gitRoot
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
+	aoBinOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "ao-e2e-bin-*")
+		if err != nil {
+			aoBinErr = fmt.Errorf("failed to create temp dir for ao binary: %w", err)
+			return
+		}
+		aoBinDir = dir
+		bin := filepath.Join(dir, "ao")
+		buildCmd := exec.Command("go", "build", "-o", bin, "./cmd/ao")
+		buildCmd.Dir = gitRoot
+		if out, err := buildCmd.CombinedOutput(); err != nil {
+			aoBinErr = fmt.Errorf("failed to build ao binary: %w\nOutput: %s", err, string(out))
+			return
+		}
+		aoBinPath = bin
+	})
+	if aoBinErr != nil {
+		t.Fatal(aoBinErr)
 	}
-	return aoBin
+	return aoBinPath
 }
 
-func setupHelloRepoFixture(t *testing.T, subH *Harness) (bareRepoDir, repoURL, baseCommit string) {
+func setupHelloRepoFixture(t *testing.T, subH *Harness, namespace string) (bareRepoDir, repoURL, baseCommit string, proxyEnv []string) {
 	t.Helper()
 	gitBaseDir := t.TempDir()
 	bareRepoDir = filepath.Join(gitBaseDir, "hello-repo.git")
@@ -1073,19 +1106,19 @@ func setupHelloRepoFixture(t *testing.T, subH *Harness) (bareRepoDir, repoURL, b
 	runGit(t, bareRepoDir, "symbolic-ref", "HEAD", "refs/heads/main")
 	runGit(t, bareRepoDir, "config", "http.receivepack", "true")
 
-	repoURL = startFixtureGitServer(t, subH, bareRepoDir)
+	repoURL, proxyEnv = startFixtureGitServer(t, subH, namespace, bareRepoDir)
 	t.Logf("Git repository available at %s (base commit %s)", repoURL, baseCommit)
 
 	// Assert the fixture git server accepts pushes
-	runGit(t, workDir, "push", repoURL, "HEAD:probe")
+	runGitEnv(t, workDir, proxyEnv, "push", repoURL, "HEAD:probe")
 	if got := runGit(t, bareRepoDir, "rev-parse", "refs/heads/probe"); got != baseCommit {
 		t.Fatalf("expected bare repo to have branch probe at %s, got %s", baseCommit, got)
 	}
 	runGit(t, bareRepoDir, "branch", "-D", "probe")
-	return bareRepoDir, repoURL, baseCommit
+	return bareRepoDir, repoURL, baseCommit, proxyEnv
 }
 
-func startAOServe(t *testing.T, subH *Harness, aoBin, repoURL string, env ...string) (serverAddr, httpAddr, stateDir string, serveStderr *bytes.Buffer) {
+func startAOServe(t *testing.T, subH *Harness, aoBin, namespace, repoURL string, env ...string) (serverAddr, httpAddr, stateDir string, serveStderr *bytes.Buffer) {
 	t.Helper()
 	aoListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1107,6 +1140,7 @@ func startAOServe(t *testing.T, subH *Harness, aoBin, repoURL string, env ...str
 		"serve",
 		"--listen", serverAddr,
 		"--http", httpAddr,
+		"--namespace", namespace,
 		"--state-dir", stateDir,
 		"--repo", repoURL,
 		"--insecure-no-auth",
@@ -1262,14 +1296,14 @@ func pollRunPhase(t *testing.T, aoBin, serverAddr, repoURL, targetPhase string, 
 	return finalRun, finalEvents
 }
 
-func assertSandboxPodObjectFS(t *testing.T, subH *Harness, sandboxName string) {
+func assertSandboxPodObjectFS(t *testing.T, subH *Harness, namespace, sandboxName string) {
 	t.Helper()
 
 	var pod corev1.Pod
 	var podErr error
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		out, err := subH.Kubectl("get", "pod", "-n", "ao-sandboxes", sandboxName, "-o", "json")
+		out, err := subH.Kubectl("get", "pod", "-n", namespace, sandboxName, "-o", "json")
 		if err != nil {
 			podErr = err
 		} else if jsonErr := json.Unmarshal([]byte(out), &pod); jsonErr != nil {
@@ -1283,7 +1317,7 @@ func assertSandboxPodObjectFS(t *testing.T, subH *Harness, sandboxName string) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if podErr != nil {
-		t.Fatalf("failed to get pod %s in ao-sandboxes: %v", sandboxName, podErr)
+		t.Fatalf("failed to get pod %s in %s: %v", sandboxName, namespace, podErr)
 	}
 
 	var workspaceVolName string
@@ -1320,7 +1354,7 @@ func assertSandboxPodObjectFS(t *testing.T, subH *Harness, sandboxName string) {
 	var pvcErr error
 	pvcDeadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(pvcDeadline) {
-		out, err := subH.Kubectl("get", "pvc", "-n", "ao-sandboxes", claimName, "-o", "json")
+		out, err := subH.Kubectl("get", "pvc", "-n", namespace, claimName, "-o", "json")
 		if err == nil {
 			if jsonErr := json.Unmarshal([]byte(out), &pvc); jsonErr == nil {
 				if pvc.Status.Phase == corev1.ClaimBound {
@@ -1384,21 +1418,25 @@ func assertSandboxPodObjectFS(t *testing.T, subH *Harness, sandboxName string) {
 	t.Logf("PASS: Sandbox pod %s mounts claim %s bound through StorageClass %s at /workspace and %s", sandboxName, claimName, *pvc.Spec.StorageClassName, homeDir)
 }
 
-func cleanupRunResources(t *testing.T, subH *Harness) {
+func createTestNamespace(t *testing.T, subH *Harness, prefix string) string {
 	t.Helper()
-	deleteAll := func() {
-		_, _ = subH.Kubectl("delete", "sessionmessages", "--all", "-n", "ao-sandboxes")
-		_, _ = subH.Kubectl("delete", "sessions", "--all", "-n", "ao-sandboxes")
-		_, _ = subH.Kubectl("delete", "heroruns", "--all", "-n", "ao-sandboxes")
+	var suffix [4]byte
+	if _, err := cryptorand.Read(suffix[:]); err != nil {
+		t.Fatalf("generating namespace suffix: %v", err)
 	}
-	deleteAll()
-	t.Cleanup(deleteAll)
+	ns := fmt.Sprintf("ao-e2e-%s-%x", prefix, suffix)
+	subH.RunKubectl("create", "namespace", ns)
+	t.Cleanup(func() {
+		_, _ = subH.Kubectl("delete", "namespace", ns, "--ignore-not-found", "--wait=false")
+	})
+	return ns
 }
 
 func TestRunLifecycle(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e run lifecycle tests")
 	}
+	t.Parallel()
 
 	clusterName := os.Getenv("KIND_CLUSTER_NAME")
 	if clusterName == "" {
@@ -1416,16 +1454,16 @@ func TestRunLifecycle(t *testing.T) {
 	aoBin := buildAOBinary(t, gitRoot)
 
 	subH := h.WithT(t)
-	cleanupRunResources(t, subH)
+	testNS := createTestNamespace(t, subH, "run-lifecycle")
 
-	_, repoURL, baseCommit := setupHelloRepoFixture(t, subH)
-	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, repoURL, "OPENAI_MODEL=fake-eliza")
+	_, repoURL, baseCommit, proxyEnv := setupHelloRepoFixture(t, subH, testNS)
+	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, testNS, repoURL, append(proxyEnv, "OPENAI_MODEL=fake-eliza")...)
 
 	var assertedObjectFS bool
 	t.Log("Waiting for run to reach Working and then NoImprovement phase...")
 	finalRun, _ := pollRunPhase(t, aoBin, serverAddr, repoURL, "NoImprovement", 90*time.Second, serveStderr, func(r *jsonRun) {
 		if !assertedObjectFS && r.SandboxName != "" {
-			assertSandboxPodObjectFS(t, subH, r.SandboxName)
+			assertSandboxPodObjectFS(t, subH, testNS, r.SandboxName)
 			assertedObjectFS = true
 		}
 	})
@@ -1448,7 +1486,7 @@ func TestRunLifecycle(t *testing.T) {
 	deleteDeadline := time.Now().Add(30 * time.Second)
 	var sbDeleted bool
 	for time.Now().Before(deleteDeadline) {
-		_, getErr := subH.Kubectl("get", "-n", "ao-sandboxes", "sandbox", sandboxName)
+		_, getErr := subH.Kubectl("get", "-n", testNS, "sandbox", sandboxName)
 		if getErr != nil {
 			sbDeleted = true
 			break
@@ -1500,7 +1538,7 @@ func TestRunLifecycle(t *testing.T) {
 	var hrList herorunv1alpha1.HeroRunList
 	flushDeadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(flushDeadline) {
-		hrOut, err := subH.Kubectl("get", "heroruns", "-n", "ao-sandboxes", "-o", "json")
+		hrOut, err := subH.Kubectl("get", "heroruns", "-n", testNS, "-o", "json")
 		if err == nil {
 			if unmarshalErr := json.Unmarshal([]byte(hrOut), &hrList); unmarshalErr == nil && len(hrList.Items) == 1 {
 				finalHRPhase = hrList.Items[0].Status.Phase
@@ -1512,7 +1550,7 @@ func TestRunLifecycle(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if len(hrList.Items) != 1 {
-		t.Fatalf("expected exactly 1 HeroRun in ao-sandboxes, got %d", len(hrList.Items))
+		t.Fatalf("expected exactly 1 HeroRun in %s, got %d", testNS, len(hrList.Items))
 	}
 	if gotRunID := hrList.Items[0].Spec.RunID; gotRunID != finalRun.ID {
 		t.Errorf("expected HeroRun spec.runID %q, got %q", finalRun.ID, gotRunID)
@@ -1534,6 +1572,7 @@ func TestRunPushesBranch(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e run pushes branch tests")
 	}
+	t.Parallel()
 
 	clusterName := os.Getenv("KIND_CLUSTER_NAME")
 	if clusterName == "" {
@@ -1550,14 +1589,16 @@ func TestRunPushesBranch(t *testing.T) {
 
 	aoBin := buildAOBinary(t, gitRoot)
 	subH := h.WithT(t)
-	cleanupRunResources(t, subH)
-	bareRepoDir, repoURL, baseCommit := setupHelloRepoFixture(t, subH)
+	testNS := createTestNamespace(t, subH, "run-pushes-branch")
+	bareRepoDir, repoURL, baseCommit, proxyEnv := setupHelloRepoFixture(t, subH, testNS)
 
 	scriptJSON := `[{"tool":"run_command","args":{"command":"cd /workspace/repo && echo 'appended line for scripted run' >> README.md && git add README.md && git commit -m 'docs: add a line to the README'"}},{"tool":"open_pull_request","args":{"title":"docs: add a line to the README","body":"This scripted run adds a line to the README."}}]`
 
-	serverAddr, httpAddr, _, serveStderr := startAOServe(t, subH, aoBin, repoURL,
-		"OPENAI_MODEL=fake-script",
-		"AO_FAKE_SCRIPT="+scriptJSON,
+	serverAddr, httpAddr, _, serveStderr := startAOServe(t, subH, aoBin, testNS, repoURL,
+		append(proxyEnv,
+			"OPENAI_MODEL=fake-script",
+			"AO_FAKE_SCRIPT="+scriptJSON,
+		)...,
 	)
 
 	t.Log("Waiting for run to reach Succeeded phase...")
@@ -1641,7 +1682,7 @@ func TestRunPushesBranch(t *testing.T) {
 	deleteDeadline := time.Now().Add(30 * time.Second)
 	var sbDeleted bool
 	for time.Now().Before(deleteDeadline) {
-		_, getErr := subH.Kubectl("get", "-n", "ao-sandboxes", "sandbox", finalRun.SandboxName)
+		_, getErr := subH.Kubectl("get", "-n", testNS, "sandbox", finalRun.SandboxName)
 		if getErr != nil {
 			sbDeleted = true
 			break
@@ -1657,6 +1698,7 @@ func TestRunSandboxPortalIsolation(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e portal isolation test")
 	}
+	t.Parallel()
 
 	clusterName := os.Getenv("KIND_CLUSTER_NAME")
 	if clusterName == "" {
@@ -1673,7 +1715,7 @@ func TestRunSandboxPortalIsolation(t *testing.T) {
 
 	aoBin := buildAOBinary(t, gitRoot)
 	subH := h.WithT(t)
-	cleanupRunResources(t, subH)
+	testNS := createTestNamespace(t, subH, "run-portal")
 
 	aoClusterIP, err := subH.Kubectl("get", "service", "-n", "ao-system", "ao", "-o", "jsonpath={.spec.clusterIP}")
 	if err != nil {
@@ -1687,11 +1729,13 @@ func TestRunSandboxPortalIsolation(t *testing.T) {
 	}
 	k8sIP := strings.TrimSpace(k8sClusterIP)
 
-	_, repoURL, _ := setupHelloRepoFixture(t, subH)
+	_, repoURL, _, proxyEnv := setupHelloRepoFixture(t, subH, testNS)
 	scriptJSON := `[{"tool":"run_command","args":{"command":"sleep 10"}}]`
-	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, repoURL,
-		"OPENAI_MODEL=fake-script",
-		"AO_FAKE_SCRIPT="+scriptJSON,
+	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, testNS, repoURL,
+		append(proxyEnv,
+			"OPENAI_MODEL=fake-script",
+			"AO_FAKE_SCRIPT="+scriptJSON,
+		)...,
 	)
 
 	t.Log("Waiting for run to reach Working phase and verify portal isolation...")
@@ -1700,7 +1744,7 @@ func TestRunSandboxPortalIsolation(t *testing.T) {
 		if assertedIsolation || r.Phase != "Working" || r.SandboxName == "" {
 			return
 		}
-		subH.WaitForCondition("ao-sandboxes", "sandbox/"+r.SandboxName, "condition=Ready", 60*time.Second)
+		subH.WaitForCondition(testNS, "sandbox/"+r.SandboxName, "condition=Ready", 60*time.Second)
 
 		restConfig, err := session.GetRESTConfig()
 		if err != nil {
@@ -1715,7 +1759,7 @@ func TestRunSandboxPortalIsolation(t *testing.T) {
 			t.Fatalf("loading signing key: %v", err)
 		}
 		runHarness := session.NewHarness(nil, sbClient, nil, session.RunOptions{
-			Namespace:             "ao-sandboxes",
+			Namespace:             testNS,
 			SigningKey:            signingKey,
 			ControlPlaneNamespace: "ao-system",
 		})
@@ -1820,6 +1864,7 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("RUN_E2E env var not set, skipping e2e test")
 	}
+	t.Parallel()
 
 	clusterName := os.Getenv("KIND_CLUSTER_NAME")
 	if clusterName == "" {
@@ -1836,9 +1881,9 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 
 	aoBin := buildAOBinary(t, gitRoot)
 	subH := h.WithT(t)
-	cleanupRunResources(t, subH)
+	testNS := createTestNamespace(t, subH, "run-deleted-midturn")
 
-	_, repoURL, _ := setupHelloRepoFixture(t, subH)
+	_, repoURL, _, proxyEnv := setupHelloRepoFixture(t, subH, testNS)
 
 	// Step 1: write a file under the home directory in the initial sandbox.
 	// Step 2: run sleep 10 so the command is in flight when sandbox is deleted.
@@ -1876,9 +1921,11 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 		t.Fatalf("marshalling script: %v", err)
 	}
 
-	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, repoURL,
-		"OPENAI_MODEL=fake-script",
-		"AO_FAKE_SCRIPT="+string(scriptBytes),
+	serverAddr, _, stateDir, serveStderr := startAOServe(t, subH, aoBin, testNS, repoURL,
+		append(proxyEnv,
+			"OPENAI_MODEL=fake-script",
+			"AO_FAKE_SCRIPT="+string(scriptBytes),
+		)...,
 	)
 
 	t.Log("Waiting for run to reach Working phase, recording initial sandbox UID, then deleting sandbox while sleep is in flight...")
@@ -1890,9 +1937,9 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 		}
 
 		if initialUID == "" {
-			subH.WaitForCondition("ao-sandboxes", "sandbox/"+r.SandboxName, "condition=Ready", 60*time.Second)
+			subH.WaitForCondition(testNS, "sandbox/"+r.SandboxName, "condition=Ready", 60*time.Second)
 
-			uidOut, err := subH.Kubectl("get", "sandbox", r.SandboxName, "-n", "ao-sandboxes", "-o", "jsonpath={.metadata.uid}")
+			uidOut, err := subH.Kubectl("get", "sandbox", r.SandboxName, "-n", testNS, "-o", "jsonpath={.metadata.uid}")
 			if err != nil {
 				t.Fatalf("failed to read sandbox UID before delete: %v", err)
 			}
@@ -1905,7 +1952,7 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 			time.Sleep(2 * time.Second)
 
 			t.Logf("Deleting sandbox %s (UID: %s) while tool call is in flight...", r.SandboxName, initialUID)
-			out, delErr := subH.Kubectl("delete", "sandbox", r.SandboxName, "-n", "ao-sandboxes")
+			out, delErr := subH.Kubectl("delete", "sandbox", r.SandboxName, "-n", testNS)
 			if delErr != nil {
 				t.Fatalf("failed to delete sandbox %s: %v, output: %s", r.SandboxName, delErr, out)
 			}
@@ -1914,7 +1961,7 @@ func TestRunSandboxDeletedMidTurnWithPortal(t *testing.T) {
 		}
 
 		if replacementUID == "" {
-			uidOut, err := subH.Kubectl("get", "sandbox", r.SandboxName, "-n", "ao-sandboxes", "-o", "jsonpath={.metadata.uid}")
+			uidOut, err := subH.Kubectl("get", "sandbox", r.SandboxName, "-n", testNS, "-o", "jsonpath={.metadata.uid}")
 			if err == nil {
 				uid := strings.TrimSpace(uidOut)
 				if uid != "" && uid != initialUID {

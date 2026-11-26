@@ -69,14 +69,54 @@ func (h *Harness) ContextName() string {
 	return "kind-" + h.clusterName
 }
 
+var (
+	clusterSetupMu  sync.Mutex
+	clusterSetupErr = map[string]error{}
+	createdClusters []string
+)
+
+// CleanupCreatedClusters deletes any kind clusters created by Harness.Setup during a test run.
+func CleanupCreatedClusters() {
+	clusterSetupMu.Lock()
+	clusters := append([]string(nil), createdClusters...)
+	clusterSetupMu.Unlock()
+	if os.Getenv("KEEP_CLUSTER") == "true" || os.Getenv("CI") == "true" || os.Getenv("GITHUB_ACTIONS") == "true" {
+		return
+	}
+	for _, name := range clusters {
+		if out, err := exec.Command("kind", "delete", "cluster", "--name", name).CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to delete kind cluster %s: %v\nOutput: %s\n", name, err, string(out))
+		}
+	}
+}
+
 // Setup verifies prerequisites and ensures the correct kubectl context is active,
 // creating the kind cluster and deploying dependencies if it does not yet exist.
+// Setup is safe to call concurrently from parallel tests.
 func (h *Harness) Setup() {
 	h.t.Helper()
+
+	clusterSetupMu.Lock()
+	if err, done := clusterSetupErr[h.clusterName]; done {
+		clusterSetupMu.Unlock()
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		return
+	}
+	err := h.setupCluster()
+	clusterSetupErr[h.clusterName] = err
+	clusterSetupMu.Unlock()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *Harness) setupCluster() error {
 	h.ensurePath()
 
 	if _, err := exec.LookPath("kubectl"); err != nil {
-		h.t.Fatalf("kubectl not found on PATH: %v", err)
+		return fmt.Errorf("kubectl not found on PATH: %w", err)
 	}
 
 	// Check if kind cluster exists
@@ -101,16 +141,17 @@ func (h *Harness) Setup() {
 			h.t.Logf("Cluster %s does not exist, creating with kind...", h.clusterName)
 			gitRoot, gitErr := h.getGitRoot()
 			if gitErr != nil {
-				h.t.Fatalf("failed to get git root to locate kind config: %v", gitErr)
+				return fmt.Errorf("failed to get git root to locate kind config: %w", gitErr)
 			}
 			kindConfigFile := filepath.Join(gitRoot, "dev", "kind-config.yaml")
 			if _, statErr := os.Stat(kindConfigFile); statErr != nil {
-				h.t.Fatalf("kind config file %s not found (required to enable containerd NRI): %v", kindConfigFile, statErr)
+				return fmt.Errorf("kind config file %s not found (required to enable containerd NRI): %w", kindConfigFile, statErr)
 			}
 			createCmd := exec.Command("kind", "create", "cluster", "--name", h.clusterName, "--config", kindConfigFile)
 			if createOut, createErr := createCmd.CombinedOutput(); createErr != nil {
-				h.t.Fatalf("failed to create kind cluster %s: %v\nOutput: %s", h.clusterName, createErr, string(createOut))
+				return fmt.Errorf("failed to create kind cluster %s: %w\nOutput: %s", h.clusterName, createErr, string(createOut))
 			}
+			createdClusters = append(createdClusters, h.clusterName)
 
 			// Deploy dependencies using dev/tasks/deploy-to-kube
 			deployScript := filepath.Join(gitRoot, "dev", "tasks", "deploy-to-kube")
@@ -121,19 +162,9 @@ func (h *Harness) Setup() {
 				deployCmd := exec.Command(deployScript)
 				deployCmd.Env = append(os.Environ(), "KIND_CLUSTER_NAME="+h.clusterName)
 				if deployOut, deployErr := deployCmd.CombinedOutput(); deployErr != nil {
-					h.t.Fatalf("failed to deploy dependencies: %v\nOutput: %s", deployErr, string(deployOut))
+					return fmt.Errorf("failed to deploy dependencies: %w\nOutput: %s", deployErr, string(deployOut))
 				}
 			}
-
-			h.t.Cleanup(func() {
-				if os.Getenv("KEEP_CLUSTER") != "true" && os.Getenv("CI") != "true" && os.Getenv("GITHUB_ACTIONS") != "true" {
-					h.t.Logf("Deleting kind cluster %s...", h.clusterName)
-					delCmd := exec.Command("kind", "delete", "cluster", "--name", h.clusterName)
-					if delOut, delErr := delCmd.CombinedOutput(); delErr != nil {
-						h.t.Logf("warning: failed to delete kind cluster: %v\nOutput: %s", delErr, string(delOut))
-					}
-				}
-			})
 		}
 	}
 
@@ -141,6 +172,7 @@ func (h *Harness) Setup() {
 	if _, err := h.Kubectl("config", "use-context", h.ContextName()); err != nil {
 		h.t.Logf("warning: failed to switch kubectl context to %s: %v", h.ContextName(), err)
 	}
+	return nil
 }
 
 func (h *Harness) getGitRoot() (string, error) {
