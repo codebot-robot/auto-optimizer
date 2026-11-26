@@ -433,4 +433,23 @@ func TestLoadDir_RepoGoals(t *testing.T) {
 	if len(loaded) == 0 {
 		t.Fatal("expected at least one goal in .goals/")
 	}
+
+	byName := make(map[string]*goals.Goal, len(loaded))
+	for _, g := range loaded {
+		if strings.TrimSpace(g.Body) == "" {
+			t.Errorf("goal %q has empty body", g.Name)
+		}
+		byName[g.Name] = g
+	}
+
+	docGoal, ok := byName["improve-doc-comments"]
+	if !ok {
+		t.Fatal("expected improve-doc-comments goal in .goals/")
+	}
+	if docGoal.Verify != "go test ./..." {
+		t.Errorf("improve-doc-comments verify = %q, want %q", docGoal.Verify, "go test ./...")
+	}
+	if docGoal.Budget == nil || docGoal.Budget.MaxDuration != "15m" {
+		t.Errorf("improve-doc-comments budget = %+v, want maxDuration 15m", docGoal.Budget)
+	}
 }
