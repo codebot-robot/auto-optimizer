@@ -212,6 +212,153 @@ ensure_cached_repo() {
   echo "${target_dir}"
 }
 
+# Parallel kind image build helpers (bash 3.2 compatible).
+KIND_BUILD_LOG_DIR=""
+KIND_BUILD_NAMES=()
+KIND_BUILD_PIDS=()
+KIND_BUILD_LOGS=()
+KIND_BUILD_STARTS=()
+KIND_BUILD_WAITED=()
+
+cleanup_kind_builds() {
+  local i pid
+  for ((i = 0; i < ${#KIND_BUILD_PIDS[@]}; i++)); do
+    if [[ "${KIND_BUILD_WAITED[i]}" != "true" ]]; then
+      pid="${KIND_BUILD_PIDS[i]}"
+      pkill -P "${pid}" 2>/dev/null || true
+      kill "${pid}" 2>/dev/null || true
+    fi
+  done
+  if [[ -n "${KIND_BUILD_LOG_DIR}" && -d "${KIND_BUILD_LOG_DIR}" ]]; then
+    rm -rf "${KIND_BUILD_LOG_DIR}"
+  fi
+}
+
+start_kind_build() {
+  local name="$1"
+  shift
+  if [[ -z "${KIND_BUILD_LOG_DIR}" ]]; then
+    KIND_BUILD_LOG_DIR="$(mktemp -d)"
+    trap cleanup_kind_builds EXIT
+  fi
+  local log_file="${KIND_BUILD_LOG_DIR}/${name}.log"
+  local start_ts
+  start_ts="$(date -u +%s)"
+  echo "Starting parallel image build: ${name}..."
+  (
+    "$@"
+  ) >"${log_file}" 2>&1 &
+  local pid=$!
+  KIND_BUILD_NAMES+=("${name}")
+  KIND_BUILD_PIDS+=("${pid}")
+  KIND_BUILD_LOGS+=("${log_file}")
+  KIND_BUILD_STARTS+=("${start_ts}")
+  KIND_BUILD_WAITED+=("false")
+}
+
+wait_kind_build() {
+  local target="$1"
+  local idx=-1
+  local i
+  for ((i = 0; i < ${#KIND_BUILD_NAMES[@]}; i++)); do
+    if [[ "${KIND_BUILD_NAMES[i]}" == "${target}" ]]; then
+      idx="${i}"
+      break
+    fi
+  done
+  if [[ "${idx}" -lt 0 ]]; then
+    echo "ERROR: Unknown kind build '${target}'" >&2
+    return 1
+  fi
+  if [[ "${KIND_BUILD_WAITED[idx]}" == "true" ]]; then
+    return 0
+  fi
+
+  local pid="${KIND_BUILD_PIDS[idx]}"
+  local log_file="${KIND_BUILD_LOGS[idx]}"
+  local start_ts="${KIND_BUILD_STARTS[idx]}"
+  local status=0
+  echo "Waiting for parallel image build: ${target}..."
+  wait "${pid}" || status=$?
+  KIND_BUILD_WAITED[idx]="true"
+
+  local elapsed=$(( $(date -u +%s) - start_ts ))
+  if [[ "${status}" -ne 0 ]]; then
+    echo "=== ERROR: Parallel image build '${target}' failed (exit ${status}, ${elapsed}s) ===" >&2
+    if [[ -f "${log_file}" ]]; then
+      cat "${log_file}" >&2
+    fi
+    return "${status}"
+  fi
+
+  echo "=== Parallel image build '${target}' succeeded (${elapsed}s) ==="
+  if [[ -f "${log_file}" ]]; then
+    cat "${log_file}"
+  fi
+}
+
+BACKEND_URL="${OBJECTFS_BACKEND:-}"
+USE_FAKES3="false"
+if [[ -z "${BACKEND_URL}" ]]; then
+  USE_FAKES3="true"
+  BACKEND_URL="s3://objectfs-bucket?endpoint=http://fakes3.kube-objectfs-system.svc.cluster.local:9000&region=us-east-1&s3ForcePathStyle=true"
+fi
+
+SERVICE_PORTALS_DIR="${CACHE_DIR}/service-portals/${SERVICE_PORTALS_COMMIT}"
+IN_CLUSTER_STORAGE_DIR="${CACHE_DIR}/in-cluster-storage/${IN_CLUSTER_STORAGE_COMMIT}"
+
+build_service_portals_images() {
+  local dir
+  dir="$(ensure_cached_repo "service-portals" "https://github.com/gke-labs/service-portals.git" "${SERVICE_PORTALS_COMMIT}")"
+  cd "${dir}"
+  "${REPO_ROOT}/.build/bin/ap" build \
+    images/service-portal-controller \
+    images/service-portal-agent \
+    images/service-portal-nri-plugin
+}
+
+build_in_cluster_storage_images() {
+  local dir
+  dir="$(ensure_cached_repo "in-cluster-storage" "https://github.com/gke-labs/in-cluster-storage.git" "${IN_CLUSTER_STORAGE_COMMIT}")"
+  cd "${dir}"
+  local targets=(
+    certsigner/images/certsigner
+    images/objectfs-controller
+    images/objectfs-fuse-holder
+    images/objectfs-node-daemon
+    images/wal-buffer
+  )
+  if [[ "${USE_FAKES3}" == "true" ]]; then
+    targets+=(fakes3/images/fakes3)
+  fi
+  "${REPO_ROOT}/.build/bin/ap" build "${targets[@]}"
+}
+
+build_ao_images() {
+  cd "${REPO_ROOT}"
+  "${REPO_ROOT}/.build/bin/ap" build
+}
+
+if [[ "${IS_KIND}" == "true" ]]; then
+  if has_component "service-portals" || has_component "objectfs" || has_component "ao"; then
+    echo "--- Starting parallel image builds for kind ---"
+    mkdir -p "${CACHE_DIR}"
+    # Pre-warm docker and docker-buildx before launching concurrent ap builds,
+    # because ap's lazy tool downloader does not coordinate across processes.
+    docker --version >/dev/null
+    docker-buildx version >/dev/null
+  fi
+  if has_component "service-portals"; then
+    start_kind_build "service-portals" build_service_portals_images
+  fi
+  if has_component "objectfs"; then
+    start_kind_build "in-cluster-storage" build_in_cluster_storage_images
+  fi
+  if has_component "ao"; then
+    start_kind_build "auto-optimizer" build_ao_images
+  fi
+fi
+
 # ------------------------------------------------------------------------------
 # 1. Namespaces
 # ------------------------------------------------------------------------------
@@ -243,8 +390,6 @@ fi
 # 3. service-portals
 # ------------------------------------------------------------------------------
 if has_component "service-portals"; then
-  SERVICE_PORTALS_DIR="$(ensure_cached_repo "service-portals" "https://github.com/gke-labs/service-portals.git" "${SERVICE_PORTALS_COMMIT}")"
-
   if [[ "${IS_KIND}" == "true" ]]; then
     echo "--- Deploying service-portals (${SERVICE_PORTALS_COMMIT}) on kind with ap deploy ---"
 
@@ -288,6 +433,8 @@ EOF
       rm -rf "${CERT_TMPDIR}"
     fi
 
+    wait_kind_build "service-portals"
+
     echo "Deploying service-portals manifests with ap deploy..."
     # Do not wait for workloads here; the controller requires the ConfigMap created below by dev/tasks/configure.
     (cd "${SERVICE_PORTALS_DIR}" && "${REPO_ROOT}/.build/bin/ap" deploy --skip-push --wait=false k8s/controller.yaml k8s/node-agent.yaml)
@@ -301,6 +448,8 @@ EOF
     echo "Waiting for portal-node-agent daemonset in service-portal-system..."
     kubectl rollout status daemonset/portal-node-agent -n service-portal-system --timeout=120s
   else
+    SERVICE_PORTALS_DIR="$(ensure_cached_repo "service-portals" "https://github.com/gke-labs/service-portals.git" "${SERVICE_PORTALS_COMMIT}")"
+
     if [[ "${INSTALL_SERVICE_PORTALS:-false}" != "true" ]]; then
       echo "--- Skipping service-portals install on non-kind cluster (set INSTALL_SERVICE_PORTALS=true to proceed) ---"
       echo "To deploy service-portals on a non-kind cluster, the operator must provide:"
@@ -339,19 +488,11 @@ if has_component "objectfs"; then
     echo "--- Installing in-cluster-storage / ObjectFS (${IN_CLUSTER_STORAGE_COMMIT}) with ap ---"
     kubectl create namespace kube-objectfs-system --dry-run=client -o yaml | kubectl apply -f -
 
-    IN_CLUSTER_STORAGE_DIR="$(ensure_cached_repo "in-cluster-storage" "https://github.com/gke-labs/in-cluster-storage.git" "${IN_CLUSTER_STORAGE_COMMIT}")"
-
-    BACKEND_URL="${OBJECTFS_BACKEND:-}"
-    USE_FAKES3="false"
-    if [[ -z "${BACKEND_URL}" ]]; then
-      USE_FAKES3="true"
-      BACKEND_URL="s3://objectfs-bucket?endpoint=http://fakes3.kube-objectfs-system.svc.cluster.local:9000&region=us-east-1&s3ForcePathStyle=true"
-    fi
-
     if [[ "${IS_KIND}" == "true" ]]; then
+      wait_kind_build "in-cluster-storage"
+
       if [[ "${USE_FAKES3}" == "true" ]]; then
-        echo "Building and loading fakes3 for kind..."
-        (cd "${IN_CLUSTER_STORAGE_DIR}/fakes3" && "${REPO_ROOT}/.build/bin/ap" build)
+        echo "Loading fakes3 into kind cluster ${KIND_CLUSTER_NAME}..."
         kind load docker-image "${IMAGE_PREFIX}/fakes3:${IMAGE_TAG}" --name "${KIND_CLUSTER_NAME}"
 
         echo "Deploying in-cluster fakes3 service and deployment..."
@@ -395,20 +536,11 @@ EOF
         kubectl rollout status deployment/fakes3 -n kube-objectfs-system --timeout=60s
       fi
 
-      echo "Building in-cluster-storage images..."
-      (cd "${IN_CLUSTER_STORAGE_DIR}" && "${REPO_ROOT}/.build/bin/ap" build)
-      echo "Loading in-cluster-storage images into kind cluster ${KIND_CLUSTER_NAME}..."
-      kind load docker-image \
-        "${IMAGE_PREFIX}/wal-buffer:${IMAGE_TAG}" \
-        "${IMAGE_PREFIX}/objectfs-controller:${IMAGE_TAG}" \
-        "${IMAGE_PREFIX}/objectfs-node-daemon:${IMAGE_TAG}" \
-        "${IMAGE_PREFIX}/objectfs-fuse-holder:${IMAGE_TAG}" \
-        --name "${KIND_CLUSTER_NAME}"
-
       echo "Deploying in-cluster-storage manifests with ap deploy..."
       # Do not wait for workloads here; backend config and credentials are configured below before waiting for rollout.
       (cd "${IN_CLUSTER_STORAGE_DIR}" && "${REPO_ROOT}/.build/bin/ap" deploy --skip-push --wait=false)
     else
+      IN_CLUSTER_STORAGE_DIR="$(ensure_cached_repo "in-cluster-storage" "https://github.com/gke-labs/in-cluster-storage.git" "${IN_CLUSTER_STORAGE_COMMIT}")"
       echo "Deploying in-cluster-storage with ap deploy (pushing to ${IMAGE_PREFIX})..."
       # Do not wait for workloads here; backend config and credentials are configured below before waiting for rollout.
       (cd "${IN_CLUSTER_STORAGE_DIR}" && "${REPO_ROOT}/.build/bin/ap" deploy --wait=false)
@@ -498,13 +630,11 @@ if has_component "ao"; then
   SANDBOX_IMAGE="${SANDBOX_IMAGE:-${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}}"
 
   if [[ "${IS_KIND}" == "true" ]]; then
-    echo "Building auto-optimizer images..."
-    (cd "${REPO_ROOT}" && "${REPO_ROOT}/.build/bin/ap" build)
-    echo "Loading auto-optimizer images into kind cluster ${KIND_CLUSTER_NAME}..."
+    wait_kind_build "auto-optimizer"
+    echo "Loading auto-optimizer sandbox images into kind cluster ${KIND_CLUSTER_NAME}..."
     kind load docker-image \
       "${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}" \
       "${IMAGE_PREFIX}/sandbox-go:${IMAGE_TAG}" \
-      "${IMAGE_PREFIX}/ao:${IMAGE_TAG}" \
       "${IMAGE_PREFIX}/sandboxd:${IMAGE_TAG}" \
       --name "${KIND_CLUSTER_NAME}"
 
