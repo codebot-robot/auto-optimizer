@@ -8486,56 +8486,63 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 type scriptedStartSessionLLM struct {
 	task        string
 	afterResult func(toolMsg llm.Message)
-	callCount   atomic.Int32
 }
 
 func (s *scriptedStartSessionLLM) CreateChatCompletion(_ context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
-	n := s.callCount.Add(1)
-	if n == 1 {
-		args, _ := json.Marshal(map[string]string{
-			"task": s.task,
-		})
+	toolCallResp := func(id, callID, name string, args map[string]string) (*llm.ChatCompletionResponse, error) {
+		raw, _ := json.Marshal(args)
 		return &llm.ChatCompletionResponse{
-			ID: "start-sess-llm",
+			ID: id,
 			Choices: []llm.Choice{{
 				Message: llm.Message{
 					Role: "assistant",
 					ToolCalls: []llm.ToolCall{{
-						ID:   "call-start-sess-1",
+						ID:   callID,
 						Type: "function",
 						Function: llm.FunctionCall{
-							Name:      "start_session",
-							Arguments: string(args),
+							Name:      name,
+							Arguments: string(raw),
 						},
 					}},
 				},
 			}},
 		}, nil
 	}
-	for _, m := range req.Messages {
-		if m.Role == "tool" && m.ToolCallID == "call-start-sess-1" {
-			if s.afterResult != nil {
-				s.afterResult(m)
+
+	var startResult *llm.Message
+	var sawWaitResult bool
+	var isChild bool
+	for i := range req.Messages {
+		m := &req.Messages[i]
+		switch m.Role {
+		case "user":
+			if m.Content != nil && *m.Content == s.task {
+				isChild = true
+			}
+		case "tool":
+			switch m.ToolCallID {
+			case "call-start-sess-1":
+				startResult = m
+			case "call-wait-1":
+				sawWaitResult = true
 			}
 		}
 	}
-	finishArgs, _ := json.Marshal(map[string]string{"summary": "child started successfully"})
-	return &llm.ChatCompletionResponse{
-		ID: "start-sess-finish",
-		Choices: []llm.Choice{{
-			Message: llm.Message{
-				Role: "assistant",
-				ToolCalls: []llm.ToolCall{{
-					ID:   "call-finish-1",
-					Type: "function",
-					Function: llm.FunctionCall{
-						Name:      "finish",
-						Arguments: string(finishArgs),
-					},
-				}},
-			},
-		}},
-	}, nil
+	if isChild {
+		return toolCallResp("child-sess-finish", "call-child-finish-1", "finish", map[string]string{"summary": "child finished"})
+	}
+	if sawWaitResult {
+		return toolCallResp("start-sess-finish", "call-finish-1", "finish", map[string]string{"summary": "child started successfully"})
+	}
+	if startResult != nil {
+		if s.afterResult != nil {
+			s.afterResult(*startResult)
+		}
+		// Wait for the child session to run and stop before finishing, so
+		// cascading cancellation does not cancel it before reconciliation.
+		return toolCallResp("start-sess-wait", "call-wait-1", "wait", map[string]string{"timeout": "30s"})
+	}
+	return toolCallResp("start-sess-llm", "call-start-sess-1", "start_session", map[string]string{"task": s.task})
 }
 
 func TestOrchestrator_Working_StartSession_CreatesChildSession(t *testing.T) {
