@@ -29,7 +29,9 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
@@ -42,7 +44,10 @@ import (
 type workflowResult struct {
 	// done reports that the workflow has reached a terminal phase and should not be called again.
 	done bool
-	// requeueAfter tells the caller to invoke Run again after a duration; zero means invoke again immediately.
+	// wait reports that the workflow is waiting on external changes (such as an owned Session)
+	// and should not immediately re-notify the orchestrator.
+	wait bool
+	// requeueAfter tells the caller to invoke Run again after a duration; zero means invoke again immediately unless wait is true.
 	requeueAfter time.Duration
 }
 
@@ -73,6 +78,8 @@ func (w *runWorkflow) Run(ctx context.Context) (workflowResult, error) {
 		return w.runPending(ctx)
 	case state.PhasePreparing:
 		return w.runPreparing(ctx)
+	case state.PhaseWorking:
+		return w.runWorking(ctx)
 	case state.PhaseSelecting:
 		return w.runSelecting(ctx)
 	case state.PhaseOpeningPR:
@@ -294,6 +301,183 @@ func (w *runWorkflow) runPreparing(ctx context.Context) (workflowResult, error) 
 	w.run.ReadyDeadline = nil
 	log.Info("run successfully prepared and entered Working phase", "run", w.run.ID, "sandbox", w.run.SandboxName)
 	return workflowResult{}, nil
+}
+
+// runWorking ensures the run's root Session resource exists, waits via Owns(&Session{})
+// while it is active, enforces the run deadline, and maps terminal Session outcomes
+// onto the next HeroRun phase.
+func (w *runWorkflow) runWorking(ctx context.Context) (workflowResult, error) {
+	if ctx.Err() != nil {
+		return workflowResult{}, nil
+	}
+
+	now := w.orch.clock().UTC()
+	ns := w.orch.namespace()
+	if w.hr != nil && w.hr.Namespace != "" {
+		ns = w.hr.Namespace
+	}
+	sessionID := topLevelSessionID(w.run.ID, w.run.SessionID)
+
+	var sess herorunv1alpha1.Session
+	err := w.orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: sessionID}, &sess)
+	if err == nil {
+		if sess.Spec.RunID != "" && sess.Spec.RunID != w.run.ID {
+			return w.failRun(now, fmt.Sprintf("session %s belongs to run %s, not %s", sessionID, sess.Spec.RunID, w.run.ID)), nil
+		}
+		if w.run.SessionID == "" {
+			w.run.SessionID = sessionID
+		}
+		if sess.Status.Phase.IsTerminal() {
+			return w.handleSessionOutcome(ctx, now, &sess), nil
+		}
+		if w.run.Deadline != nil && !now.Before(*w.run.Deadline) {
+			if err := w.cancelSession(ctx, &sess); err != nil {
+				return workflowResult{}, fmt.Errorf("canceling session %s: %w", sessionID, err)
+			}
+			return w.failDeadlineExceeded(now), nil
+		}
+		return w.workingWaitResult(now), nil
+	}
+	if !k8serrors.IsNotFound(err) {
+		return workflowResult{}, fmt.Errorf("getting session %s: %w", sessionID, err)
+	}
+
+	if w.run.Deadline != nil && !now.Before(*w.run.Deadline) {
+		return w.failDeadlineExceeded(now), nil
+	}
+	if w.run.SandboxName == "" {
+		return w.failRun(now, "sandbox name is empty for working run"), nil
+	}
+
+	var basePrompt string
+	if w.orch.harness != nil {
+		basePrompt = w.orch.harness.RunOptions().SystemPrompt
+	}
+	hrName := sandboxNameForRun(w.run.ID)
+	if w.hr != nil && w.hr.Name != "" {
+		hrName = w.hr.Name
+	}
+	root := &herorunv1alpha1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            sessionID,
+			Namespace:       ns,
+			Labels:          map[string]string{LabelRun: w.run.ID},
+			OwnerReferences: heroRunOwnerReferences(w.hr),
+		},
+		Spec: herorunv1alpha1.SessionSpec{
+			RunID:              w.run.ID,
+			HeroRunName:        hrName,
+			Repository:         w.repo.URL,
+			Branch:             w.run.BranchName(),
+			SystemPrompt:       buildSystemPrompt(basePrompt, w.repo, w.run, w.goalBody(ctx)),
+			InitialPrompt:      "Please work on the goal.",
+			SandboxName:        w.run.SandboxName,
+			WorkspaceClaimName: w.run.WorkspaceClaimName,
+			MaxTurns:           w.orch.maxTurns,
+			MaxDepth:           w.orch.maxSessionDepth,
+			Deadline:           toMetaTime(w.run.Deadline),
+			AllowPullRequest:   true,
+		},
+	}
+	if err := w.orch.kubeClient.Create(ctx, root); err != nil {
+		if k8serrors.IsAlreadyExists(err) {
+			return workflowResult{}, nil
+		}
+		return workflowResult{}, fmt.Errorf("creating session %s: %w", sessionID, err)
+	}
+
+	w.run.SessionID = sessionID
+	w.appendEvent(ctx, now, state.PhaseWorking, "session_started", fmt.Sprintf("Started session %s", sessionID), map[string]any{"session_id": sessionID})
+	return w.workingWaitResult(now), nil
+}
+
+func (w *runWorkflow) handleSessionOutcome(ctx context.Context, now time.Time, sess *herorunv1alpha1.Session) workflowResult {
+	switch sess.Status.Outcome {
+	case herorunv1alpha1.SessionOutcomePullRequest:
+		w.run.PRTitle, w.run.PRBody = sess.Status.PRTitle, sess.Status.PRBody
+		w.run.SetPhase(state.PhaseSelecting, now)
+		w.appendEvent(ctx, now, state.PhaseSelecting, "pull_request_requested", "Pull request requested by agent", nil)
+		w.orch.releaseSandbox(w.run.SandboxName)
+		return workflowResult{}
+	case herorunv1alpha1.SessionOutcomeFinished:
+		w.run.Summary = sess.Status.Summary
+		return w.noImprovement(now, "finished", sess.Status.Summary, nil)
+	case herorunv1alpha1.SessionOutcomeCompleted, herorunv1alpha1.SessionOutcomeMaxTurns:
+		return w.noImprovement(now, "no_improvement", "session ended without a pull request", nil)
+	case herorunv1alpha1.SessionOutcomeDeadlineExceeded:
+		return w.failDeadlineExceeded(now)
+	case herorunv1alpha1.SessionOutcomeCanceled:
+		if w.run.Deadline != nil && !now.Before(*w.run.Deadline) {
+			return w.failDeadlineExceeded(now)
+		}
+		if sess.Status.Error != "" {
+			return w.failRun(now, fmt.Sprintf("session canceled: %s", sess.Status.Error))
+		}
+		return w.failRun(now, "session canceled")
+	default:
+		if sess.Status.Phase == herorunv1alpha1.SessionPhaseCanceled && w.run.Deadline != nil && !now.Before(*w.run.Deadline) {
+			return w.failDeadlineExceeded(now)
+		}
+		if sess.Status.Error != "" {
+			return w.failRun(now, fmt.Sprintf("session error: %s", sess.Status.Error))
+		}
+		if sess.Status.Outcome == herorunv1alpha1.SessionOutcomeFailed || sess.Status.Outcome == "" {
+			return w.failRun(now, "session failed")
+		}
+		return w.failRun(now, fmt.Sprintf("session ended with unexpected outcome %q", sess.Status.Outcome))
+	}
+}
+
+func (w *runWorkflow) cancelSession(ctx context.Context, sess *herorunv1alpha1.Session) error {
+	key := client.ObjectKeyFromObject(sess)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var current herorunv1alpha1.Session
+		if err := w.orch.kubeClient.Get(ctx, key, &current); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if current.Status.Phase.IsTerminal() {
+			return nil
+		}
+		now := metav1.NewTime(w.orch.clock().UTC())
+		current.Status.Phase, current.Status.Outcome = herorunv1alpha1.SessionPhaseCanceled, herorunv1alpha1.SessionOutcomeCanceled
+		current.Status.Error, current.Status.WaitingUntil = "run deadline exceeded", nil
+		current.Status.FinishedAt, current.Status.ObservedAt = &now, &now
+		return w.orch.kubeClient.Status().Update(ctx, &current)
+	})
+}
+
+func (w *runWorkflow) failDeadlineExceeded(now time.Time) workflowResult {
+	var data map[string]any
+	if w.run.Deadline != nil {
+		var elapsed time.Duration
+		if start := runStartTime(w.run); !start.IsZero() && now.After(start) {
+			elapsed = now.Sub(start)
+		}
+		data = map[string]any{"deadline": w.run.Deadline.Format(time.RFC3339), "elapsed": elapsed.String()}
+	}
+	res := w.failRunWithKind(now, "deadline_exceeded", "deadline exceeded")
+	w.end = &runEnd{Phase: state.PhaseFailed, Kind: "deadline_exceeded", Message: "deadline exceeded", Data: data}
+	return res
+}
+
+func (w *runWorkflow) workingWaitResult(now time.Time) workflowResult {
+	var requeueAfter time.Duration
+	if w.run.Deadline != nil {
+		requeueAfter = w.run.Deadline.Sub(now)
+	}
+	return workflowResult{wait: true, requeueAfter: requeueAfter}
+}
+
+func (w *runWorkflow) goalBody(ctx context.Context) string {
+	if w.run.Goal != nil {
+		return w.run.Goal.Body
+	}
+	if w.run.GoalName != "" && w.orch.store != nil {
+		if rec, err := w.orch.store.GetGoal(ctx, w.repo.Key(), w.run.GoalName); err == nil && rec != nil && rec.Goal != nil {
+			return rec.Goal.Body
+		}
+	}
+	return ""
 }
 
 // runSelecting executes the Selecting phase: runs the goal's verify command if configured,

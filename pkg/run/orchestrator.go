@@ -649,7 +649,7 @@ func (o *Orchestrator) reconcileWorkflow(ctx context.Context, wf *runWorkflow) (
 			log.Error(err, "failed to append phase event", "phase", wf.run.Phase, "run", wf.run.ID)
 		}
 	}
-	if res.requeueAfter > 0 {
+	if res.wait || res.requeueAfter > 0 {
 		return reconcile.Result{RequeueAfter: res.requeueAfter}, nil
 	}
 	o.Notify(wf.repo.Key(), wf.run.ID)
