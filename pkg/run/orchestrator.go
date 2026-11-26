@@ -27,8 +27,6 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -54,13 +52,11 @@ import (
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
-	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/portal"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
-	"github.com/gke-labs/auto-optimizer/pkg/toolsets/ao"
 )
 
 const (
@@ -243,18 +239,9 @@ func (o *OrchestratorOptions) Validate() error {
 	return nil
 }
 
-type turnOutcome struct {
-	Err      error
-	Finished time.Time
-	PRTitle  string
-	PRBody   string
-	Summary  string
-}
-
 // Orchestrator reconciles runs in phase Pending and Working using a controller-runtime controller.
 type Orchestrator struct {
 	store              state.Store
-	sessionStore       session.Store
 	harness            *session.Harness
 	clock              func() time.Time
 	maxTurns           int
@@ -281,13 +268,7 @@ type Orchestrator struct {
 	runStatesMu sync.Mutex
 	runStates   map[string]*runState
 
-	turnWorkersMu sync.Mutex
-	turnWorkers   map[string]*turnWorkerHandle
-	workerWG      sync.WaitGroup
-
-	pendingMessagesMu sync.Mutex
-	pendingMessagesCh chan struct{}
-	msgSeq            atomic.Uint64
+	msgSeq atomic.Uint64
 
 	managerCtxMu sync.Mutex
 	managerCtx   context.Context
@@ -299,14 +280,6 @@ var ErrRunNotWorking = errors.New("run is no longer working")
 // runState holds in-memory runtime state shared across sessions of an active run.
 type runState struct {
 	sandboxOwner *session.SandboxOwner
-	turnBudget   *session.TurnBudget
-	children     *childGroup
-}
-
-// turnWorkerHandle tracks a live in-process turn worker goroutine.
-type turnWorkerHandle struct {
-	runID  string
-	cancel context.CancelFunc
 }
 
 var _ reconcile.Reconciler = (*Orchestrator)(nil)
@@ -362,7 +335,6 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 
 	orch := &Orchestrator{
 		store:                 opts.Store,
-		sessionStore:          opts.SessionStore,
 		harness:               opts.Harness,
 		clock:                 opts.Clock,
 		maxTurns:              opts.MaxTurns,
@@ -382,25 +354,8 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		runIndex:              make(map[string]runIndexEntry),
 		notifyCh:              make(chan event.TypedGenericEvent[reconcile.Request], 1024),
 		runStates:             make(map[string]*runState),
-		turnWorkers:           make(map[string]*turnWorkerHandle),
 	}
 	return orch, nil
-}
-
-func (o *Orchestrator) turnBudget(runID string) *session.TurnBudget {
-	if o == nil {
-		return nil
-	}
-	o.runStatesMu.Lock()
-	defer o.runStatesMu.Unlock()
-	rs := o.runStates[runID]
-	if rs == nil {
-		return nil
-	}
-	if rs.turnBudget == nil {
-		rs.turnBudget = session.NewTurnBudget(o.maxTurns)
-	}
-	return rs.turnBudget
 }
 
 func (o *Orchestrator) recordRunIndex(name string, repo state.RepoKey, runID string) {
@@ -542,11 +497,8 @@ func (o *Orchestrator) getRunForReconcile(ctx context.Context, req reconcile.Req
 }
 
 // Reconcile loads the run and the repository, dispatches on the phase to
-// runWorkflow.Run (for Pending, Preparing, Selecting, and OpeningPR) or
-// workRun, and returns.
+// runWorkflow.Run, and returns.
 func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	log := scoped.Log(ctx)
-
 	run, repo, hr, err := o.getRunForReconcile(ctx, req)
 	if err != nil {
 		return reconcile.Result{}, err
@@ -557,27 +509,13 @@ func (o *Orchestrator) Reconcile(ctx context.Context, req reconcile.Request) (re
 
 	if run.Phase.IsTerminal() {
 		o.deleteRunIndex(req.Name)
-		o.cancelRunTurnWorkers(run.ID)
 		o.deleteRunState(run.ID)
 		return reconcile.Result{}, nil
 	}
 
 	switch run.Phase {
-	case state.PhasePending, state.PhasePreparing, state.PhaseSelecting, state.PhaseOpeningPR:
+	case state.PhasePending, state.PhasePreparing, state.PhaseWorking, state.PhaseSelecting, state.PhaseOpeningPR:
 		return o.reconcileWorkflow(ctx, newRunWorkflow(o, repo, run, hr))
-
-	case state.PhaseWorking:
-		if o.sessionStore != nil && o.harness != nil && o.harness.LLMClient() != nil {
-			res, err := o.workRun(ctx, repo, run, hr)
-			if err != nil {
-				log.Error(err, "working run failed", "repo", repo.URL, "run", run.ID)
-				if run.Phase.IsTerminal() {
-					return reconcile.Result{}, nil
-				}
-				return reconcile.Result{}, err
-			}
-			return res, nil
-		}
 	}
 
 	return reconcile.Result{}, nil
@@ -881,156 +819,6 @@ func (o *Orchestrator) prepareSandbox(ctx context.Context, repo *state.Repo, run
 	return nil
 }
 
-// ensureRunState creates the in-memory state for a run if it does not yet exist.
-func (o *Orchestrator) ensureRunState(runID string) *runState {
-	o.runStatesMu.Lock()
-	defer o.runStatesMu.Unlock()
-	rs := o.runStates[runID]
-	if rs == nil {
-		rs = &runState{}
-		o.runStates[runID] = rs
-	}
-	return rs
-}
-
-func newTurnOperationID(sessionID string) (string, error) {
-	b := make([]byte, 8)
-	if _, err := cryptorand.Read(b); err != nil {
-		return "", fmt.Errorf("generating operation ID: %w", err)
-	}
-	return fmt.Sprintf("%s:%x", sessionID, b), nil
-}
-
-func (o *Orchestrator) isTurnWorkerRunning(opID string) bool {
-	if opID == "" {
-		return false
-	}
-	o.turnWorkersMu.Lock()
-	defer o.turnWorkersMu.Unlock()
-	return o.turnWorkers[opID] != nil
-}
-
-func (o *Orchestrator) reserveTurnWorker(opID, runID string) bool {
-	o.turnWorkersMu.Lock()
-	defer o.turnWorkersMu.Unlock()
-	if o.turnWorkers == nil {
-		o.turnWorkers = make(map[string]*turnWorkerHandle)
-	}
-	for _, w := range o.turnWorkers {
-		if w.runID == runID {
-			return false
-		}
-	}
-	o.turnWorkers[opID] = &turnWorkerHandle{runID: runID}
-	return true
-}
-
-func (o *Orchestrator) setTurnWorkerCancel(opID string, cancel context.CancelFunc) {
-	o.turnWorkersMu.Lock()
-	defer o.turnWorkersMu.Unlock()
-	if w := o.turnWorkers[opID]; w != nil {
-		w.cancel = cancel
-	}
-}
-
-func (o *Orchestrator) deleteTurnWorker(opID string) {
-	if opID == "" {
-		return
-	}
-	o.turnWorkersMu.Lock()
-	defer o.turnWorkersMu.Unlock()
-	delete(o.turnWorkers, opID)
-}
-
-func (o *Orchestrator) cancelRunTurnWorkers(runID string) {
-	o.turnWorkersMu.Lock()
-	var cancels []context.CancelFunc
-	for _, w := range o.turnWorkers {
-		if w.runID == runID && w.cancel != nil {
-			cancels = append(cancels, w.cancel)
-		}
-	}
-	o.turnWorkersMu.Unlock()
-	for _, cancel := range cancels {
-		cancel()
-	}
-}
-
-func completedActiveOperation(opID string, outcome turnOutcome) *herorunv1alpha1.ActiveOperation {
-	op := &herorunv1alpha1.ActiveOperation{
-		ID:   opID,
-		Done: true,
-	}
-	if !outcome.Finished.IsZero() {
-		op.FinishedAt = toMetaTime(&outcome.Finished)
-	}
-	switch {
-	case errors.Is(outcome.Err, session.ErrPullRequestRequested):
-		op.Result = herorunv1alpha1.OperationResultPullRequest
-		op.PRTitle = outcome.PRTitle
-		op.PRBody = outcome.PRBody
-	case errors.Is(outcome.Err, session.ErrSessionFinished):
-		op.Result = herorunv1alpha1.OperationResultFinished
-		op.Summary = outcome.Summary
-	case outcome.Err == nil:
-		op.Result = herorunv1alpha1.OperationResultCompleted
-	case errors.Is(outcome.Err, session.ErrMaxTurns):
-		op.Result = herorunv1alpha1.OperationResultMaxTurns
-	case isCanceled(outcome.Err):
-		op.Result = herorunv1alpha1.OperationResultCanceled
-		op.Error = outcome.Err.Error()
-	default:
-		op.Result = herorunv1alpha1.OperationResultFailed
-		op.Error = outcome.Err.Error()
-	}
-	return op
-}
-
-func (o *Orchestrator) recordTurnOutcome(ctx context.Context, runID, opID string, outcome turnOutcome) {
-	if ctx.Err() != nil || o.isManagerCanceled() {
-		return
-	}
-	key := client.ObjectKey{Namespace: o.namespace(), Name: sandboxNameForRun(runID)}
-
-	const maxAttempts = 5
-	for range maxAttempts {
-		var hr herorunv1alpha1.HeroRun
-		if err := o.kubeClient.Get(ctx, key, &hr); err != nil {
-			if !k8serrors.IsNotFound(err) {
-				scoped.Log(ctx).Error(err, "failed to get HeroRun to record turn outcome", "run", runID, "operation", opID)
-			}
-			return
-		}
-		if state.RunPhase(hr.Status.Phase).IsTerminal() {
-			return
-		}
-		if hr.Status.ActiveOperation == nil || hr.Status.ActiveOperation.ID != opID || hr.Status.ActiveOperation.Done {
-			return
-		}
-		hr.Status.ActiveOperation = completedActiveOperation(opID, outcome)
-		now := metav1.NewTime(o.clock().UTC().Truncate(time.Second))
-		hr.Status.ObservedAt = &now
-		if err := o.kubeClient.Status().Update(ctx, &hr); err != nil {
-			if k8serrors.IsConflict(err) {
-				continue
-			}
-			scoped.Log(ctx).Error(err, "failed to record turn outcome on HeroRun", "run", runID, "operation", opID)
-			return
-		}
-		return
-	}
-}
-
-func (o *Orchestrator) getWorkerContext(ctx context.Context) context.Context {
-	o.managerCtxMu.Lock()
-	base := o.managerCtx
-	o.managerCtxMu.Unlock()
-	if base == nil {
-		base = context.WithoutCancel(ctx)
-	}
-	return scoped.WithLog(base, scoped.Log(ctx))
-}
-
 func (o *Orchestrator) releaseSandbox(sandboxName string) {
 	if o.harness == nil || sandboxName == "" {
 		return
@@ -1047,42 +835,6 @@ func (o *Orchestrator) deleteRunState(runID string) {
 	delete(o.runStates, runID)
 }
 
-func (o *Orchestrator) deliverPendingMessages(ctx context.Context, repo state.RepoKey, runID string, session *session.Session) error {
-	o.pendingMessagesMu.Lock()
-	defer o.pendingMessagesMu.Unlock()
-
-	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID, session.Name)
-	if err != nil {
-		return err
-	}
-	if len(msgs) == 0 {
-		return nil
-	}
-
-	var toAdd []llm.Message
-	for _, pm := range msgs {
-		text := pm.Text
-		if pm.From != "" {
-			text = fmt.Sprintf("Message from %s: %s", pm.From, pm.Text)
-		}
-		toAdd = append(toAdd, llm.Message{
-			Role:    "user",
-			Content: &text,
-		})
-	}
-
-	// Persist to session first under the lock.
-	if err := session.AddMessages(ctx, toAdd...); err != nil {
-		return fmt.Errorf("adding pending messages to session: %w", err)
-	}
-
-	// Remove pending messages file only after AddMessages succeeds.
-	if err := o.store.ClearPendingMessages(ctx, repo, runID, session.Name); err != nil {
-		return fmt.Errorf("clearing pending messages: %w", err)
-	}
-	return nil
-}
-
 // topLevelSessionID returns the top-level session ID for a run.
 // Because the top-level session ID is derived deterministically from the run ID
 // via generateSessionID, it is known before the session is created or recorded on the run.
@@ -1093,19 +845,8 @@ func topLevelSessionID(runID string, sessionID string) string {
 	return generateSessionID(runID)
 }
 
-func (o *Orchestrator) hasPendingMessages(ctx context.Context, repo state.RepoKey, runID string, sessionID string) (bool, error) {
-	sessionID = topLevelSessionID(runID, sessionID)
-	o.pendingMessagesMu.Lock()
-	defer o.pendingMessagesMu.Unlock()
-	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID, sessionID)
-	if err != nil {
-		return false, err
-	}
-	return len(msgs) > 0, nil
-}
-
 // PostMessage enqueues a user message to be delivered to the session of a run before its next model call.
-func (o *Orchestrator) PostMessage(ctx context.Context, repo state.RepoKey, runID string, text string) error {
+func (o *Orchestrator) PostMessage(ctx context.Context, _ state.RepoKey, runID string, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("message text is required")
 	}
@@ -1127,26 +868,19 @@ func (o *Orchestrator) PostMessage(ctx context.Context, repo state.RepoKey, runI
 	sessionID := topLevelSessionID(runID, hr.Status.SessionID)
 
 	var target herorunv1alpha1.Session
-	err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: o.namespace(), Name: sessionID}, &target)
-	if err == nil {
-		if target.Spec.RunID != "" && target.Spec.RunID != runID {
-			return fmt.Errorf("session %s belongs to run %s, not %s", sessionID, target.Spec.RunID, runID)
+	if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: o.namespace(), Name: sessionID}, &target); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return fmt.Errorf("%w: session %s not found", ErrRunNotWorking, sessionID)
 		}
-		if target.Status.Phase.IsTerminal() || target.DeletionTimestamp != nil {
-			return fmt.Errorf("%w: session %s is in phase %s", ErrRunNotWorking, sessionID, target.Status.Phase)
-		}
-		return o.createSessionMessage(ctx, &target, runID, text)
-	}
-	if !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("getting Session %s: %w", sessionID, err)
 	}
-
-	if err := o.appendPendingMessage(ctx, repo, runID, sessionID, state.PendingMessage{Text: text}); err != nil {
-		return err
+	if target.Spec.RunID != "" && target.Spec.RunID != runID {
+		return fmt.Errorf("session %s belongs to run %s, not %s", sessionID, target.Spec.RunID, runID)
 	}
-
-	o.Notify(repo, runID)
-	return nil
+	if target.Status.Phase.IsTerminal() || target.DeletionTimestamp != nil {
+		return fmt.Errorf("%w: session %s is in phase %s", ErrRunNotWorking, sessionID, target.Status.Phase)
+	}
+	return o.createSessionMessage(ctx, &target, runID, text)
 }
 
 func (o *Orchestrator) createSessionMessage(ctx context.Context, target *herorunv1alpha1.Session, runID, text string) error {
@@ -1184,125 +918,6 @@ func (o *Orchestrator) newSessionMessageName(targetName string) (string, error) 
 	ts := max(o.clock().UTC().UnixNano(), 0)
 	seq := o.msgSeq.Add(1)
 	return fmt.Sprintf("%s-msg-%016x-%06x-%s", targetName, ts, seq, hex.EncodeToString(suffix[:])), nil
-}
-
-func (o *Orchestrator) sendMessage(ctx context.Context, children *childGroup, repo *state.Repo, run *state.Run, senderSession *session.Session, recipient string, message string) error {
-	if senderSession.Metadata.RunID == "" {
-		return errors.New("cannot call send_message: session belongs to no run")
-	}
-	if recipient == senderSession.Name {
-		return errors.New("cannot send message to self")
-	}
-
-	_, recipientMeta, err := o.sessionStore.LoadSession(ctx, recipient)
-	if err != nil {
-		if errors.Is(err, session.ErrNotFound) {
-			return fmt.Errorf("recipient session %q not found", recipient)
-		}
-		return fmt.Errorf("loading recipient session %q: %w", recipient, err)
-	}
-	if recipientMeta == nil || recipientMeta.RunID != run.ID {
-		return fmt.Errorf("cannot send message to session %q: not in the same run", recipient)
-	}
-
-	if recipient != run.SessionID && !children.isRunning(recipient) {
-		return fmt.Errorf("recipient session %q is not running", recipient)
-	}
-
-	if err := o.appendPendingMessage(ctx, repo.Key(), run.ID, recipient, state.PendingMessage{From: senderSession.Name, Text: message}); err != nil {
-		return err
-	}
-
-	o.Notify(repo.Key(), run.ID)
-	return nil
-}
-
-func (o *Orchestrator) appendPendingMessage(ctx context.Context, repo state.RepoKey, runID, sessionID string, msg state.PendingMessage) error {
-	o.pendingMessagesMu.Lock()
-	defer o.pendingMessagesMu.Unlock()
-	if err := o.store.AppendPendingMessage(ctx, repo, runID, sessionID, msg); err != nil {
-		return fmt.Errorf("appending pending message: %w", err)
-	}
-	if o.pendingMessagesCh != nil {
-		close(o.pendingMessagesCh)
-		o.pendingMessagesCh = nil
-	}
-	return nil
-}
-
-func (o *Orchestrator) checkPendingMessages(ctx context.Context, repo state.RepoKey, runID, sessionID string) (bool, chan struct{}, error) {
-	o.pendingMessagesMu.Lock()
-	defer o.pendingMessagesMu.Unlock()
-	msgs, err := o.store.ReadPendingMessages(ctx, repo, runID, sessionID)
-	if err != nil {
-		return false, nil, err
-	}
-	if len(msgs) > 0 {
-		return true, nil, nil
-	}
-	if o.pendingMessagesCh == nil {
-		o.pendingMessagesCh = make(chan struct{})
-	}
-	return false, o.pendingMessagesCh, nil
-}
-
-func (o *Orchestrator) waitForEvent(ctx context.Context, children *childGroup, repo *state.Repo, run *state.Run, sess *session.Session, timeout time.Duration) (string, error) {
-	if sess.Metadata.RunID == "" {
-		return "", errors.New("cannot call wait: session belongs to no run")
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
-	waitDur, cappedByDeadline := timeout, false
-	if run.Deadline != nil {
-		if rem := run.Deadline.Sub(o.clock().UTC()); rem <= 0 {
-			o.Notify(repo.Key(), run.ID)
-			return "Wait ended: run deadline passed.", nil
-		} else if rem < waitDur {
-			waitDur, cappedByDeadline = rem, true
-		}
-	}
-
-	timer := time.NewTimer(waitDur)
-	defer timer.Stop()
-
-	for {
-		hasMsg, msgCh, err := o.checkPendingMessages(ctx, repo.Key(), run.ID, sess.Name)
-		if err != nil {
-			return "", fmt.Errorf("checking pending messages: %w", err)
-		}
-		var stopped []string
-		var childCh chan struct{}
-		if children != nil {
-			stopped, childCh = children.popStopped(sess.Name)
-		}
-		if hasMsg || len(stopped) > 0 {
-			var parts []string
-			if hasMsg {
-				parts = append(parts, "A message arrived.")
-			}
-			if len(stopped) == 1 {
-				parts = append(parts, fmt.Sprintf("Child session %s stopped.", stopped[0]))
-			} else if len(stopped) > 1 {
-				parts = append(parts, fmt.Sprintf("Child sessions stopped: %s.", strings.Join(stopped, ", ")))
-			}
-			return strings.Join(parts, " "), nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-msgCh:
-		case <-childCh:
-		case <-timer.C:
-			if cappedByDeadline {
-				o.Notify(repo.Key(), run.ID)
-				return "Wait ended: run deadline passed.", nil
-			}
-			return fmt.Sprintf("Timed out after %s with no new messages or stopped child sessions.", timeout), nil
-		}
-	}
 }
 
 // SandboxOwnerForSession returns the shared SandboxOwner for a HeroRun-owned
@@ -1440,37 +1055,6 @@ func (o *Orchestrator) isManagerCanceled() bool {
 	return o.managerCtx != nil && o.managerCtx.Err() != nil
 }
 
-func isCanceled(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) {
-		return true
-	}
-	if status.Code(err) == codes.Canceled {
-		return true
-	}
-	var se interface{ GRPCStatus() *status.Status }
-	if errors.As(err, &se) {
-		return se.GRPCStatus().Code() == codes.Canceled
-	}
-	return false
-}
-
-func (o *Orchestrator) finishRun(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, end runEnd) error {
-	if ctx.Err() != nil || o.isManagerCanceled() {
-		return nil
-	}
-
-	prev := run.Phase
-	endTime := o.clock().UTC()
-	run.SetPhase(end.Phase, endTime)
-	if end.Phase == state.PhaseFailed {
-		run.Error = end.Message
-	}
-	return o.saveTerminalRun(ctx, repo, run, hr, prev, endTime, end)
-}
-
 func (o *Orchestrator) saveTerminalRun(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, prev state.RunPhase, endTime time.Time, end runEnd) error {
 	if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
 		return fmt.Errorf("updating terminal run state: %w", err)
@@ -1494,7 +1078,6 @@ func (o *Orchestrator) saveTerminalRun(ctx context.Context, repo *state.Repo, ru
 		scoped.Log(ctx).Error(err, "failed to append event", "kind", end.Kind, "run", run.ID)
 	}
 
-	o.cancelRunTurnWorkers(run.ID)
 	o.deleteRunState(run.ID)
 
 	if end.Sandbox != nil {
@@ -1518,354 +1101,6 @@ func runStartTime(run *state.Run) time.Time {
 		return t
 	}
 	return time.Time{}
-}
-
-func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) (reconcile.Result, error) {
-	log := scoped.Log(ctx)
-
-	if ctx.Err() != nil {
-		return reconcile.Result{}, nil
-	}
-
-	if op := run.ActiveOperation; op != nil && op.Done {
-		return reconcile.Result{}, o.handleTurnOutcome(ctx, repo, run, hr, op)
-	}
-
-	if o.isManagerCanceled() {
-		return reconcile.Result{}, nil
-	}
-
-	now := o.clock().UTC()
-	if run.Deadline != nil && !now.Before(*run.Deadline) {
-		var sb *session.Sandbox
-		if o.harness != nil && run.SandboxName != "" {
-			sb = o.harness.GetOrAttachSandbox(run.SandboxName)
-		}
-		var elapsed time.Duration
-		if start := runStartTime(run); !start.IsZero() {
-			if e := now.Sub(start); e > 0 {
-				elapsed = e
-			}
-		}
-		run.ActiveOperation = nil
-		if err := o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "deadline_exceeded",
-			Message: "deadline exceeded",
-			Data: map[string]any{
-				"deadline": run.Deadline.Format(time.RFC3339),
-				"elapsed":  elapsed.String(),
-			},
-			Sandbox: sb,
-		}); err != nil {
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{}, nil
-	}
-
-	requeueAfter := time.Duration(0)
-	if run.Deadline != nil {
-		requeueAfter = run.Deadline.Sub(now)
-	}
-
-	if op := run.ActiveOperation; op != nil && o.isTurnWorkerRunning(op.ID) {
-		log.V(2).Info("run is already actively executing a session", "run", run.ID, "operation", op.ID)
-		return reconcile.Result{RequeueAfter: requeueAfter}, nil
-	}
-
-	if err := o.startTurn(ctx, repo, run, hr); err != nil {
-		return reconcile.Result{}, err
-	}
-	return reconcile.Result{RequeueAfter: requeueAfter}, nil
-}
-
-func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) error {
-	if o.isManagerCanceled() {
-		return nil
-	}
-
-	o.ensureRunState(run.ID)
-
-	sessionStarted := false
-	if run.SessionID == "" {
-		run.SessionID = topLevelSessionID(run.ID, "")
-		sessionStarted = true
-	}
-
-	opID, err := newTurnOperationID(run.SessionID)
-	if err != nil {
-		return err
-	}
-	if !o.reserveTurnWorker(opID, run.ID) {
-		return nil
-	}
-
-	run.ActiveOperation = &state.ActiveOperation{ID: opID}
-	if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
-		o.deleteTurnWorker(opID)
-		return fmt.Errorf("updating run with active operation: %w", err)
-	}
-	if sessionStarted {
-		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-			Time:    o.clock().UTC(),
-			Phase:   state.PhaseWorking,
-			Kind:    "session_started",
-			Message: fmt.Sprintf("Started session %s", run.SessionID),
-			Data:    map[string]any{"session_id": run.SessionID},
-		}); err != nil {
-			scoped.Log(ctx).Error(err, "failed to append session_started event", "run", run.ID)
-		}
-	}
-
-	workerCtx, cancel := context.WithCancel(o.getWorkerContext(ctx))
-	o.setTurnWorkerCancel(opID, cancel)
-
-	o.workerWG.Add(1)
-	go func() {
-		defer o.workerWG.Done()
-		defer cancel()
-		defer o.deleteTurnWorker(opID)
-		outcome := o.runTurnWorker(workerCtx, repo, run, hr)
-		o.recordTurnOutcome(workerCtx, run.ID, opID, outcome)
-		o.deleteTurnWorker(opID)
-		o.Notify(repo.Key(), run.ID)
-	}()
-	return nil
-}
-
-func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun) turnOutcome {
-	o.ensureRunState(run.ID)
-
-	sandboxName := run.SandboxName
-	if sandboxName == "" {
-		return turnOutcome{
-			Err:      errors.New("sandbox name is empty for working run"),
-			Finished: o.clock().UTC(),
-		}
-	}
-
-	var sb *session.Sandbox
-	if o.harness != nil {
-		sb = o.harness.GetOrAttachSandbox(sandboxName)
-	}
-
-	sessionID := run.SessionID
-
-	goalBody := ""
-	if run.Goal != nil {
-		goalBody = run.Goal.Body
-	} else if run.GoalName != "" {
-		goalRec, err := o.store.GetGoal(ctx, repo.Key(), run.GoalName)
-		if err == nil && goalRec != nil && goalRec.Goal != nil {
-			goalBody = goalRec.Goal.Body
-		}
-	}
-
-	sess, err := o.harness.LoadSession(ctx, o.sessionStore, sessionID)
-	if err != nil {
-		if errors.Is(err, session.ErrNotFound) {
-			sess, err = o.harness.NewSession(ctx, o.sessionStore, sessionID, session.Metadata{
-				Repo:      repo.Key().String(),
-				RunID:     run.ID,
-				CreatedAt: o.clock().UTC(),
-			})
-			if err != nil {
-				return turnOutcome{
-					Err:      fmt.Errorf("creating session %s: %w", sessionID, err),
-					Finished: o.clock().UTC(),
-				}
-			}
-		} else {
-			return turnOutcome{
-				Err:      fmt.Errorf("loading session %s: %w", sessionID, err),
-				Finished: o.clock().UTC(),
-			}
-		}
-	}
-
-	// Bind sandbox owner to session
-	sess.SetSandboxOwner(o.getOrCreateSandboxOwner(ctx, repo, run, hr, sb))
-
-	// Seed system prompt if new session
-	if len(sess.Messages()) == 0 {
-		sysPrompt := buildSystemPrompt(o.harness.RunOptions().SystemPrompt, repo, run, goalBody)
-		if err := sess.AddMessages(ctx, llm.Message{
-			Role:    "system",
-			Content: &sysPrompt,
-		}); err != nil {
-			return turnOutcome{
-				Err:      fmt.Errorf("seeding system prompt: %w", err),
-				Finished: o.clock().UTC(),
-			}
-		}
-	}
-
-	sessionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-	children.setRunning(sessionID, true)
-	o.setRunChildren(run.ID, children)
-	defer func() {
-		children.setRunning(sessionID, false)
-		o.setRunChildren(run.ID, nil)
-	}()
-
-	events := &orchestratorTurnEvents{
-		orch:    o,
-		repoKey: repo.Key(),
-		runID:   run.ID,
-	}
-
-	// A fresh session starts with RunTurn to supply the initial goal prompt.
-	// A resumed session (after restart or previous turn) continues from transcript history.
-	hasUserMessage := false
-	for _, m := range sess.Messages() {
-		if m.Role == "user" {
-			hasUserMessage = true
-			break
-		}
-	}
-
-	finishTool := ao.NewFinishTool()
-	prTool := ao.NewOpenPullRequestTool(ao.OpenPullRequestExpectation{
-		Repository: repo.URL,
-		Branch:     run.BranchName(),
-	})
-	startSessionTool := ao.NewStartSessionTool(func(toolCtx context.Context, task string) (string, error) {
-		return o.startChildSession(toolCtx, children, repo, run, sess, task)
-	})
-	listSessionsTool := ao.NewListSessionsTool(func(toolCtx context.Context) ([]ao.SessionInfo, error) {
-		return o.listRunSessions(toolCtx, run, children)
-	})
-	sendMessageTool := ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
-		return o.sendMessage(toolCtx, children, repo, run, sess, recipient, message)
-	})
-	waitTool := ao.NewWaitTool(func(toolCtx context.Context, timeout time.Duration) (string, error) {
-		return o.waitForEvent(toolCtx, children, repo, run, sess, timeout)
-	})
-	budget := o.turnBudget(run.ID)
-	messageSource := func(ctx context.Context, session *session.Session) error {
-		return o.deliverPendingMessages(ctx, repo.Key(), run.ID, session)
-	}
-	harness := o.harness.WithTurnBudget(budget).WithExtraTools(finishTool, prTool, startSessionTool, listSessionsTool, sendMessageTool, waitTool).WithMessageSource(messageSource)
-
-	var turnErr error
-	if hasUserMessage {
-		turnErr = harness.ContinueTurn(sessionCtx, sess, events)
-	} else {
-		turnErr = harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
-	}
-
-	cancelChildren()
-	children.wg.Wait()
-
-	return turnOutcome{
-		Err:      turnErr,
-		Finished: o.clock().UTC(),
-		PRTitle:  prTool.Title,
-		PRBody:   prTool.Body,
-		Summary:  finishTool.Summary,
-	}
-}
-
-func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, run *state.Run, hr *herorunv1alpha1.HeroRun, op *state.ActiveOperation) error {
-	log := scoped.Log(ctx)
-
-	if run.Phase.IsTerminal() {
-		return nil
-	}
-
-	attachSandbox := func() *session.Sandbox {
-		if o.harness != nil && run.SandboxName != "" {
-			return o.harness.GetOrAttachSandbox(run.SandboxName)
-		}
-		return nil
-	}
-
-	switch op.Result {
-	case state.OperationResultPullRequest:
-		run.PRTitle = op.PRTitle
-		run.PRBody = op.PRBody
-		run.ActiveOperation = nil
-		prev := run.Phase
-		now := o.clock().UTC()
-		run.SetPhase(state.PhaseSelecting, now)
-		if err := o.putRun(ctx, repo, run, hr, prev); err != nil {
-			return fmt.Errorf("updating run to Selecting: %w", err)
-		}
-		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-			Time:    now,
-			Phase:   state.PhaseSelecting,
-			Kind:    "pull_request_requested",
-			Message: "Pull request requested by agent",
-		}); err != nil {
-			log.Error(err, "failed to append pull_request_requested event", "run", run.ID)
-		}
-		o.releaseSandbox(run.SandboxName)
-		o.Notify(repo.Key(), run.ID)
-		return nil
-
-	case state.OperationResultFinished:
-		run.Summary = op.Summary
-		run.ActiveOperation = nil
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseNoImprovement,
-			Kind:    "finished",
-			Message: op.Summary,
-			Sandbox: attachSandbox(),
-		})
-
-	case state.OperationResultCompleted, state.OperationResultMaxTurns:
-		hasPending, err := o.hasPendingMessages(ctx, repo.Key(), run.ID, run.SessionID)
-		if err != nil {
-			return fmt.Errorf("checking pending messages: %w", err)
-		}
-		if hasPending && op.Result != state.OperationResultMaxTurns {
-			run.ActiveOperation = nil
-			if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
-				return fmt.Errorf("clearing active operation: %w", err)
-			}
-			o.Notify(repo.Key(), run.ID)
-			return nil
-		}
-		run.ActiveOperation = nil
-		return o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseNoImprovement,
-			Kind:    "no_improvement",
-			Message: "session ended without a pull request",
-			Sandbox: attachSandbox(),
-		})
-
-	case state.OperationResultCanceled:
-		if ctx.Err() != nil || o.isManagerCanceled() {
-			return nil
-		}
-		run.ActiveOperation = nil
-		if err := o.putRun(ctx, repo, run, hr, run.Phase); err != nil {
-			return fmt.Errorf("clearing active operation: %w", err)
-		}
-		o.Notify(repo.Key(), run.ID)
-		return nil
-
-	default:
-		if ctx.Err() != nil || o.isManagerCanceled() {
-			return nil
-		}
-		errMsg := fmt.Sprintf("session error: %s", op.Error)
-		run.ActiveOperation = nil
-		if err := o.finishRun(ctx, repo, run, hr, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "failed",
-			Message: errMsg,
-			Sandbox: attachSandbox(),
-		}); err != nil {
-			return err
-		}
-		return errors.New(errMsg)
-	}
 }
 
 func buildSystemPrompt(basePrompt string, repo *state.Repo, run *state.Run, goalBody string) string {
@@ -1920,258 +1155,26 @@ func generateSessionID(runID string) string {
 	return id
 }
 
-// generateChildSessionName derives a child session name from parent, ensuring
-// the result is at most 40 alphanumeric characters.
-func (o *Orchestrator) generateChildSessionName(parent string) (string, error) {
-	prefix := parent
-	if len(prefix) > 28 {
-		prefix = prefix[:28]
-	}
-	b := make([]byte, 4)
-	if _, err := cryptorand.Read(b); err != nil {
-		return "", fmt.Errorf("generating random session ID suffix: %w", err)
-	}
-	return fmt.Sprintf("%sc%x", prefix, b), nil
-}
-
-// startChildSession creates and starts a child session for parentSession within run.
-func (o *Orchestrator) startChildSession(ctx context.Context, children *childGroup, repo *state.Repo, run *state.Run, parentSession *session.Session, task string) (string, error) {
-	if parentSession.Metadata.RunID == "" {
-		return "", errors.New("cannot call start_session: session belongs to no run")
-	}
-
-	if o.harness.LLMClient() == nil {
-		return "", errors.New("cannot call start_session: no LLM client configured")
-	}
-
-	budget := o.turnBudget(run.ID)
-	if budget == nil {
-		return "", errors.New("cannot call start_session: run has no turn budget")
-	}
-
-	if parentSession.Metadata.Depth() >= o.maxSessionDepth {
-		return "", fmt.Errorf("depth limit of %d reached; cannot start child session", o.maxSessionDepth)
-	}
-
-	childName, err := o.generateChildSessionName(parentSession.Name)
-	if err != nil {
-		return "", err
-	}
-
-	childMeta := parentSession.Metadata.Child(parentSession.Name)
-	childMeta.Toolset = parentSession.Metadata.Toolset
-	childMeta.CreatedAt = o.clock().UTC()
-	childSess, err := o.harness.NewSession(ctx, o.sessionStore, childName, childMeta)
-	if err != nil {
-		return "", fmt.Errorf("creating child session: %w", err)
-	}
-
-	childSess.SetSandboxOwner(parentSession.SandboxOwner())
-
-	if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-		Time:    o.clock().UTC(),
-		Phase:   state.PhaseWorking,
-		Kind:    "session_started",
-		Message: fmt.Sprintf("Started session %s", childName),
-		Data: map[string]any{
-			"session_id": childName,
-			"parent":     parentSession.Name,
-		},
-	}); err != nil {
-		scoped.Log(ctx).Error(err, "failed to append session_started event", "run", run.ID, "session", childName)
-	}
-
-	childStartTool := ao.NewStartSessionTool(func(toolCtx context.Context, subTask string) (string, error) {
-		return o.startChildSession(toolCtx, children, repo, run, childSess, subTask)
-	})
-	childListTool := ao.NewListSessionsTool(func(toolCtx context.Context) ([]ao.SessionInfo, error) {
-		return o.listRunSessions(toolCtx, run, children)
-	})
-	childSendTool := ao.NewSendMessageTool(func(toolCtx context.Context, recipient, message string) error {
-		return o.sendMessage(toolCtx, children, repo, run, childSess, recipient, message)
-	})
-	childWaitTool := ao.NewWaitTool(func(toolCtx context.Context, timeout time.Duration) (string, error) {
-		return o.waitForEvent(toolCtx, children, repo, run, childSess, timeout)
-	})
-	childMessageSource := func(ctx context.Context, session *session.Session) error {
-		return o.deliverPendingMessages(ctx, repo.Key(), run.ID, session)
-	}
-	childHarness := o.harness.WithTurnBudget(budget).WithExtraTools(childStartTool, childListTool, childSendTool, childWaitTool, ao.NewFinishTool()).WithMessageSource(childMessageSource)
-
-	children.setRunning(childName, true)
-	children.wg.Add(1)
-	o.workerWG.Add(1)
-	go func() {
-		defer o.workerWG.Done()
-		defer children.wg.Done()
-		defer children.markStopped(parentSession.Name, childName)
-
-		if len(childSess.Messages()) == 0 {
-			sysPrompt := buildSystemPrompt(o.harness.RunOptions().SystemPrompt, repo, run, task)
-			if err := childSess.AddMessages(children.ctx, llm.Message{
-				Role:    "system",
-				Content: &sysPrompt,
-			}); err != nil {
-				scoped.Log(children.ctx).Error(err, "failed to seed system prompt", "session", childName)
-				return
-			}
-		}
-
-		events := &orchestratorTurnEvents{
-			orch:    o,
-			repoKey: repo.Key(),
-			runID:   run.ID,
-		}
-		if err := childHarness.RunTurn(children.ctx, childSess, task, events); err != nil {
-			scoped.Log(children.ctx).Info("child session finished with error", "session", childName, "error", err)
-		}
-	}()
-
-	return childName, nil
-}
-
-func (o *Orchestrator) listRunSessions(ctx context.Context, run *state.Run, children *childGroup) ([]ao.SessionInfo, error) {
-	sessions, err := session.ListRunSessions(ctx, o.sessionStore, run.ID)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]ao.SessionInfo, len(sessions))
-	for i, s := range sessions {
-		st := "stopped"
-		if s.Name == run.SessionID || children.isRunning(s.Name) {
-			st = "running"
-		}
-		result[i] = ao.SessionInfo{
-			Name:   s.Name,
-			Parent: s.Metadata.Parent,
-			State:  st,
-		}
-	}
-	return result, nil
-}
-
-// childGroup coordinates child sessions started within a turn worker.
-type childGroup struct {
-	ctx     context.Context
-	wg      *sync.WaitGroup
-	mu      sync.Mutex
-	running map[string]bool
-	stopped map[string][]string
-	notify  chan struct{}
-}
-
-func newChildGroup(ctx context.Context) *childGroup {
-	return &childGroup{
-		ctx:     ctx,
-		wg:      &sync.WaitGroup{},
-		running: make(map[string]bool),
-		stopped: make(map[string][]string),
-	}
-}
-
-func (g *childGroup) setRunning(name string, running bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if running {
-		g.running[name] = true
-	} else {
-		delete(g.running, name)
-	}
-}
-
-func (g *childGroup) markStopped(parent, name string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	delete(g.running, name)
-	g.stopped[parent] = append(g.stopped[parent], name)
-	if g.notify != nil {
-		close(g.notify)
-		g.notify = nil
-	}
-}
-
-func (g *childGroup) popStopped(parent string) ([]string, chan struct{}) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if names := g.stopped[parent]; len(names) > 0 {
-		delete(g.stopped, parent)
-		return names, nil
-	}
-	if g.notify == nil {
-		g.notify = make(chan struct{})
-	}
-	return nil, g.notify
-}
-
-func (g *childGroup) isRunning(name string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.running[name]
-}
-
-func (g *childGroup) runningSnapshot() map[string]bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if len(g.running) == 0 {
-		return nil
-	}
-	snap := make(map[string]bool, len(g.running))
-	for name, active := range g.running {
-		if active {
-			snap[name] = true
-		}
-	}
-	return snap
-}
-
-func (o *Orchestrator) setRunChildren(runID string, children *childGroup) {
-	o.runStatesMu.Lock()
-	defer o.runStatesMu.Unlock()
-	if rs := o.runStates[runID]; rs != nil {
-		rs.children = children
-	}
-}
-
-// RunningSessions returns the names of sessions currently running for runID.
+// RunningSessions returns the names of non-terminal Session resources currently running for runID.
 func (o *Orchestrator) RunningSessions(runID string) map[string]bool {
-	o.runStatesMu.Lock()
-	rs := o.runStates[runID]
-	var children *childGroup
-	if rs != nil {
-		children = rs.children
-	}
-	o.runStatesMu.Unlock()
-	if children == nil {
+	if o == nil || o.kubeClient == nil || o.harness == nil || runID == "" {
 		return nil
 	}
-	return children.runningSnapshot()
-}
-
-type orchestratorTurnEvents struct {
-	orch    *Orchestrator
-	repoKey state.RepoKey
-	runID   string
-}
-
-func (e *orchestratorTurnEvents) AssistantMessage(_ context.Context, _ string) {}
-
-func (e *orchestratorTurnEvents) ApproveToolCall(_ context.Context, _ llm.ToolCall) (bool, error) {
-	return true, nil
-}
-
-func (e *orchestratorTurnEvents) ToolCallStarted(ctx context.Context, call llm.ToolCall) {
-	scoped.Log(ctx).V(1).Info("tool call started", "tool", call.Function.Name)
-}
-
-func (e *orchestratorTurnEvents) ToolCallFinished(ctx context.Context, call llm.ToolCall, err error) {
-	scoped.Log(ctx).V(1).Info("tool call finished", "tool", call.Function.Name, "error", err)
-	if e.orch != nil {
-		e.orch.Notify(e.repoKey, e.runID)
+	var list herorunv1alpha1.SessionList
+	if err := o.kubeClient.List(context.Background(), &list, client.InNamespace(o.namespace())); err != nil {
+		return nil
 	}
-}
-
-func (e *orchestratorTurnEvents) MessageAppended(_ context.Context, _ llm.Message) {
-	if e.orch != nil {
-		e.orch.Notify(e.repoKey, e.runID)
+	var running map[string]bool
+	for i := range list.Items {
+		s := &list.Items[i]
+		matchesRun := s.Spec.RunID == runID || (s.Spec.RunID == "" && s.Labels[LabelRun] == runID)
+		if !matchesRun || s.Status.Phase.IsTerminal() || s.DeletionTimestamp != nil {
+			continue
+		}
+		if running == nil {
+			running = make(map[string]bool)
+		}
+		running[s.Name] = true
 	}
+	return running
 }

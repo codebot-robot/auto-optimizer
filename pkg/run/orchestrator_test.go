@@ -80,6 +80,7 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/portal"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
+	"github.com/gke-labs/auto-optimizer/pkg/sessioncontroller"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets/ao"
@@ -194,42 +195,27 @@ func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServe
 	return harness, agentsCS, coreCS
 }
 
-func (o *Orchestrator) cancelWorkers() {
-	o.turnWorkersMu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(o.turnWorkers))
-	for _, w := range o.turnWorkers {
-		if w != nil && w.cancel != nil {
-			cancels = append(cancels, w.cancel)
-		}
-	}
-	o.turnWorkersMu.Unlock()
-	for _, cancel := range cancels {
-		cancel()
-	}
+type testSessionState struct {
+	store      session.Store
+	reconciler *sessioncontroller.Reconciler
 }
 
-func (o *Orchestrator) isRunActive(runID string) bool {
-	o.turnWorkersMu.Lock()
-	defer o.turnWorkersMu.Unlock()
-	for _, w := range o.turnWorkers {
-		if w != nil && w.runID == runID {
-			return true
-		}
-	}
-	return false
+var (
+	testSessionsMu sync.Mutex
+	testSessions   = make(map[*Orchestrator]*testSessionState)
+)
+
+func testSessionInfo(orch *Orchestrator) *testSessionState {
+	testSessionsMu.Lock()
+	defer testSessionsMu.Unlock()
+	return testSessions[orch]
 }
 
-func seedCompletedTurnOp(t *testing.T, ctx context.Context, orch *Orchestrator, runID, opID string, outcome turnOutcome) {
-	t.Helper()
-	name := sandboxNameForRun(runID)
-	var hr herorunv1alpha1.HeroRun
-	if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: orch.namespace(), Name: name}, &hr); err != nil {
-		t.Fatalf("getting HeroRun %s: %v", name, err)
+func testSessionStore(orch *Orchestrator) session.Store {
+	if ts := testSessionInfo(orch); ts != nil {
+		return ts.store
 	}
-	hr.Status.ActiveOperation = completedActiveOperation(opID, outcome)
-	if err := orch.kubeClient.Status().Update(ctx, &hr); err != nil {
-		t.Fatalf("updating HeroRun %s activeOperation: %v", name, err)
-	}
+	return nil
 }
 
 func newTestFakeClientBuilder(scheme *apiruntime.Scheme) *fake.ClientBuilder {
@@ -262,10 +248,32 @@ func newTestOrchestrator(t *testing.T, opts OrchestratorOptions) *Orchestrator {
 	if err != nil {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
-	t.Cleanup(func() {
-		orch.cancelWorkers()
-		orch.workerWG.Wait()
-	})
+	if opts.SessionStore != nil && orch.harness != nil {
+		sr, err := sessioncontroller.NewReconciler(sessioncontroller.Options{
+			Client:          orch.kubeClient,
+			SessionStore:    opts.SessionStore,
+			StateStore:      orch.store,
+			HarnessFactory:  func(string) (*session.Harness, error) { return orch.harness, nil },
+			SandboxOwnerFor: orch.SandboxOwnerForSession,
+			DefaultMaxTurns: orch.maxTurns,
+			DefaultMaxDepth: orch.maxSessionDepth,
+			Clock:           orch.clock,
+		})
+		if err != nil {
+			t.Fatalf("sessioncontroller.NewReconciler: %v", err)
+		}
+		testSessionsMu.Lock()
+		testSessions[orch] = &testSessionState{
+			store:      opts.SessionStore,
+			reconciler: sr,
+		}
+		testSessionsMu.Unlock()
+		t.Cleanup(func() {
+			testSessionsMu.Lock()
+			delete(testSessions, orch)
+			testSessionsMu.Unlock()
+		})
+	}
 	return orch
 }
 
@@ -333,29 +341,120 @@ func runRequest(orch *Orchestrator, repo state.RepoKey, runID string) reconcile.
 	}
 }
 
+func reconcileSessionUntilTerminal(ctx context.Context, orch *Orchestrator, sessName string) error {
+	ts := testSessionInfo(orch)
+	if ts == nil || ts.reconciler == nil {
+		return errors.New("test orchestrator has no session reconciler configured")
+	}
+	ns := orch.namespace()
+	sessReq := reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: ns, Name: sessName},
+	}
+
+	// Reconcile any child sessions created while the root session runs.
+	childCtx, cancelChildren := context.WithCancel(ctx)
+	var childWG sync.WaitGroup
+	var activeMu sync.Mutex
+	activeChildren := make(map[string]bool)
+	childWG.Add(1)
+	go func() {
+		defer childWG.Done()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-childCtx.Done():
+				return
+			case <-ticker.C:
+				var list herorunv1alpha1.SessionList
+				if err := orch.kubeClient.List(childCtx, &list, client.InNamespace(ns)); err != nil {
+					continue
+				}
+				for i := range list.Items {
+					s := &list.Items[i]
+					if s.Name == sessName || s.Status.Phase.IsTerminal() {
+						continue
+					}
+					activeMu.Lock()
+					if activeChildren[s.Name] {
+						activeMu.Unlock()
+						continue
+					}
+					activeChildren[s.Name] = true
+					activeMu.Unlock()
+					childName := s.Name
+					childWG.Add(1)
+					go func() {
+						defer childWG.Done()
+						defer func() {
+							activeMu.Lock()
+							delete(activeChildren, childName)
+							activeMu.Unlock()
+						}()
+						_, _ = ts.reconciler.Reconcile(childCtx, reconcile.Request{
+							NamespacedName: types.NamespacedName{Namespace: ns, Name: childName},
+						})
+					}()
+				}
+			}
+		}
+	}()
+	defer func() {
+		cancelChildren()
+		childWG.Wait()
+	}()
+
+	for {
+		res, err := ts.reconciler.Reconcile(ctx, sessReq)
+		if err != nil {
+			return err
+		}
+		var sess herorunv1alpha1.Session
+		if err := orch.kubeClient.Get(ctx, sessReq.NamespacedName, &sess); err != nil {
+			return err
+		}
+		if sess.Status.Phase.IsTerminal() {
+			return nil
+		}
+		if res.RequeueAfter > 0 {
+			timer := time.NewTimer(min(res.RequeueAfter, 10*time.Millisecond))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+		if !res.Requeue {
+			// Wait briefly for pending messages or child updates if session is waiting.
+			if sess.Status.Phase == herorunv1alpha1.SessionPhaseWaiting {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			return nil
+		}
+	}
+}
+
 func reconcileWorkingRun(ctx context.Context, orch *Orchestrator, req reconcile.Request) (reconcile.Result, error) {
-	run, _, _, err := orch.getRunForReconcile(ctx, req)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-	if run == nil {
-		return reconcile.Result{}, fmt.Errorf("could not resolve request %v to run", req)
-	}
-	runID := run.ID
-	// First pass starts the worker
+	// First pass creates the root Session CRD (or fails immediately if deadline passed).
 	res, err := orch.Reconcile(ctx, req)
 	if err != nil {
 		return res, err
 	}
-	// Wait for worker to finish
-	deadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(runID) {
-		if time.Now().After(deadline) {
-			return res, fmt.Errorf("timed out waiting for worker on run %s", runID)
-		}
-		time.Sleep(5 * time.Millisecond)
+	run, _, _, err := orch.getRunForReconcile(ctx, req)
+	if err != nil {
+		return res, err
 	}
-	// Second pass consumes the outcome
+	if run == nil || run.Phase != state.PhaseWorking {
+		return res, nil
+	}
+	sessName := topLevelSessionID(run.ID, run.SessionID)
+	if err := reconcileSessionUntilTerminal(ctx, orch, sessName); err != nil {
+		return reconcile.Result{}, err
+	}
+	// Second pass consumes the terminal Session outcome.
 	return orch.Reconcile(ctx, req)
 }
 
@@ -1534,128 +1633,6 @@ func (l *multiCallLLM) CreateChatCompletion(ctx context.Context, req llm.ChatCom
 	}, nil
 }
 
-func TestOrchestrator_Working_SharedTurnBudget(t *testing.T) {
-	ctx := t.Context()
-	storeDir := t.TempDir()
-	store := state.NewFileStore(storeDir)
-	sessionStore := session.NewFileStore(storeDir)
-
-	repo := &state.Repo{
-		URL:           "https://github.com/gke-labs/test-repo",
-		Host:          "github.com",
-		Owner:         "gke-labs",
-		Name:          "test-repo",
-		DefaultBranch: "main",
-	}
-	if err := store.PutRepo(ctx, repo); err != nil {
-		t.Fatalf("PutRepo: %v", err)
-	}
-
-	runID := "20261030T120000Z-sharedbudget"
-	sandboxName := "run-20261030t120000z-sharedbudget"
-	run := &state.Run{
-		ID:          runID,
-		Repo:        repo.Key(),
-		GoalName:    "shared-goal",
-		Phase:       state.PhaseWorking,
-		BaseCommit:  "base-sha",
-		SandboxName: sandboxName,
-		SessionID:   "session1",
-		Goal: &goals.Goal{
-			Name: "shared-goal",
-			Body: "optimize",
-		},
-	}
-
-	procSrv := &mockProcessServer{
-		exitCode: 0,
-		stdout:   "ok\n",
-	}
-
-	// LLM: call 1 finishes with text; subsequent calls return tool calls (looping).
-	mockLLM := &multiCallLLM{
-		textResponses: 1,
-	}
-	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, mockLLM)
-
-	policy := sandboxv1beta1.ShutdownPolicyDelete
-	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      sandboxName,
-			Namespace: "ao-sandboxes",
-		},
-		Spec: sandboxv1beta1.SandboxSpec{
-			Lifecycle: sandboxv1beta1.Lifecycle{
-				ShutdownTime:   &metav1.Time{Time: time.Now().Add(5 * time.Minute)},
-				ShutdownPolicy: &policy,
-			},
-		},
-	}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("creating sandbox: %v", err)
-	}
-
-	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		Clock:        func() time.Time { return fixedTime },
-		MaxTurns:     3,
-	})
-	putTestRun(t, ctx, orch, run)
-
-	var hr herorunv1alpha1.HeroRun
-	if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: harness.Namespace(), Name: sandboxNameForRun(run.ID)}, &hr); err != nil {
-		t.Fatalf("getting HeroRun: %v", err)
-	}
-
-	// 1. Session 1 runs turn worker: uses 1 turn and finishes normally.
-	outcome1 := orch.runTurnWorker(ctx, repo, run, &hr)
-	if outcome1.Err != nil {
-		t.Fatalf("session 1 turnErr: %v", outcome1.Err)
-	}
-
-	// 2. Session 2 for the same run runs turn worker: uses remaining 2 turns and hits max turns.
-	run.SessionID = "session2"
-	outcome2 := orch.runTurnWorker(ctx, repo, run, &hr)
-	if !errors.Is(outcome2.Err, session.ErrMaxTurns) {
-		t.Fatalf("session 2 expected ErrMaxTurns, got %v", outcome2.Err)
-	}
-
-	// 3. Verify total LLM calls stopped at exactly MaxTurns (3)
-	mockLLM.mu.Lock()
-	calls := mockLLM.callCount
-	mockLLM.mu.Unlock()
-	if calls != 3 {
-		t.Errorf("expected 3 total LLM calls across sessions, got %d", calls)
-	}
-
-	// 4. Session 2's next turn also immediately ends with ErrMaxTurns without additional LLM calls
-	outcome3 := orch.runTurnWorker(ctx, repo, run, &hr)
-	if !errors.Is(outcome3.Err, session.ErrMaxTurns) {
-		t.Fatalf("session 2 next turn expected ErrMaxTurns, got %v", outcome3.Err)
-	}
-
-	// 5. Append a new user message to session 1; its next turn also immediately ends with ErrMaxTurns
-	nextPrompt := "continue session 1"
-	if err := sessionStore.AppendMessages(ctx, "session1", llm.Message{Role: "user", Content: &nextPrompt}); err != nil {
-		t.Fatalf("AppendMessages: %v", err)
-	}
-	run.SessionID = "session1"
-	outcome4 := orch.runTurnWorker(ctx, repo, run, &hr)
-	if !errors.Is(outcome4.Err, session.ErrMaxTurns) {
-		t.Fatalf("session 1 next turn expected ErrMaxTurns, got %v", outcome4.Err)
-	}
-
-	mockLLM.mu.Lock()
-	callsAfter := mockLLM.callCount
-	mockLLM.mu.Unlock()
-	if callsAfter != 3 {
-		t.Errorf("expected no additional LLM calls when budget is spent, got %d", callsAfter)
-	}
-}
-
 func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 	ctx := t.Context()
 	storeDir := t.TempDir()
@@ -2634,8 +2611,6 @@ func startReconcileDriver(t *testing.T, orch *Orchestrator) *reconcileDriver {
 		cancel()
 		queue.ShutDown()
 		workersWG.Wait()
-		orch.cancelWorkers()
-		orch.workerWG.Wait()
 	})
 
 	go func() {
@@ -2652,6 +2627,80 @@ func startReconcileDriver(t *testing.T, orch *Orchestrator) *reconcileDriver {
 			}
 		}
 	}()
+
+	if ts := testSessionInfo(orch); ts != nil && ts.reconciler != nil && orch.harness != nil && orch.harness.LLMClient() != nil {
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			var activeMu sync.Mutex
+			active := make(map[string]bool)
+			enqueuedTerminal := make(map[string]bool)
+			var sessWG sync.WaitGroup
+			defer sessWG.Wait()
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			ns := orch.namespace()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					var list herorunv1alpha1.SessionList
+					if err := orch.kubeClient.List(ctx, &list, client.InNamespace(ns)); err != nil {
+						continue
+					}
+					for i := range list.Items {
+						s := &list.Items[i]
+						if s.Status.Phase.IsTerminal() {
+							activeMu.Lock()
+							done := enqueuedTerminal[s.Name]
+							if !done {
+								enqueuedTerminal[s.Name] = true
+							}
+							activeMu.Unlock()
+							if !done {
+								if owner := metav1.GetControllerOf(s); owner != nil && owner.Kind == "HeroRun" {
+									queue.Add(reconcile.Request{
+										NamespacedName: types.NamespacedName{Namespace: s.Namespace, Name: owner.Name},
+									})
+								}
+							}
+							continue
+						}
+						activeMu.Lock()
+						if active[s.Name] {
+							activeMu.Unlock()
+							continue
+						}
+						active[s.Name] = true
+						activeMu.Unlock()
+						sessName := s.Name
+						owner := metav1.GetControllerOf(s)
+						sessWG.Add(1)
+						go func() {
+							defer sessWG.Done()
+							defer func() {
+								activeMu.Lock()
+								delete(active, sessName)
+								activeMu.Unlock()
+							}()
+							_, _ = ts.reconciler.Reconcile(ctx, reconcile.Request{
+								NamespacedName: types.NamespacedName{Namespace: ns, Name: sessName},
+							})
+							if owner != nil && owner.Kind == "HeroRun" {
+								var updated herorunv1alpha1.Session
+								if err := orch.kubeClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: sessName}, &updated); err == nil && updated.Status.Phase.IsTerminal() {
+									queue.Add(reconcile.Request{
+										NamespacedName: types.NamespacedName{Namespace: ns, Name: owner.Name},
+									})
+								}
+							}
+						}()
+					}
+				}
+			}
+		}()
+	}
 
 	if orch.harness != nil && orch.harness.SandboxClient() != nil && orch.harness.SandboxClient().AgentsClient() != nil {
 		factory := informers.NewSharedInformerFactoryWithOptions(
@@ -3061,20 +3110,16 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 	})
 	putTestRun(t, t.Context(), orch, run)
 
-	go func() {
-		_ = orch.Start(testCtx)
-	}()
-
-	// Reconcile with the cancellable context. The LLM will cancel the context during the session.
-	_, _ = orch.Reconcile(testCtx, runRequest(orch, repo.Key(), runID))
-
-	deadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(runID) {
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for worker to stop after context cancellation")
-		}
-		time.Sleep(5 * time.Millisecond)
+	// Reconcile HeroRun to create root Session CRD, then reconcile Session with the cancellable context.
+	// The LLM cancels testCtx mid-turn, simulating process shutdown before Session reaches terminal status.
+	if _, err := orch.Reconcile(testCtx, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
 	}
+	sessName := topLevelSessionID(runID, "")
+	ts := testSessionInfo(orch)
+	_, _ = ts.reconciler.Reconcile(testCtx, reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: orch.namespace(), Name: sessName},
+	})
 
 	// Check with test context: run MUST stay in Working phase
 	gotRun, err := GetRun(t.Context(), orch.kubeClient, orch.namespace(), runID)
@@ -3099,7 +3144,7 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 		}
 	}
 
-	// Consuming the outcome must also leave the run in Working
+	// Reconciling HeroRun after shutdown cancellation must also leave the run in Working
 	if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("Reconcile after cancellation: %v", err)
 	}
@@ -3144,65 +3189,6 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 	}
 	if resRun.Summary != "restarted and finished" {
 		t.Errorf("expected summary 'restarted and finished', got %q", resRun.Summary)
-	}
-}
-
-func TestOrchestrator_Working_GRPCCanceled_LeavesWorking(t *testing.T) {
-	ctx := t.Context()
-	storeDir := t.TempDir()
-	store := state.NewFileStore(storeDir)
-	sessionStore := session.NewFileStore(storeDir)
-
-	repo := &state.Repo{
-		URL:           "https://github.com/gke-labs/test-repo",
-		Host:          "github.com",
-		Owner:         "gke-labs",
-		Name:          "test-repo",
-		DefaultBranch: "main",
-	}
-	if err := store.PutRepo(ctx, repo); err != nil {
-		t.Fatalf("PutRepo: %v", err)
-	}
-
-	runID := "20261030T120000Z-grpccancel"
-	sandboxName := "run-20261030t120000z-grpccancel"
-	run := &state.Run{
-		ID:          runID,
-		Repo:        repo.Key(),
-		GoalName:    "grpc-goal",
-		Phase:       state.PhaseWorking,
-		BaseCommit:  "base-sha",
-		SandboxName: sandboxName,
-	}
-
-	harness, _, _ := setupTestHarnessWithLLM(t, nil, nil)
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-	})
-	putTestRun(t, ctx, orch, run)
-
-	// Storing a gRPC codes.Canceled outcome (like an in-flight sandbox call being canceled) must leave the run Working.
-	grpcErr := status.Error(codes.Canceled, "in-flight sandbox rpc canceled")
-	seedCompletedTurnOp(t, ctx, orch, runID, "op-grpc-cancel", turnOutcome{
-		Err:      fmt.Errorf("in-flight sandbox call: %w", grpcErr),
-		Finished: time.Now(),
-	})
-
-	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun: %v", err)
-	}
-	if gotRun.Phase != state.PhaseWorking {
-		t.Errorf("expected phase %s after gRPC codes.Canceled, got %s", state.PhaseWorking, gotRun.Phase)
-	}
-	if gotRun.Error != "" {
-		t.Errorf("expected empty error, got %q", gotRun.Error)
 	}
 }
 
@@ -4216,7 +4202,9 @@ func TestOrchestrator_FinishedRunHasNoIndexEntry(t *testing.T) {
 	var hrObj herorunv1alpha1.HeroRun
 	_ = fakeClient.Get(ctx, client.ObjectKey{Namespace: harness.Namespace(), Name: hrName}, &hrObj)
 	_ = orch.saveHeroRun(ctx, &hrObj, run)
-	_ = orch.finishRun(ctx, repo, run, &hrObj, runEnd{Phase: state.PhaseNoImprovement, Kind: "finished"})
+	now := time.Now().UTC()
+	run.SetPhase(state.PhaseNoImprovement, now)
+	_ = orch.saveTerminalRun(ctx, repo, run, &hrObj, state.PhaseWorking, now, runEnd{Phase: state.PhaseNoImprovement, Kind: "finished"})
 
 	orch.runIndexMu.RLock()
 	_, found := orch.runIndex[hrName]
@@ -6146,12 +6134,17 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 	putTestRun(t, ctx, orch, run1)
 	putTestRun(t, ctx, orch, run2)
 
-	// 1. Reconcile run1 (Working). This starts the turn worker, which runs in a goroutine.
+	// 1. Reconcile run1 (Working). This creates the root Session CRD without blocking.
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo1.Key(), run1ID)); err != nil {
 		t.Fatalf("orch.Reconcile run1: %v", err)
 	}
 
-	// Wait for run1's worker to enter the blocking tool call.
+	sess1Done := make(chan error, 1)
+	go func() {
+		sess1Done <- reconcileSessionUntilTerminal(ctx, orch, topLevelSessionID(run1ID, ""))
+	}()
+
+	// Wait for run1's session controller to enter the blocking tool call.
 	select {
 	case <-toolEntered:
 	case <-time.After(5 * time.Second):
@@ -6172,18 +6165,18 @@ func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testin
 		t.Fatalf("expected run2 to reach Working while run1 was blocked, got %s", gotRun2.Phase)
 	}
 
-	// 3. Release run1 and let it finish.
+	// 3. Release run1 and let its Session finish.
 	close(toolRelease)
-
-	deadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(run1ID) {
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for run1 worker to finish")
+	select {
+	case err := <-sess1Done:
+		if err != nil {
+			t.Fatalf("reconcileSessionUntilTerminal run1: %v", err)
 		}
-		time.Sleep(5 * time.Millisecond)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for run1 session to finish")
 	}
 
-	// Reconcile run1 to consume outcome.
+	// Reconcile run1 to consume terminal Session outcome.
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo1.Key(), run1ID)); err != nil {
 		t.Fatalf("orch.Reconcile run1 outcome: %v", err)
 	}
@@ -6302,92 +6295,6 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 	})
 }
 
-func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-
-	repo := &state.Repo{
-		URL:           "https://github.com/gke-labs/test-repo",
-		Host:          "github.com",
-		Owner:         "gke-labs",
-		Name:          "test-repo",
-		DefaultBranch: "main",
-	}
-	if err := store.PutRepo(ctx, repo); err != nil {
-		t.Fatalf("PutRepo: %v", err)
-	}
-
-	runID := "20261030T120000Z-consumed-once"
-	sandboxName := "run-consumed-once"
-	run := &state.Run{
-		ID:          runID,
-		Repo:        repo.Key(),
-		GoalName:    "goal-consume",
-		Phase:       state.PhaseWorking,
-		BaseCommit:  "base-sha",
-		SandboxName: sandboxName,
-	}
-
-	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
-	policy := sandboxv1beta1.ShutdownPolicyDelete
-	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: "ao-sandboxes"},
-		Spec:       sandboxv1beta1.SandboxSpec{Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: time.Now().Add(5 * time.Minute)}, ShutdownPolicy: &policy}},
-	}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("creating sandbox: %v", err)
-	}
-
-	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		Clock:        func() time.Time { return fixedTime },
-	})
-	putTestRun(t, ctx, orch, run)
-
-	// Pre-store an outcome for the run
-	opID := "op-consumed-once"
-	seedCompletedTurnOp(t, ctx, orch, runID, opID, turnOutcome{
-		Err:      nil,
-		Finished: fixedTime,
-	})
-
-	// Pass 1: Reconcile consumes the outcome and moves run to NoImprovement
-	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-		t.Fatalf("orch.Reconcile pass 1: %v", err)
-	}
-
-	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun: %v", err)
-	}
-	if gotRun.Phase != state.PhaseNoImprovement {
-		t.Fatalf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
-	}
-
-	// Verify outcome was removed upon consumption
-	if gotRun.ActiveOperation != nil {
-		t.Fatalf("expected ActiveOperation to be cleared once consumed, got %+v", gotRun.ActiveOperation)
-	}
-
-	// Pass 2: Reconcile again with no outcome stored
-	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-		t.Fatalf("orch.Reconcile pass 2: %v", err)
-	}
-
-	// Outcome was not consumed twice (ActiveOperation remains nil)
-	gotRun2, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun pass 2: %v", err)
-	}
-	if gotRun2.ActiveOperation != nil {
-		t.Fatalf("ActiveOperation appeared again after pass 2: %+v", gotRun2.ActiveOperation)
-	}
-}
-
 type scriptedMultiToolLLM struct {
 	mu           sync.Mutex
 	callCount    int
@@ -6480,72 +6387,6 @@ func findGoroutinesContaining(target string) []string {
 		}
 	}
 	return matches
-}
-
-func TestOrchestrator_CancelWorker(t *testing.T) {
-	orch := &Orchestrator{
-		turnWorkers: make(map[string]*turnWorkerHandle),
-	}
-
-	cancelled := false
-	cancel := context.CancelFunc(func() {
-		cancelled = true
-	})
-
-	orch.reserveTurnWorker("op-1", "run-1")
-	orch.setTurnWorkerCancel("op-1", cancel)
-	orch.cancelRunTurnWorkers("run-1")
-
-	if !cancelled {
-		t.Errorf("expected worker to be cancelled")
-	}
-
-	// Calling cancelRunTurnWorkers on nonexistent run should not panic
-	orch.cancelRunTurnWorkers("nonexistent")
-}
-
-func TestOrchestrator_CancelWorkers(t *testing.T) {
-	orch := &Orchestrator{
-		turnWorkers: make(map[string]*turnWorkerHandle),
-	}
-
-	var canc1, canc2 bool
-	orch.reserveTurnWorker("op-1", "run-1")
-	orch.setTurnWorkerCancel("op-1", func() { canc1 = true })
-	orch.reserveTurnWorker("op-2", "run-2")
-	orch.setTurnWorkerCancel("op-2", func() { canc2 = true })
-	orch.cancelWorkers()
-
-	if !canc1 || !canc2 {
-		t.Errorf("expected both workers to be cancelled, got canc1=%v canc2=%v", canc1, canc2)
-	}
-}
-
-func TestNewTestOrchestrator_WaitsForWorkers(t *testing.T) {
-	store := state.NewFileStore(t.TempDir())
-	harness, _, _ := setupTestHarness(t, nil)
-
-	var workerExited bool
-	t.Run("subtest with worker", func(subT *testing.T) {
-		orch := newTestOrchestrator(subT, OrchestratorOptions{
-			Store:   store,
-			Harness: harness,
-		})
-
-		ctx, cancel := context.WithCancel(subT.Context())
-		orch.reserveTurnWorker("op-test", "test-run")
-		orch.setTurnWorkerCancel("op-test", cancel)
-		orch.workerWG.Add(1)
-		go func() {
-			defer orch.workerWG.Done()
-			<-ctx.Done()
-			workerExited = true
-		}()
-	})
-
-	if !workerExited {
-		t.Errorf("expected worker goroutine to have exited before subtest cleanup completed")
-	}
 }
 
 func TestOrchestrator_PrepareRun_DeadlineAndShutdownTime(t *testing.T) {
@@ -6856,7 +6697,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 	})
 	putTestRun(t, ctx, orch, run)
 
-	// 1. First reconcile pass starts the turn worker. RequeueAfter should be 0.
+	// 1. First reconcile pass creates the root Session CRD. RequeueAfter should be 0.
 	res, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
 		t.Fatalf("orch.Reconcile start: %v", err)
@@ -6864,6 +6705,11 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 	if res.RequeueAfter != 0 {
 		t.Errorf("expected RequeueAfter 0, got %v", res.RequeueAfter)
 	}
+
+	sessDone := make(chan error, 1)
+	go func() {
+		sessDone <- reconcileSessionUntilTerminal(ctx, orch, topLevelSessionID(runID, ""))
+	}()
 
 	// Wait for tool 1 to execute and finish, and tool 2 to be entered and blocked
 	select {
@@ -6878,7 +6724,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 		t.Fatal("timed out waiting for step 2 to be entered")
 	}
 
-	// While blocked in step 2: advance clock and reconcile while worker is running
+	// While blocked in step 2: advance clock and reconcile while session is running
 	advanceClock(5 * time.Minute)
 	res1, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
@@ -6911,7 +6757,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 		t.Fatal("timed out waiting for step 3 to be entered")
 	}
 
-	// Advance clock again and reconcile while worker is waiting on step3Allowed
+	// Advance clock again and reconcile while session is waiting on step3Allowed
 	advanceClock(10 * time.Minute)
 	res2, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil {
@@ -6933,16 +6779,16 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 	// 3. Allow LLM call 3 to complete ("done")
 	close(step3Allowed)
 
-	// Wait for worker goroutine to exit
-	deadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(runID) {
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for worker to finish")
+	select {
+	case err := <-sessDone:
+		if err != nil {
+			t.Fatalf("reconcileSessionUntilTerminal: %v", err)
 		}
-		time.Sleep(5 * time.Millisecond)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for session to finish")
 	}
 
-	// Reconcile to consume outcome
+	// Reconcile to consume terminal Session outcome
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
 		t.Fatalf("orch.Reconcile outcome: %v", err)
 	}
@@ -7512,10 +7358,18 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 		t.Fatalf("Reconcile got res=%v err=%v, want RequeueAfter=10m", res, err)
 	}
 
+	sessName := topLevelSessionID(runID, "")
+	sessCtx, cancelSess := context.WithCancel(ctx)
+	defer cancelSess()
+	sessDone := make(chan error, 1)
+	go func() {
+		sessDone <- reconcileSessionUntilTerminal(sessCtx, orch, sessName)
+	}()
+
 	select {
 	case <-blockingLLM.started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for worker to start LLM call")
+		t.Fatal("timed out waiting for session to start LLM call")
 	}
 
 	currentTime = deadline.Add(time.Minute)
@@ -7523,10 +7377,12 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 		t.Fatalf("Reconcile after deadline: %v", err)
 	}
 
-	select {
-	case <-blockingLLM.cancelled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected worker context to be cancelled")
+	var sess herorunv1alpha1.Session
+	if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: orch.namespace(), Name: sessName}, &sess); err != nil {
+		t.Fatalf("Get Session: %v", err)
+	}
+	if sess.Status.Phase != herorunv1alpha1.SessionPhaseCanceled {
+		t.Errorf("expected root Session phase %q, got %q", herorunv1alpha1.SessionPhaseCanceled, sess.Status.Phase)
 	}
 
 	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
@@ -7557,10 +7413,11 @@ func TestOrchestrator_Working_DeadlineExceededMidTurn(t *testing.T) {
 		t.Errorf("expected deadline_exceeded event, got events: %+v", events)
 	}
 
-	// Later outcome from finished worker is ignored
-	orch.workerWG.Wait()
+	// Cancel in-flight session goroutine and verify later Reconcile keeps Failed.
+	cancelSess()
+	<-sessDone
 	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-		t.Fatalf("Reconcile with leftover outcome: %v", err)
+		t.Fatalf("Reconcile on terminal run: %v", err)
 	}
 	gotRunAfter, _ := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if gotRunAfter.Phase != state.PhaseFailed {
@@ -7620,10 +7477,15 @@ func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
 				t.Fatalf("Reconcile: %v", err)
 			}
 
+			sessDone := make(chan error, 1)
+			go func() {
+				sessDone <- reconcileSessionUntilTerminal(ctx, orch, topLevelSessionID(runID, ""))
+			}()
+
 			select {
 			case <-blockingLLM.started:
 			case <-time.After(5 * time.Second):
-				t.Fatal("timed out waiting for worker to start LLM call")
+				t.Fatal("timed out waiting for session to start LLM call")
 			}
 
 			if err := tc.mutate(ctx, agentsCS, sbName); err != nil {
@@ -7636,15 +7498,22 @@ func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
 
 			select {
 			case <-blockingLLM.cancelled:
-				t.Fatal("worker context should not be cancelled on sandbox deletion")
+				t.Fatal("session context should not be cancelled on sandbox deletion")
 			default:
 			}
 
 			close(blockingLLM.release)
-			orch.workerWG.Wait()
+			select {
+			case err := <-sessDone:
+				if err != nil {
+					t.Fatalf("reconcileSessionUntilTerminal: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for session to finish")
+			}
 
 			if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-				t.Fatalf("Reconcile after worker finish: %v", err)
+				t.Fatalf("Reconcile after session finish: %v", err)
 			}
 
 			gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
@@ -7686,64 +7555,11 @@ func TestOrchestrator_Working_RequeueRemainingDeadline(t *testing.T) {
 		t.Fatalf("Reconcile got res=%v err=%v, want RequeueAfter=25m", res, err)
 	}
 
-	select {
-	case <-blockingLLM.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for worker to start")
-	}
-
-	// Reconcile while active should return remaining time
+	// Reconcile while root Session is non-terminal should return remaining time
 	currentTime = startTime.Add(5 * time.Minute)
 	res2, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID))
 	if err != nil || res2.RequeueAfter != 20*time.Minute {
 		t.Fatalf("Reconcile active got res2=%v err=%v, want RequeueAfter=20m", res2, err)
-	}
-}
-
-func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261030T120000Z-outcome-first", "run-outcome-first"
-	startTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
-	deadline := startTime.Add(10 * time.Minute)
-
-	store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, &deadline, &llm.ElizaClient{})
-
-	currentTime := startTime
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store: store, SessionStore: sessionStore, Harness: harness,
-		Clock:      func() time.Time { return currentTime },
-		KubeClient: fakeClient,
-	})
-
-	// Store an outcome that finished before the deadline
-	seedCompletedTurnOp(t, ctx, orch, runID, "op-outcome-first", turnOutcome{
-		Err:      session.ErrSessionFinished,
-		Finished: startTime.Add(5 * time.Minute),
-	})
-
-	// Advance clock past the deadline before Reconcile runs
-	currentTime = deadline.Add(5 * time.Minute)
-
-	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun: %v", err)
-	}
-	if gotRun.Phase != state.PhaseNoImprovement {
-		t.Errorf("expected phase %s (from finished outcome), got %s", state.PhaseNoImprovement, gotRun.Phase)
-	}
-
-	events, err := store.ReadEvents(ctx, repo.Key(), runID)
-	if err != nil {
-		t.Fatalf("ReadEvents: %v", err)
-	}
-	for _, e := range events {
-		if e.Kind == "deadline_exceeded" {
-			t.Errorf("did not expect deadline_exceeded event when turn outcome was waiting")
-		}
 	}
 }
 
@@ -8759,7 +8575,7 @@ func TestOrchestrator_Working_StartSession_CreatesChildSession(t *testing.T) {
 		t.Fatalf("expected non-empty SessionID on run")
 	}
 
-	childSess, err := orch.harness.LoadSession(ctx, orch.sessionStore, childName)
+	childSess, err := orch.harness.LoadSession(ctx, testSessionStore(orch), childName)
 	if err != nil {
 		t.Fatalf("LoadSession(childName=%q): %v", childName, err)
 	}
@@ -8793,405 +8609,6 @@ func TestOrchestrator_Working_StartSession_CreatesChildSession(t *testing.T) {
 	}
 	if !foundChildEvent {
 		t.Errorf("expected session_started event for child session %s", childName)
-	}
-}
-
-func TestOrchestrator_StartSession_SharesSandboxOwnerAndTurnBudget(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
-	if err := store.PutRepo(ctx, repo); err != nil {
-		t.Fatalf("PutRepo: %v", err)
-	}
-	run := &state.Run{ID: "run-sb-owner", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-owner"}
-
-	procSrv := &mockProcessServer{exitCode: 0, stdout: "ok\n"}
-	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, &llm.ElizaClient{})
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		MaxTurns:     5,
-	})
-	putTestRun(t, ctx, orch, run)
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootsb", session.Metadata{
-		RunID: run.ID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession root: %v", err)
-	}
-
-	sb := harness.GetOrAttachSandbox(run.SandboxName)
-	owner := session.NewSandboxOwner(harness)
-	owner.SetActiveSandbox(sb)
-	owner.SetCreateSandboxOptions(session.CreateSandboxOptions{
-		Name:               run.SandboxName,
-		WorkspaceClaimName: "ws-claim",
-		ExtendLifecycle:    false,
-	})
-	root.SetSandboxOwner(owner)
-
-	rs := orch.ensureRunState(run.ID)
-	rs.sandboxOwner = owner
-
-	tb := orch.turnBudget(run.ID)
-	if tb == nil {
-		t.Fatal("expected non-nil turn budget for run")
-	}
-	// The parent takes 2 turns before starting the child, leaving 3 of 5.
-	for i := 0; i < 2; i++ {
-		if !tb.Take() {
-			t.Fatalf("parent take turn %d failed", i+1)
-		}
-	}
-
-	children := newChildGroup(ctx)
-	// ElizaClient handles "run: <cmd>" in 2 turns. Turn 1 requests run_command, and turn 2 returns a text reply.
-	childName, err := orch.startChildSession(ctx, children, repo, run, root, "run: echo from-child")
-	if err != nil {
-		t.Fatalf("startChildSession: %v", err)
-	}
-	children.wg.Wait()
-
-	childSess, err := harness.LoadSession(ctx, sessionStore, childName)
-	if err != nil {
-		t.Fatalf("LoadSession: %v", err)
-	}
-	if childSess.Metadata.Parent != "rootsb" {
-		t.Errorf("child Parent = %q, want 'rootsb'", childSess.Metadata.Parent)
-	}
-
-	// Verify the child used the parent's active SandboxOwner rather than creating a new sandbox.
-	procSrv.mu.Lock()
-	cmds := slices.Clone(procSrv.commands)
-	procSrv.mu.Unlock()
-	if len(cmds) != 1 || !slices.Equal(cmds[0], []string{"sh", "-c", "echo from-child"}) {
-		t.Errorf("sandbox commands = %v, want [[sh -c echo from-child]]", cmds)
-	}
-	sandboxes, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		t.Fatalf("listing sandboxes: %v", err)
-	}
-	if len(sandboxes.Items) != 0 {
-		t.Errorf("created sandboxes = %d, want 0 because child must reuse parent SandboxOwner", len(sandboxes.Items))
-	}
-
-	// Verify the child drew 2 turns from the shared budget on top of the parent's 2 turns.
-	if tb.Used() != 4 {
-		t.Fatalf("budget Used() after child = %d, want 4", tb.Used())
-	}
-	if !tb.Take() {
-		t.Fatalf("parent take final turn 5 failed")
-	}
-	if tb.Take() {
-		t.Errorf("expected budget exhausted on 6th turn")
-	}
-
-	// Verify a child started after the shared budget is exhausted makes no LLM turn.
-	exhaustedChild, err := orch.startChildSession(ctx, children, repo, run, root, "after exhaustion")
-	if err != nil {
-		t.Fatalf("startChildSession after exhaustion: %v", err)
-	}
-	children.wg.Wait()
-
-	exhaustedSess, err := harness.LoadSession(ctx, sessionStore, exhaustedChild)
-	if err != nil {
-		t.Fatalf("LoadSession(exhaustedChild): %v", err)
-	}
-	for _, msg := range exhaustedSess.Messages() {
-		if msg.Role == "assistant" {
-			t.Errorf("expected no assistant message when shared budget is exhausted, got %+v", msg)
-		}
-	}
-	if tb.Used() != 5 {
-		t.Errorf("budget Used() after exhausted child = %d, want 5", tb.Used())
-	}
-}
-
-func TestOrchestrator_StartSession_DepthLimit(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
-	_ = store.PutRepo(ctx, repo)
-	run := &state.Run{ID: "run-depth-test", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-depth"}
-
-	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:           store,
-		SessionStore:    sessionStore,
-		Harness:         harness,
-		MaxSessionDepth: 3,
-	})
-	putTestRun(t, ctx, orch, run)
-
-	root, err := harness.NewSession(ctx, sessionStore, "root", session.Metadata{
-		RunID: run.ID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession root: %v", err)
-	}
-
-	orch.ensureRunState(run.ID)
-
-	children := newChildGroup(ctx)
-
-	// 1. Root starts child (depth 1) - allowed
-	child1Name, err := orch.startChildSession(ctx, children, repo, run, root, "task 1")
-	if err != nil {
-		t.Fatalf("startChildSession (child1): %v", err)
-	}
-	child1, err := harness.LoadSession(ctx, sessionStore, child1Name)
-	if err != nil {
-		t.Fatalf("LoadSession(child1): %v", err)
-	}
-	if child1.Metadata.Depth() != 1 {
-		t.Errorf("child1 depth = %d, want 1", child1.Metadata.Depth())
-	}
-
-	// 2. Child1 starts child2 (depth 2) - allowed
-	child2Name, err := orch.startChildSession(ctx, children, repo, run, child1, "task 2")
-	if err != nil {
-		t.Fatalf("startChildSession (child2): %v", err)
-	}
-	child2, err := harness.LoadSession(ctx, sessionStore, child2Name)
-	if err != nil {
-		t.Fatalf("LoadSession(child2): %v", err)
-	}
-	if child2.Metadata.Depth() != 2 {
-		t.Errorf("child2 depth = %d, want 2", child2.Metadata.Depth())
-	}
-
-	// 3. Child2 starts child3 (depth 3) - allowed
-	child3Name, err := orch.startChildSession(ctx, children, repo, run, child2, "task 3")
-	if err != nil {
-		t.Fatalf("startChildSession (child3): %v", err)
-	}
-	child3, err := harness.LoadSession(ctx, sessionStore, child3Name)
-	if err != nil {
-		t.Fatalf("LoadSession(child3): %v", err)
-	}
-	if child3.Metadata.Depth() != 3 {
-		t.Errorf("child3 depth = %d, want 3", child3.Metadata.Depth())
-	}
-
-	// 4. Child3 (depth 3) attempts to start child4 - exceeds limit 3, fails and starts nothing
-	child4Name, err := orch.startChildSession(ctx, children, repo, run, child3, "task 4")
-	if err == nil {
-		t.Fatalf("expected error for exceeding depth limit, got childName=%q", child4Name)
-	}
-	if !strings.Contains(err.Error(), "depth limit of 3 reached") {
-		t.Errorf("err = %q, want containing 'depth limit of 3 reached'", err.Error())
-	}
-
-	// Verify custom depth limit of 1
-	orch1 := newTestOrchestrator(t, OrchestratorOptions{
-		Store:           store,
-		SessionStore:    sessionStore,
-		Harness:         harness,
-		MaxSessionDepth: 1,
-	})
-	orch1.ensureRunState(run.ID)
-	children1 := newChildGroup(ctx)
-	cName, err := orch1.startChildSession(ctx, children1, repo, run, root, "subtask")
-	if err != nil {
-		t.Fatalf("orch1 start child: %v", err)
-	}
-	c1, _ := harness.LoadSession(ctx, sessionStore, cName)
-	_, err = orch1.startChildSession(ctx, children1, repo, run, c1, "subsubtask")
-	if err == nil || !strings.Contains(err.Error(), "depth limit of 1 reached") {
-		t.Errorf("expected depth limit 1 error, got %v", err)
-	}
-}
-
-func TestOrchestrator_StartSession_NoRun(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-	harness, _, _ := setupTestHarness(t, nil)
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-	})
-
-	sessWithoutRun, err := harness.NewSession(ctx, sessionStore, "norunsess", session.Metadata{})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	children := newChildGroup(ctx)
-	_, err = orch.startChildSession(ctx, children, nil, nil, sessWithoutRun, "do something")
-	if err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
-		t.Errorf("expected 'session belongs to no run' error, got %v", err)
-	}
-}
-
-func TestOrchestrator_StartSession_NoLLMClient(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
-	_ = store.PutRepo(ctx, repo)
-	run := &state.Run{ID: "run-no-llm", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-no-llm"}
-
-	harness, _, _ := setupTestHarness(t, nil)
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-	})
-	putTestRun(t, ctx, orch, run)
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootnollm", session.Metadata{
-		RunID: run.ID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	children := newChildGroup(ctx)
-	_, err = orch.startChildSession(ctx, children, repo, run, root, "task")
-	if err == nil || !strings.Contains(err.Error(), "no LLM client configured") {
-		t.Errorf("expected 'no LLM client configured' error, got %v", err)
-	}
-}
-
-func TestOrchestrator_StartSession_NoTurnBudget(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
-	_ = store.PutRepo(ctx, repo)
-	run := &state.Run{ID: "run-no-budget", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sb-no-budget"}
-
-	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-	})
-	putTestRun(t, ctx, orch, run)
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootnobudget", session.Metadata{
-		RunID: run.ID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	// runStates does not have runID, so turnBudget returns nil
-	children := newChildGroup(ctx)
-	_, err = orch.startChildSession(ctx, children, repo, run, root, "task")
-	if err == nil || !strings.Contains(err.Error(), "run has no turn budget") {
-		t.Errorf("expected 'run has no turn budget' error, got %v", err)
-	}
-}
-
-func TestOrchestrator_StartSession_RunBounds_ChildStopsWhenRunEnds(t *testing.T) {
-	ctx := t.Context()
-	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, "run-child-bound", "sb-bound", nil, blockingLLM)
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		Clock:        time.Now,
-		KubeClient:   fakeClient,
-	})
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootbound", session.Metadata{
-		RunID: run.ID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	// Ensure runState exists with turn budget
-	orch.ensureRunState(run.ID)
-
-	workerCtx, cancelWorker := context.WithCancel(ctx)
-	childCtx, cancelChildren := context.WithCancel(workerCtx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-
-	// Start child session with blocking LLM
-	_, err = orch.startChildSession(ctx, children, repo, run, root, "blocking work")
-	if err != nil {
-		t.Fatalf("startChildSession: %v", err)
-	}
-
-	select {
-	case <-blockingLLM.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for child worker to start LLM call")
-	}
-
-	cancelWorker()
-
-	select {
-	case <-blockingLLM.cancelled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for child worker to be cancelled after cancelWorker")
-	}
-
-	cancelChildren()
-	children.wg.Wait()
-}
-
-func TestOrchestrator_Working_ChildrenStopWhenTopLevelFinishes(t *testing.T) {
-	ctx := t.Context()
-	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, "run-child-topfinish", "sb-topfinish", nil, blockingLLM)
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		Clock:        time.Now,
-		KubeClient:   fakeClient,
-	})
-
-	root, err := harness.NewSession(ctx, sessionStore, "roottopfinish", session.Metadata{
-		RunID: run.ID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	orch.ensureRunState(run.ID)
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-
-	_, err = orch.startChildSession(ctx, children, repo, run, root, "child task")
-	if err != nil {
-		t.Fatalf("startChildSession: %v", err)
-	}
-
-	select {
-	case <-blockingLLM.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for child to start")
-	}
-
-	cancelChildren()
-	children.wg.Wait()
-
-	select {
-	case <-blockingLLM.cancelled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for child to stop after top-level session finished work")
 	}
 }
 
@@ -9285,14 +8702,24 @@ func TestOrchestrator_Working_ListSessions_RootAndChildren(t *testing.T) {
 	run.SessionID = generateSessionID(run.ID)
 	putTestRun(t, ctx, orch, run)
 
-	// Pre-create a stopped child session
-	_, err := orch.harness.NewSession(ctx, orch.sessionStore, "childstopped", session.Metadata{
-		RunID:     run.ID,
-		Parent:    run.SessionID,
-		CreatedAt: time.Now().Add(-2 * time.Minute),
-	})
-	if err != nil {
-		t.Fatalf("NewSession childstopped: %v", err)
+	// Pre-create a stopped child Session CRD
+	stoppedChild := &herorunv1alpha1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "childstopped",
+			Namespace: orch.namespace(),
+			Labels:    map[string]string{LabelRun: run.ID},
+		},
+		Spec: herorunv1alpha1.SessionSpec{
+			RunID:  run.ID,
+			Parent: run.SessionID,
+		},
+	}
+	if err := orch.kubeClient.Create(ctx, stoppedChild); err != nil {
+		t.Fatalf("Create childstopped Session: %v", err)
+	}
+	stoppedChild.Status.Phase = herorunv1alpha1.SessionPhaseSucceeded
+	if err := orch.kubeClient.Status().Update(ctx, stoppedChild); err != nil {
+		t.Fatalf("Status().Update childstopped Session: %v", err)
 	}
 
 	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), run.ID)); err != nil {
@@ -9312,138 +8739,21 @@ func TestOrchestrator_Working_ListSessions_RootAndChildren(t *testing.T) {
 		t.Fatalf("expected 2 sessions, got %d: %+v", len(parsed), parsed)
 	}
 
+	byName := make(map[string]ao.SessionInfo, len(parsed))
+	for _, s := range parsed {
+		byName[s.Name] = s
+	}
+
 	// 1. Root session (calling session) is running
-	if parsed[0].Name != run.SessionID || parsed[0].Parent != "" || parsed[0].State != "running" {
-		t.Errorf("unexpected root session in list: %+v, want name=%q parent='' state='running'", parsed[0], run.SessionID)
+	rootInfo, ok := byName[run.SessionID]
+	if !ok || rootInfo.Parent != "" || rootInfo.State != "running" {
+		t.Errorf("unexpected root session in list: %+v, want name=%q parent='' state='running'", rootInfo, run.SessionID)
 	}
 
 	// 2. Child stopped
-	if parsed[1].Name != "childstopped" || parsed[1].Parent != run.SessionID || parsed[1].State != "stopped" {
-		t.Errorf("unexpected child in list: %+v, want name='childstopped' parent=%q state='stopped'", parsed[1], run.SessionID)
-	}
-}
-
-func TestOrchestrator_ListSessions_RunningChild(t *testing.T) {
-	ctx := t.Context()
-	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, "run-list-running", "sb-list-running", nil, blockingLLM)
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		Clock:        time.Now,
-		KubeClient:   fakeClient,
-	})
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootrunning", session.Metadata{
-		RunID: run.ID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	orch.ensureRunState(run.ID)
-
-	workerCtx, cancelWorker := context.WithCancel(ctx)
-	defer cancelWorker()
-	childCtx, cancelChildren := context.WithCancel(workerCtx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-
-	childName, err := orch.startChildSession(ctx, children, repo, run, root, "blocking task")
-	if err != nil {
-		t.Fatalf("startChildSession: %v", err)
-	}
-
-	select {
-	case <-blockingLLM.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for child worker to start LLM call")
-	}
-
-	sessions, err := orch.listRunSessions(ctx, run, children)
-	if err != nil {
-		t.Fatalf("listRunSessions: %v", err)
-	}
-
-	var foundChild bool
-	for _, s := range sessions {
-		if s.Name == childName {
-			foundChild = true
-			if s.State != "running" {
-				t.Errorf("child session %s state = %q, want 'running'", childName, s.State)
-			}
-			if s.Parent != "rootrunning" {
-				t.Errorf("child session %s parent = %q, want 'rootrunning'", childName, s.Parent)
-			}
-		}
-	}
-	if !foundChild {
-		t.Errorf("expected child session %s in listRunSessions", childName)
-	}
-
-	close(blockingLLM.release)
-	cancelChildren()
-	children.wg.Wait()
-
-	// After child worker stops, it should be stopped
-	sessionsAfter, err := orch.listRunSessions(ctx, run, children)
-	if err != nil {
-		t.Fatalf("listRunSessions after stop: %v", err)
-	}
-	for _, s := range sessionsAfter {
-		if s.Name == childName && s.State != "stopped" {
-			t.Errorf("child session %s state after stop = %q, want 'stopped'", childName, s.State)
-		}
-	}
-}
-
-func TestOrchestrator_ListSessions_IsolatesRuns(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-	harness, _, _ := setupTestHarness(t, nil)
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-	})
-
-	run1 := &state.Run{ID: "run-alpha"}
-	run2 := &state.Run{ID: "run-beta"}
-
-	// Create sessions in Run 1
-	if _, err := harness.NewSession(ctx, sessionStore, "run1sess", session.Metadata{
-		RunID: "run-alpha",
-	}); err != nil {
-		t.Fatalf("NewSession run1sess: %v", err)
-	}
-
-	// Create sessions in Run 2
-	if _, err := harness.NewSession(ctx, sessionStore, "run2sess", session.Metadata{
-		RunID: "run-beta",
-	}); err != nil {
-		t.Fatalf("NewSession run2sess: %v", err)
-	}
-
-	// Listing run-alpha sees run1sess but never run2sess
-	list1, err := orch.listRunSessions(ctx, run1, newChildGroup(ctx))
-	if err != nil {
-		t.Fatalf("listRunSessions(run-alpha): %v", err)
-	}
-	if len(list1) != 1 || list1[0].Name != "run1sess" {
-		t.Errorf("list1 = %+v, want exactly [run1sess]", list1)
-	}
-
-	// Listing run-beta sees run2sess but never run1sess
-	list2, err := orch.listRunSessions(ctx, run2, newChildGroup(ctx))
-	if err != nil {
-		t.Fatalf("listRunSessions(run-beta): %v", err)
-	}
-	if len(list2) != 1 || list2[0].Name != "run2sess" {
-		t.Errorf("list2 = %+v, want exactly [run2sess]", list2)
+	childInfo, ok := byName["childstopped"]
+	if !ok || childInfo.Parent != run.SessionID || childInfo.State != "stopped" {
+		t.Errorf("unexpected child in list: %+v, want name='childstopped' parent=%q state='stopped'", childInfo, run.SessionID)
 	}
 }
 
@@ -9453,71 +8763,6 @@ func TestOrchestrator_ListSessions_NoRun(t *testing.T) {
 	_, err := tool.Run(ctx, nil)
 	if err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
 		t.Errorf("expected 'session belongs to no run' error, got %v", err)
-	}
-}
-
-func TestOrchestrator_Working_ChildSession_CanCallListSessions(t *testing.T) {
-	ctx := t.Context()
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-
-	var childToolResult string
-	childLLM := &scriptedListSessionsLLM{
-		afterResult: func(toolMsg llm.Message) {
-			if toolMsg.Content != nil {
-				childToolResult = *toolMsg.Content
-			}
-		},
-	}
-
-	harness, _, _ := setupTestHarnessWithLLM(t, nil, childLLM)
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		Clock:        time.Now,
-	})
-
-	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
-	run := &state.Run{ID: "runchildlist", SessionID: "rootparent", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sbchildlist", Goal: &goals.Goal{Name: "g1", Body: "task"}}
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootparent", session.Metadata{
-		RunID: run.ID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession rootparent: %v", err)
-	}
-
-	orch.ensureRunState(run.ID)
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-
-	childName, err := orch.startChildSession(ctx, children, repo, run, root, "list sessions task")
-	if err != nil {
-		t.Fatalf("startChildSession: %v", err)
-	}
-
-	children.wg.Wait()
-
-	if childToolResult == "" {
-		t.Fatal("expected non-empty childToolResult from list_sessions call")
-	}
-
-	var parsed []ao.SessionInfo
-	if err := json.Unmarshal([]byte(childToolResult), &parsed); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(parsed) != 2 {
-		t.Fatalf("expected 2 sessions, got %d: %+v", len(parsed), parsed)
-	}
-	if parsed[0].Name != "rootparent" || parsed[0].State != "running" {
-		t.Errorf("parsed[0] = %+v, want name='rootparent' state='running'", parsed[0])
-	}
-	if parsed[1].Name != childName || parsed[1].Parent != "rootparent" || parsed[1].State != "running" {
-		t.Errorf("parsed[1] = %+v, want name=%q parent='rootparent' state='running'", parsed[1], childName)
 	}
 }
 
@@ -9580,6 +8825,7 @@ func TestOrchestrator_PostMessage_RunJSONDeletedSucceeds(t *testing.T) {
 		t.Fatalf("NewScheme: %v", err)
 	}
 
+	targetSessID := topLevelSessionID(runID, "")
 	hr := &herorunv1alpha1.HeroRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sandboxNameForRun(runID),
@@ -9593,12 +8839,26 @@ func TestOrchestrator_PostMessage_RunJSONDeletedSucceeds(t *testing.T) {
 			BaseCommit: "commit-base123",
 		},
 		Status: herorunv1alpha1.HeroRunStatus{
-			Phase: string(state.PhaseWorking),
+			Phase:     string(state.PhaseWorking),
+			SessionID: targetSessID,
+		},
+	}
+	sess := &herorunv1alpha1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      targetSessID,
+			Namespace: harness.Namespace(),
+			UID:       types.UID("uid-" + targetSessID),
+		},
+		Spec: herorunv1alpha1.SessionSpec{
+			RunID: runID,
+		},
+		Status: herorunv1alpha1.SessionStatus{
+			Phase: herorunv1alpha1.SessionPhaseRunning,
 		},
 	}
 
 	fakeClient := newTestFakeClientBuilder(scheme).
-		WithObjects(hr).
+		WithObjects(hr, sess).
 		Build()
 
 	orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -9614,17 +8874,21 @@ func TestOrchestrator_PostMessage_RunJSONDeletedSucceeds(t *testing.T) {
 		t.Fatalf("expected run.json to not exist on disk")
 	}
 
-	// PostMessage must succeed by reading the phase from HeroRun rather than run.json
+	// PostMessage must succeed by reading HeroRun and Session CRDs rather than run.json
 	customMsg := "Instruction delivered with deleted run.json"
 	if err := orch.PostMessage(ctx, repo.Key(), runID, customMsg); err != nil {
 		t.Fatalf("PostMessage failed with deleted run.json: %v", err)
 	}
 
-	// Verify pending message was persisted
-	targetSessID := topLevelSessionID(runID, "")
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
-	if err != nil || len(pending) != 1 || pending[0].Text != customMsg {
-		t.Fatalf("expected pending message %q on disk, got %v (err: %v)", customMsg, pending, err)
+	var list herorunv1alpha1.SessionMessageList
+	if err := fakeClient.List(ctx, &list,
+		client.InNamespace(orch.namespace()),
+		client.MatchingLabels{herorunv1alpha1.LabelSession: targetSessID},
+	); err != nil {
+		t.Fatalf("List SessionMessages: %v", err)
+	}
+	if len(list.Items) != 1 || list.Items[0].Spec.Text != customMsg {
+		t.Fatalf("expected 1 SessionMessage %q, got %+v", customMsg, list.Items)
 	}
 }
 
@@ -9640,12 +8904,18 @@ func TestOrchestrator_PostMessage_DeliveredOnNextTurn(t *testing.T) {
 		KubeClient:   fakeClient,
 	})
 
+	req := runRequest(orch, repo.Key(), runID)
+	// Pass 1 creates the root Session CRD.
+	if _, err := orch.Reconcile(ctx, req); err != nil {
+		t.Fatalf("orch.Reconcile: %v", err)
+	}
+
 	customMsg := "Please optimize the database queries."
 	if err := orch.PostMessage(ctx, repo.Key(), runID, customMsg); err != nil {
 		t.Fatalf("PostMessage: %v", err)
 	}
 
-	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+	if _, err := reconcileWorkingRun(ctx, orch, req); err != nil {
 		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
@@ -9750,10 +9020,15 @@ func TestOrchestrator_PostMessage_DeliveredBeforeNextModelCall(t *testing.T) {
 
 	req := runRequest(orch, repo.Key(), runID)
 
-	// Step 1: Start turn worker
+	// Step 1: Create root Session CRD and start Session reconciliation.
 	if _, err := orch.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile pass 1: %v", err)
 	}
+	targetSessID := generateSessionID(runID)
+	sessDone := make(chan error, 1)
+	go func() {
+		sessDone <- reconcileSessionUntilTerminal(ctx, orch, targetSessID)
+	}()
 
 	// Wait until sandbox tool executes and blocks
 	select {
@@ -9768,27 +9043,27 @@ func TestOrchestrator_PostMessage_DeliveredBeforeNextModelCall(t *testing.T) {
 		t.Fatalf("PostMessage: %v", err)
 	}
 
-	targetSessID := generateSessionID(runID)
-
-	// Verify pending message is persisted on disk
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
-	if err != nil || len(pending) != 1 {
-		t.Fatalf("expected 1 pending message on disk, got %v (err: %v)", pending, err)
+	// Verify SessionMessage was created
+	var msgList herorunv1alpha1.SessionMessageList
+	if err := fakeClient.List(ctx, &msgList,
+		client.InNamespace(orch.namespace()),
+		client.MatchingLabels{herorunv1alpha1.LabelSession: targetSessID},
+	); err != nil || len(msgList.Items) != 1 {
+		t.Fatalf("expected 1 SessionMessage, got %v (err: %v)", msgList.Items, err)
 	}
 
-	// Step 3: Unblock sandbox tool
+	// Step 3: Unblock sandbox tool and wait for session to complete
 	close(toolRelease)
-
-	// Wait for turn worker to finish
-	deadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(runID) {
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for worker to complete")
+	select {
+	case err := <-sessDone:
+		if err != nil {
+			t.Fatalf("reconcileSessionUntilTerminal: %v", err)
 		}
-		time.Sleep(5 * time.Millisecond)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for session to complete")
 	}
 
-	// Step 4: Reconcile pass 2 consumes outcome
+	// Step 4: Reconcile pass 2 consumes terminal Session outcome
 	if _, err := orch.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile pass 2: %v", err)
 	}
@@ -9818,10 +9093,15 @@ func TestOrchestrator_PostMessage_DeliveredBeforeNextModelCall(t *testing.T) {
 		t.Fatalf("model call 2 did not contain posted user message; messages = %+v", call2Msgs)
 	}
 
-	// Verify pending message on disk was consumed/cleared
-	pendingAfter, err := store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
-	if err != nil || len(pendingAfter) != 0 {
-		t.Errorf("expected 0 pending messages on disk after delivery, got %v", pendingAfter)
+	// Verify SessionMessage status is marked delivered
+	if err := fakeClient.List(ctx, &msgList,
+		client.InNamespace(orch.namespace()),
+		client.MatchingLabels{herorunv1alpha1.LabelSession: targetSessID},
+	); err != nil {
+		t.Fatalf("List SessionMessages after delivery: %v", err)
+	}
+	if len(msgList.Items) != 1 || msgList.Items[0].Status.DeliveredAt == nil {
+		t.Errorf("expected SessionMessage to be marked delivered, got %+v", msgList.Items)
 	}
 }
 
@@ -9837,16 +9117,24 @@ func TestOrchestrator_PostMessage_SurvivesRestart(t *testing.T) {
 		KubeClient:   fakeClient,
 	})
 
+	req1 := runRequest(orch1, repo.Key(), runID)
+	if _, err := orch1.Reconcile(ctx, req1); err != nil {
+		t.Fatalf("orch1.Reconcile: %v", err)
+	}
+
 	targetSessID := generateSessionID(runID)
 	surviveMsg := "Instruction that survives restart"
 	if err := orch1.PostMessage(ctx, repo.Key(), runID, surviveMsg); err != nil {
 		t.Fatalf("PostMessage: %v", err)
 	}
 
-	// Message is on disk in pending_messages.jsonl
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
-	if err != nil || len(pending) != 1 || pending[0].Text != surviveMsg {
-		t.Fatalf("expected pending message on disk, got %v (err: %v)", pending, err)
+	// SessionMessage is persisted in kube-apiserver
+	var msgList herorunv1alpha1.SessionMessageList
+	if err := fakeClient.List(ctx, &msgList,
+		client.InNamespace(orch1.namespace()),
+		client.MatchingLabels{herorunv1alpha1.LabelSession: targetSessID},
+	); err != nil || len(msgList.Items) != 1 || msgList.Items[0].Spec.Text != surviveMsg {
+		t.Fatalf("expected 1 SessionMessage %q, got %v (err: %v)", surviveMsg, msgList.Items, err)
 	}
 
 	// Simulate control plane restart by creating a new Orchestrator instance
@@ -9884,72 +9172,16 @@ func TestOrchestrator_PostMessage_SurvivesRestart(t *testing.T) {
 		t.Fatalf("expected session transcript to contain survived message, got %+v", msgs)
 	}
 
-	// Pending file is cleared after delivery
-	pending, err = store.ReadPendingMessages(ctx, repo.Key(), runID, targetSessID)
-	if err != nil || len(pending) != 0 {
-		t.Errorf("expected pending messages cleared after delivery, got %v", pending)
+	// SessionMessage is marked delivered after restart
+	if err := fakeClient.List(ctx, &msgList,
+		client.InNamespace(orch2.namespace()),
+		client.MatchingLabels{herorunv1alpha1.LabelSession: targetSessID},
+	); err != nil {
+		t.Fatalf("List SessionMessages after restart: %v", err)
 	}
-}
-
-func TestOrchestrator_PostMessage_SessionWriteFails_RemainsPending(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-postfail", "run-postfail"
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	// Create a session backed by a failing session store.
-	failingStore := &failingSessionStore{
-		Store:     sessionStore,
-		appendErr: errors.New("simulated disk full error on session store"),
+	if len(msgList.Items) != 1 || msgList.Items[0].Status.DeliveredAt == nil {
+		t.Errorf("expected SessionMessage marked delivered after restart, got %+v", msgList.Items)
 	}
-	topSessID := topLevelSessionID(runID, "")
-	failingSess, err := harness.NewSession(ctx, failingStore, topSessID, session.Metadata{
-		Repo:  repo.Key().String(),
-		RunID: run.ID,
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	run.SessionID = failingSess.Name
-	putTestRun(t, ctx, orch, run)
-
-	pendingText := "critical instruction that must not be lost"
-	if err := orch.PostMessage(ctx, repo.Key(), runID, pendingText); err != nil {
-		t.Fatalf("PostMessage: %v", err)
-	}
-
-	// Attempt delivery; it should fail because session.AddMessages fails.
-	err = orch.deliverPendingMessages(ctx, repo.Key(), runID, failingSess)
-	if err == nil {
-		t.Fatal("expected error from deliverPendingMessages, got nil")
-	}
-
-	// Verify that the message is STILL pending in store and was not lost!
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, failingSess.Name)
-	if err != nil {
-		t.Fatalf("ReadPendingMessages: %v", err)
-	}
-	if len(pending) != 1 || pending[0].Text != pendingText {
-		t.Fatalf("expected message to remain pending on disk after failed session write, got %+v", pending)
-	}
-}
-
-type failingSessionStore struct {
-	session.Store
-	appendErr error
-}
-
-func (f *failingSessionStore) AppendMessages(ctx context.Context, sessionID string, messages ...llm.Message) error {
-	if f.appendErr != nil {
-		return f.appendErr
-	}
-	return f.Store.AppendMessages(ctx, sessionID, messages...)
 }
 
 type mockMultiCallLLM struct {
@@ -9993,20 +9225,26 @@ func TestOrchestrator_PostMessage_WhileTurnActive_DeliveredOnSubsequentTurn(t *t
 
 	req := runRequest(orch, repo.Key(), runID)
 
-	// Step 1: Reconcile pass 1 starts the turn worker (turn 1).
+	// Step 1: Create root Session CRD and run turn 1 via session controller.
 	if _, err := orch.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile pass 1: %v", err)
 	}
+	sessName := generateSessionID(runID)
+	sessDone := make(chan error, 1)
+	go func() {
+		sessDone <- reconcileSessionUntilTerminal(ctx, orch, sessName)
+	}()
 
-	// Wait until turn worker starts and blocks in LLM.
+	// Wait until session controller starts and blocks in LLM.
 	select {
 	case <-blockingLLM.started:
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for turn 1 to start")
 	}
 
-	if !orch.isRunActive(runID) {
-		t.Fatal("expected run to be active during turn 1")
+	running := orch.RunningSessions(runID)
+	if !running[sessName] {
+		t.Fatalf("expected session %q to be running during turn 1, got %v", sessName, running)
 	}
 
 	// Step 2: Post message while turn 1 is active.
@@ -10015,44 +9253,25 @@ func TestOrchestrator_PostMessage_WhileTurnActive_DeliveredOnSubsequentTurn(t *t
 		t.Fatalf("PostMessage while turn active: %v", err)
 	}
 
-	// Step 3: Unblock turn 1.
+	// Step 3: Unblock turn 1; sessioncontroller continues for the pending SessionMessage and completes.
 	close(blockingLLM.release)
-
-	// Wait for turn 1 worker to finish.
-	deadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(runID) {
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for turn 1 worker to complete")
+	select {
+	case err := <-sessDone:
+		if err != nil {
+			t.Fatalf("reconcileSessionUntilTerminal: %v", err)
 		}
-		time.Sleep(5 * time.Millisecond)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for session to complete")
 	}
 
-	// Step 4: Reconcile pass 2 consumes turn 1 outcome.
-	// Since there is a pending message, run must stay Working and not finish.
+	// Step 4: Reconcile HeroRun to consume terminal Session outcome.
 	if _, err := orch.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile pass 2: %v", err)
 	}
 
 	gotRun, err := GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
 	if err != nil {
-		t.Fatalf("GetRun: %v", err)
-	}
-	if gotRun.Phase != state.PhaseWorking {
-		t.Fatalf("expected run to remain in PhaseWorking due to pending message, got %s", gotRun.Phase)
-	}
-
-	// Step 5: Second turn worker starts for the pending message.
-	// For turn 2, configure a second response so LLM can finish.
-	blockingLLM.release = make(chan struct{})
-	close(blockingLLM.release) // instantly unblocked for turn 2
-
-	if _, err := reconcileWorkingRun(ctx, orch, req); err != nil {
-		t.Fatalf("reconcileWorkingRun for turn 2: %v", err)
-	}
-
-	gotRun, err = GetRun(ctx, orch.kubeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun after turn 2: %v", err)
+		t.Fatalf("GetRun after completion: %v", err)
 	}
 	if gotRun.Phase != state.PhaseNoImprovement {
 		t.Errorf("expected phase %s after turn 2, got %s", state.PhaseNoImprovement, gotRun.Phase)
@@ -10079,1331 +9298,73 @@ func TestOrchestrator_PostMessage_WhileTurnActive_DeliveredOnSubsequentTurn(t *t
 	}
 }
 
-func TestOrchestrator_SendMessage_Validation(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-msgval", "run-msgval"
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootval", session.Metadata{
-		RunID: runID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	run.SessionID = root.Name
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-
-	// 1. Session without a run
-	sessNoRun, err := harness.NewSession(ctx, sessionStore, "norun", session.Metadata{})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	if err := orch.sendMessage(ctx, children, repo, run, sessNoRun, "other", "hello"); err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
-		t.Errorf("expected 'session belongs to no run' error, got %v", err)
-	}
-
-	// 2. Send to self
-	if err := orch.sendMessage(ctx, children, repo, run, root, "rootval", "hello self"); err == nil || !strings.Contains(err.Error(), "cannot send message to self") {
-		t.Errorf("expected 'cannot send message to self' error, got %v", err)
-	}
-
-	// 3. Non-existent recipient
-	if err := orch.sendMessage(ctx, children, repo, run, root, "nonexistent", "hello"); err == nil || !strings.Contains(err.Error(), "recipient session \"nonexistent\" not found") {
-		t.Errorf("expected not found error, got %v", err)
-	}
-
-	// 4. Recipient belongs to another run
-	otherRunSess, err := harness.NewSession(ctx, sessionStore, "otherrunsess", session.Metadata{
-		RunID: "different-run",
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	if err := orch.sendMessage(ctx, children, repo, run, root, otherRunSess.Name, "hello"); err == nil || !strings.Contains(err.Error(), "not in the same run") {
-		t.Errorf("expected 'not in the same run' error, got %v", err)
-	}
-
-	// 5. Stopped child session (not running)
-	validChild, err := harness.NewSession(ctx, sessionStore, "validchild", session.Metadata{
-		RunID:  runID,
-		Parent: "rootval",
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	if err := orch.sendMessage(ctx, children, repo, run, root, validChild.Name, "hello"); err == nil || !strings.Contains(err.Error(), "is not running") {
-		t.Errorf("expected 'is not running' error for stopped child session, got %v", err)
-	}
-}
-
-func TestOrchestrator_SendMessage_ParentToChild_And_ChildToParent(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-msgexchange", "run-msgexchange"
-
-	childStarted := make(chan struct{})
-	childRelease := make(chan struct{})
-
-	// Scripted LLM for child session:
-	// Call 1: Wait until parent posts message, then return assistant answer
-	childLLM := &customCallbackLLM{
-		fn: func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
-			select {
-			case childStarted <- struct{}{}:
-			default:
-			}
-			<-childRelease
-			msg := "child finished task"
-			return &llm.ChatCompletionResponse{
-				Choices: []llm.Choice{{Message: llm.Message{Role: "assistant", Content: &msg}}},
-			}, nil
-		},
-	}
-
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, childLLM)
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootparent", session.Metadata{
-		RunID: runID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession root: %v", err)
-	}
-	run.SessionID = root.Name
-	orch.ensureRunState(run.ID)
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-
-	childName, err := orch.startChildSession(ctx, children, repo, run, root, "analyze logs")
-	if err != nil {
-		t.Fatalf("startChildSession: %v", err)
-	}
-
-	// 1. Parent sends a message to the child session while child is running
-	parentMsg := "focus on auth.log"
-	if err := orch.sendMessage(ctx, children, repo, run, root, childName, parentMsg); err != nil {
-		t.Fatalf("sendMessage parent->child: %v", err)
-	}
-
-	// 2. Child sends a message back to the parent session
-	childSess, err := harness.LoadSession(ctx, sessionStore, childName)
-	if err != nil {
-		t.Fatalf("LoadSession child: %v", err)
-	}
-	childMsg := "found 3 anomalies in auth.log"
-	if err := orch.sendMessage(ctx, children, repo, run, childSess, root.Name, childMsg); err != nil {
-		t.Fatalf("sendMessage child->parent: %v", err)
-	}
-
-	// Release child LLM call
-	close(childRelease)
-	children.wg.Wait()
-
-	// Verify child session received parent's message before its LLM call
-	childLoaded, err := harness.LoadSession(ctx, sessionStore, childName)
-	if err != nil {
-		t.Fatalf("LoadSession childLoaded: %v", err)
-	}
-	var childSawParentMsg bool
-	for _, m := range childLoaded.Messages() {
-		if m.Role == "user" && m.Content != nil && *m.Content == "Message from rootparent: focus on auth.log" {
-			childSawParentMsg = true
-			break
-		}
-	}
-	if !childSawParentMsg {
-		t.Errorf("child session transcript missing parent message: %+v", childLoaded.Messages())
-	}
-
-	// Now deliver to parent session (e.g. before parent's next model call)
-	if err := orch.deliverPendingMessages(ctx, repo.Key(), runID, root); err != nil {
-		t.Fatalf("deliverPendingMessages parent: %v", err)
-	}
-
-	rootLoaded, err := harness.LoadSession(ctx, sessionStore, root.Name)
-	if err != nil {
-		t.Fatalf("LoadSession rootLoaded: %v", err)
-	}
-	var parentSawChildMsg bool
-	for _, m := range rootLoaded.Messages() {
-		if m.Role == "user" && m.Content != nil && *m.Content == "Message from "+childName+": found 3 anomalies in auth.log" {
-			parentSawChildMsg = true
-			break
-		}
-	}
-	if !parentSawChildMsg {
-		t.Errorf("parent session transcript missing child message: %+v", rootLoaded.Messages())
-	}
-
-	// Pending files for both sessions should now be cleared
-	pendingChild, err := store.ReadPendingMessages(ctx, repo.Key(), runID, childName)
-	if err != nil || len(pendingChild) != 0 {
-		t.Errorf("expected 0 pending messages for child after delivery, got %v", pendingChild)
-	}
-	pendingRoot, err := store.ReadPendingMessages(ctx, repo.Key(), runID, root.Name)
-	if err != nil || len(pendingRoot) != 0 {
-		t.Errorf("expected 0 pending messages for root after delivery, got %v", pendingRoot)
-	}
-}
-
-func TestOrchestrator_SendMessage_OrderPreserved(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-msgorder", "run-msgorder"
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	s1, err := harness.NewSession(ctx, sessionStore, "sess1", session.Metadata{RunID: runID})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	run.SessionID = s1.Name
-
-	s2, err := harness.NewSession(ctx, sessionStore, "sess2", session.Metadata{RunID: runID, Parent: s1.Name})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-	children.setRunning(s2.Name, true)
-
-	// Send 3 messages in order
-	for i := 1; i <= 3; i++ {
-		text := fmt.Sprintf("step %d", i)
-		if err := orch.sendMessage(ctx, children, repo, run, s1, s2.Name, text); err != nil {
-			t.Fatalf("sendMessage %d: %v", i, err)
-		}
-	}
-
-	// Deliver to s2
-	if err := orch.deliverPendingMessages(ctx, repo.Key(), runID, s2); err != nil {
-		t.Fatalf("deliverPendingMessages: %v", err)
-	}
-
-	s2Loaded, err := harness.LoadSession(ctx, sessionStore, s2.Name)
-	if err != nil {
-		t.Fatalf("LoadSession: %v", err)
-	}
-
-	msgs := s2Loaded.Messages()
-	if len(msgs) != 3 {
-		t.Fatalf("expected 3 messages, got %d: %+v", len(msgs), msgs)
-	}
-	for i := 1; i <= 3; i++ {
-		want := fmt.Sprintf("Message from sess1: step %d", i)
-		if msgs[i-1].Role != "user" || msgs[i-1].Content == nil || *msgs[i-1].Content != want {
-			t.Errorf("msg[%d] = %v, want %q", i-1, msgs[i-1], want)
-		}
-	}
-}
-
-func TestOrchestrator_SendMessage_SurvivesRestart(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-msgsurvive", "run-msgsurvive"
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
-
-	orch1 := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	s1, err := harness.NewSession(ctx, sessionStore, "s1", session.Metadata{RunID: runID})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	run.SessionID = s1.Name
-
-	s2, err := harness.NewSession(ctx, sessionStore, "s2", session.Metadata{RunID: runID, Parent: s1.Name})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-	children.setRunning(s2.Name, true)
-
-	surviveText := "persistent message across control plane restarts"
-	if err := orch1.sendMessage(ctx, children, repo, run, s1, s2.Name, surviveText); err != nil {
-		t.Fatalf("sendMessage: %v", err)
-	}
-
-	// Verify pending message is persisted on disk in s2's file
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, s2.Name)
-	if err != nil || len(pending) != 1 || pending[0].Text != surviveText || pending[0].From != "s1" {
-		t.Fatalf("expected pending message on disk, got %v (err: %v)", pending, err)
-	}
-
-	// Simulate control plane restart
-	orch2 := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   orch1.kubeClient,
-	})
-
-	if err := orch2.deliverPendingMessages(ctx, repo.Key(), runID, s2); err != nil {
-		t.Fatalf("deliverPendingMessages on orch2: %v", err)
-	}
-
-	s2Loaded, err := harness.LoadSession(ctx, sessionStore, s2.Name)
-	if err != nil {
-		t.Fatalf("LoadSession: %v", err)
-	}
-	msgs := s2Loaded.Messages()
-	if len(msgs) != 1 || msgs[0].Content == nil || *msgs[0].Content != "Message from s1: "+surviveText {
-		t.Fatalf("unexpected delivered message: %+v", msgs)
-	}
-
-	pendingAfter, err := store.ReadPendingMessages(ctx, repo.Key(), runID, s2.Name)
-	if err != nil || len(pendingAfter) != 0 {
-		t.Errorf("expected 0 pending messages after restart delivery, got %v", pendingAfter)
-	}
-}
-
-func TestOrchestrator_SendMessage_IdleRecipient_RefusedOrWoken(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-msgidle", "run-msgidle"
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootidle", session.Metadata{RunID: runID})
-	if err != nil {
-		t.Fatalf("NewSession root: %v", err)
-	}
-	run.SessionID = root.Name
-
-	child, err := harness.NewSession(ctx, sessionStore, "childidle", session.Metadata{RunID: runID, Parent: "rootidle"})
-	if err != nil {
-		t.Fatalf("NewSession child: %v", err)
-	}
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-
-	// 1. Sending to stopped/idle child session is refused
-	err = orch.sendMessage(ctx, children, repo, run, root, child.Name, "instruction to stopped child")
-	if err == nil || !strings.Contains(err.Error(), "is not running") {
-		t.Fatalf("expected 'is not running' error, got %v", err)
-	}
-
-	// 2. Sending to top-level session (which is idle between turns) is accepted and retained
-	idleMsg := "result reported to idle parent"
-	if err := orch.sendMessage(ctx, children, repo, run, child, root.Name, idleMsg); err != nil {
-		t.Fatalf("sendMessage to parent: %v", err)
-	}
-
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, root.Name)
-	if err != nil || len(pending) != 1 || pending[0].Text != idleMsg {
-		t.Fatalf("expected pending message on disk for root, got %v (err: %v)", pending, err)
-	}
-
-	if err := orch.deliverPendingMessages(ctx, repo.Key(), runID, root); err != nil {
-		t.Fatalf("deliverPendingMessages root: %v", err)
-	}
-
-	pendingFinal, err := store.ReadPendingMessages(ctx, repo.Key(), runID, root.Name)
-	if err != nil || len(pendingFinal) != 0 {
-		t.Fatalf("expected message to be consumed, got %v", pendingFinal)
-	}
-}
-
-type customCallbackLLM struct {
-	fn func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error)
-}
-
-func (c *customCallbackLLM) CreateChatCompletion(_ context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
-	if c.fn != nil {
-		return c.fn(req)
-	}
-	return &llm.ChatCompletionResponse{}, nil
-}
-
-func TestOrchestrator_Working_SendMessage_ToolCall(t *testing.T) {
-	ctx := t.Context()
-	var toolResultContent string
-
-	childLLM := &customCallbackLLM{
-		fn: func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
-			for _, m := range req.Messages {
-				if m.Role == "tool" && m.ToolCallID == "call-send-msg-1" && m.Content != nil {
-					toolResultContent = *m.Content
-					finishArgs, _ := json.Marshal(map[string]string{"summary": "done"})
-					return &llm.ChatCompletionResponse{
-						Choices: []llm.Choice{{
-							Message: llm.Message{
-								Role: "assistant",
-								ToolCalls: []llm.ToolCall{{
-									ID:   "call-finish-1",
-									Type: "function",
-									Function: llm.FunctionCall{
-										Name:      "finish",
-										Arguments: string(finishArgs),
-									},
-								}},
-							},
-						}},
-					}, nil
-				}
-			}
-			args, _ := json.Marshal(map[string]string{
-				"recipient": "rootparent",
-				"message":   "please read report.txt",
-			})
-			return &llm.ChatCompletionResponse{
-				Choices: []llm.Choice{{
-					Message: llm.Message{
-						Role: "assistant",
-						ToolCalls: []llm.ToolCall{{
-							ID:   "call-send-msg-1",
-							Type: "function",
-							Function: llm.FunctionCall{
-								Name:      "send_message",
-								Arguments: string(args),
-							},
-						}},
-					},
-				}},
-			}, nil
-		},
-	}
-
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-	harness, _, _ := setupTestHarnessWithLLM(t, nil, childLLM)
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-	})
-
-	repo := &state.Repo{URL: "https://github.com/gke-labs/test-repo", Host: "github.com", Owner: "gke-labs", Name: "test-repo"}
-	run := &state.Run{ID: "runsendtool", SessionID: "rootparent", Repo: repo.Key(), Phase: state.PhaseWorking, SandboxName: "sbsendtool", Goal: &goals.Goal{Name: "g1", Body: "task"}}
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootparent", session.Metadata{
-		RunID: run.ID,
-		Repo:  repo.Key().String(),
-	})
-	if err != nil {
-		t.Fatalf("NewSession rootparent: %v", err)
-	}
-
-	orch.ensureRunState(run.ID)
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-
-	childName, err := orch.startChildSession(ctx, children, repo, run, root, "send message task")
-	if err != nil {
-		t.Fatalf("startChildSession: %v", err)
-	}
-
-	children.wg.Wait()
-
-	if toolResultContent == "" || !strings.Contains(toolResultContent, "rootparent") {
-		t.Fatalf("expected confirmation containing rootparent, got %q", toolResultContent)
-	}
-
-	// Verify message is pending on disk for rootparent
-	pending, err := store.ReadPendingMessages(ctx, repo.Key(), run.ID, "rootparent")
-	if err != nil || len(pending) != 1 {
-		t.Fatalf("expected 1 pending message on disk, got %v (err: %v)", pending, err)
-	}
-	if pending[0].From != childName || pending[0].Text != "please read report.txt" {
-		t.Errorf("unexpected pending message: %+v", pending[0])
-	}
-}
-
-func TestOrchestrator_Wait_MessageArrives(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-waitmsg", "run-waitmsg"
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	root, err := harness.NewSession(ctx, sessionStore, generateSessionID(runID), session.Metadata{RunID: runID, Repo: repo.Key().String()})
-	if err != nil {
-		t.Fatalf("NewSession root: %v", err)
-	}
-	run.SessionID = root.Name
-	child, err := harness.NewSession(ctx, sessionStore, "childwait", session.Metadata{RunID: runID, Parent: root.Name, Repo: repo.Key().String()})
-	if err != nil {
-		t.Fatalf("NewSession child: %v", err)
-	}
-	other, err := harness.NewSession(ctx, sessionStore, "otherwait", session.Metadata{RunID: runID, Parent: root.Name, Repo: repo.Key().String()})
-	if err != nil {
-		t.Fatalf("NewSession other: %v", err)
-	}
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-	children.setRunning(child.Name, true)
-	children.setRunning(other.Name, true)
-
-	// 1. Session without a run is rejected.
-	noRun, err := harness.NewSession(ctx, sessionStore, "waitnorun", session.Metadata{})
-	if err != nil {
-		t.Fatalf("NewSession norun: %v", err)
-	}
-	if _, err := orch.waitForEvent(ctx, children, repo, run, noRun, time.Second); err == nil || !strings.Contains(err.Error(), "session belongs to no run") {
-		t.Fatalf("expected 'session belongs to no run' error, got %v", err)
-	}
-
-	// 2. Message arriving for another session does not wake root; message for root does.
-	type waitRes struct {
-		out string
-		err error
-	}
-	resCh := make(chan waitRes, 1)
-	go func() {
-		out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
-		resCh <- waitRes{out: out, err: err}
-	}()
-
-	time.Sleep(20 * time.Millisecond)
-	if err := orch.sendMessage(ctx, children, repo, run, child, other.Name, "for other only"); err != nil {
-		t.Fatalf("sendMessage to other: %v", err)
-	}
-	select {
-	case r := <-resCh:
-		t.Fatalf("root wait woke prematurely for message to other: %+v", r)
-	case <-time.After(30 * time.Millisecond):
-	}
-
-	if err := orch.sendMessage(ctx, children, repo, run, child, root.Name, "hello parent"); err != nil {
-		t.Fatalf("sendMessage to root: %v", err)
-	}
-	select {
-	case r := <-resCh:
-		if r.err != nil {
-			t.Fatalf("waitForEvent error: %v", r.err)
-		}
-		if !strings.Contains(r.out, "message") {
-			t.Errorf("expected wait result to mention message, got %q", r.out)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for waitForEvent after sendMessage")
-	}
-
-	// 3. Pre-existing pending message returns immediately without blocking.
-	out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
-	if err != nil || !strings.Contains(out, "message") {
-		t.Fatalf("expected immediate message result, got out=%q err=%v", out, err)
-	}
-	if err := store.ClearPendingMessages(ctx, repo.Key(), runID, root.Name); err != nil {
-		t.Fatalf("ClearPendingMessages: %v", err)
-	}
-
-	// 4. PostMessage from a human also wakes waitForEvent.
-	run.SetPhase(state.PhaseWorking, time.Now().UTC())
-	putTestRun(t, ctx, orch, run)
-	go func() {
-		out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
-		resCh <- waitRes{out: out, err: err}
-	}()
-	time.Sleep(20 * time.Millisecond)
-	if err := orch.PostMessage(ctx, repo.Key(), runID, "human guidance"); err != nil {
-		t.Fatalf("PostMessage: %v", err)
-	}
-	select {
-	case r := <-resCh:
-		if r.err != nil || !strings.Contains(r.out, "message") {
-			t.Fatalf("expected message wakeup after PostMessage, got out=%q err=%v", r.out, r.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for waitForEvent after PostMessage")
-	}
-}
-
-func TestOrchestrator_Wait_ChildStops(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-waitchild", "run-waitchild"
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootchild", session.Metadata{RunID: runID})
-	if err != nil {
-		t.Fatalf("NewSession root: %v", err)
-	}
-	childA, err := harness.NewSession(ctx, sessionStore, "childa", session.Metadata{RunID: runID, Parent: root.Name})
-	if err != nil {
-		t.Fatalf("NewSession childA: %v", err)
-	}
-	childB, err := harness.NewSession(ctx, sessionStore, "childb", session.Metadata{RunID: runID, Parent: root.Name})
-	if err != nil {
-		t.Fatalf("NewSession childB: %v", err)
-	}
-	run.SessionID = root.Name
-
-	childCtx, cancelChildren := context.WithCancel(ctx)
-	defer cancelChildren()
-	children := newChildGroup(childCtx)
-	children.setRunning(childA.Name, true)
-	children.setRunning(childB.Name, true)
-
-	// 1. Sibling stopping does not wake childA; root's child stopping wakes root and names the child.
-	type waitRes struct {
-		out string
-		err error
-	}
-	rootRes := make(chan waitRes, 1)
-	childARes := make(chan waitRes, 1)
-	go func() {
-		out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
-		rootRes <- waitRes{out: out, err: err}
-	}()
-	go func() {
-		out, err := orch.waitForEvent(ctx, children, repo, run, childA, 80*time.Millisecond)
-		childARes <- waitRes{out: out, err: err}
-	}()
-
-	time.Sleep(20 * time.Millisecond)
-	children.markStopped(root.Name, childB.Name)
-
-	select {
-	case r := <-rootRes:
-		if r.err != nil {
-			t.Fatalf("root waitForEvent error: %v", r.err)
-		}
-		if !strings.Contains(r.out, childB.Name) || !strings.Contains(r.out, "stopped") {
-			t.Errorf("expected root wait result to name stopped child %q, got %q", childB.Name, r.out)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for root to wake when childB stopped")
-	}
-
-	select {
-	case r := <-childARes:
-		if r.err != nil {
-			t.Fatalf("childA waitForEvent error: %v", r.err)
-		}
-		if !strings.Contains(r.out, "Timed out") {
-			t.Errorf("expected childA to time out instead of waking on sibling stop, got %q", r.out)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for childA timeout")
-	}
-
-	// 2. Child stopping BEFORE parent calls wait is reported once, not repeated.
-	children.markStopped(root.Name, childA.Name)
-	out, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
-	if err != nil || !strings.Contains(out, childA.Name) {
-		t.Fatalf("expected immediate stop for %q, got out=%q err=%v", childA.Name, out, err)
-	}
-	out2, err := orch.waitForEvent(ctx, children, repo, run, root, 30*time.Millisecond)
-	if err != nil || !strings.Contains(out2, "Timed out") {
-		t.Fatalf("expected second wait to time out after stop was consumed, got out=%q err=%v", out2, err)
-	}
-
-	// 3. A real child started via startChildSession wakes its parent when it finishes.
-	orch.ensureRunState(run.ID)
-	startedChild, err := orch.startChildSession(ctx, children, repo, run, root, "quick task")
-	if err != nil {
-		t.Fatalf("startChildSession: %v", err)
-	}
-	out3, err := orch.waitForEvent(ctx, children, repo, run, root, 5*time.Second)
-	if err != nil || !strings.Contains(out3, startedChild) || !strings.Contains(out3, "stopped") {
-		t.Fatalf("expected wait to report started child %q stopped, got out=%q err=%v", startedChild, out3, err)
-	}
-	children.wg.Wait()
-}
-
-func TestOrchestrator_Wait_TimeoutRunEndAndDeadline(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-waitbounds", "run-waitbounds"
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, &llm.ElizaClient{})
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		Clock:        time.Now,
-		KubeClient:   fakeClient,
-	})
-
-	root, err := harness.NewSession(ctx, sessionStore, "rootbounds", session.Metadata{RunID: runID})
-	if err != nil {
-		t.Fatalf("NewSession root: %v", err)
-	}
-	run.SessionID = root.Name
-	children := newChildGroup(ctx)
-
-	// 1. Timeout returns timeout description.
-	out, err := orch.waitForEvent(ctx, children, repo, run, root, 30*time.Millisecond)
-	if err != nil || !strings.Contains(out, "Timed out") || !strings.Contains(out, "30ms") {
-		t.Fatalf("expected timeout result, got out=%q err=%v", out, err)
-	}
-
-	// 2. Run ending (context cancelled) ends wait immediately with context.Canceled.
-	runCtx, cancelRun := context.WithCancel(ctx)
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := orch.waitForEvent(runCtx, children, repo, run, root, 5*time.Second)
-		errCh <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	cancelRun()
-	select {
-	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("expected context.Canceled when run ends, got %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for waitForEvent to exit on run cancel")
-	}
-
-	// 3. Upcoming run deadline ends wait before a much longer timeout.
-	shortDeadline := time.Now().UTC().Add(40 * time.Millisecond)
-	run.Deadline = &shortDeadline
-	start := time.Now()
-	out, err = orch.waitForEvent(ctx, children, repo, run, root, 10*time.Second)
-	if err != nil || !strings.Contains(out, "deadline") {
-		t.Fatalf("expected deadline result, got out=%q err=%v", out, err)
-	}
-	if time.Since(start) > 2*time.Second {
-		t.Fatalf("wait took too long (%v) despite short run deadline", time.Since(start))
-	}
-
-	// 4. Already-passed run deadline returns immediately.
-	pastDeadline := time.Now().UTC().Add(-time.Second)
-	run.Deadline = &pastDeadline
-	out, err = orch.waitForEvent(ctx, children, repo, run, root, 10*time.Second)
-	if err != nil || !strings.Contains(out, "deadline") {
-		t.Fatalf("expected immediate deadline result, got out=%q err=%v", out, err)
-	}
-}
-
-func TestOrchestrator_Wait_ToolCallUsesNoExtraTurns(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261123T120000Z-waittool", "run-waittool"
-
-	childRelease := make(chan struct{})
-	var rootLLMCalls, childLLMCalls int
-	var mu sync.Mutex
-	var waitToolResult string
-	var rootSawChildMsg bool
-
-	scriptedLLM := &customCallbackLLM{
-		fn: func(req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
-			// Distinguish child from root by initial user prompt.
-			isChild := false
-			for _, m := range req.Messages {
-				if m.Role == "user" && m.Content != nil && *m.Content == "compute answer" {
-					isChild = true
-					break
-				}
-			}
-
-			mu.Lock()
-			if isChild {
-				childLLMCalls++
-				callNum := childLLMCalls
-				mu.Unlock()
-
-				if callNum == 1 {
-					<-childRelease
-					args, _ := json.Marshal(map[string]string{
-						"recipient": generateSessionID(runID),
-						"message":   "answer is 42",
-					})
-					return &llm.ChatCompletionResponse{
-						Choices: []llm.Choice{{
-							Message: llm.Message{
-								Role: "assistant",
-								ToolCalls: []llm.ToolCall{{
-									ID:   "child-send-1",
-									Type: "function",
-									Function: llm.FunctionCall{
-										Name:      "send_message",
-										Arguments: string(args),
-									},
-								}},
-							},
-						}},
-					}, nil
-				}
-				finishArgs, _ := json.Marshal(map[string]string{"summary": "child done"})
-				return &llm.ChatCompletionResponse{
-					Choices: []llm.Choice{{
-						Message: llm.Message{
-							Role: "assistant",
-							ToolCalls: []llm.ToolCall{{
-								ID:   "child-finish-1",
-								Type: "function",
-								Function: llm.FunctionCall{
-									Name:      "finish",
-									Arguments: string(finishArgs),
-								},
-							}},
-						},
-					}},
-				}, nil
-			}
-
-			rootLLMCalls++
-			callNum := rootLLMCalls
-			mu.Unlock()
-
-			switch callNum {
-			case 1:
-				args, _ := json.Marshal(map[string]string{"task": "compute answer"})
-				return &llm.ChatCompletionResponse{
-					Choices: []llm.Choice{{
-						Message: llm.Message{
-							Role: "assistant",
-							ToolCalls: []llm.ToolCall{{
-								ID:   "root-start-1",
-								Type: "function",
-								Function: llm.FunctionCall{
-									Name:      "start_session",
-									Arguments: string(args),
-								},
-							}},
-						},
-					}},
-				}, nil
-			case 2:
-				// Release child slightly after root enters wait.
-				go func() {
-					time.Sleep(40 * time.Millisecond)
-					close(childRelease)
-				}()
-				args, _ := json.Marshal(map[string]string{"timeout": "5s"})
-				return &llm.ChatCompletionResponse{
-					Choices: []llm.Choice{{
-						Message: llm.Message{
-							Role: "assistant",
-							ToolCalls: []llm.ToolCall{{
-								ID:   "root-wait-1",
-								Type: "function",
-								Function: llm.FunctionCall{
-									Name:      "wait",
-									Arguments: string(args),
-								},
-							}},
-						},
-					}},
-				}, nil
-			default:
-				for _, m := range req.Messages {
-					if m.Role == "tool" && m.ToolCallID == "root-wait-1" && m.Content != nil {
-						waitToolResult = *m.Content
-					}
-					if m.Role == "user" && m.Content != nil && strings.Contains(*m.Content, "answer is 42") {
-						rootSawChildMsg = true
-					}
-				}
-				finishArgs, _ := json.Marshal(map[string]string{"summary": "parent done"})
-				return &llm.ChatCompletionResponse{
-					Choices: []llm.Choice{{
-						Message: llm.Message{
-							Role: "assistant",
-							ToolCalls: []llm.ToolCall{{
-								ID:   "root-finish-1",
-								Type: "function",
-								Function: llm.FunctionCall{
-									Name:      "finish",
-									Arguments: string(finishArgs),
-								},
-							}},
-						},
-					}},
-				}, nil
-			}
-		},
-	}
-
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, nil, scriptedLLM)
-	run.SessionID = generateSessionID(runID)
-	run.SetPhase(state.PhaseWorking, time.Now().UTC())
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		Clock:        time.Now,
-		KubeClient:   fakeClient,
-	})
-	putTestRun(t, ctx, orch, run)
-	orch.ensureRunState(run.ID)
-
-	outcome := orch.runTurnWorker(ctx, repo, run, nil)
-	if !errors.Is(outcome.Err, session.ErrSessionFinished) {
-		t.Fatalf("expected ErrSessionFinished, got %v", outcome.Err)
-	}
-	if !strings.Contains(waitToolResult, "message") {
-		t.Errorf("expected wait tool result to report message arrival, got %q", waitToolResult)
-	}
-	if !rootSawChildMsg {
-		t.Error("expected parent session to receive child message after wait returned")
-	}
-	// Parent spent 3 model turns (start_session, wait, finish) and child spent 2 (send_message, finish).
-	// Waiting itself spent 0 turns.
-	if rootLLMCalls != 3 {
-		t.Errorf("rootLLMCalls = %d, want 3", rootLLMCalls)
-	}
-	if childLLMCalls != 2 {
-		t.Errorf("childLLMCalls = %d, want 2", childLLMCalls)
-	}
-}
-
-func TestOrchestrator_ActiveOperation_PersistedBeforeWorkerAndClearedOnCompletion(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261124T100000Z-actop", "run-20261124t100000z-actop"
-
-	var (
-		mu              sync.Mutex
-		observedOpInLLM *herorunv1alpha1.ActiveOperation
-		fakeClient      client.Client
-	)
-	started := make(chan struct{})
-	release := make(chan struct{})
-
-	observingLLM := &mockMultiCallLLM{
-		callFn: func(_ llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
-			var hr herorunv1alpha1.HeroRun
-			if err := fakeClient.Get(ctx, client.ObjectKey{Namespace: "ao-sandboxes", Name: sandboxNameForRun(runID)}, &hr); err == nil && hr.Status.ActiveOperation != nil {
-				mu.Lock()
-				observedOpInLLM = hr.Status.ActiveOperation.DeepCopy()
-				mu.Unlock()
-			}
-			close(started)
-			<-release
-			content := "done"
-			return &llm.ChatCompletionResponse{
-				Choices: []llm.Choice{{Message: llm.Message{Role: "assistant", Content: &content}}},
-			}, nil
-		},
-	}
-
-	store, sessionStore, repo, _, harness, _, fc := setupWorkingTestRun(t, runID, sbName, nil, observingLLM)
-	fakeClient = fc
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	req := runRequest(orch, repo.Key(), runID)
-	reconcileCtx, cancelReconcile := context.WithCancel(ctx)
-	if _, err := orch.Reconcile(reconcileCtx, req); err != nil {
-		t.Fatalf("Reconcile start: %v", err)
-	}
-	// Canceling the Reconcile request context after startTurn returns must not prevent
-	// the background worker from persisting its completed outcome to HeroRun.Status.
-	cancelReconcile()
-
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for turn worker to call LLM")
-	}
-
-	gotRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun while running: %v", err)
-	}
-	if gotRun.ActiveOperation == nil || gotRun.ActiveOperation.ID == "" || gotRun.ActiveOperation.Done {
-		t.Fatalf("ActiveOperation while running = %+v, want non-empty ID with Done=false", gotRun.ActiveOperation)
-	}
-	opID := gotRun.ActiveOperation.ID
-
-	mu.Lock()
-	seenInWorker := observedOpInLLM
-	mu.Unlock()
-	if seenInWorker == nil || seenInWorker.ID != opID || seenInWorker.Done {
-		t.Errorf("worker observed ActiveOperation=%+v, want ID=%q Done=false", seenInWorker, opID)
-	}
-
-	if !orch.isTurnWorkerRunning(opID) {
-		t.Errorf("expected isTurnWorkerRunning(%q) to be true while worker is running", opID)
-	}
-
-	close(release)
-	waitDeadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(runID) {
-		if time.Now().After(waitDeadline) {
-			t.Fatal("timed out waiting for turn worker to finish")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// Worker must have recorded the completed outcome directly on HeroRun.Status and removed its live handle.
-	doneRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun after worker exit: %v", err)
-	}
-	if doneRun.ActiveOperation == nil || doneRun.ActiveOperation.ID != opID || !doneRun.ActiveOperation.Done || doneRun.ActiveOperation.Result != state.OperationResultCompleted {
-		t.Fatalf("ActiveOperation after worker exit = %+v, want ID=%q Done=true Result=%q", doneRun.ActiveOperation, opID, state.OperationResultCompleted)
-	}
-	if orch.isTurnWorkerRunning(opID) {
-		t.Errorf("expected live worker handle %q to be removed after worker exited", opID)
-	}
-
-	// A brand-new orchestrator instance (simulating control-plane restart) consumes the outcome from HeroRun.Status.
-	restartedOrch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-	if _, err := restartedOrch.Reconcile(ctx, runRequest(restartedOrch, repo.Key(), runID)); err != nil {
-		t.Fatalf("restartedOrch.Reconcile consume: %v", err)
-	}
-
-	finalRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun after completion: %v", err)
-	}
-	if finalRun.Phase != state.PhaseNoImprovement {
-		t.Errorf("final phase = %s, want %s", finalRun.Phase, state.PhaseNoImprovement)
-	}
-	if finalRun.ActiveOperation != nil {
-		t.Errorf("ActiveOperation after completion = %+v, want nil", finalRun.ActiveOperation)
-	}
-}
-
-func TestOrchestrator_ActiveOperation_ClearedOnDeadlineExceeded(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261124T100000Z-actdl", "run-20261124t100000z-actdl"
-	startTime := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
-	deadline := startTime.Add(10 * time.Minute)
-	currentTime := startTime
-
-	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, sbName, &deadline, blockingLLM)
-
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		Clock:        func() time.Time { return currentTime },
-		KubeClient:   fakeClient,
-	})
-
-	req := runRequest(orch, repo.Key(), runID)
-	if _, err := orch.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile start: %v", err)
-	}
-
-	select {
-	case <-blockingLLM.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for turn worker to start")
-	}
-
-	runningRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun while running: %v", err)
-	}
-	if runningRun.ActiveOperation == nil || runningRun.ActiveOperation.ID == "" {
-		t.Fatal("expected ActiveOperation to be set while turn is running")
-	}
-	opID := runningRun.ActiveOperation.ID
-
-	currentTime = deadline.Add(time.Minute)
-	if _, err := orch.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile past deadline: %v", err)
-	}
-	orch.workerWG.Wait()
-
-	failedRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun after deadline: %v", err)
-	}
-	if failedRun.Phase != state.PhaseFailed {
-		t.Errorf("phase = %s, want %s", failedRun.Phase, state.PhaseFailed)
-	}
-	if failedRun.ActiveOperation != nil {
-		t.Errorf("ActiveOperation after deadline = %+v, want nil", failedRun.ActiveOperation)
-	}
-	if orch.isTurnWorkerRunning(opID) {
-		t.Errorf("expected live worker handle %q to be removed after deadline failure", opID)
-	}
-}
-
-func TestOrchestrator_ActiveOperation_OutcomeRetainedUntilSaveSucceeds(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261124T100000Z-actretry", "run-20261124t100000z-actretry"
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-
-	repo := &state.Repo{
-		URL:           "https://github.com/gke-labs/test-repo",
-		Host:          "github.com",
-		Owner:         "gke-labs",
-		Name:          "test-repo",
-		DefaultBranch: "main",
-	}
-	if err := store.PutRepo(ctx, repo); err != nil {
-		t.Fatalf("PutRepo: %v", err)
-	}
-
-	scheme, err := NewScheme()
-	if err != nil {
-		t.Fatalf("NewScheme: %v", err)
-	}
-
-	failNextStatusUpdate := false
-	fakeClient := newTestFakeClientBuilder(scheme).
-		WithInterceptorFuncs(interceptor.Funcs{
-			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-				if failNextStatusUpdate {
-					failNextStatusUpdate = false
-					return errors.New("transient status update failure")
-				}
-				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
-			},
-		}).
-		Build()
-
-	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	putTestRun(t, ctx, orch, &state.Run{
-		ID:          runID,
-		Repo:        repo.Key(),
-		GoalName:    "retry-goal",
-		Phase:       state.PhaseWorking,
-		BaseCommit:  "base-sha",
-		SandboxName: sbName,
-	})
-
-	opID := "op-save-retry"
-	seedCompletedTurnOp(t, ctx, orch, runID, opID, turnOutcome{
-		Err:      session.ErrPullRequestRequested,
-		PRTitle:  "Optimize hot loop",
-		PRBody:   "Benchmarks improved.",
-		Finished: time.Now().UTC(),
-	})
-
-	req := runRequest(orch, repo.Key(), runID)
-
-	// Pass 1: status update fails; completed ActiveOperation on HeroRun must remain intact.
-	failNextStatusUpdate = true
-	if _, err := orch.Reconcile(ctx, req); err == nil {
-		t.Fatal("expected Reconcile to return error when status update fails")
-	}
-	afterFailRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun after failed save: %v", err)
-	}
-	if afterFailRun.ActiveOperation == nil || afterFailRun.ActiveOperation.ID != opID || !afterFailRun.ActiveOperation.Done {
-		t.Errorf("ActiveOperation after failed save = %+v, want ID=%q Done=true", afterFailRun.ActiveOperation, opID)
-	}
-
-	// Pass 2: status update succeeds; run advances to Selecting and ActiveOperation clears.
-	if _, err := orch.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile retry: %v", err)
-	}
-	afterRetryRun, err := GetRun(ctx, fakeClient, orch.namespace(), runID)
-	if err != nil {
-		t.Fatalf("GetRun after retry: %v", err)
-	}
-	if afterRetryRun.Phase != state.PhaseSelecting {
-		t.Errorf("phase after retry = %s, want %s", afterRetryRun.Phase, state.PhaseSelecting)
-	}
-	if afterRetryRun.PRTitle != "Optimize hot loop" || afterRetryRun.PRBody != "Benchmarks improved." {
-		t.Errorf("PR fields after retry = (%q, %q), want (%q, %q)", afterRetryRun.PRTitle, afterRetryRun.PRBody, "Optimize hot loop", "Benchmarks improved.")
-	}
-	if afterRetryRun.ActiveOperation != nil {
-		t.Errorf("ActiveOperation after retry = %+v, want nil", afterRetryRun.ActiveOperation)
-	}
-}
-
-func TestOrchestrator_ActiveOperation_SaveFailureDoesNotLaunchWorker(t *testing.T) {
-	ctx := t.Context()
-	runID, sbName := "20261124T100000Z-actsf", "run-20261124t100000z-actsf"
-	store := state.NewFileStore(t.TempDir())
-	sessionStore := session.NewFileStore(t.TempDir())
-
-	repo := &state.Repo{
-		URL:           "https://github.com/gke-labs/test-repo",
-		Host:          "github.com",
-		Owner:         "gke-labs",
-		Name:          "test-repo",
-		DefaultBranch: "main",
-	}
-	if err := store.PutRepo(ctx, repo); err != nil {
-		t.Fatalf("PutRepo: %v", err)
-	}
-
-	scheme, err := NewScheme()
-	if err != nil {
-		t.Fatalf("NewScheme: %v", err)
-	}
-
-	failStatusUpdate := false
-	fakeClient := newTestFakeClientBuilder(scheme).
-		WithInterceptorFuncs(interceptor.Funcs{
-			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-				if failStatusUpdate {
-					return errors.New("status update rejected")
-				}
-				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
-			},
-		}).
-		Build()
-
-	var llmCalled bool
-	mockLLM := &mockMultiCallLLM{
-		callFn: func(_ llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
-			llmCalled = true
-			content := "unexpected"
-			return &llm.ChatCompletionResponse{
-				Choices: []llm.Choice{{Message: llm.Message{Role: "assistant", Content: &content}}},
-			}, nil
-		},
-	}
-
-	harness, _, _ := setupTestHarnessWithLLM(t, nil, mockLLM)
-	orch := newTestOrchestrator(t, OrchestratorOptions{
-		Store:        store,
-		SessionStore: sessionStore,
-		Harness:      harness,
-		KubeClient:   fakeClient,
-	})
-
-	putTestRun(t, ctx, orch, &state.Run{
-		ID:          runID,
-		Repo:        repo.Key(),
-		GoalName:    "save-fail-goal",
-		Phase:       state.PhaseWorking,
-		BaseCommit:  "base-sha",
-		SandboxName: sbName,
-	})
-
-	failStatusUpdate = true
-	if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err == nil {
-		t.Fatal("expected Reconcile to fail when persisting ActiveOperation fails")
-	}
-	orch.workerWG.Wait()
-
-	if llmCalled {
-		t.Error("expected turn worker not to launch when persisting ActiveOperation fails")
-	}
-	if orch.isRunActive(runID) {
-		t.Error("expected no live worker handle to remain after failed startTurn save")
-	}
-}
-
 func TestOrchestrator_RunningSessions(t *testing.T) {
 	ctx := t.Context()
-	blockingLLM := newMidTurnBlockingLLM()
-	store, sessionStore, repo, run, harness, _, fakeClient := setupWorkingTestRun(t, "run-live-status", "sb-live-status", nil, blockingLLM)
+	store, sessionStore, _, run, harness, _, fakeClient := setupWorkingTestRun(t, "run-live-status", "sb-live-status", nil, &llm.ElizaClient{})
 	orch := newTestOrchestrator(t, OrchestratorOptions{
 		Store:        store,
 		SessionStore: sessionStore,
 		Harness:      harness,
 		KubeClient:   fakeClient,
 	})
-	orch.ensureRunState(run.ID)
 
 	if got := orch.RunningSessions(run.ID); len(got) != 0 {
-		t.Fatalf("RunningSessions before turn = %v, want empty", got)
+		t.Fatalf("RunningSessions before sessions exist = %v, want empty", got)
 	}
 
-	root, err := harness.NewSession(ctx, sessionStore, "rootlive", session.Metadata{
-		RunID:   run.ID,
-		Repo:    repo.Key().String(),
-		Toolset: "basic",
-	})
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	run.SessionID = root.Name
-
-	workerCtx, cancelWorker := context.WithCancel(ctx)
-	defer cancelWorker()
-	children := newChildGroup(workerCtx)
-	children.setRunning(root.Name, true)
-	orch.setRunChildren(run.ID, children)
-
-	childName, err := orch.startChildSession(ctx, children, repo, run, root, "blocking task")
-	if err != nil {
-		t.Fatalf("startChildSession: %v", err)
-	}
-
-	select {
-	case <-blockingLLM.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for child worker to start LLM call")
-	}
-
-	running := orch.RunningSessions(run.ID)
-	if !running[root.Name] || !running[childName] {
-		t.Errorf("RunningSessions = %v, want both %q and %q running", running, root.Name, childName)
+	createSession := func(name, runID string, phase herorunv1alpha1.SessionPhase, finalizer bool) *herorunv1alpha1.Session {
+		s := &herorunv1alpha1.Session{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: orch.namespace(),
+				Labels:    map[string]string{LabelRun: runID},
+			},
+			Spec: herorunv1alpha1.SessionSpec{
+				RunID: runID,
+			},
+		}
+		if finalizer {
+			s.Finalizers = []string{"test.auto-optimizer.labs.gke.io/hold"}
+		}
+		if err := fakeClient.Create(ctx, s); err != nil {
+			t.Fatalf("Create Session %s: %v", name, err)
+		}
+		if phase != "" {
+			s.Status.Phase = phase
+			if err := fakeClient.Status().Update(ctx, s); err != nil {
+				t.Fatalf("Status().Update Session %s: %v", name, err)
+			}
+		}
+		return s
 	}
 
-	close(blockingLLM.release)
-	cancelWorker()
-	children.wg.Wait()
-
-	runningAfterChild := orch.RunningSessions(run.ID)
-	if !runningAfterChild[root.Name] || runningAfterChild[childName] {
-		t.Errorf("RunningSessions after child stop = %v, want only %q running", runningAfterChild, root.Name)
+	createSession("root-running", run.ID, herorunv1alpha1.SessionPhaseRunning, false)
+	createSession("child-pending", run.ID, herorunv1alpha1.SessionPhasePending, false)
+	createSession("child-waiting", run.ID, herorunv1alpha1.SessionPhaseWaiting, false)
+	createSession("child-new", run.ID, "", false)
+	createSession("child-succeeded", run.ID, herorunv1alpha1.SessionPhaseSucceeded, false)
+	createSession("child-failed", run.ID, herorunv1alpha1.SessionPhaseFailed, false)
+	createSession("child-canceled", run.ID, herorunv1alpha1.SessionPhaseCanceled, false)
+	deleting := createSession("child-deleting", run.ID, herorunv1alpha1.SessionPhaseRunning, true)
+	if err := fakeClient.Delete(ctx, deleting); err != nil {
+		t.Fatalf("Delete Session child-deleting: %v", err)
 	}
+	createSession("other-run-running", "other-run", herorunv1alpha1.SessionPhaseRunning, false)
 
-	orch.setRunChildren(run.ID, nil)
-	if got := orch.RunningSessions(run.ID); len(got) != 0 {
-		t.Errorf("RunningSessions after clearing children = %v, want empty", got)
+	got := orch.RunningSessions(run.ID)
+	want := map[string]bool{
+		"root-running":  true,
+		"child-pending": true,
+		"child-waiting": true,
+		"child-new":     true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("RunningSessions = %v, want %v", got, want)
+	}
+	for name := range want {
+		if !got[name] {
+			t.Errorf("expected %q in RunningSessions, got %v", name, got)
+		}
 	}
 }
 
@@ -11735,6 +9696,29 @@ func TestOrchestrator_PostMessage_CreatesSessionMessage(t *testing.T) {
 		}
 		if len(list.Items) != 0 {
 			t.Errorf("expected 0 SessionMessages, got %d", len(list.Items))
+		}
+	})
+
+	t.Run("missing session returns ErrRunNotWorking without file fallback", func(t *testing.T) {
+		const runID = "20261125T120000Z-smsgmissing"
+		store, sessionStore, repo, _, harness, _, fakeClient := setupWorkingTestRun(t, runID, "run-"+runID, nil, &llm.ElizaClient{})
+		orch := newTestOrchestrator(t, OrchestratorOptions{
+			Store:        store,
+			SessionStore: sessionStore,
+			Harness:      harness,
+			KubeClient:   fakeClient,
+			Clock:        func() time.Time { return fixedTime },
+		})
+
+		if err := orch.PostMessage(ctx, repo.Key(), runID, "no session yet"); !errors.Is(err, ErrRunNotWorking) {
+			t.Fatalf("PostMessage with missing session = %v, want ErrRunNotWorking", err)
+		}
+		pending, err := store.ReadPendingMessages(ctx, repo.Key(), runID, generateSessionID(runID))
+		if err != nil {
+			t.Fatalf("ReadPendingMessages: %v", err)
+		}
+		if len(pending) != 0 {
+			t.Errorf("expected 0 file pending messages, got %+v", pending)
 		}
 	})
 }

@@ -1889,6 +1889,15 @@ func TestReconcile_StartSessionAndDepthLimit(t *testing.T) {
 		const runID = "20261124T120000Z-child1"
 		const repoURL = "https://github.com/gke-labs/test-repo"
 		stateStore := state.NewFileStore(t.TempDir())
+		if err := stateStore.PutRepo(t.Context(), &state.Repo{
+			URL:           repoURL,
+			Host:          "github.com",
+			Owner:         "gke-labs",
+			Name:          "test-repo",
+			DefaultBranch: "main",
+		}); err != nil {
+			t.Fatalf("PutRepo: %v", err)
+		}
 		deadline := metav1.NewTime(time.Date(2026, 11, 24, 13, 0, 0, 0, time.UTC))
 
 		root := pendingSession("rootstart", herorunv1alpha1.SessionSpec{
@@ -2532,4 +2541,32 @@ func TestReconcile_CascadingCancellation(t *testing.T) {
 			t.Errorf("orphan child status = %+v, want Canceled/Canceled", got.Status)
 		}
 	})
+}
+
+func TestReconcile_IgnoresUnregisteredRepo(t *testing.T) {
+	sessObj := pendingSession("other-repo-sess", herorunv1alpha1.SessionSpec{
+		RunID:         "run-other",
+		Repository:    "https://github.com/gke-labs/unregistered-repo",
+		InitialPrompt: "Should not run.",
+	})
+	fakeLLM := &scriptedLLM{handlers: []func(context.Context, llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error){
+		textReply("must not run"),
+	}}
+	stateStore := state.NewFileStore(t.TempDir())
+	env := newTestEnv(t, fakeLLM, []client.Object{sessObj}, func(o *Options) {
+		o.StateStore = stateStore
+	})
+
+	if _, err := env.reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "ao-sandboxes", Name: sessObj.Name},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if fakeLLM.calls != 0 {
+		t.Errorf("LLM calls = %d, want 0", fakeLLM.calls)
+	}
+	got := env.getSession(t, sessObj.Name)
+	if got.Status.Phase != herorunv1alpha1.SessionPhasePending {
+		t.Errorf("status phase = %q, want %q (untouched)", got.Status.Phase, herorunv1alpha1.SessionPhasePending)
+	}
 }
