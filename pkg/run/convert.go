@@ -100,7 +100,6 @@ func HeroRunToRun(hr *herorunv1alpha1.HeroRun) (*state.Run, error) {
 		PRBody:             hr.Status.PRBody,
 		PRURL:              hr.Status.PullRequestURL,
 		SessionID:          hr.Status.SessionID,
-		ActiveOperation:    fromHeroRunActiveOperation(hr.Status.ActiveOperation),
 		SandboxName:        hr.Status.SandboxName,
 		WorkspaceClaimName: hr.Status.WorkspaceClaimName,
 		ReadyDeadline:      fromMetaTime(hr.Status.ReadyDeadline),
@@ -190,7 +189,6 @@ func HeroRunFromRun(run *state.Run) *herorunv1alpha1.HeroRun {
 			PRBody:             run.PRBody,
 			PullRequestURL:     run.PRURL,
 			SessionID:          run.SessionID,
-			ActiveOperation:    toHeroRunActiveOperation(run.ActiveOperation),
 			SandboxName:        run.SandboxName,
 			WorkspaceClaimName: run.WorkspaceClaimName,
 			ReadyDeadline:      toMetaTime(run.ReadyDeadline),
@@ -260,36 +258,4 @@ func fromMetaTime(mt *metav1.Time) *time.Time {
 	}
 	t := mt.Time.Truncate(time.Second).UTC()
 	return &t
-}
-
-func fromHeroRunActiveOperation(op *herorunv1alpha1.ActiveOperation) *state.ActiveOperation {
-	if op == nil {
-		return nil
-	}
-	return &state.ActiveOperation{
-		ID:         op.ID,
-		Done:       op.Done,
-		Result:     state.OperationResult(op.Result),
-		PRTitle:    op.PRTitle,
-		PRBody:     op.PRBody,
-		Summary:    op.Summary,
-		Error:      op.Error,
-		FinishedAt: fromMetaTime(op.FinishedAt),
-	}
-}
-
-func toHeroRunActiveOperation(op *state.ActiveOperation) *herorunv1alpha1.ActiveOperation {
-	if op == nil {
-		return nil
-	}
-	return &herorunv1alpha1.ActiveOperation{
-		ID:         op.ID,
-		Done:       op.Done,
-		Result:     herorunv1alpha1.OperationResult(op.Result),
-		PRTitle:    op.PRTitle,
-		PRBody:     op.PRBody,
-		Summary:    op.Summary,
-		Error:      op.Error,
-		FinishedAt: toMetaTime(op.FinishedAt),
-	}
 }
