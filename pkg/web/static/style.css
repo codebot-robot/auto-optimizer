@@ -136,6 +136,7 @@ a:hover { text-decoration: underline; }
   font-weight: 700;
   margin: 0 0 8px 0;
   color: var(--ink);
+  word-break: break-word;
 }
 
 .page-subtitle {
@@ -204,6 +205,7 @@ tr:last-child td {
 
 .meta-badges {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 8px;
 }

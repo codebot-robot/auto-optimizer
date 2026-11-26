@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -227,9 +228,26 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := RenderSessionListPage(r.Context(), w, SessionListPageData{Sessions: summaries}); err != nil {
+	runs := s.resolveRunsForSessions(r.Context(), summaries)
+	if err := RenderSessionListPage(r.Context(), w, SessionListPageData{Sessions: summaries, Runs: runs}); err != nil {
 		scoped.Log(r.Context()).Error(err, "rendering session list page")
 	}
+}
+
+func (s *Server) resolveRunsForSessions(ctx context.Context, summaries []sessionapi.SessionSummary) map[string]*state.Run {
+	if !slices.ContainsFunc(summaries, func(sum sessionapi.SessionSummary) bool { return sum.RunID != "" }) {
+		return nil
+	}
+	runList, err := run.ListRuns(ctx, s.kubeClient, s.namespace, state.RepoKey{})
+	if err != nil {
+		scoped.Log(ctx).V(2).Info("listing runs for session list", "error", err)
+		return nil
+	}
+	runs := make(map[string]*state.Run, len(runList))
+	for _, r := range runList {
+		runs[r.ID] = r
+	}
+	return runs
 }
 
 func (s *Server) handleListRepos(w http.ResponseWriter, r *http.Request) {
@@ -483,8 +501,17 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, name s
 		return
 	}
 
+	var runRec *state.Run
+	if detail.Summary.RunID != "" {
+		var runErr error
+		runRec, runErr = run.GetRun(r.Context(), s.kubeClient, s.namespace, detail.Summary.RunID)
+		if runErr != nil && !errors.Is(runErr, state.ErrNotFound) {
+			scoped.Log(r.Context()).V(2).Info("getting run for session", "session", name, "run", detail.Summary.RunID, "error", runErr)
+		}
+	}
+
 	full := r.URL.Query().Get("full") == "1"
-	if err := RenderTranscriptPage(r.Context(), w, TranscriptPageData{Detail: *detail, Full: full}); err != nil {
+	if err := RenderTranscriptPage(r.Context(), w, TranscriptPageData{Detail: *detail, Run: runRec, Full: full}); err != nil {
 		scoped.Log(r.Context()).Error(err, "rendering transcript page", "session", name)
 	}
 }
