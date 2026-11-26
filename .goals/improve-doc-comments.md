@@ -1,5 +1,5 @@
 ---
-verify: go test ./...
+verify: 'test -z "$(gofmt -l .)" && go vet ./...'
 budget:
   maxDuration: 15m
 ---
