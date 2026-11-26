@@ -1854,3 +1854,714 @@ func TestReconcileWorkflow_OpeningPR_SavesBeforeRecordingEvent(t *testing.T) {
 		t.Errorf("expected pull_request_reused event for %s, got %+v", prs[0].URL, events)
 	}
 }
+
+type workingWorkflowFixture struct {
+	orch       *Orchestrator
+	store      state.Store
+	kubeClient client.Client
+	harness    *session.Harness
+	repo       *state.Repo
+	run        *state.Run
+	hr         *herorunv1alpha1.HeroRun
+	now        time.Time
+}
+
+func newWorkingWorkflowFixture(t *testing.T, runID string, now time.Time, deadline *time.Time, opts ...func(*OrchestratorOptions, *state.Run)) *workingWorkflowFixture {
+	t.Helper()
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarness(t, nil)
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
+	}
+
+	hrName := sandboxNameForRun(runID)
+	run := &state.Run{
+		ID:                 runID,
+		Repo:               repo.Key(),
+		GoalName:           "optimize-latency",
+		Phase:              state.PhaseWorking,
+		PhaseTimestamps:    map[state.RunPhase]time.Time{state.PhasePending: now.Add(-15 * time.Minute), state.PhaseWorking: now.Add(-10 * time.Minute)},
+		BaseCommit:         "abcdef1234567890",
+		Branch:             "ao/optimize-latency/" + runID,
+		SandboxName:        hrName,
+		WorkspaceClaimName: hrName,
+		Deadline:           deadline,
+		Goal: &goals.Goal{
+			Name: "optimize-latency",
+			Body: "Reduce p99 request latency by optimizing hot path allocations.",
+		},
+	}
+
+	if _, err := agentsCS.AgentsV1beta1().Sandboxes(harness.Namespace()).Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: hrName, Namespace: harness.Namespace()},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	orchOpts := OrchestratorOptions{
+		Store:           store,
+		Harness:         harness,
+		Clock:           func() time.Time { return now },
+		MaxTurns:        25,
+		MaxSessionDepth: 4,
+	}
+	for _, fn := range opts {
+		fn(&orchOpts, run)
+	}
+
+	hr := HeroRunFromRun(run)
+	hr.Namespace = harness.Namespace()
+	hr.UID = types.UID("hr-uid-" + runID)
+	hr.Spec.Repository = repo.URL
+	fakeClient := newTestFakeClientBuilder(scheme).WithObjects(hr).Build()
+	if orchOpts.KubeClient == nil {
+		orchOpts.KubeClient = fakeClient
+	}
+
+	orch := newTestOrchestrator(t, orchOpts)
+	return &workingWorkflowFixture{
+		orch:       orch,
+		store:      store,
+		kubeClient: orch.kubeClient,
+		harness:    harness,
+		repo:       repo,
+		run:        run,
+		hr:         hr,
+		now:        now,
+	}
+}
+
+func createTestSession(t *testing.T, ctx context.Context, c client.Client, sess *herorunv1alpha1.Session) {
+	t.Helper()
+	st := sess.Status
+	if err := c.Create(ctx, sess); err != nil {
+		t.Fatalf("creating Session %s: %v", sess.Name, err)
+	}
+	if st.Phase != "" || st.Outcome != "" || st.Error != "" || st.PRTitle != "" || st.PRBody != "" || st.Summary != "" {
+		sess.Status = st
+		if err := c.Status().Update(ctx, sess); err != nil {
+			t.Fatalf("updating Session %s status: %v", sess.Name, err)
+		}
+	}
+}
+
+func TestRunWorkflow_Working_CreatesRootSession(t *testing.T) {
+	ctx := t.Context()
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	deadline := now.Add(30 * time.Minute)
+	f := newWorkingWorkflowFixture(t, "20261126T120000Z-wfworkcreate", now, &deadline, func(o *OrchestratorOptions, _ *state.Run) {
+		opts := o.Harness.RunOptions()
+		opts.SystemPrompt = "Base toolset system instructions."
+		o.Harness = session.NewHarness(o.Harness.LLMClient(), o.Harness.SandboxClient(), nil, opts)
+	})
+
+	wf := newRunWorkflow(f.orch, f.repo, f.run, f.hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if res.done || !res.wait || res.requeueAfter != 30*time.Minute {
+		t.Fatalf("got res=%+v, want {done:false wait:true requeueAfter:30m}", res)
+	}
+
+	wantSessID := generateSessionID(f.run.ID)
+	if wf.run.Phase != state.PhaseWorking {
+		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseWorking)
+	}
+	if wf.run.SessionID != wantSessID {
+		t.Errorf("SessionID = %q, want %q", wf.run.SessionID, wantSessID)
+	}
+
+	var sess herorunv1alpha1.Session
+	if err := f.kubeClient.Get(ctx, client.ObjectKey{Namespace: f.harness.Namespace(), Name: wantSessID}, &sess); err != nil {
+		t.Fatalf("getting created Session: %v", err)
+	}
+	if sess.Labels[LabelRun] != f.run.ID {
+		t.Errorf("label %s = %q, want %q", LabelRun, sess.Labels[LabelRun], f.run.ID)
+	}
+	if len(sess.OwnerReferences) != 1 {
+		t.Fatalf("OwnerReferences = %+v, want 1", sess.OwnerReferences)
+	}
+	ref := sess.OwnerReferences[0]
+	if ref.Kind != "HeroRun" || ref.Name != f.hr.Name || ref.UID != f.hr.UID || ref.Controller == nil || !*ref.Controller {
+		t.Errorf("unexpected OwnerReference: %+v", ref)
+	}
+	if sess.Spec.RunID != f.run.ID || sess.Spec.HeroRunName != f.hr.Name {
+		t.Errorf("RunID/HeroRunName = %q/%q, want %q/%q", sess.Spec.RunID, sess.Spec.HeroRunName, f.run.ID, f.hr.Name)
+	}
+	if sess.Spec.Repository != f.repo.URL || sess.Spec.Branch != f.run.BranchName() {
+		t.Errorf("Repository/Branch = %q/%q, want %q/%q", sess.Spec.Repository, sess.Spec.Branch, f.repo.URL, f.run.BranchName())
+	}
+	if !strings.Contains(sess.Spec.SystemPrompt, "Base toolset system instructions.") ||
+		!strings.Contains(sess.Spec.SystemPrompt, f.run.Goal.Body) ||
+		!strings.Contains(sess.Spec.SystemPrompt, f.repo.URL) ||
+		!strings.Contains(sess.Spec.SystemPrompt, f.run.BranchName()) {
+		t.Errorf("SystemPrompt missing expected sections: %q", sess.Spec.SystemPrompt)
+	}
+	if sess.Spec.InitialPrompt != "Please work on the goal." {
+		t.Errorf("InitialPrompt = %q, want %q", sess.Spec.InitialPrompt, "Please work on the goal.")
+	}
+	if sess.Spec.SandboxName != f.run.SandboxName || sess.Spec.WorkspaceClaimName != f.run.WorkspaceClaimName {
+		t.Errorf("SandboxName/WorkspaceClaimName = %q/%q, want %q/%q", sess.Spec.SandboxName, sess.Spec.WorkspaceClaimName, f.run.SandboxName, f.run.WorkspaceClaimName)
+	}
+	if sess.Spec.MaxTurns != 25 || sess.Spec.MaxDepth != 4 {
+		t.Errorf("MaxTurns/MaxDepth = %d/%d, want 25/4", sess.Spec.MaxTurns, sess.Spec.MaxDepth)
+	}
+	if sess.Spec.Deadline == nil || !sess.Spec.Deadline.Time.Equal(deadline) {
+		t.Errorf("Deadline = %v, want %v", sess.Spec.Deadline, deadline)
+	}
+	if !sess.Spec.AllowPullRequest {
+		t.Errorf("expected AllowPullRequest = true")
+	}
+
+	events, err := f.store.ReadEvents(ctx, f.repo.Key(), f.run.ID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].Phase != state.PhaseWorking || events[0].Kind != "session_started" {
+		t.Fatalf("unexpected events: %+v", events)
+	}
+	data, ok := events[0].Data.(map[string]any)
+	if !ok || data["session_id"] != wantSessID {
+		t.Errorf("session_started event data = %+v, want session_id=%q", events[0].Data, wantSessID)
+	}
+}
+
+func TestRunWorkflow_Working_CreatesRootSession_GoalFallbackFromStore(t *testing.T) {
+	ctx := t.Context()
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	f := newWorkingWorkflowFixture(t, "20261126T120000Z-wfworkgoal", now, nil, func(_ *OrchestratorOptions, r *state.Run) {
+		r.Goal = nil
+	})
+	if err := f.store.PutGoal(ctx, f.repo.Key(), &state.GoalRecord{
+		Goal: &goals.Goal{Name: f.run.GoalName, Body: "Goal body loaded from store."},
+	}); err != nil {
+		t.Fatalf("PutGoal: %v", err)
+	}
+
+	wf := newRunWorkflow(f.orch, f.repo, f.run, f.hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if !res.wait || res.done || res.requeueAfter != 0 {
+		t.Fatalf("got res=%+v, want {done:false wait:true requeueAfter:0}", res)
+	}
+
+	var sess herorunv1alpha1.Session
+	if err := f.kubeClient.Get(ctx, client.ObjectKey{Namespace: f.harness.Namespace(), Name: generateSessionID(f.run.ID)}, &sess); err != nil {
+		t.Fatalf("getting Session: %v", err)
+	}
+	if !strings.Contains(sess.Spec.SystemPrompt, "Goal body loaded from store.") {
+		t.Errorf("expected goal body from store in SystemPrompt, got: %q", sess.Spec.SystemPrompt)
+	}
+	if sess.Spec.Deadline != nil {
+		t.Errorf("expected nil Deadline when run has no deadline, got %v", sess.Spec.Deadline)
+	}
+}
+
+func TestRunWorkflow_Working_WaitsWhileSessionNonTerminal(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	deadline := now.Add(15 * time.Minute)
+
+	cases := []struct {
+		name        string
+		phase       herorunv1alpha1.SessionPhase
+		deadline    *time.Time
+		wantRequeue time.Duration
+		clearSessID bool
+	}{
+		{name: "pending with deadline", phase: herorunv1alpha1.SessionPhasePending, deadline: &deadline, wantRequeue: 15 * time.Minute, clearSessID: true},
+		{name: "running with deadline", phase: herorunv1alpha1.SessionPhaseRunning, deadline: &deadline, wantRequeue: 15 * time.Minute},
+		{name: "waiting without deadline", phase: herorunv1alpha1.SessionPhaseWaiting, deadline: nil, wantRequeue: 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			runID := "20261126T120000Z-wfwait"
+			f := newWorkingWorkflowFixture(t, runID, now, tc.deadline)
+			sessID := generateSessionID(runID)
+			if !tc.clearSessID {
+				f.run.SessionID = sessID
+			}
+			createTestSession(t, ctx, f.kubeClient, &herorunv1alpha1.Session{
+				ObjectMeta: metav1.ObjectMeta{Name: sessID, Namespace: f.harness.Namespace()},
+				Spec:       herorunv1alpha1.SessionSpec{RunID: runID},
+				Status:     herorunv1alpha1.SessionStatus{Phase: tc.phase},
+			})
+
+			res, err := f.orch.reconcileWorkflow(ctx, newRunWorkflow(f.orch, f.repo, f.run, f.hr))
+			if err != nil {
+				t.Fatalf("reconcileWorkflow: %v", err)
+			}
+			if res.RequeueAfter != tc.wantRequeue {
+				t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, tc.wantRequeue)
+			}
+			if len(f.orch.notifyCh) != 0 {
+				t.Errorf("expected no o.Notify call while waiting on non-terminal Session, got %d", len(f.orch.notifyCh))
+			}
+
+			gotRun, err := GetRun(ctx, f.kubeClient, f.harness.Namespace(), runID)
+			if err != nil {
+				t.Fatalf("GetRun: %v", err)
+			}
+			if gotRun.Phase != state.PhaseWorking || gotRun.SessionID != sessID {
+				t.Errorf("got phase=%s sessionID=%q, want Working/%q", gotRun.Phase, gotRun.SessionID, sessID)
+			}
+			events, err := f.store.ReadEvents(ctx, f.repo.Key(), runID)
+			if err != nil {
+				t.Fatalf("ReadEvents: %v", err)
+			}
+			if len(events) != 0 {
+				t.Errorf("expected no events when reusing existing non-terminal Session, got %+v", events)
+			}
+		})
+	}
+}
+
+func TestRunWorkflow_Working_TerminalOutcomes(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	deadline := now.Add(20 * time.Minute)
+
+	t.Run("PullRequest transitions to Selecting and releases local sandbox handle", func(t *testing.T) {
+		ctx := t.Context()
+		runID := "20261126T120000Z-wfpr"
+		f := newWorkingWorkflowFixture(t, runID, now, &deadline)
+		sessID := generateSessionID(runID)
+		f.run.SessionID = sessID
+		createTestSession(t, ctx, f.kubeClient, &herorunv1alpha1.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessID, Namespace: f.harness.Namespace()},
+			Spec:       herorunv1alpha1.SessionSpec{RunID: runID},
+			Status: herorunv1alpha1.SessionStatus{
+				Phase:   herorunv1alpha1.SessionPhaseSucceeded,
+				Outcome: herorunv1alpha1.SessionOutcomePullRequest,
+				PRTitle: "Reduce allocations in router",
+				PRBody:  "Eliminates per-request slice copy.",
+			},
+		})
+		// Track the sandbox handle locally so we can verify releaseSandbox clears it.
+		f.harness.GetOrAttachSandbox(f.run.SandboxName)
+		if f.harness.SandboxClient().TrackedSandboxesCount() != 1 {
+			t.Fatalf("expected 1 tracked sandbox before reconcile")
+		}
+
+		res, err := f.orch.reconcileWorkflow(ctx, newRunWorkflow(f.orch, f.repo, f.run, f.hr))
+		if err != nil {
+			t.Fatalf("reconcileWorkflow: %v", err)
+		}
+		if res != (reconcile.Result{}) {
+			t.Errorf("expected empty reconcile.Result, got %+v", res)
+		}
+		if len(f.orch.notifyCh) != 1 {
+			t.Errorf("expected o.Notify to trigger Selecting immediately, got %d notifications", len(f.orch.notifyCh))
+		}
+		if f.harness.SandboxClient().TrackedSandboxesCount() != 0 {
+			t.Errorf("expected releaseSandbox to clear local handle, got %d tracked", f.harness.SandboxClient().TrackedSandboxesCount())
+		}
+		if _, err := f.harness.SandboxClient().GetSandboxResource(ctx, f.harness.Namespace(), f.run.SandboxName); err != nil {
+			t.Errorf("expected Kubernetes Sandbox resource to remain for Selecting, got err: %v", err)
+		}
+
+		gotRun, err := GetRun(ctx, f.kubeClient, f.harness.Namespace(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseSelecting || gotRun.PRTitle != "Reduce allocations in router" || gotRun.PRBody != "Eliminates per-request slice copy." {
+			t.Errorf("got run %+v, want Selecting with PRTitle/PRBody", gotRun)
+		}
+
+		events, err := f.store.ReadEvents(ctx, f.repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		var sawPRReq, sawPhase bool
+		for _, ev := range events {
+			if ev.Phase == state.PhaseSelecting && ev.Kind == "pull_request_requested" {
+				sawPRReq = true
+			}
+			if ev.Phase == state.PhaseSelecting && ev.Kind == "phase" {
+				sawPhase = true
+			}
+		}
+		if !sawPRReq || !sawPhase {
+			t.Errorf("expected pull_request_requested and phase events, got %+v", events)
+		}
+	})
+
+	terminalCases := []struct {
+		name          string
+		status        herorunv1alpha1.SessionStatus
+		wantPhase     state.RunPhase
+		wantEventKind string
+		wantSummary   string
+		wantErrorKind string
+		wantErrorPart string
+	}{
+		{
+			name: "Finished transitions to NoImprovement with Summary",
+			status: herorunv1alpha1.SessionStatus{
+				Phase:   herorunv1alpha1.SessionPhaseSucceeded,
+				Outcome: herorunv1alpha1.SessionOutcomeFinished,
+				Summary: "Already optimal; no safe optimization found.",
+			},
+			wantPhase:     state.PhaseNoImprovement,
+			wantEventKind: "finished",
+			wantSummary:   "Already optimal; no safe optimization found.",
+		},
+		{
+			name: "Completed transitions to NoImprovement",
+			status: herorunv1alpha1.SessionStatus{
+				Phase:   herorunv1alpha1.SessionPhaseSucceeded,
+				Outcome: herorunv1alpha1.SessionOutcomeCompleted,
+			},
+			wantPhase:     state.PhaseNoImprovement,
+			wantEventKind: "no_improvement",
+		},
+		{
+			name: "MaxTurns transitions to NoImprovement",
+			status: herorunv1alpha1.SessionStatus{
+				Phase:   herorunv1alpha1.SessionPhaseSucceeded,
+				Outcome: herorunv1alpha1.SessionOutcomeMaxTurns,
+			},
+			wantPhase:     state.PhaseNoImprovement,
+			wantEventKind: "no_improvement",
+		},
+		{
+			name: "DeadlineExceeded transitions to Failed with deadline_exceeded",
+			status: herorunv1alpha1.SessionStatus{
+				Phase:   herorunv1alpha1.SessionPhaseFailed,
+				Outcome: herorunv1alpha1.SessionOutcomeDeadlineExceeded,
+				Error:   "deadline exceeded",
+			},
+			wantPhase:     state.PhaseFailed,
+			wantEventKind: "deadline_exceeded",
+			wantErrorKind: "deadline_exceeded",
+			wantErrorPart: "deadline exceeded",
+		},
+		{
+			name: "Failed transitions to Failed with session error",
+			status: herorunv1alpha1.SessionStatus{
+				Phase:   herorunv1alpha1.SessionPhaseFailed,
+				Outcome: herorunv1alpha1.SessionOutcomeFailed,
+				Error:   "LLM API 503",
+			},
+			wantPhase:     state.PhaseFailed,
+			wantEventKind: "failed",
+			wantErrorKind: "failed",
+			wantErrorPart: "session error: LLM API 503",
+		},
+		{
+			name: "Failed with empty error uses fallback message",
+			status: herorunv1alpha1.SessionStatus{
+				Phase:   herorunv1alpha1.SessionPhaseFailed,
+				Outcome: herorunv1alpha1.SessionOutcomeFailed,
+			},
+			wantPhase:     state.PhaseFailed,
+			wantEventKind: "failed",
+			wantErrorKind: "failed",
+			wantErrorPart: "session failed",
+		},
+		{
+			name: "Canceled before deadline transitions to Failed",
+			status: herorunv1alpha1.SessionStatus{
+				Phase:   herorunv1alpha1.SessionPhaseCanceled,
+				Outcome: herorunv1alpha1.SessionOutcomeCanceled,
+				Error:   "canceled externally",
+			},
+			wantPhase:     state.PhaseFailed,
+			wantEventKind: "failed",
+			wantErrorKind: "failed",
+			wantErrorPart: "session canceled: canceled externally",
+		},
+	}
+
+	for _, tc := range terminalCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			runID := "20261126T120000Z-wfterm"
+			f := newWorkingWorkflowFixture(t, runID, now, &deadline)
+			sessID := generateSessionID(runID)
+			f.run.SessionID = sessID
+			createTestSession(t, ctx, f.kubeClient, &herorunv1alpha1.Session{
+				ObjectMeta: metav1.ObjectMeta{Name: sessID, Namespace: f.harness.Namespace()},
+				Spec:       herorunv1alpha1.SessionSpec{RunID: runID},
+				Status:     tc.status,
+			})
+
+			res, err := f.orch.reconcileWorkflow(ctx, newRunWorkflow(f.orch, f.repo, f.run, f.hr))
+			if err != nil {
+				t.Fatalf("reconcileWorkflow: %v", err)
+			}
+			if res != (reconcile.Result{}) {
+				t.Errorf("expected empty reconcile.Result, got %+v", res)
+			}
+			if len(f.orch.notifyCh) != 0 {
+				t.Errorf("expected no o.Notify on terminal run, got %d", len(f.orch.notifyCh))
+			}
+
+			gotRun, err := GetRun(ctx, f.kubeClient, f.harness.Namespace(), runID)
+			if err != nil {
+				t.Fatalf("GetRun: %v", err)
+			}
+			if gotRun.Phase != tc.wantPhase {
+				t.Errorf("phase = %s, want %s", gotRun.Phase, tc.wantPhase)
+			}
+			if tc.wantSummary != "" && gotRun.Summary != tc.wantSummary {
+				t.Errorf("Summary = %q, want %q", gotRun.Summary, tc.wantSummary)
+			}
+			if tc.wantErrorKind != "" && gotRun.ErrorKind != tc.wantErrorKind {
+				t.Errorf("ErrorKind = %q, want %q", gotRun.ErrorKind, tc.wantErrorKind)
+			}
+			if tc.wantErrorPart != "" && !strings.Contains(gotRun.Error, tc.wantErrorPart) {
+				t.Errorf("Error = %q, want substring %q", gotRun.Error, tc.wantErrorPart)
+			}
+
+			if _, err := f.harness.SandboxClient().GetSandboxResource(ctx, f.harness.Namespace(), f.run.SandboxName); !k8serrors.IsNotFound(err) {
+				t.Errorf("expected sandbox deleted after terminal run, got err: %v", err)
+			}
+
+			events, err := f.store.ReadEvents(ctx, f.repo.Key(), runID)
+			if err != nil {
+				t.Fatalf("ReadEvents: %v", err)
+			}
+			if len(events) != 1 || events[0].Phase != tc.wantPhase || events[0].Kind != tc.wantEventKind {
+				t.Fatalf("events = %+v, want single %s/%s event", events, tc.wantPhase, tc.wantEventKind)
+			}
+			if tc.wantEventKind == "deadline_exceeded" {
+				data, ok := events[0].Data.(map[string]any)
+				if !ok || data["deadline"] != deadline.Format(time.RFC3339) || data["elapsed"] == "" {
+					t.Errorf("expected deadline and elapsed in event data, got %+v", events[0].Data)
+				}
+			}
+		})
+	}
+}
+
+func TestRunWorkflow_Working_TerminalOutcomeConsumedBeforeDeadline(t *testing.T) {
+	ctx := t.Context()
+	deadline := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	afterDeadline := deadline.Add(5 * time.Minute)
+	runID := "20261126T120000Z-wftermfirst"
+
+	f := newWorkingWorkflowFixture(t, runID, afterDeadline, &deadline)
+	sessID := generateSessionID(runID)
+	f.run.SessionID = sessID
+	createTestSession(t, ctx, f.kubeClient, &herorunv1alpha1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: sessID, Namespace: f.harness.Namespace()},
+		Spec:       herorunv1alpha1.SessionSpec{RunID: runID},
+		Status: herorunv1alpha1.SessionStatus{
+			Phase:   herorunv1alpha1.SessionPhaseSucceeded,
+			Outcome: herorunv1alpha1.SessionOutcomePullRequest,
+			PRTitle: "Last-second optimization",
+			PRBody:  "Completed right before deadline.",
+		},
+	})
+
+	wf := newRunWorkflow(f.orch, f.repo, f.run, f.hr)
+	res, err := wf.Run(ctx)
+	if err != nil {
+		t.Fatalf("wf.Run: %v", err)
+	}
+	if res != (workflowResult{}) {
+		t.Fatalf("got res=%+v, want immediate requeue for Selecting", res)
+	}
+	if wf.run.Phase != state.PhaseSelecting || wf.run.PRTitle != "Last-second optimization" {
+		t.Errorf("got phase=%s PRTitle=%q, want Selecting/Last-second optimization", wf.run.Phase, wf.run.PRTitle)
+	}
+
+	// Verify Session status was not overwritten to Canceled.
+	var gotSess herorunv1alpha1.Session
+	if err := f.kubeClient.Get(ctx, client.ObjectKey{Namespace: f.harness.Namespace(), Name: sessID}, &gotSess); err != nil {
+		t.Fatalf("Get Session: %v", err)
+	}
+	if gotSess.Status.Phase != herorunv1alpha1.SessionPhaseSucceeded || gotSess.Status.Outcome != herorunv1alpha1.SessionOutcomePullRequest {
+		t.Errorf("Session status unexpectedly mutated: %+v", gotSess.Status)
+	}
+}
+
+func TestRunWorkflow_Working_DeadlineHandling(t *testing.T) {
+	deadline := time.Date(2026, 11, 26, 12, 30, 0, 0, time.UTC)
+
+	t.Run("cancels non-terminal root Session and fails run", func(t *testing.T) {
+		ctx := t.Context()
+		now := deadline.Add(time.Minute)
+		runID := "20261126T120000Z-wfdlcancel"
+		f := newWorkingWorkflowFixture(t, runID, now, &deadline)
+		sessID := generateSessionID(runID)
+		f.run.SessionID = sessID
+		waitUntil := metav1.NewTime(deadline.Add(5 * time.Minute))
+		createTestSession(t, ctx, f.kubeClient, &herorunv1alpha1.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessID, Namespace: f.harness.Namespace()},
+			Spec:       herorunv1alpha1.SessionSpec{RunID: runID},
+			Status: herorunv1alpha1.SessionStatus{
+				Phase:        herorunv1alpha1.SessionPhaseWaiting,
+				WaitingUntil: &waitUntil,
+			},
+		})
+
+		if _, err := f.orch.reconcileWorkflow(ctx, newRunWorkflow(f.orch, f.repo, f.run, f.hr)); err != nil {
+			t.Fatalf("reconcileWorkflow: %v", err)
+		}
+
+		var gotSess herorunv1alpha1.Session
+		if err := f.kubeClient.Get(ctx, client.ObjectKey{Namespace: f.harness.Namespace(), Name: sessID}, &gotSess); err != nil {
+			t.Fatalf("Get Session: %v", err)
+		}
+		if gotSess.Status.Phase != herorunv1alpha1.SessionPhaseCanceled || gotSess.Status.Outcome != herorunv1alpha1.SessionOutcomeCanceled {
+			t.Errorf("Session status = %s/%s, want Canceled/Canceled", gotSess.Status.Phase, gotSess.Status.Outcome)
+		}
+		if gotSess.Status.WaitingUntil != nil || gotSess.Status.FinishedAt == nil || gotSess.Status.ObservedAt == nil {
+			t.Errorf("unexpected Session timestamps/wait: %+v", gotSess.Status)
+		}
+
+		gotRun, err := GetRun(ctx, f.kubeClient, f.harness.Namespace(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseFailed || gotRun.ErrorKind != "deadline_exceeded" {
+			t.Errorf("got phase=%s errorKind=%q, want Failed/deadline_exceeded", gotRun.Phase, gotRun.ErrorKind)
+		}
+		if _, err := f.harness.SandboxClient().GetSandboxResource(ctx, f.harness.Namespace(), f.run.SandboxName); !k8serrors.IsNotFound(err) {
+			t.Errorf("expected sandbox deleted on deadline exceeded, got err: %v", err)
+		}
+		events, err := f.store.ReadEvents(ctx, f.repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		if len(events) != 1 || events[0].Kind != "deadline_exceeded" {
+			t.Fatalf("expected deadline_exceeded event, got %+v", events)
+		}
+	})
+
+	t.Run("fails without creating Session when deadline already reached", func(t *testing.T) {
+		ctx := t.Context()
+		runID := "20261126T120000Z-wfdlnosess"
+		f := newWorkingWorkflowFixture(t, runID, deadline, &deadline)
+
+		wf := newRunWorkflow(f.orch, f.repo, f.run, f.hr)
+		res, err := wf.Run(ctx)
+		if err != nil {
+			t.Fatalf("wf.Run: %v", err)
+		}
+		if !res.done || wf.run.Phase != state.PhaseFailed || wf.run.ErrorKind != "deadline_exceeded" {
+			t.Fatalf("got res=%+v phase=%s errorKind=%q, want done Failed/deadline_exceeded", res, wf.run.Phase, wf.run.ErrorKind)
+		}
+		var list herorunv1alpha1.SessionList
+		if err := f.kubeClient.List(ctx, &list); err != nil {
+			t.Fatalf("List Sessions: %v", err)
+		}
+		if len(list.Items) != 0 {
+			t.Errorf("expected no Session created after deadline, got %d", len(list.Items))
+		}
+	})
+
+	t.Run("retries cleanly as deadline_exceeded if Session was already canceled after deadline", func(t *testing.T) {
+		ctx := t.Context()
+		now := deadline.Add(2 * time.Minute)
+		runID := "20261126T120000Z-wfdlretry"
+		f := newWorkingWorkflowFixture(t, runID, now, &deadline)
+		sessID := generateSessionID(runID)
+		f.run.SessionID = sessID
+		createTestSession(t, ctx, f.kubeClient, &herorunv1alpha1.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessID, Namespace: f.harness.Namespace()},
+			Spec:       herorunv1alpha1.SessionSpec{RunID: runID},
+			Status: herorunv1alpha1.SessionStatus{
+				Phase:   herorunv1alpha1.SessionPhaseCanceled,
+				Outcome: herorunv1alpha1.SessionOutcomeCanceled,
+				Error:   "run deadline exceeded",
+			},
+		})
+
+		wf := newRunWorkflow(f.orch, f.repo, f.run, f.hr)
+		res, err := wf.Run(ctx)
+		if err != nil {
+			t.Fatalf("wf.Run: %v", err)
+		}
+		if !res.done || wf.run.Phase != state.PhaseFailed || wf.run.ErrorKind != "deadline_exceeded" {
+			t.Errorf("got res=%+v phase=%s errorKind=%q, want done Failed/deadline_exceeded", res, wf.run.Phase, wf.run.ErrorKind)
+		}
+	})
+}
+
+func TestRunWorkflow_Working_EdgeCases(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+
+	t.Run("empty SandboxName fails without creating Session", func(t *testing.T) {
+		ctx := t.Context()
+		f := newWorkingWorkflowFixture(t, "20261126T120000Z-wfnosb", now, nil, func(_ *OrchestratorOptions, r *state.Run) {
+			r.SandboxName = ""
+		})
+		wf := newRunWorkflow(f.orch, f.repo, f.run, f.hr)
+		res, err := wf.Run(ctx)
+		if err != nil {
+			t.Fatalf("wf.Run: %v", err)
+		}
+		if !res.done || wf.run.Phase != state.PhaseFailed || !strings.Contains(wf.run.Error, "sandbox name is empty") {
+			t.Errorf("got res=%+v phase=%s err=%q", res, wf.run.Phase, wf.run.Error)
+		}
+		var list herorunv1alpha1.SessionList
+		if err := f.kubeClient.List(ctx, &list); err != nil {
+			t.Fatalf("List Sessions: %v", err)
+		}
+		if len(list.Items) != 0 {
+			t.Errorf("expected 0 Sessions, got %d", len(list.Items))
+		}
+	})
+
+	t.Run("session belonging to another run fails", func(t *testing.T) {
+		ctx := t.Context()
+		runID := "20261126T120000Z-wfother"
+		f := newWorkingWorkflowFixture(t, runID, now, nil)
+		sessID := generateSessionID(runID)
+		createTestSession(t, ctx, f.kubeClient, &herorunv1alpha1.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessID, Namespace: f.harness.Namespace()},
+			Spec:       herorunv1alpha1.SessionSpec{RunID: "different-run"},
+			Status:     herorunv1alpha1.SessionStatus{Phase: herorunv1alpha1.SessionPhaseRunning},
+		})
+		wf := newRunWorkflow(f.orch, f.repo, f.run, f.hr)
+		res, err := wf.Run(ctx)
+		if err != nil {
+			t.Fatalf("wf.Run: %v", err)
+		}
+		if !res.done || wf.run.Phase != state.PhaseFailed || !strings.Contains(wf.run.Error, "belongs to run different-run") {
+			t.Errorf("got res=%+v phase=%s err=%q", res, wf.run.Phase, wf.run.Error)
+		}
+	})
+
+	t.Run("canceled context returns without creating Session", func(t *testing.T) {
+		ctx := t.Context()
+		f := newWorkingWorkflowFixture(t, "20261126T120000Z-wfctx", now, nil)
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		wf := newRunWorkflow(f.orch, f.repo, f.run, f.hr)
+		res, err := wf.Run(cancelCtx)
+		if err != nil {
+			t.Fatalf("wf.Run: %v", err)
+		}
+		if res != (workflowResult{}) || wf.run.SessionID != "" {
+			t.Errorf("got res=%+v sessionID=%q, want zero", res, wf.run.SessionID)
+		}
+		var list herorunv1alpha1.SessionList
+		if err := f.kubeClient.List(ctx, &list); err != nil {
+			t.Fatalf("List Sessions: %v", err)
+		}
+		if len(list.Items) != 0 {
+			t.Errorf("expected 0 Sessions on canceled context, got %d", len(list.Items))
+		}
+	})
+}
