@@ -97,6 +97,16 @@ func (d RunPageData) Finished() bool {
 	return d.Run != nil && d.Run.Phase.IsTerminal()
 }
 
+// EventTail returns the command output tail stored in e.Data, if present.
+func (RunPageData) EventTail(e state.Event) string {
+	m, ok := e.Data.(map[string]any)
+	if !ok {
+		return ""
+	}
+	tail, _ := m["tail"].(string)
+	return tail
+}
+
 //go:embed run_page.html
 var runPageHTML string
 

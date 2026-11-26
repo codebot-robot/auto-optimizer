@@ -85,7 +85,11 @@
         {{if .Phase}}<span class="badge phase-{{.Phase}}">{{.Phase}}</span>{{end}}
         {{if .Kind}}<span class="meta-badge">{{.Kind}}</span>{{end}}
         {{if .Message}}<span class="event-message">{{.Message}}</span>{{end}}
-        {{if .Error}}<div class="event-error">{{.Error}}</div>{{end}}
+        {{if .Error}}<div class="event-error">{{.Error}}</div>{{end}}{{$tail := $.EventTail .}}{{if $tail}}
+        <details class="event-output"{{if eq .Kind "verify_failed"}} open{{end}}>
+          <summary>Output</summary>
+          <pre>{{$tail}}</pre>
+        </details>{{end}}
       </div>
     </div>
     {{end}}

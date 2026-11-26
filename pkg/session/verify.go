@@ -34,6 +34,8 @@ type VerifyResult struct {
 // RunVerify runs a goal's verify command in the sandbox at repoDir and keeps
 // the last tailLines lines of combined stdout and stderr.
 // When tailLines is zero (or negative), it defaults to 50 lines.
+// If the command fails to complete after producing output, RunVerify returns a
+// partial VerifyResult with the captured tail alongside the error.
 func (s *Sandbox) RunVerify(ctx context.Context, repoDir, command string, tailLines int) (*VerifyResult, error) {
 	if s == nil {
 		return nil, errors.New("sandbox is nil")
@@ -53,6 +55,9 @@ func (s *Sandbox) RunVerify(ctx context.Context, repoDir, command string, tailLi
 
 	res, err := s.ExecCommand(ctx, opts)
 	if err != nil {
+		if tail := tw.String(); tail != "" {
+			return &VerifyResult{Tail: tail}, err
+		}
 		return nil, err
 	}
 

@@ -270,3 +270,56 @@ func TestRenderRunPage_SessionTree(t *testing.T) {
 		t.Errorf("unexpected session order in HTML: root=%d child=%d grandchild=%d", rootIdx, childIdx, grandIdx)
 	}
 }
+
+func TestRenderRunPage_EventOutput(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ts := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	data := RunPageData{
+		Run: &state.Run{
+			ID:       "20261126T120000Z-ver",
+			Repo:     state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"},
+			GoalName: "verify-goal",
+			Phase:    state.PhaseNoImprovement,
+		},
+		Events: []state.Event{
+			{
+				Time:    ts,
+				Phase:   state.PhaseSelecting,
+				Kind:    "verify_started",
+				Message: "Running verify command: go test ./...",
+				Data:    map[string]any{"command": "go test ./..."},
+			},
+			{
+				Time:    ts.Add(time.Second),
+				Phase:   state.PhaseSelecting,
+				Kind:    "verify_passed",
+				Message: "Verify command passed",
+				Data:    map[string]any{"exitCode": 0, "tail": "PASS\nok\n"},
+			},
+			{
+				Time:    ts.Add(2 * time.Second),
+				Phase:   state.PhaseNoImprovement,
+				Kind:    "verify_failed",
+				Message: "verify command failed with exit code 1",
+				Data:    map[string]any{"exitCode": 1, "tail": "FAIL <pkg>\n"},
+			},
+		},
+	}
+
+	if err := RenderRunPage(t.Context(), rec, data); err != nil {
+		t.Fatalf("RenderRunPage: %v", err)
+	}
+
+	body := rec.Body.String()
+	for _, want := range []string{
+		`<details class="event-output">` + "\n          <summary>Output</summary>\n          <pre>PASS\nok\n</pre>",
+		`<details class="event-output" open>` + "\n          <summary>Output</summary>\n          <pre>FAIL &lt;pkg&gt;\n</pre>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("rendered page missing %q\nbody:\n%s", want, body)
+		}
+	}
+	if got := strings.Count(body, `<details class="event-output"`); got != 2 {
+		t.Errorf("event-output details count = %d, want 2", got)
+	}
+}

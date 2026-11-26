@@ -15,10 +15,12 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -149,6 +151,27 @@ func TestRunVerify_ExecutionFailure(t *testing.T) {
 	}
 	if res != nil {
 		t.Errorf("RunVerify() result = %v, want nil", res)
+	}
+}
+
+func TestRunVerify_TimeoutReturnsPartialTail(t *testing.T) {
+	srv := &fakeProcessServer{
+		startStdout:  [][]byte{[]byte("step 1 ok\nrunning slow test...\n")},
+		startBlockCh: make(chan struct{}),
+	}
+	sb, cleanup := setupTestProcessClient(t, srv, nil, "")
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	res, err := sb.RunVerify(ctx, "/workspace/repo", "go test ./...", 50)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RunVerify() error = %v, want DeadlineExceeded", err)
+	}
+	wantTail := "step 1 ok\nrunning slow test...\n"
+	if res == nil || res.Tail != wantTail {
+		t.Errorf("RunVerify() result = %+v, want Tail=%q", res, wantTail)
 	}
 }
 
