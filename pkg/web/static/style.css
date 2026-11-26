@@ -220,15 +220,15 @@ tr:last-child td {
 .transcript-container {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  margin-bottom: 32px;
+  gap: 8px;
+  margin-bottom: 24px;
 }
 
 .message-card {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 16px 20px;
+  padding: 10px 14px;
   box-shadow: 0 1px 2px rgba(0,0,0,0.03);
 }
 
@@ -254,7 +254,7 @@ tr:last-child td {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  margin-bottom: 8px;
+  margin-bottom: 4px;
 }
 
 .role-user .message-role { color: var(--indigo); }
@@ -264,7 +264,7 @@ tr:last-child td {
 
 .message-content {
   font-size: 14px;
-  line-height: 1.6;
+  line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -273,18 +273,18 @@ tr:last-child td {
   background: var(--canvas);
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 8px 12px;
-  margin-top: 8px;
+  padding: 6px 10px;
+  margin-top: 6px;
   font-family: var(--mono);
   font-size: 13px;
 }
 
 details.tool-result {
-  margin-top: 8px;
+  margin-top: 6px;
   background: var(--canvas);
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 8px 12px;
+  padding: 6px 10px;
 }
 
 details.tool-result summary {

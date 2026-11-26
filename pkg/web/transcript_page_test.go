@@ -63,8 +63,43 @@ func TestRenderTranscriptPage(t *testing.T) {
 	if !strings.Contains(body, "Session: transcript-session") {
 		t.Errorf("expected body to contain session name %q, got:\n%s", "Session: transcript-session", body)
 	}
-	if !strings.Contains(body, "hello world") {
-		t.Errorf("expected body to contain message content %q, got:\n%s", "hello world", body)
+	if !strings.Contains(body, `<div class="message-content">hello world</div>`) {
+		t.Errorf("expected .message-content with no surrounding template whitespace, got:\n%s", body)
+	}
+}
+
+func TestRenderTranscriptPage_MessageContentNoTemplateWhitespace(t *testing.T) {
+	long := strings.Repeat("a", maxTruncateLen+10)
+	truncated := strings.Repeat("a", maxTruncateLen) + "..."
+
+	cases := []struct {
+		name    string
+		content string
+		full    bool
+		want    string
+	}{
+		{"short", "line one\nline two", false, `<div class="message-content">line one` + "\n" + `line two</div>`},
+		{"truncated", long, false, `<div class="message-content">` + truncated + `<div><a href="/sessions/s?full=1" class="show-all-link">show all</a></div></div>`},
+		{"full", long, true, `<div class="message-content">` + long + `<div><a href="/sessions/s" class="show-all-link">show less</a></div></div>`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			data := TranscriptPageData{
+				Detail: sessionapi.SessionDetail{
+					Summary:  sessionapi.SessionSummary{Name: "s"},
+					Messages: []sessionapi.Message{{Role: "assistant", Content: tc.content}},
+				},
+				Full: tc.full,
+			}
+			if err := RenderTranscriptPage(t.Context(), rec, data); err != nil {
+				t.Fatalf("RenderTranscriptPage: %v", err)
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Errorf("body missing expected .message-content %q\ngot:\n%s", tc.want, rec.Body.String())
+			}
+		})
 	}
 }
 
