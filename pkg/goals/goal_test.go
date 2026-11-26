@@ -446,8 +446,9 @@ func TestLoadDir_RepoGoals(t *testing.T) {
 	if !ok {
 		t.Fatal("expected improve-doc-comments goal in .goals/")
 	}
-	if docGoal.Verify != "go test ./..." {
-		t.Errorf("improve-doc-comments verify = %q, want %q", docGoal.Verify, "go test ./...")
+	wantVerify := `test -z "$(gofmt -l .)" && go vet ./...`
+	if docGoal.Verify != wantVerify {
+		t.Errorf("improve-doc-comments verify = %q, want %q", docGoal.Verify, wantVerify)
 	}
 	if docGoal.Budget == nil || docGoal.Budget.MaxDuration != "15m" {
 		t.Errorf("improve-doc-comments budget = %+v, want maxDuration 15m", docGoal.Budget)
