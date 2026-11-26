@@ -117,6 +117,8 @@ data:
   AO_PUBLIC_URL: ""
   # Comma-separated list of GitHub logins allowed to sign in.
   AO_GITHUB_ALLOWED_USERS: ""
+  # Maximum number of session turns per run. Leave empty to use the server default.
+  AO_MAX_TURNS: ""
   PORTAL_CONTROLLER_ADDR: ""
   PORTAL_CONTROLLER_CA_FILE: "/etc/portal/tls.crt"
   PORTAL_TOKEN_FILE: "/var/run/secrets/portal/token"

@@ -66,7 +66,7 @@ const (
 	AnnotationRepo = "auto-optimizer.labs.gke.io/repo"
 
 	// DefaultMaxTurns is the default maximum number of turns for a run.
-	DefaultMaxTurns = 30
+	DefaultMaxTurns = 100
 
 	// DefaultMaxConcurrentRuns is the default maximum number of concurrent runs.
 	DefaultMaxConcurrentRuns = 4
