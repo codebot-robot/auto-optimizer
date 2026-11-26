@@ -218,9 +218,9 @@ A `HeroRun` moves through five active phases before reaching a terminal phase.
 - **`OpeningPR`.** The `HeroRun` controller checks for an existing pull request
   on the branch or opens a new one, records the pull request link, and enters
   `Succeeded`.
-- **Terminal phases.** When a run reaches `Succeeded`, `Failed`, or
-  `NoImprovement`, the `HeroRun` controller stops reconciling the run and
-  releases the active sandbox.
+- **Terminal phases.** When a run reaches `Succeeded`, `NoImprovement`,
+  `VerifyFailed`, or `Failed`, the `HeroRun` controller stops reconciling the
+  run and releases the active sandbox.
 
 Each reconcile pass returns one of four outcomes to the controller runtime.
 

@@ -176,7 +176,7 @@ kubectl get hr -n ao-sandboxes -w
 ```
 
 The output displays the goal name, current phase, branch name, and elapsed time.
-A run moves through the `Pending`, `Preparing`, `Working`, `Selecting`, and `OpeningPR` phases.
+A run moves through the `Pending`, `Preparing`, `Working`, `Selecting`, and `OpeningPR` phases before reaching a terminal phase of `Succeeded`, `NoImprovement`, `VerifyFailed`, `Failed`, `Cancelled`, or `Expired`.
 
 Inspect run details and agent transcripts in the web UI.
 Port-forward the web service to your local workstation:
@@ -191,7 +191,7 @@ The run page displays the session transcript, tool executions, and state events.
 
 You will see several event kinds in the run event log:
 
-- `verify_failed`: the candidate failed the verification command or the command timed out.
+- `verify_failed`: the candidate failed the verification command or the command timed out, ending the run in `VerifyFailed`.
 - `no_changes`: the agent made no git commits against the base commit.
 - `refused`: the agent modified files under `.goals/`.
 - `deadline_exceeded`: the run reached its `budget.maxDuration` or the `--max-run-duration` default and the orchestrator ended it.

@@ -597,13 +597,13 @@ func (w *runWorkflow) runVerify(ctx context.Context, sb *session.Sandbox) (workf
 	if err != nil {
 		now := w.orch.clock().UTC()
 		if timedOut {
-			return w.noImprovement(now, "verify_failed", fmt.Sprintf("verify command timed out after %s", w.orch.verifyTimeout), verifyEventData(res, false)), true
+			return w.verifyFailed(now, fmt.Sprintf("verify command timed out after %s", w.orch.verifyTimeout), verifyEventData(res, false)), true
 		}
 		return w.failRunWithKind(now, "verify_error", fmt.Sprintf("running verify command: %v", err)), true
 	}
 	if res.ExitCode != 0 {
 		msg := fmt.Sprintf("verify command failed with exit code %d", res.ExitCode)
-		return w.noImprovement(w.orch.clock().UTC(), "verify_failed", msg, verifyEventData(res, true)), true
+		return w.verifyFailed(w.orch.clock().UTC(), msg, verifyEventData(res, true)), true
 	}
 
 	w.appendEvent(ctx, w.orch.clock().UTC(), state.PhaseSelecting, "verify_passed", "Verify command passed", verifyEventData(res, true))
@@ -645,6 +645,18 @@ func (w *runWorkflow) noImprovement(now time.Time, kind, msg string, data map[st
 	w.end = &runEnd{
 		Phase:   state.PhaseNoImprovement,
 		Kind:    kind,
+		Message: msg,
+		Data:    data,
+	}
+	return workflowResult{done: true}
+}
+
+func (w *runWorkflow) verifyFailed(now time.Time, msg string, data map[string]any) workflowResult {
+	w.run.ReadyDeadline = nil
+	w.run.SetPhase(state.PhaseVerifyFailed, now)
+	w.end = &runEnd{
+		Phase:   state.PhaseVerifyFailed,
+		Kind:    "verify_failed",
 		Message: msg,
 		Data:    data,
 	}

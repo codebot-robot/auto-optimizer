@@ -1211,7 +1211,7 @@ func TestRunWorkflow_Selecting_VerifyOutcomes(t *testing.T) {
 				},
 			},
 			verifyTimeout: time.Minute,
-			wantPhase:     state.PhaseNoImprovement,
+			wantPhase:     state.PhaseVerifyFailed,
 			wantKind:      "verify_failed",
 			wantSubstr:    "exit code 2",
 			wantExitCode:  2,
@@ -1228,7 +1228,7 @@ func TestRunWorkflow_Selecting_VerifyOutcomes(t *testing.T) {
 				},
 			},
 			verifyTimeout: 30 * time.Millisecond,
-			wantPhase:     state.PhaseNoImprovement,
+			wantPhase:     state.PhaseVerifyFailed,
 			wantKind:      "verify_failed",
 			wantSubstr:    "timed out",
 		},
@@ -1245,7 +1245,7 @@ func TestRunWorkflow_Selecting_VerifyOutcomes(t *testing.T) {
 				},
 			},
 			verifyTimeout: 100 * time.Millisecond,
-			wantPhase:     state.PhaseNoImprovement,
+			wantPhase:     state.PhaseVerifyFailed,
 			wantKind:      "verify_failed",
 			wantSubstr:    "timed out",
 			wantTail:      "running slow test...\n",
@@ -1310,7 +1310,10 @@ func TestRunWorkflow_Selecting_VerifyOutcomes(t *testing.T) {
 			if wf.run.Phase != tc.wantPhase {
 				t.Errorf("phase = %s, want %s", wf.run.Phase, tc.wantPhase)
 			}
-			if tc.wantPhase == state.PhaseNoImprovement {
+			if tc.wantPhase == state.PhaseVerifyFailed {
+				if wf.run.Error != "" || wf.run.ErrorKind != "" {
+					t.Errorf("expected empty Error/ErrorKind for VerifyFailed, got %q/%q", wf.run.Error, wf.run.ErrorKind)
+				}
 				if wf.end == nil || wf.end.Kind != tc.wantKind || !strings.Contains(wf.end.Message, tc.wantSubstr) {
 					t.Errorf("wf.end = %+v, want kind=%q msg containing %q", wf.end, tc.wantKind, tc.wantSubstr)
 				}
