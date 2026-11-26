@@ -22,12 +22,30 @@ import (
 	"sync"
 
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
 // SessionListPageData contains data for rendering the session list page.
 type SessionListPageData struct {
 	Sessions []sessionapi.SessionSummary
+	Runs     map[string]*state.Run
 	User     string
+}
+
+// SessionRunPath returns the structured repo/goal/run path for a session's run, or an empty string.
+func (d SessionListPageData) SessionRunPath(s sessionapi.SessionSummary) string {
+	if s.RunID == "" || d.Runs == nil {
+		return ""
+	}
+	return runPath(d.Runs[s.RunID])
+}
+
+// SessionLabel returns the display label for a session, using the structured run path when available.
+func (d SessionListPageData) SessionLabel(s sessionapi.SessionSummary) string {
+	if p := d.SessionRunPath(s); p != "" {
+		return p
+	}
+	return s.Name
 }
 
 // Title returns the page title for the layout header.

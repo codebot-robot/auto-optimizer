@@ -1101,6 +1101,10 @@ func TestServer_ReposAndRuns(t *testing.T) {
 		t.Fatalf("GET / status = %d, want 200", resp.StatusCode)
 	}
 	bodyStr = string(body)
+	wantRunPath := "github.com/gke-labs/auto-optimizer/latency-reduction/" + runID
+	if !strings.Contains(bodyStr, wantRunPath) {
+		t.Errorf("expected session list to contain run path %q, got:\n%s", wantRunPath, bodyStr)
+	}
 	if !strings.Contains(bodyStr, sessionID) {
 		t.Errorf("expected session list to contain session ID %q", sessionID)
 	}
@@ -2075,6 +2079,7 @@ func TestGetRun_SessionTreeWithStatusAndTranscriptLinks(t *testing.T) {
 	assertStatusAfter(child2Name, `<span class="badge badge-in-flight">running</span>`)
 
 	// Verify each child transcript link resolves cleanly.
+	wantPath := repoKey.String() + "/tree-goal/" + runID
 	for _, name := range []string{rootName, child1Name, grandchildName, child2Name} {
 		tReq := httptest.NewRequest(http.MethodGet, "/sessions/"+name, nil)
 		tRec := httptest.NewRecorder()
@@ -2082,8 +2087,16 @@ func TestGetRun_SessionTreeWithStatusAndTranscriptLinks(t *testing.T) {
 		if tRec.Code != http.StatusOK {
 			t.Errorf("GET /sessions/%s status = %d, want 200", name, tRec.Code)
 		}
-		if !strings.Contains(tRec.Body.String(), "Session: "+name) {
-			t.Errorf("GET /sessions/%s missing session heading", name)
+		tBody := tRec.Body.String()
+		for _, want := range []string{
+			"<title>" + wantPath + " · auto-optimizer</title>",
+			`href="/repos/` + repoKey.String() + `"`,
+			`href="/runs/` + runID + `"`,
+			"session: " + name,
+		} {
+			if !strings.Contains(tBody, want) {
+				t.Errorf("GET /sessions/%s missing %q", name, want)
+			}
 		}
 	}
 }

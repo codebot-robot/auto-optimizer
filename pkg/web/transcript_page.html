@@ -1,9 +1,10 @@
 {{define "content"}}
 <div class="page-header">
   <div>
-    <h1 class="page-title">Session: {{.Summary.Name}}</h1>
+    <h1 class="page-title">{{if .RunPath}}{{if .HasRepo}}<a href="/repos/{{.Run.Repo.Host}}/{{.Run.Repo.Owner}}/{{.Run.Repo.Name}}">{{.Run.Repo}}</a>{{if or .Run.GoalName .Run.ID}}/{{end}}{{end}}{{if .Run.GoalName}}{{.Run.GoalName}}{{if .Run.ID}}/{{end}}{{end}}{{if .Run.ID}}<a href="/runs/{{.Run.ID}}">{{.Run.ID}}</a>{{end}}{{else}}Session: {{.Summary.Name}}{{end}}</h1>
     <div class="meta-badges">
-      <span class="meta-badge">toolset: {{.Summary.Toolset}}</span>
+      {{if .RunPath}}<span class="meta-badge">session: {{.Summary.Name}}</span>
+      {{end}}<span class="meta-badge">toolset: {{.Summary.Toolset}}</span>
       {{if .Summary.Parent}}<span class="meta-badge">parent: {{.Summary.Parent}}</span>{{end}}
       <span class="meta-badge">created: {{formatTime .Summary.CreatedAt}}</span>
       {{if .Summary.InFlight}}

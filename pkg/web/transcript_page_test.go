@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
 func TestRenderTranscriptPage(t *testing.T) {
@@ -65,6 +66,43 @@ func TestRenderTranscriptPage(t *testing.T) {
 	}
 	if !strings.Contains(body, "hello world") {
 		t.Errorf("expected body to contain message content %q, got:\n%s", "hello world", body)
+	}
+}
+
+func TestRenderTranscriptPage_WithRun(t *testing.T) {
+	rec := httptest.NewRecorder()
+	data := TranscriptPageData{
+		Detail: sessionapi.SessionDetail{
+			Summary: sessionapi.SessionSummary{
+				Name:      "run20261126t231827z0e08",
+				RunID:     "20261126T231827Z-0e08",
+				Toolset:   "basic",
+				CreatedAt: time.Date(2026, 11, 26, 23, 18, 27, 0, time.UTC),
+			},
+		},
+		Run: &state.Run{
+			ID:       "20261126T231827Z-0e08",
+			Repo:     state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"},
+			GoalName: "fix-broken-links",
+		},
+	}
+
+	if err := RenderTranscriptPage(t.Context(), rec, data); err != nil {
+		t.Fatalf("RenderTranscriptPage: %v", err)
+	}
+
+	body := rec.Body.String()
+	for _, want := range []string{
+		"<title>github.com/gke-labs/auto-optimizer/fix-broken-links/20261126T231827Z-0e08 · auto-optimizer</title>",
+		`<a href="/repos/github.com/gke-labs/auto-optimizer">github.com/gke-labs/auto-optimizer</a>/fix-broken-links/<a href="/runs/20261126T231827Z-0e08">20261126T231827Z-0e08</a>`,
+		`<span class="meta-badge">session: run20261126t231827z0e08</span>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected body to contain %q, got:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "Session: run20261126t231827z0e08") {
+		t.Errorf("expected run session header not to use raw session prefix, got:\n%s", body)
 	}
 }
 

@@ -19,14 +19,17 @@ import (
 	_ "embed"
 	"html/template"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
+	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
 
 // TranscriptPageData contains data for rendering the session transcript page.
 type TranscriptPageData struct {
 	Detail sessionapi.SessionDetail
+	Run    *state.Run
 	Full   bool
 	User   string
 }
@@ -41,9 +44,43 @@ func (d TranscriptPageData) Messages() []sessionapi.Message {
 	return d.Detail.Messages
 }
 
+// HasRepo reports whether the associated run has a complete repository key.
+func (d TranscriptPageData) HasRepo() bool {
+	return d.Run != nil && hasRepoKey(d.Run.Repo)
+}
+
+// RunPath returns the structured repo/goal/run path for the session's run, or an empty string.
+func (d TranscriptPageData) RunPath() string {
+	return runPath(d.Run)
+}
+
 // Title returns the page title for the layout header.
 func (d TranscriptPageData) Title() string {
+	if p := d.RunPath(); p != "" {
+		return p
+	}
 	return "Session " + d.Detail.Summary.Name
+}
+
+func hasRepoKey(k state.RepoKey) bool {
+	return k.Host != "" && k.Owner != "" && k.Name != ""
+}
+
+func runPath(r *state.Run) string {
+	if r == nil {
+		return ""
+	}
+	var parts []string
+	if hasRepoKey(r.Repo) {
+		parts = append(parts, r.Repo.String())
+	}
+	if r.GoalName != "" {
+		parts = append(parts, r.GoalName)
+	}
+	if r.ID != "" {
+		parts = append(parts, r.ID)
+	}
+	return strings.Join(parts, "/")
 }
 
 // InFlight reports whether a turn is currently in flight.

@@ -28,7 +28,7 @@
       <tbody>
         {{range .Sessions}}
         <tr>
-          <td><a href="/sessions/{{.Name}}"><strong>{{.Name}}</strong></a></td>
+          <td><a href="/sessions/{{.Name}}"><strong>{{$.SessionLabel .}}</strong></a>{{if $.SessionRunPath .}}<div class="session-meta">{{.Name}}</div>{{end}}</td>
           <td>
             {{if .RunID}}
             <a href="/runs/{{.RunID}}"><code>{{.RunID}}</code></a>
