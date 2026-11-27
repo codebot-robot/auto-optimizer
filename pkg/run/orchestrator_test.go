@@ -3518,7 +3518,7 @@ func TestBuildSystemPrompt(t *testing.T) {
 		"# Repository Facts",
 		"- URL: https://github.com/example/repo",
 		"- Default Branch: main",
-		"- Branch: ao/throughput/20261104T120000Z-0001",
+		"- Branch: auto-optimizer/throughput/20261104T120000Z-0001",
 		"- Base Commit: abcdef123456",
 		"- Working Directory: /workspace/repo",
 		"Commit your changes with git before calling open_pull_request; only commits on the branch are pushed, nothing uncommitted is included.",
@@ -4740,7 +4740,7 @@ func TestOrchestrator_Working_OpenPullRequest_TransitionsToSelecting(t *testing.
 	ctx := t.Context()
 	prLLM := &scriptedOpenPullRequestLLM{
 		repo:   "https://github.com/gke-labs/test-repo",
-		branch: "ao/goal/20261030T120000Z-test",
+		branch: "auto-optimizer/goal/20261030T120000Z-test",
 		title:  "Optimize search index queries",
 		body:   "Adds composite index on (repo, goal, run_id).",
 	}
@@ -4861,7 +4861,7 @@ func TestOrchestrator_Selecting_PushesBranch_Succeeds(t *testing.T) {
 	if gotRun.PRURL != "" {
 		t.Errorf("expected empty PRURL, got %q", gotRun.PRURL)
 	}
-	wantBranch := "ao/export-goal/" + runID
+	wantBranch := "auto-optimizer/export-goal/" + runID
 	if gotRun.Branch != wantBranch {
 		t.Errorf("expected branch %q, got %q", wantBranch, gotRun.Branch)
 	}
@@ -4949,8 +4949,8 @@ func TestOrchestrator_Selecting_BranchMoved_Fails(t *testing.T) {
 		PRBody:      "Implements feature",
 	}
 
-	// Advance ao/<goal>/<run-id> in the bare repository to another commit before Selecting
-	wantBranch := "ao/export-goal/" + runID
+	// Advance auto-optimizer/<goal>/<run-id> in the bare repository to another commit before Selecting
+	wantBranch := "auto-optimizer/export-goal/" + runID
 	wt, err := work.Worktree()
 	if err != nil {
 		t.Fatalf("Worktree: %v", err)
@@ -5629,7 +5629,7 @@ func setupOpeningPRTest(t *testing.T, forgeFor func(string) (forge.Forge, error)
 
 	runID := "20261106T120000Z-testpr"
 	baseSHA := "1189a319f389802669884696409ba28db20216b0"
-	branchName := "ao/optimize-speed/" + runID
+	branchName := "auto-optimizer/optimize-speed/" + runID
 	run := &state.Run{
 		ID:         runID,
 		Repo:       repo.Key(),
@@ -5716,7 +5716,7 @@ func TestOrchestrator_OpeningPR_ReusesOpenPullRequest(t *testing.T) {
 	ctx := t.Context()
 	fakeForge := forge.NewFake()
 	// Pre-create an open pull request for the branch
-	existingPR, err := fakeForge.OpenPullRequest(ctx, "https://github.com/example/repo", "ao/optimize-speed/20261106T120000Z-testpr", "main", "Existing PR", "Existing body")
+	existingPR, err := fakeForge.OpenPullRequest(ctx, "https://github.com/example/repo", "auto-optimizer/optimize-speed/20261106T120000Z-testpr", "main", "Existing PR", "Existing body")
 	if err != nil {
 		t.Fatalf("OpenPullRequest: %v", err)
 	}
@@ -5924,7 +5924,7 @@ func TestOrchestrator_Selecting_PushesAndOpensPullRequest_WithFakeForge(t *testi
 	if gotRun.Phase != state.PhaseSucceeded {
 		t.Errorf("expected phase %s, got %s", state.PhaseSucceeded, gotRun.Phase)
 	}
-	wantBranch := "ao/export-goal/" + runID
+	wantBranch := "auto-optimizer/export-goal/" + runID
 	if gotRun.Branch != wantBranch {
 		t.Errorf("expected branch %q, got %q", wantBranch, gotRun.Branch)
 	}

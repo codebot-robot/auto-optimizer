@@ -149,7 +149,7 @@ func (r *Run) SetPhase(phase RunPhase, t time.Time) {
 	r.PhaseTimestamps[phase] = t
 }
 
-// BranchName returns the branch name for this run, defaulting to ao/<goalName>/<id>.
+// BranchName returns the branch name for this run, defaulting to auto-optimizer/<goalName>/<id>.
 func (r *Run) BranchName() string {
 	if r == nil {
 		return ""
@@ -158,7 +158,7 @@ func (r *Run) BranchName() string {
 		return r.Branch
 	}
 	if r.GoalName != "" && r.ID != "" {
-		return fmt.Sprintf("ao/%s/%s", r.GoalName, r.ID)
+		return fmt.Sprintf("auto-optimizer/%s/%s", r.GoalName, r.ID)
 	}
 	return ""
 }

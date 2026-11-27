@@ -211,7 +211,7 @@ You will see several event kinds in the run event log:
 
 ## The Result
 
-When a candidate passes verification, the control plane pushes commits to a branch named `ao/<goal>/<run-id>` on your fork.
+When a candidate passes verification, the control plane pushes commits to a branch named `auto-optimizer/<goal>/<run-id>` on your fork.
 The control plane then opens a pull request against the default branch of the fork.
 The pull request originates from the configured GitHub App or the account that owns `GITHUB_TOKEN`.
 The pull request description contains the harness-written summary and run metadata.

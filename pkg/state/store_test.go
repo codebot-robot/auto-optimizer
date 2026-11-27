@@ -231,7 +231,7 @@ func TestRun_PutRun(t *testing.T) {
 		GoalName:      "bench",
 		Phase:         PhaseSucceeded,
 		BaseCommit:    "c0ffee",
-		Branch:        "ao/bench/20261023T100000Z-0001",
+		Branch:        "auto-optimizer/bench/20261023T100000Z-0001",
 		PRTitle:       "optimize benchmark",
 		PRBody:        "improves runtime by 15%",
 		PRURL:         "https://github.com/gke-labs/auto-optimizer/pull/1",
@@ -680,8 +680,8 @@ func TestRun_BranchName(t *testing.T) {
 		GoalName: "my-goal",
 		ID:       "run-1",
 	}
-	if got := defaultRun.BranchName(); got != "ao/my-goal/run-1" {
-		t.Errorf("default Run.BranchName() = %q, want ao/my-goal/run-1", got)
+	if got := defaultRun.BranchName(); got != "auto-optimizer/my-goal/run-1" {
+		t.Errorf("default Run.BranchName() = %q, want auto-optimizer/my-goal/run-1", got)
 	}
 
 	emptyRun := &Run{}

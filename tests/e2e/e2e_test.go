@@ -1605,10 +1605,10 @@ func TestRunPushesBranch(t *testing.T) {
 	finalRun, finalEvents := pollRunPhase(t, aoBin, serverAddr, repoURL, "Succeeded", 90*time.Second, serveStderr)
 	runID := finalRun.ID
 
-	wantBranch := fmt.Sprintf("ao/hello/%s", runID)
+	wantBranch := fmt.Sprintf("auto-optimizer/hello/%s", runID)
 	t.Logf("PASS: Run %s reached phase %s with branch %s", runID, finalRun.Phase, finalRun.Branch)
 
-	// 1. Assert run record has Branch equal to ao/hello/<run-id>
+	// 1. Assert run record has Branch equal to auto-optimizer/hello/<run-id>
 	if finalRun.Branch != wantBranch {
 		t.Errorf("run record branch = %q, want %q", finalRun.Branch, wantBranch)
 	}

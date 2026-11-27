@@ -228,10 +228,10 @@ watches, and bounded worker concurrency.
 A run progresses through `Pending`, `Preparing`, `Working`, `Selecting`, and
 `OpeningPR` before reaching a terminal outcome of `Succeeded`, `NoImprovement`,
 `VerifyFailed`, or `Failed`. During selection, the control plane verifies the
-candidate, rejects empty diffs or edits under `.goals/`, pushes a deterministic
-branch name with a lease, and deletes the sandbox. Because the branch name is
-deterministic, retrying pull request creation reuses any existing open pull
-request instead of creating duplicates.
+candidate, rejects empty diffs or edits under `.goals/`, pushes the
+deterministic branch `auto-optimizer/<goal>/<run-id>` with a lease, and deletes
+the sandbox. Because this branch name is deterministic, retrying pull request
+creation reuses any existing open pull request instead of creating duplicates.
 
 `HeroRun` custom resources in `kube-apiserver` hold the authoritative workflow
 state for every run. Representing runs as Kubernetes resources gives
