@@ -39,6 +39,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1557,5 +1558,75 @@ func TestNewServer_RequiresKubeClientAndNamespace(t *testing.T) {
 		KubeClient:     newFakeKubeClient(t),
 	}); err == nil {
 		t.Error("expected error when Namespace is empty")
+	}
+}
+
+func TestServer_SessionStatusFromCRD(t *testing.T) {
+	ctx := t.Context()
+	store := session.NewFileStore(t.TempDir())
+	kc := newFakeKubeClient(t)
+	srv, err := NewServer(ServerOptions{
+		Store:          store,
+		HarnessFactory: func(_ string) (*session.Harness, error) { return nil, nil },
+		KubeClient:     kc,
+		Namespace:      session.DefaultNamespace,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	t0 := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	for i, s := range []struct {
+		name, runID string
+		phase       herorunv1alpha1.SessionPhase
+		outcome     herorunv1alpha1.SessionOutcome
+	}{
+		{"sessfin", "run1", herorunv1alpha1.SessionPhaseSucceeded, herorunv1alpha1.SessionOutcomeFinished},
+		{"sessrun", "run1", herorunv1alpha1.SessionPhaseRunning, ""},
+		{"sesswait", "run1", herorunv1alpha1.SessionPhaseWaiting, ""},
+		{"sessidle", "", "", ""},
+	} {
+		if err := store.NewSession(ctx, s.name, session.Metadata{Toolset: "basic", RunID: s.runID, CreatedAt: t0.Add(time.Duration(i) * time.Minute)}); err != nil {
+			t.Fatalf("NewSession(%s): %v", s.name, err)
+		}
+		if s.phase != "" {
+			obj := &herorunv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: s.name, Namespace: session.DefaultNamespace}}
+			if err := kc.Create(ctx, obj); err != nil {
+				t.Fatalf("Create Session %s: %v", s.name, err)
+			}
+			obj.Status = herorunv1alpha1.SessionStatus{Phase: s.phase, Outcome: s.outcome}
+			if err := kc.Status().Update(ctx, obj); err != nil {
+				t.Fatalf("Status Update %s: %v", s.name, err)
+			}
+		}
+	}
+
+	summaries, err := srv.ListSessionSummaries(ctx)
+	if err != nil {
+		t.Fatalf("ListSessionSummaries: %v", err)
+	}
+	byName := make(map[string]SessionSummary, len(summaries))
+	for _, s := range summaries {
+		byName[s.Name] = s
+	}
+	if s := byName["sessfin"]; !s.IsTerminal() || s.InFlight || s.Outcome != herorunv1alpha1.SessionOutcomeFinished {
+		t.Errorf("sessfin summary = %+v, want terminal Finished not InFlight", s)
+	}
+	if s := byName["sessrun"]; s.IsTerminal() || !s.InFlight || s.Phase != herorunv1alpha1.SessionPhaseRunning {
+		t.Errorf("sessrun summary = %+v, want Running InFlight", s)
+	}
+	if s := byName["sesswait"]; s.IsTerminal() || s.InFlight || s.Phase != herorunv1alpha1.SessionPhaseWaiting {
+		t.Errorf("sesswait summary = %+v, want Waiting not InFlight", s)
+	}
+	if s := byName["sessidle"]; s.IsTerminal() || s.InFlight || s.Phase != "" {
+		t.Errorf("sessidle summary = %+v, want idle empty Phase", s)
+	}
+
+	detail, err := srv.GetSessionDetail(ctx, "sessfin")
+	if err != nil {
+		t.Fatalf("GetSessionDetail(sessfin): %v", err)
+	}
+	if !detail.Summary.IsTerminal() || detail.Summary.Outcome != herorunv1alpha1.SessionOutcomeFinished {
+		t.Errorf("GetSessionDetail(sessfin) = %+v, want terminal Finished", detail.Summary)
 	}
 }

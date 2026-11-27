@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
@@ -105,5 +106,39 @@ func TestRenderSessionListPage_CancelledContext(t *testing.T) {
 	err := RenderSessionListPage(ctx, rec, SessionListPageData{})
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
+	}
+}
+
+func TestRenderSessionListPage_Statuses(t *testing.T) {
+	rec := httptest.NewRecorder()
+	data := SessionListPageData{
+		Sessions: []sessionapi.SessionSummary{
+			{Name: "s-fin", Phase: herorunv1alpha1.SessionPhaseSucceeded, Outcome: herorunv1alpha1.SessionOutcomeFinished},
+			{Name: "s-pr", Phase: herorunv1alpha1.SessionPhaseSucceeded, Outcome: herorunv1alpha1.SessionOutcomePullRequest},
+			{Name: "s-turns", Phase: herorunv1alpha1.SessionPhaseSucceeded, Outcome: herorunv1alpha1.SessionOutcomeMaxTurns},
+			{Name: "s-fail", Phase: herorunv1alpha1.SessionPhaseFailed, Outcome: herorunv1alpha1.SessionOutcomeFailed},
+			{Name: "s-cancel", Phase: herorunv1alpha1.SessionPhaseCanceled, Outcome: herorunv1alpha1.SessionOutcomeCanceled},
+			{Name: "s-wait", Phase: herorunv1alpha1.SessionPhaseWaiting},
+			{Name: "s-run", InFlight: true, Phase: herorunv1alpha1.SessionPhaseRunning},
+			{Name: "s-idle"},
+		},
+	}
+	if err := RenderSessionListPage(t.Context(), rec, data); err != nil {
+		t.Fatalf("RenderSessionListPage: %v", err)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`<span class="badge badge-succeeded">finished</span>`,
+		`<span class="badge badge-succeeded">succeeded</span>`,
+		`<span class="badge badge-max-turns">max turns</span>`,
+		`<span class="badge badge-failed">failed</span>`,
+		`<span class="badge badge-cancelled">cancelled</span>`,
+		`<span class="badge badge-in-flight">waiting</span>`,
+		`<span class="badge badge-in-flight">in flight</span>`,
+		`<span class="badge badge-idle">idle</span>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("session list body missing %q", want)
+		}
 	}
 }

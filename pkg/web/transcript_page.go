@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 
+	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 )
@@ -83,9 +84,12 @@ func runPath(r *state.Run) string {
 	return strings.Join(parts, "/")
 }
 
-// InFlight reports whether a turn is currently in flight.
+// InFlight reports whether a turn is currently in flight or the session is waiting.
 func (d TranscriptPageData) InFlight() bool {
-	return d.Detail.Summary.InFlight
+	if d.Detail.Summary.IsTerminal() {
+		return false
+	}
+	return d.Detail.Summary.InFlight || d.Detail.Summary.Phase == herorunv1alpha1.SessionPhaseWaiting
 }
 
 //go:embed transcript_page.html
