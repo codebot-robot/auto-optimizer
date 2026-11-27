@@ -60,7 +60,7 @@ func (e *BranchMovedError) Unwrap() error {
 // PushPackfileOptions configures a packfile push operation.
 type PushPackfileOptions struct {
 	RemoteURL   string
-	Branch      string        // for example ao/<goal>/<run-id>
+	Branch      string        // for example auto-optimizer/<goal>/<run-id>
 	Tip, Base   plumbing.Hash // Tip must be reachable to Base through the packfile's commits
 	Packfile    io.Reader
 	Credentials PushCredentialer // may be nil for unauthenticated remotes

@@ -1003,7 +1003,7 @@ func TestRunWorkflow_Selecting_Success(t *testing.T) {
 	if wf.run.Phase != state.PhaseOpeningPR {
 		t.Errorf("phase = %s, want %s", wf.run.Phase, state.PhaseOpeningPR)
 	}
-	wantBranch := "ao/export-goal/" + runID
+	wantBranch := "auto-optimizer/export-goal/" + runID
 	if wf.run.Branch != wantBranch {
 		t.Errorf("branch = %q, want %q", wf.run.Branch, wantBranch)
 	}
@@ -1489,7 +1489,7 @@ func TestReconcileWorkflow_Selecting_SavesOpeningPRBeforeDeletingSandbox(t *test
 	if gotRun.Phase != state.PhaseOpeningPR {
 		t.Errorf("phase = %s, want %s", gotRun.Phase, state.PhaseOpeningPR)
 	}
-	wantBranch := "ao/export-goal/" + runID
+	wantBranch := "auto-optimizer/export-goal/" + runID
 	if gotRun.Branch != wantBranch {
 		t.Errorf("branch = %q, want %q", gotRun.Branch, wantBranch)
 	}
@@ -1560,7 +1560,7 @@ func newOpeningPRWorkflowFixture(t *testing.T, forgeFor func(string) (forge.Forg
 		GoalName:   "optimize-speed",
 		Phase:      state.PhaseOpeningPR,
 		BaseCommit: "1189a319f389802669884696409ba28db20216b0",
-		Branch:     "ao/optimize-speed/" + runID,
+		Branch:     "auto-optimizer/optimize-speed/" + runID,
 		PRTitle:    "Speed up queries",
 		PRBody:     "Replaced linear scan with hash map lookup.",
 	}
@@ -1584,7 +1584,7 @@ func TestRunWorkflow_OpeningPR_OpensPullRequest(t *testing.T) {
 		t.Fatalf("expected done=true requeueAfter=0, got %+v", res)
 	}
 
-	wantBranch := "ao/optimize-speed/" + run.ID
+	wantBranch := "auto-optimizer/optimize-speed/" + run.ID
 	if wf.run.Branch != wantBranch {
 		t.Errorf("branch = %q, want %q", wf.run.Branch, wantBranch)
 	}
@@ -1933,7 +1933,7 @@ func newWorkingWorkflowFixture(t *testing.T, runID string, now time.Time, deadli
 		Phase:              state.PhaseWorking,
 		PhaseTimestamps:    map[state.RunPhase]time.Time{state.PhasePending: now.Add(-15 * time.Minute), state.PhaseWorking: now.Add(-10 * time.Minute)},
 		BaseCommit:         "abcdef1234567890",
-		Branch:             "ao/optimize-latency/" + runID,
+		Branch:             "auto-optimizer/optimize-latency/" + runID,
 		SandboxName:        hrName,
 		WorkspaceClaimName: hrName,
 		Deadline:           deadline,

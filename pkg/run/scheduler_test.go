@@ -697,7 +697,7 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
 		{
 			Number: 1,
-			Head:   "ao/optimize-latency/20261030T120000Z-0001",
+			Head:   "auto-optimizer/optimize-latency/20261030T120000Z-0001",
 			Base:   "main",
 			State:  "open",
 			URL:    repo.URL + "/pull/1",
@@ -720,7 +720,7 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 		fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
 			{
 				Number: 1,
-				Head:   "ao/optimize-latency/20261030T120000Z-0001",
+				Head:   "auto-optimizer/optimize-latency/20261030T120000Z-0001",
 				Base:   "main",
 				State:  stateVal,
 				URL:    repo.URL + "/pull/1",
@@ -746,7 +746,7 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
 		{
 			Number: 2,
-			Head:   "ao/other-goal/20261030T120000Z-0002",
+			Head:   "auto-optimizer/other-goal/20261030T120000Z-0002",
 			Base:   "main",
 			State:  "open",
 			URL:    repo.URL + "/pull/2",
@@ -795,7 +795,7 @@ func TestScheduler_OpenPullRequestSkipsGoal(t *testing.T) {
 	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
 		{
 			Number: 1,
-			Head:   "ao/optimize-latency/20261030T120000Z-0001",
+			Head:   "auto-optimizer/optimize-latency/20261030T120000Z-0001",
 			Base:   "main",
 			State:  "open",
 			URL:    repo.URL + "/pull/1",
@@ -1024,7 +1024,7 @@ func TestScheduler_StartRun(t *testing.T) {
 	saveTestHeroRun(t, ctx, scheduler.Orchestrator, run)
 
 	fakeForge.SetPullRequests(repo.URL, []forge.PullRequest{
-		{Number: 1, Head: "ao/optimize-latency/run-1", State: "open", URL: repo.URL + "/pull/1"},
+		{Number: 1, Head: "auto-optimizer/optimize-latency/run-1", State: "open", URL: repo.URL + "/pull/1"},
 	})
 	_, err = scheduler.StartRun(ctx, repo, goalRec.Goal.Name, StartOptions{Reason: "manual"})
 	if !errors.Is(err, ErrOpenPullRequest) {

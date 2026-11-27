@@ -396,7 +396,7 @@ func (s *Scheduler) findOpenPullRequest(ctx context.Context, repo *state.Repo, g
 	if !ok {
 		return nil, nil
 	}
-	prs, err := cr.ListPullRequests(ctx, repo.URL, "ao/"+goalName+"/")
+	prs, err := cr.ListPullRequests(ctx, repo.URL, "auto-optimizer/"+goalName+"/")
 	if err != nil {
 		return nil, err
 	}
