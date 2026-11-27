@@ -515,6 +515,13 @@ func TestGoldenFiles(t *testing.T) {
 					Message: "Cloning repository",
 				},
 				{
+					Time:    fixedTime.Add(1 * time.Minute),
+					Phase:   state.PhaseSelecting,
+					Kind:    "verify_failed",
+					Message: "verify command failed with exit code 1",
+					Data:    map[string]any{"exitCode": 1, "tail": "--- FAIL: TestThroughput\nFAIL\n"},
+				},
+				{
 					Time:  fixedTime.Add(2 * time.Minute),
 					Phase: state.PhaseFailed,
 					Error: "evaluation script failed: exit status 1",

@@ -1029,6 +1029,12 @@ func TestRunWorkflow_Selecting_Success(t *testing.T) {
 	var kinds []string
 	for _, e := range events {
 		kinds = append(kinds, e.Kind)
+		if e.Kind == "verify_passed" {
+			m, ok := e.Data.(map[string]any)
+			if !ok || m["exitCode"] != float64(0) || m["tail"] != "ok\n" {
+				t.Errorf("verify_passed data = %#v, want exitCode=0 tail=%q", e.Data, "ok\n")
+			}
+		}
 	}
 	wantKinds := []string{"verify_started", "verify_passed", "commits_exported", "branch_pushed"}
 	if strings.Join(kinds, ",") != strings.Join(wantKinds, ",") {
@@ -1191,6 +1197,7 @@ func TestRunWorkflow_Selecting_VerifyOutcomes(t *testing.T) {
 		wantKind      string
 		wantSubstr    string
 		wantExitCode  int
+		wantTail      string
 	}{
 		{
 			name: "non-zero exit",
@@ -1208,6 +1215,7 @@ func TestRunWorkflow_Selecting_VerifyOutcomes(t *testing.T) {
 			wantKind:      "verify_failed",
 			wantSubstr:    "exit code 2",
 			wantExitCode:  2,
+			wantTail:      "FAIL\n",
 		},
 		{
 			name: "timeout",
@@ -1223,6 +1231,24 @@ func TestRunWorkflow_Selecting_VerifyOutcomes(t *testing.T) {
 			wantPhase:     state.PhaseNoImprovement,
 			wantKind:      "verify_failed",
 			wantSubstr:    "timed out",
+		},
+		{
+			name: "timeout with output",
+			procSrv: &scriptedExportServer{
+				startHandlers: map[string]func(stream processv1.ProcessService_StartServer) error{
+					expectedShell: func(stream processv1.ProcessService_StartServer) error {
+						_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Init{Init: &processv1.InitEvent{ProcessId: 42}}})
+						_ = stream.Send(&processv1.StartResponse{Event: &processv1.StartResponse_Stdout{Stdout: []byte("running slow test...\n")}})
+						<-stream.Context().Done()
+						return status.Error(codes.DeadlineExceeded, "deadline exceeded")
+					},
+				},
+			},
+			verifyTimeout: 100 * time.Millisecond,
+			wantPhase:     state.PhaseNoImprovement,
+			wantKind:      "verify_failed",
+			wantSubstr:    "timed out",
+			wantTail:      "running slow test...\n",
 		},
 		{
 			name: "execution error",
@@ -1292,6 +1318,15 @@ func TestRunWorkflow_Selecting_VerifyOutcomes(t *testing.T) {
 					if wf.end.Data["exitCode"] != tc.wantExitCode {
 						t.Errorf("exitCode = %v, want %d", wf.end.Data["exitCode"], tc.wantExitCode)
 					}
+				} else if _, hasExit := wf.end.Data["exitCode"]; hasExit {
+					t.Errorf("unexpected exitCode in data: %#v", wf.end.Data)
+				}
+				if tc.wantTail != "" {
+					if wf.end.Data["tail"] != tc.wantTail {
+						t.Errorf("tail = %q, want %q", wf.end.Data["tail"], tc.wantTail)
+					}
+				} else if tc.wantExitCode == 0 && wf.end.Data != nil {
+					t.Errorf("data = %#v, want nil", wf.end.Data)
 				}
 			} else if wf.run.ErrorKind != tc.wantKind || !strings.Contains(wf.run.Error, tc.wantSubstr) {
 				t.Errorf("ErrorKind/Error = %q/%q, want kind=%q msg containing %q", wf.run.ErrorKind, wf.run.Error, tc.wantKind, tc.wantSubstr)

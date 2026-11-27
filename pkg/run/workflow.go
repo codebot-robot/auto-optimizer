@@ -597,20 +597,34 @@ func (w *runWorkflow) runVerify(ctx context.Context, sb *session.Sandbox) (workf
 	if err != nil {
 		now := w.orch.clock().UTC()
 		if timedOut {
-			return w.noImprovement(now, "verify_failed", fmt.Sprintf("verify command timed out after %s", w.orch.verifyTimeout), nil), true
+			return w.noImprovement(now, "verify_failed", fmt.Sprintf("verify command timed out after %s", w.orch.verifyTimeout), verifyEventData(res, false)), true
 		}
 		return w.failRunWithKind(now, "verify_error", fmt.Sprintf("running verify command: %v", err)), true
 	}
 	if res.ExitCode != 0 {
 		msg := fmt.Sprintf("verify command failed with exit code %d", res.ExitCode)
-		return w.noImprovement(w.orch.clock().UTC(), "verify_failed", msg, map[string]any{
-			"exitCode": res.ExitCode,
-			"tail":     res.Tail,
-		}), true
+		return w.noImprovement(w.orch.clock().UTC(), "verify_failed", msg, verifyEventData(res, true)), true
 	}
 
-	w.appendEvent(ctx, w.orch.clock().UTC(), state.PhaseSelecting, "verify_passed", "Verify command passed", nil)
+	w.appendEvent(ctx, w.orch.clock().UTC(), state.PhaseSelecting, "verify_passed", "Verify command passed", verifyEventData(res, true))
 	return workflowResult{}, false
+}
+
+func verifyEventData(res *session.VerifyResult, includeExitCode bool) map[string]any {
+	if res == nil {
+		return nil
+	}
+	data := make(map[string]any, 2)
+	if includeExitCode {
+		data["exitCode"] = res.ExitCode
+	}
+	if res.Tail != "" {
+		data["tail"] = res.Tail
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	return data
 }
 
 func (w *runWorkflow) appendEvent(ctx context.Context, at time.Time, phase state.RunPhase, kind, msg string, data any) {
