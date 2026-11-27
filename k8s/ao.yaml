@@ -204,6 +204,8 @@ spec:
           volumeMounts:
             - name: state
               mountPath: /home/nonroot/.local/auto-optimizer
+            - name: tmp
+              mountPath: /tmp
             - name: portal-ca
               mountPath: /etc/portal
               readOnly: true
@@ -214,6 +216,8 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: ao-state
+        - name: tmp
+          emptyDir: {}
         - name: portal-ca
           secret:
             secretName: service-portal-controller-ca
