@@ -411,6 +411,7 @@ details.tool-result pre {
 }
 
 .badge.phase-Failed,
+.badge.phase-VerifyFailed,
 .badge.phase-Cancelled,
 .badge.phase-Expired {
   background: var(--bad-soft);

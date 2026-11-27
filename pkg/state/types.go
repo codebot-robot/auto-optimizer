@@ -90,6 +90,7 @@ const (
 	PhaseOpeningPR     RunPhase = "OpeningPR"
 	PhaseSucceeded     RunPhase = "Succeeded"
 	PhaseNoImprovement RunPhase = "NoImprovement"
+	PhaseVerifyFailed  RunPhase = "VerifyFailed"
 	PhaseFailed        RunPhase = "Failed"
 	PhaseCancelled     RunPhase = "Cancelled"
 	PhaseExpired       RunPhase = "Expired"
@@ -98,7 +99,7 @@ const (
 // IsTerminal returns true if the phase is one of the terminal run phases.
 func (p RunPhase) IsTerminal() bool {
 	switch p {
-	case PhaseSucceeded, PhaseNoImprovement, PhaseFailed, PhaseCancelled, PhaseExpired:
+	case PhaseSucceeded, PhaseNoImprovement, PhaseVerifyFailed, PhaseFailed, PhaseCancelled, PhaseExpired:
 		return true
 	default:
 		return false

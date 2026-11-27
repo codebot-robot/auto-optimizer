@@ -653,7 +653,7 @@ func TestValidation(t *testing.T) {
 	}
 
 	// RunPhase terminal check
-	if !PhaseSucceeded.IsTerminal() || !PhaseFailed.IsTerminal() || !PhaseCancelled.IsTerminal() || !PhaseExpired.IsTerminal() || !PhaseNoImprovement.IsTerminal() {
+	if !PhaseSucceeded.IsTerminal() || !PhaseFailed.IsTerminal() || !PhaseCancelled.IsTerminal() || !PhaseExpired.IsTerminal() || !PhaseNoImprovement.IsTerminal() || !PhaseVerifyFailed.IsTerminal() {
 		t.Error("expected terminal phases to return true from IsTerminal()")
 	}
 	if PhasePending.IsTerminal() || PhasePreparing.IsTerminal() || PhaseWorking.IsTerminal() || PhaseSelecting.IsTerminal() || PhaseOpeningPR.IsTerminal() {

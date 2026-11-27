@@ -226,6 +226,29 @@ func TestRoundTrip_AllPhases_ThroughJSON(t *testing.T) {
 			},
 		},
 		{
+			name: "VerifyFailed",
+			run: &state.Run{
+				ID:                 "20261122T100000Z-0011",
+				GoalName:           "optimize-latency",
+				Phase:              state.PhaseVerifyFailed,
+				BaseCommit:         "0123456789abcdef0123456789abcdef01234567",
+				Branch:             "ao/optimize-latency/20261122T100000Z-0011",
+				SessionID:          "sess-work-0011",
+				SandboxName:        "run-20261122t100000z-0011",
+				WorkspaceClaimName: "run-20261122t100000z-0011",
+				Deadline:           &deadline,
+				CostUSD:            1.10,
+				Goal:               sampleGoal(),
+				PhaseTimestamps: map[state.RunPhase]time.Time{
+					state.PhasePending:      baseTime,
+					state.PhasePreparing:    baseTime.Add(1 * time.Minute),
+					state.PhaseWorking:      baseTime.Add(3 * time.Minute),
+					state.PhaseSelecting:    baseTime.Add(20 * time.Minute),
+					state.PhaseVerifyFailed: baseTime.Add(22 * time.Minute),
+				},
+			},
+		},
+		{
 			name: "Failed",
 			run: &state.Run{
 				ID:                 "20261122T100000Z-0008",

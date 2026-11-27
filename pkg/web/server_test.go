@@ -579,6 +579,9 @@ func TestHealthzAndStatic(t *testing.T) {
 	if !strings.Contains(string(cssBody), "--indigo") {
 		t.Errorf("expected CSS content, got: %s", string(cssBody))
 	}
+	if !strings.Contains(string(cssBody), ".badge.phase-VerifyFailed") {
+		t.Error("expected CSS to include .badge.phase-VerifyFailed")
+	}
 }
 
 func TestTruncateRunes(t *testing.T) {

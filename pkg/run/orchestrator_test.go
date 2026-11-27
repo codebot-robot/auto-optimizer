@@ -5367,7 +5367,7 @@ func TestOrchestrator_Selecting_Verify_PassingProceedsToExport(t *testing.T) {
 	}
 }
 
-func TestOrchestrator_Selecting_Verify_FailingEndsInNoImprovement(t *testing.T) {
+func TestOrchestrator_Selecting_Verify_FailingEndsInVerifyFailed(t *testing.T) {
 	ctx := t.Context()
 	const verifyCmd = "make test"
 	expectedVerifyShell := "sh -c cd '/workspace/repo' && " + verifyCmd
@@ -5393,8 +5393,8 @@ func TestOrchestrator_Selecting_Verify_FailingEndsInNoImprovement(t *testing.T) 
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
-	if gotRun.Phase != state.PhaseNoImprovement {
-		t.Errorf("got phase %s, want NoImprovement", gotRun.Phase)
+	if gotRun.Phase != state.PhaseVerifyFailed {
+		t.Errorf("got phase %s, want VerifyFailed", gotRun.Phase)
 	}
 
 	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
@@ -5403,7 +5403,7 @@ func TestOrchestrator_Selecting_Verify_FailingEndsInNoImprovement(t *testing.T) 
 		if e.Kind == "verify_started" {
 			foundStarted = true
 		}
-		if e.Phase == state.PhaseNoImprovement && e.Kind == "verify_failed" {
+		if e.Phase == state.PhaseVerifyFailed && e.Kind == "verify_failed" {
 			foundFailed = true
 			if !strings.Contains(e.Message, "2") {
 				t.Errorf("expected exit code in message, got: %q", e.Message)
@@ -5444,7 +5444,7 @@ func TestOrchestrator_Selecting_Verify_FailingEndsInNoImprovement(t *testing.T) 
 	}
 }
 
-func TestOrchestrator_Selecting_Verify_TimeoutEndsInNoImprovement(t *testing.T) {
+func TestOrchestrator_Selecting_Verify_TimeoutEndsInVerifyFailed(t *testing.T) {
 	ctx := t.Context()
 	const verifyCmd = "sleep 10"
 	expectedVerifyShell := "sh -c cd '/workspace/repo' && " + verifyCmd
@@ -5482,14 +5482,14 @@ func TestOrchestrator_Selecting_Verify_TimeoutEndsInNoImprovement(t *testing.T) 
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
-	if gotRun.Phase != state.PhaseNoImprovement {
-		t.Errorf("got phase %s, want NoImprovement", gotRun.Phase)
+	if gotRun.Phase != state.PhaseVerifyFailed {
+		t.Errorf("got phase %s, want VerifyFailed", gotRun.Phase)
 	}
 
 	events, _ := store.ReadEvents(ctx, repo.Key(), run.ID)
 	var foundTimeout bool
 	for _, e := range events {
-		if e.Phase == state.PhaseNoImprovement && e.Kind == "verify_failed" && strings.Contains(e.Message, "timed out") {
+		if e.Phase == state.PhaseVerifyFailed && e.Kind == "verify_failed" && strings.Contains(e.Message, "timed out") {
 			foundTimeout = true
 		}
 	}

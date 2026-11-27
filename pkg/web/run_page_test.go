@@ -142,6 +142,37 @@ func TestRenderRunPage_FailedRun(t *testing.T) {
 	}
 }
 
+func TestRenderRunPage_VerifyFailedRun(t *testing.T) {
+	rec := httptest.NewRecorder()
+	data := RunPageData{
+		Run: &state.Run{
+			ID: "20261028T131500Z-verf",
+			Repo: state.RepoKey{
+				Host:  "github.com",
+				Owner: "gke-labs",
+				Name:  "auto-optimizer",
+			},
+			GoalName: "verify-goal",
+			Phase:    state.PhaseVerifyFailed,
+		},
+	}
+
+	if err := RenderRunPage(t.Context(), rec, data); err != nil {
+		t.Fatalf("RenderRunPage returned unexpected error: %v", err)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `<span class="badge phase-VerifyFailed">VerifyFailed</span>`) {
+		t.Errorf("expected VerifyFailed phase badge in body:\n%s", body)
+	}
+	if strings.Contains(body, "<meta http-equiv=\"refresh\" content=\"2\">") {
+		t.Error("expected terminal VerifyFailed run NOT to have refresh meta tag")
+	}
+	if !strings.Contains(body, "Run again") {
+		t.Error("expected terminal VerifyFailed run to contain 'Run again' button")
+	}
+}
+
 func TestRenderRunPage_ActionError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	data := RunPageData{
