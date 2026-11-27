@@ -60,17 +60,26 @@ kubectl create secret generic ao-model-keys \
 Alternatively, on Google Kubernetes Engine you can configure Vertex AI with Workload Identity to avoid cluster Secrets.
 
 Provide forge credentials so the control plane can push branches and open pull requests.
-Create a fork of the target repository on GitHub.
-Generate a GitHub personal access token with repository read and write permissions.
-Store the token in the `ao-forge` Secret in the `ao-system` namespace:
+Use either a GitHub App (recommended) or a personal access token in the `ao-forge` Secret in `ao-system`.
+
+For a GitHub App, create an app under **Settings > Developer settings > GitHub Apps** with **Contents: Read and write** and **Pull requests: Read and write** repository permissions.
+Generate a private key (`.pem` file), install the app on your target repositories, and store its credentials in `ao-forge`:
+
+```bash
+kubectl create secret generic ao-forge \
+  -n ao-system \
+  --from-literal=GITHUB_APP_ID="<app-id>" \
+  --from-file=GITHUB_APP_PRIVATE_KEY="<path-to-key.pem>"
+```
+
+The control plane mints short-lived per-repository installation tokens automatically.
+When `GITHUB_APP_ID` is unset, `ao` falls back to `GITHUB_TOKEN`:
 
 ```bash
 kubectl create secret generic ao-forge \
   -n ao-system \
   --from-literal=GITHUB_TOKEN="<token>"
 ```
-
-The account that owns this token pushes branches and authors the pull requests.
 
 Configure the repository list and model in the `ao-config` ConfigMap:
 
@@ -204,7 +213,7 @@ You will see several event kinds in the run event log:
 
 When a candidate passes verification, the control plane pushes commits to a branch named `ao/<goal>/<run-id>` on your fork.
 The control plane then opens a pull request against the default branch of the fork.
-The pull request originates from the account that owns the `GITHUB_TOKEN`.
+The pull request originates from the configured GitHub App or the account that owns `GITHUB_TOKEN`.
 The pull request description contains the harness-written summary and run metadata.
 The scheduler does not start another run for that goal while the pull request remains open.
 Review and merge or close the pull request before the scheduler runs that goal again.
