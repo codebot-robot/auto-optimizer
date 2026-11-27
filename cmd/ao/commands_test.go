@@ -113,8 +113,11 @@ func TestServeFlags(t *testing.T) {
 	if cmd.Flag("repo") == nil {
 		t.Error("expected --repo flag on ao serve")
 	}
-	if cmd.Flag("max-turns") == nil {
+	maxTurnsFlag := cmd.Flag("max-turns")
+	if maxTurnsFlag == nil {
 		t.Error("expected --max-turns flag on ao serve")
+	} else if maxTurnsFlag.DefValue != "100" {
+		t.Errorf("expected default max-turns to be 100, got %s", maxTurnsFlag.DefValue)
 	}
 	maxSessionDepthFlag := cmd.Flag("max-session-depth")
 	if maxSessionDepthFlag == nil {
@@ -331,24 +334,33 @@ func TestServePublicURLValidation(t *testing.T) {
 }
 
 func TestServeMaxTurnsValidation(t *testing.T) {
-	t.Run("default is 30", func(t *testing.T) {
-		cmd := newServeCommand()
+	t.Run("default is 100", func(t *testing.T) {
+		t.Setenv("AO_MAX_TURNS", "")
+		var opts serveOptions
+		cmd := newServeCommandWithOptions(&opts)
 		if err := cmd.ParseFlags([]string{}); err != nil {
 			t.Fatalf("ParseFlags: %v", err)
 		}
 		if err := cmd.PreRunE(cmd, nil); err != nil {
 			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+		if opts.orchestrator.MaxTurns != 100 {
+			t.Errorf("orchestrator.MaxTurns = %d, want 100", opts.orchestrator.MaxTurns)
 		}
 	})
 
 	t.Run("valid AO_MAX_TURNS", func(t *testing.T) {
 		t.Setenv("AO_MAX_TURNS", "42")
-		cmd := newServeCommand()
+		var opts serveOptions
+		cmd := newServeCommandWithOptions(&opts)
 		if err := cmd.ParseFlags([]string{}); err != nil {
 			t.Fatalf("ParseFlags: %v", err)
 		}
 		if err := cmd.PreRunE(cmd, nil); err != nil {
 			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+		if opts.orchestrator.MaxTurns != 42 {
+			t.Errorf("orchestrator.MaxTurns = %d, want 42", opts.orchestrator.MaxTurns)
 		}
 	})
 
@@ -427,12 +439,16 @@ func TestServeMaxTurnsValidation(t *testing.T) {
 
 	t.Run("flag overrides AO_MAX_TURNS", func(t *testing.T) {
 		t.Setenv("AO_MAX_TURNS", "10")
-		cmd := newServeCommand()
+		var opts serveOptions
+		cmd := newServeCommandWithOptions(&opts)
 		if err := cmd.ParseFlags([]string{"--max-turns", "25"}); err != nil {
 			t.Fatalf("ParseFlags: %v", err)
 		}
 		if err := cmd.PreRunE(cmd, nil); err != nil {
 			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+		if opts.orchestrator.MaxTurns != 25 {
+			t.Errorf("orchestrator.MaxTurns = %d, want 25", opts.orchestrator.MaxTurns)
 		}
 	})
 
