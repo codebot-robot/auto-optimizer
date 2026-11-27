@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -27,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
@@ -47,10 +49,12 @@ type cachedResponse struct {
 // Forge implements forge.Forge, forge.ChangeRequestCreator, and forge.PushCredentialer for GitHub.
 type Forge struct {
 	token          string
+	app            *appAuth
 	baseURL        string
 	httpClient     *http.Client
 	remote         forge.Forge
 	rateLimitFloor int
+	now            func() time.Time
 
 	mu                 sync.Mutex
 	cache              map[string]cachedResponse
@@ -93,10 +97,8 @@ func WithRemote(remote forge.Forge) Option {
 	}
 }
 
-// New creates a new GitHub Forge authenticated with the given personal access token.
-func New(token string, opts ...Option) *Forge {
+func newForge(opts ...Option) *Forge {
 	f := &Forge{
-		token:          token,
 		baseURL:        defaultBaseURL,
 		httpClient:     http.DefaultClient,
 		rateLimitFloor: defaultRateLimitFloor,
@@ -105,6 +107,13 @@ func New(token string, opts ...Option) *Forge {
 	for _, opt := range opts {
 		opt(f)
 	}
+	return f
+}
+
+// New creates a new GitHub Forge authenticated with the given personal access token.
+func New(token string, opts ...Option) *Forge {
+	f := newForge(opts...)
+	f.token = token
 	if f.remote == nil {
 		if token != "" {
 			f.remote = forge.NewGitRemoteWithCredentials("x-access-token", token)
@@ -115,13 +124,72 @@ func New(token string, opts ...Option) *Forge {
 	return f
 }
 
-// NewFromEnv creates a new GitHub Forge using the GITHUB_TOKEN environment variable.
-func NewFromEnv(opts ...Option) *Forge {
-	return New(os.Getenv("GITHUB_TOKEN"), opts...)
+// NewFromEnv creates a GitHub Forge from environment variables.
+// When GITHUB_APP_ID is set, it reads the private key from GITHUB_APP_PRIVATE_KEY
+// or GITHUB_APP_PRIVATE_KEY_FILE and fails if the key is missing or invalid.
+// Otherwise it falls back to GITHUB_TOKEN, returning (nil, nil) when unset.
+func NewFromEnv(opts ...Option) (*Forge, error) {
+	if appID := strings.TrimSpace(os.Getenv("GITHUB_APP_ID")); appID != "" {
+		keyPEM := []byte(os.Getenv("GITHUB_APP_PRIVATE_KEY"))
+		if len(bytes.TrimSpace(keyPEM)) == 0 {
+			keyFile := strings.TrimSpace(os.Getenv("GITHUB_APP_PRIVATE_KEY_FILE"))
+			if keyFile == "" {
+				return nil, errors.New("GITHUB_APP_ID is set without GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_FILE")
+			}
+			var err error
+			keyPEM, err = os.ReadFile(keyFile)
+			if err != nil {
+				return nil, fmt.Errorf("reading GITHUB_APP_PRIVATE_KEY_FILE %q: %w", keyFile, err)
+			}
+		}
+		return NewApp(appID, keyPEM, opts...)
+	}
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		return New(token, opts...), nil
+	}
+	return nil, nil
+}
+
+func (f *Forge) setAPIHeaders(ctx context.Context, req *http.Request, repoURL string) error {
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
+	token := f.token
+	if f.app != nil {
+		tok, err := f.installationTokenForRepo(ctx, repoURL)
+		if err != nil {
+			return err
+		}
+		token = tok.token
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return nil
+}
+
+func (f *Forge) remoteFor(ctx context.Context, repoURL string) (forge.Forge, error) {
+	if f.remote != nil {
+		return f.remote, nil
+	}
+	if f.app != nil {
+		tok, err := f.installationTokenForRepo(ctx, repoURL)
+		return tok.remote, err
+	}
+	return forge.NewGitRemote(), nil
 }
 
 // PushCredentials returns HTTP basic auth credentials for a control-plane git push.
 func (f *Forge) PushCredentials(repoURL string) (username, password string) {
+	if f.app != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), pushTokenTimeout)
+		defer cancel()
+		tok, err := f.installationTokenForRepo(ctx, repoURL)
+		if err != nil {
+			scoped.Log(ctx).Error(err, "failed to obtain GitHub App installation token for push")
+			return "", ""
+		}
+		return "x-access-token", tok.token
+	}
 	if f.token == "" {
 		return "", ""
 	}
@@ -130,7 +198,11 @@ func (f *Forge) PushCredentials(repoURL string) (username, password string) {
 
 // ListRefs queries references from the repository using the underlying gitremote forge.
 func (f *Forge) ListRefs(ctx context.Context, repoURL string) (map[string]string, error) {
-	return f.remote.ListRefs(ctx, repoURL)
+	r, err := f.remoteFor(ctx, repoURL)
+	if err != nil {
+		return nil, err
+	}
+	return r.ListRefs(ctx, repoURL)
 }
 
 // FetchTree retrieves the file tree at the given commit using the underlying gitremote forge.
@@ -138,12 +210,20 @@ func (f *Forge) ListRefs(ctx context.Context, repoURL string) (map[string]string
 // blobs outside the prefix are skipped without reading their contents.
 // If prefix is empty, all files in the tree are fetched.
 func (f *Forge) FetchTree(ctx context.Context, repoURL string, commit string, prefix string) (fs.FS, error) {
-	return f.remote.FetchTree(ctx, repoURL, commit, prefix)
+	r, err := f.remoteFor(ctx, repoURL)
+	if err != nil {
+		return nil, err
+	}
+	return r.FetchTree(ctx, repoURL, commit, prefix)
 }
 
 // DefaultBranch queries the repository's default branch using the underlying gitremote forge.
 func (f *Forge) DefaultBranch(ctx context.Context, repoURL string) (string, error) {
-	return f.remote.DefaultBranch(ctx, repoURL)
+	r, err := f.remoteFor(ctx, repoURL)
+	if err != nil {
+		return "", err
+	}
+	return r.DefaultBranch(ctx, repoURL)
 }
 
 func parseRepo(repoURL string) (owner, name string, err error) {
@@ -278,10 +358,8 @@ func (f *Forge) ListPullRequests(ctx context.Context, repoURL, headPrefix string
 		return nil, fmt.Errorf("creating list pull requests request: %w", err)
 	}
 
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
-	if f.token != "" {
-		req.Header.Set("Authorization", "Bearer "+f.token)
+	if err := f.setAPIHeaders(ctx, req, repoURL); err != nil {
+		return nil, err
 	}
 
 	body, err := f.doRead(ctx, req)
@@ -343,10 +421,8 @@ func (f *Forge) OpenPullRequest(ctx context.Context, repoURL, head, base, title,
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
-	if f.token != "" {
-		req.Header.Set("Authorization", "Bearer "+f.token)
+	if err := f.setAPIHeaders(ctx, req, repoURL); err != nil {
+		return nil, err
 	}
 
 	resp, err := f.httpClient.Do(req)

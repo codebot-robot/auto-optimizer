@@ -28,6 +28,8 @@ import (
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
+	"github.com/gke-labs/auto-optimizer/pkg/forge"
+	"github.com/gke-labs/auto-optimizer/pkg/forge/github"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	runpkg "github.com/gke-labs/auto-optimizer/pkg/run"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
@@ -503,42 +505,70 @@ func TestServeEgressHostsValidation(t *testing.T) {
 }
 
 func TestSelectForge(t *testing.T) {
+	ghForge := github.New("ghp_secret")
+	fallback := forge.NewGitRemote()
 	tests := []struct {
 		repoURL     string
-		githubToken string
+		githubForge *github.Forge
 		wantForge   string
 	}{
 		{
 			repoURL:     "https://github.com/gke-labs/auto-optimizer",
-			githubToken: "ghp_secret",
+			githubForge: ghForge,
 			wantForge:   "github",
 		},
 		{
 			repoURL:     "https://github.com/gke-labs/auto-optimizer",
-			githubToken: "",
+			githubForge: nil,
 			wantForge:   "gitremote",
 		},
 		{
 			repoURL:     "https://gitlab.com/example/repo",
-			githubToken: "ghp_secret",
+			githubForge: ghForge,
 			wantForge:   "gitremote",
 		},
 		{
 			repoURL:     "/path/to/bare/repo.git",
-			githubToken: "ghp_secret",
+			githubForge: ghForge,
 			wantForge:   "gitremote",
 		},
 	}
 
 	for _, tt := range tests {
-		_, name, err := selectForge(tt.repoURL, tt.githubToken)
+		_, name, err := selectForge(tt.repoURL, tt.githubForge, fallback)
 		if err != nil {
-			t.Errorf("selectForge(%q, token=%q) returned unexpected error: %v", tt.repoURL, tt.githubToken, err)
+			t.Errorf("selectForge(%q) returned unexpected error: %v", tt.repoURL, err)
 		}
 		if name != tt.wantForge {
-			t.Errorf("selectForge(%q, token=%q) = %q; want %q", tt.repoURL, tt.githubToken, name, tt.wantForge)
+			t.Errorf("selectForge(%q) = %q; want %q", tt.repoURL, name, tt.wantForge)
 		}
 	}
+}
+
+func TestServeGitHubAppFailFast(t *testing.T) {
+	t.Run("missing private key fails fast", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "12345")
+		t.Setenv("GITHUB_APP_PRIVATE_KEY", "")
+		t.Setenv("GITHUB_APP_PRIVATE_KEY_FILE", "")
+		cmd := newServeCommand()
+		cmd.SetArgs([]string{"--insecure-no-auth"})
+		err := cmd.ExecuteContext(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "initializing GitHub forge") {
+			t.Fatalf("err = %v, want error containing 'initializing GitHub forge'", err)
+		}
+	})
+
+	t.Run("invalid private key fails fast", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "12345")
+		t.Setenv("GITHUB_APP_PRIVATE_KEY", "not-a-valid-key")
+		t.Setenv("GITHUB_APP_PRIVATE_KEY_FILE", "")
+		cmd := newServeCommand()
+		cmd.SetArgs([]string{"--insecure-no-auth"})
+		err := cmd.ExecuteContext(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "initializing GitHub forge") {
+			t.Fatalf("err = %v, want error containing 'initializing GitHub forge'", err)
+		}
+	})
 }
 
 func TestRunListCommand_Execution(t *testing.T) {

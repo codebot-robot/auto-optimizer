@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -241,6 +242,11 @@ func runServe(ctx context.Context, opts serveOptions) error {
 		return err
 	}
 
+	githubForge, err := github.NewFromEnv()
+	if err != nil {
+		return fmt.Errorf("initializing GitHub forge: %w", err)
+	}
+
 	stateDir := opts.stateDir
 	if strings.HasPrefix(stateDir, "~/") {
 		userHome, err := os.UserHomeDir()
@@ -283,7 +289,11 @@ func runServe(ctx context.Context, opts serveOptions) error {
 
 	sessionStore := session.NewFileStore(stateDir)
 	stateStore := state.NewFileStore(stateDir)
-	forgeClient := forge.NewGitRemote()
+	gitRemote := forge.NewGitRemote()
+	forgeFor := func(repoURL string) (forge.Forge, error) {
+		f, _, err := selectForge(repoURL, githubForge, gitRemote)
+		return f, err
+	}
 
 	var repoURLs []string
 	repoURLs = append(repoURLs, opts.repos...)
@@ -295,7 +305,6 @@ func runServe(ctx context.Context, opts serveOptions) error {
 		}
 	}
 
-	githubToken := os.Getenv("GITHUB_TOKEN")
 	for _, repoURL := range repoURLs {
 		key, err := state.ParseRepoURL(repoURL)
 		if err != nil {
@@ -305,7 +314,7 @@ func runServe(ctx context.Context, opts serveOptions) error {
 		_, err = stateStore.GetRepo(ctx, key)
 		if err != nil {
 			if errors.Is(err, state.ErrNotFound) {
-				repoForge, forgeKind, err := selectForge(repoURL, githubToken)
+				repoForge, forgeKind, err := selectForge(repoURL, githubForge, gitRemote)
 				if err != nil {
 					return fmt.Errorf("selecting forge for %s: %w", repoURL, err)
 				}
@@ -336,7 +345,7 @@ func runServe(ctx context.Context, opts serveOptions) error {
 
 	syncerEngine, err := syncer.New(syncer.Options{
 		Store: stateStore,
-		Forge: forgeClient,
+		Forge: routingForge(forgeFor),
 	})
 	if err != nil {
 		return fmt.Errorf("initializing syncer: %w", err)
@@ -375,10 +384,7 @@ func runServe(ctx context.Context, opts serveOptions) error {
 	orchOpts.Harness = orchestratorHarness
 	orchOpts.KubeClient = mgr.GetClient()
 	orchOpts.GitAuthor = opts.git.Author
-	orchOpts.ForgeFor = func(repoURL string) (forge.Forge, error) {
-		f, _, err := selectForge(repoURL, githubToken)
-		return f, err
-	}
+	orchOpts.ForgeFor = forgeFor
 	if opts.portal.Enabled() {
 		portalClient, err := portal.New(opts.portal)
 		if err != nil {
@@ -406,10 +412,7 @@ func runServe(ctx context.Context, opts serveOptions) error {
 	scheduler, err := run.NewScheduler(run.SchedulerOptions{
 		Store:        stateStore,
 		Orchestrator: orchestrator,
-		ForgeFor: func(repoURL string) (forge.Forge, error) {
-			f, _, err := selectForge(repoURL, githubToken)
-			return f, err
-		},
+		ForgeFor:     forgeFor,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing scheduler: %w", err)
@@ -551,13 +554,42 @@ func setupSessionController(
 	return nil
 }
 
-func selectForge(repoURL, githubToken string) (forge.Forge, string, error) {
+type routingForge func(repoURL string) (forge.Forge, error)
+
+func (fn routingForge) ListRefs(ctx context.Context, repoURL string) (map[string]string, error) {
+	f, err := fn(repoURL)
+	if err != nil {
+		return nil, err
+	}
+	return f.ListRefs(ctx, repoURL)
+}
+
+func (fn routingForge) FetchTree(ctx context.Context, repoURL, commit, prefix string) (fs.FS, error) {
+	f, err := fn(repoURL)
+	if err != nil {
+		return nil, err
+	}
+	return f.FetchTree(ctx, repoURL, commit, prefix)
+}
+
+func (fn routingForge) DefaultBranch(ctx context.Context, repoURL string) (string, error) {
+	f, err := fn(repoURL)
+	if err != nil {
+		return "", err
+	}
+	return f.DefaultBranch(ctx, repoURL)
+}
+
+func selectForge(repoURL string, githubForge *github.Forge, fallback forge.Forge) (forge.Forge, string, error) {
 	key, err := state.ParseRepoURL(repoURL)
 	if err != nil {
 		return nil, "", fmt.Errorf("parsing repository URL %q: %w", repoURL, err)
 	}
-	if (key.Host == "github.com" || strings.HasSuffix(key.Host, ".github.com")) && githubToken != "" {
-		return github.New(githubToken), "github", nil
+	if (key.Host == "github.com" || strings.HasSuffix(key.Host, ".github.com")) && githubForge != nil {
+		return githubForge, "github", nil
+	}
+	if fallback != nil {
+		return fallback, "gitremote", nil
 	}
 	return forge.NewGitRemote(), "gitremote", nil
 }
